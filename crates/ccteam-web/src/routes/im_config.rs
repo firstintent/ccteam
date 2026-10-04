@@ -1,4 +1,5 @@
-//! v0.8.8 F4 — web IM credential configuration (Telegram + Lark/Feishu).
+//! v0.8.8 F4 — web IM credential configuration (Telegram + Lark/Feishu +
+//! Slack).
 //!
 //! Mounted into the `/api/v1` `OpenApiRouter` (see [`super::openapi`]), so
 //! every route here sits behind the same web-token gate as the rest of the
@@ -20,11 +21,12 @@
 //!   `true` only on the standalone web path with no daemon gateway, where the
 //!   new creds take effect on the next `ccteam start`). Mirrors the per-tenant
 //!   path in [`super::users`]`::apply_tenant_im`.
-//! - **Validate before persist.** A bad Telegram token / Lark app secret is
-//!   rejected (`400` + the [`OnboardingError`] `Display` reason) *before* it
-//!   lands on disk — reusing the CLI validators
-//!   (`onboarding::{telegram_validate_token_with_base, lark_setup_with_base}`)
-//!   directly in the async handler (no nested runtime).
+//! - **Validate before persist.** A bad Telegram token / Lark app secret /
+//!   Slack token is rejected (`400` + the [`OnboardingError`] `Display`
+//!   reason) *before* it lands on disk — reusing the CLI validators
+//!   (`onboarding::{telegram_validate_token_with_base, lark_setup_with_base,
+//!   slack_setup_with_base}`) directly in the async handler (no nested
+//!   runtime).
 //! - **No TLS.** The daemon serves plain HTTP; configuring secrets over a
 //!   LAN link is plaintext on the wire. The GET response carries a
 //!   `transport_warning` so the SPA can surface it.
@@ -51,8 +53,9 @@ use axum::{
 };
 use ccteam_im::credentials::{self, Credentials, LarkCreds, TelegramCreds};
 use ccteam_im::onboarding::{
-    lark_setup_with_base, telegram_poll_chat_id_with_base, telegram_validate_token_with_base,
-    FEISHU_API_BASE, LARK_API_BASE, TELEGRAM_API_BASE,
+    lark_setup_with_base, slack_setup_with_base, telegram_poll_chat_id_with_base,
+    telegram_validate_token_with_base, FEISHU_API_BASE, LARK_API_BASE, SLACK_API_BASE,
+    TELEGRAM_API_BASE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -92,6 +95,8 @@ fn reload_note(reloaded: bool) -> &'static str {
 const TELEGRAM_API_BASE_ENV: &str = "CCTEAM_TELEGRAM_API_BASE";
 /// Env override for the Lark/Feishu open-platform API base (both regions).
 const LARK_API_BASE_ENV: &str = "CCTEAM_LARK_API_BASE";
+/// Env override for the Slack Web API base (same test-override pattern).
+const SLACK_API_BASE_ENV: &str = "CCTEAM_SLACK_API_BASE";
 
 /// Resolve the Telegram API base: the [`TELEGRAM_API_BASE_ENV`] override if
 /// set + non-empty, else the production constant. `pub(crate)` so the per-tenant
@@ -118,6 +123,15 @@ fn lark_api_base(use_feishu: bool) -> String {
     } else {
         LARK_API_BASE.to_string()
     }
+}
+
+/// Resolve the Slack Web API base: the [`SLACK_API_BASE_ENV`] override if set
+/// + non-empty, else the production constant.
+fn slack_api_base() -> String {
+    std::env::var(SLACK_API_BASE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| SLACK_API_BASE.to_string())
 }
 
 // --------------------------------------------------------------------------
@@ -170,6 +184,21 @@ pub struct LarkStatus {
     pub allowed_user_id_count: usize,
 }
 
+/// Masked Slack status. Note the absence of any `bot_token` / `app_token`
+/// field — only last-4 fingerprints. Slack member ids (`U…`) are not
+/// secrets, so the allowlist is returned as-is.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SlackStatus {
+    /// Always `true` when present.
+    pub configured: bool,
+    /// Last-4 fingerprint of the `xoxb-` bot token, never the token.
+    pub bot_token_last4: String,
+    /// Last-4 fingerprint of the `xapp-` app-level token, never the token.
+    pub app_token_last4: String,
+    /// The Slack user ids allowed to drive the bot (empty = nobody).
+    pub allowed_user_ids: Vec<String>,
+}
+
 /// `GET /config/im` response — masked, secret-free.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ImConfigStatus {
@@ -177,6 +206,8 @@ pub struct ImConfigStatus {
     pub telegram: Option<TelegramStatus>,
     /// Present iff a Lark block exists on disk.
     pub lark: Option<LarkStatus>,
+    /// Present iff a Slack block exists on disk.
+    pub slack: Option<SlackStatus>,
     /// Cleartext-on-LAN caveat (no TLS) — for the SPA to surface.
     pub transport_warning: String,
 }
@@ -210,6 +241,20 @@ pub struct LarkConfigForm {
 
 fn default_use_feishu() -> bool {
     true
+}
+
+/// `PUT /config/im/slack` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SlackConfigForm {
+    /// `xoxb-…` bot token (validated via `auth.test`).
+    pub bot_token: String,
+    /// `xapp-…` app-level token with `connections:write` (validated via
+    /// `apps.connections.open`).
+    pub app_token: String,
+    /// Slack user ids (`U…`) allowed to drive the bot. Empty = fail-closed
+    /// (the bot answers no one) — matches the provider-layer semantics.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
 }
 
 // --------------------------------------------------------------------------
@@ -274,8 +319,9 @@ fn json_500(msg: String) -> Response {
 
 /// `GET /api/v1/config/im` — masked view of the configured IM credentials.
 ///
-/// Never returns a `bot_token` or `app_secret` (the response type has no
-/// such field); only last-4 fingerprints + counts + the `use_feishu` flag.
+/// Never returns a `bot_token`, `app_token` or `app_secret` (the response
+/// type has no such field); only last-4 fingerprints, counts, the
+/// `use_feishu` flag and the (non-secret) Slack member-id allowlist.
 #[utoipa::path(
     get,
     path = "/api/v1/config/im",
@@ -309,9 +355,16 @@ pub(crate) async fn handle_get_im_config(
         use_feishu: l.use_feishu,
         allowed_user_id_count: l.allowed_user_ids.len(),
     });
+    let slack = creds.slack.map(|s| SlackStatus {
+        configured: true,
+        bot_token_last4: mask_last4(&s.bot_token),
+        app_token_last4: mask_last4(&s.app_token),
+        allowed_user_ids: s.allowed_user_ids,
+    });
     Json(ImConfigStatus {
         telegram,
         lark,
+        slack,
         transport_warning: TRANSPORT_WARNING.to_string(),
     })
     .into_response()
@@ -616,6 +669,223 @@ pub(crate) async fn handle_put_lark(
 }
 
 // --------------------------------------------------------------------------
+// PUT /config/im/slack — validate both tokens + persist
+// --------------------------------------------------------------------------
+
+/// `PUT /api/v1/config/im/slack` — validate the bot token (`auth.test`) and
+/// the app-level token (`apps.connections.open`), then persist. A rejected
+/// token is `400` before it touches disk.
+#[utoipa::path(
+    put,
+    path = "/api/v1/config/im/slack",
+    tag = "config",
+    request_body(content = SlackConfigForm, description = "Slack app tokens + member-id allowlist (JSON or x-www-form-urlencoded)"),
+    responses(
+        (status = 200, description = "Validated + persisted; `{ok, reloaded, restart_required, team, bot_user, note}`", body = serde_json::Value),
+        (status = 400, description = "Missing token / token rejected by Slack"),
+        (status = 500, description = "Credentials file read/write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_slack(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    FormOrJson(form, _mode): FormOrJson<SlackConfigForm>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let bot_token = form.bot_token.trim();
+    let app_token = form.app_token.trim();
+    if bot_token.is_empty() || app_token.is_empty() {
+        return json_400("bot_token and app_token must not be empty".to_string());
+    }
+    let allowed_user_ids: Vec<String> = form
+        .allowed_user_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    // Validate before persisting (reuse the CLI validator).
+    let result = match slack_setup_with_base(
+        bot_token,
+        app_token,
+        allowed_user_ids,
+        &slack_api_base(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return json_400(format!("Slack credentials rejected: {err}")),
+    };
+
+    // load → merge slack → save.
+    let mut creds = match load_creds(&app) {
+        Ok(c) => c,
+        Err(e) => return json_500(e),
+    };
+    creds.slack = Some(result.creds);
+    if let Err(e) = save_creds(&app, &creds) {
+        return json_500(e);
+    }
+
+    let reloaded = nudge_im_reload(&app).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+        "team": result.team,
+        "bot_user": result.bot_user,
+        "note": reload_note(reloaded),
+    }))
+    .into_response()
+}
+
+// --------------------------------------------------------------------------
+// Slack guided setup: create the app from a link, capture who to allow
+// --------------------------------------------------------------------------
+
+/// `GET /config/im/slack/app-manifest` query.
+#[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct SlackManifestQuery {
+    /// The Slack app's display name (default `ccteam`).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `GET /config/im/slack/app-manifest` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SlackManifestResponse {
+    /// The app manifest ccteam needs (JSON — Slack's manifest editor takes it
+    /// as is).
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
+    /// Opens Slack's "create app" flow with the manifest filled in.
+    pub create_url: String,
+}
+
+/// `GET /api/v1/config/im/slack/app-manifest` — the manifest for a new Slack
+/// app and a one-click link that creates it, so setup never starts from a
+/// hand-copied YAML. The manifest's one home is
+/// [`ccteam_im::onboarding::slack_app_manifest`].
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/im/slack/app-manifest",
+    tag = "config",
+    params(SlackManifestQuery),
+    responses(
+        (status = 200, description = "Manifest + create-app link", body = SlackManifestResponse),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_get_slack_manifest(
+    Extension(identity): Extension<Identity>,
+    axum::extract::Query(query): axum::extract::Query<SlackManifestQuery>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let name = query.name.unwrap_or_default();
+    Json(SlackManifestResponse {
+        manifest: ccteam_im::onboarding::slack_app_manifest(&name),
+        create_url: ccteam_im::onboarding::slack_create_app_url(&name),
+    })
+    .into_response()
+}
+
+/// `GET /api/v1/config/im/slack/user-id-candidates` — Slack member ids the
+/// global Slack bot saw and REJECTED (not on its allowlist yet), newest
+/// first. The setup card polls it after the tokens are saved: DM the bot,
+/// your own `U…` appears, one click allows it. The rejected messages reached
+/// no agent.
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/im/slack/user-id-candidates",
+    tag = "config",
+    params(("since" = Option<u64>, Query, description = "Only candidates at/after this Unix timestamp")),
+    responses(
+        (status = 200, description = "Recent rejected Slack senders", body = super::users::SenderCandidatesResponse),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_get_slack_user_id_candidates(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    axum::extract::Query(query): axum::extract::Query<super::users::CandidateQuery>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    Json(super::users::SenderCandidatesResponse {
+        candidates: super::users::read_sender_candidates(
+            &super::users::probe_path(&app),
+            "slack",
+            query.since,
+        ),
+    })
+    .into_response()
+}
+
+/// `PUT /config/im/slack/allowed-users` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SlackAllowedUsersForm {
+    /// The full desired allowlist of Slack member ids (`U…`).
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
+/// `PUT /api/v1/config/im/slack/allowed-users` — replace only the Slack
+/// allowlist (also the owner roster) of the configured app. The tokens are
+/// never echoed, so binding a member id must not require re-entering them.
+#[utoipa::path(
+    put,
+    path = "/api/v1/config/im/slack/allowed-users",
+    tag = "config",
+    request_body(content = SlackAllowedUsersForm, description = "Full desired allowed_user_ids list"),
+    responses(
+        (status = 200, description = "Allowlist saved; `{ok, allowed_user_ids, reloaded, note}`", body = serde_json::Value),
+        (status = 400, description = "No Slack app configured yet"),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_put_slack_allowed_users(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(form): Json<SlackAllowedUsersForm>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let mut creds = match load_creds(&app) {
+        Ok(c) => c,
+        Err(e) => return json_500(e),
+    };
+    let Some(slack) = creds.slack.as_mut() else {
+        return json_400("no Slack app configured; save the bot and app-level tokens first".into());
+    };
+    let mut ids: Vec<String> = form
+        .allowed_user_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.dedup();
+    slack.allowed_user_ids = ids.clone();
+    if let Err(e) = save_creds(&app, &creds) {
+        return json_500(e);
+    }
+    let reloaded = nudge_im_reload(&app).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "allowed_user_ids": ids,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+        "note": reload_note(reloaded),
+    }))
+    .into_response()
+}
+
+// --------------------------------------------------------------------------
 // Test-only seam: drive the async poll against a mock base
 // --------------------------------------------------------------------------
 
@@ -664,5 +934,19 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         assert!(v.get("bot_token").is_none(), "no bot_token key");
         assert!(v.get("bot_token_last4").is_some());
+    }
+
+    #[test]
+    fn slack_status_serializes_without_token_fields() {
+        let s = SlackStatus {
+            configured: true,
+            bot_token_last4: "…abcd".into(),
+            app_token_last4: "…wxyz".into(),
+            allowed_user_ids: vec!["U1".into()],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("bot_token").is_none(), "no bot_token key");
+        assert!(v.get("app_token").is_none(), "no app_token key");
+        assert_eq!(v["allowed_user_ids"], serde_json::json!(["U1"]));
     }
 }

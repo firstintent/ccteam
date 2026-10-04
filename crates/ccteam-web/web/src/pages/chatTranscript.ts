@@ -9,10 +9,11 @@
 // owns its OWN transcript (a per-sid localStorage key), so switching the
 // sid view NEVER mixes two sessions' rows.
 
-import type {
-  SessionActivity,
-  SessionEvent,
-  SessionEventOption,
+import {
+  isTurnBoundary,
+  type SessionActivity,
+  type SessionEvent,
+  type SessionEventOption,
 } from "../hooks/useSessionEvents";
 import type { OutboundAttachmentRef, SessionHistoryEvent, TurnStatus } from "../lib/sessionsApi";
 
@@ -51,6 +52,12 @@ export interface TranscriptRow {
    *  ProgressFold — a turn's many tool/think steps collapse into ONE counter
    *  row. Present ⇒ render {@link TranscriptRow.content} as the fold line. */
   fold?: ActivityFold;
+  /** Assistant-only, live: an answer that is neither a mid-turn line nor a
+   *  turn's status-bearing end (a watchdog heads-up, a slash-command or
+   *  terminal-protocol reply, a failure notice). Complete on its own, it is no
+   *  turn's last reply, so a later status-only closing frame never footers it
+   *  (#209). */
+  standalone?: boolean;
 }
 
 export const ROWS_CAP = 400;
@@ -118,9 +125,12 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       ts: ev.ts,
       status: ev.status,
       attachments: ev.attachments,
+      ...(ev.interim !== true && !ev.status ? { standalone: true } : {}),
     };
   }
-  // progress — only surface a finalizing edit with text (status churn is noise).
+  // progress — only surface a sealed card with text (status churn is noise).
+  // It reads the frame's own text: mid-turn an interim answer seals the card
+  // as `↳ 3 tools · 1 files`, only the boundary's reads `✅ done · …` (#209).
   if (ev.done && ev.content) {
     return { id: ev.id ?? nextRowId("system"), kind: "system", content: ev.content, ts: ev.ts };
   }
@@ -242,13 +252,65 @@ export function renderFold(fold: ActivityFold): string {
   return `${head} · ${counts}`;
 }
 
+/** `sid`'s activity folded over its CURRENT turn (the team view's side
+ *  panel): every step since that session's last turn end. An interim answer
+ *  is the session speaking mid-turn (#209) — the turn goes on, so the count
+ *  keeps growing across it; only an end ({@link isTurnBoundary}) starts a
+ *  fresh fold. Pure — unit-testable. */
+export function currentTurnFold(
+  events: readonly {
+    sid?: string;
+    kind: string;
+    activity?: SessionActivity;
+    interim?: boolean;
+    options?: readonly unknown[];
+  }[],
+  sid: string,
+): ActivityFold {
+  let fold = emptyFold();
+  for (const ev of events) {
+    if (ev.sid !== sid) continue;
+    if (ev.kind === "activity" && ev.activity) fold = foldActivity(fold, ev.activity);
+    else if (isTurnBoundary(ev)) fold = emptyFold();
+  }
+  return fold;
+}
+
+/** Index of the assistant row a status-only turn boundary footers (#209), or
+ *  `-1`. A long turn's replies go out mid-turn with no status, and the turn
+ *  closes with a frame (live) / row (history) that has the status but no
+ *  text: its `turn N · ctx` footer belongs on the turn's LAST reply. Walks
+ *  back over activity / progress / approval rows and standalone answers
+ *  (no turn's reply); a user row (where the turn began) or an
+ *  already-footered reply (a previous turn's end) stops the walk, so a
+ *  footer never lands on another turn's bubble. */
+function turnFooterIndex(rows: readonly TranscriptRow[]): number {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.kind === "user") return -1;
+    if (row.kind !== "assistant" || row.standalone) continue;
+    return row.status ? -1 : index;
+  }
+  return -1;
+}
+
 /** Reduce one SSE {@link SessionEvent} into the transcript, FOLDING a run of
  *  consecutive structured activity steps into a single counter row. Any other
- *  event (answer / approval / finalizing progress, or a bare activity frame
+ *  event (answer / approval / sealed progress card, or a bare activity frame
  *  with no payload) lands as its own row via {@link eventToRow} — which
  *  naturally "closes" the current fold, so the next activity starts a fresh
- *  one. This is the single entry the live SSE loop uses. */
+ *  one. An interim answer is therefore a normal bubble that also closes the
+ *  fold; a status-only turn boundary draws no bubble and hands its status to
+ *  the turn's last reply as the footer (#209). This is the single entry the
+ *  live SSE loop uses. */
 export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): TranscriptRow[] {
+  if (isTurnBoundary(ev) && ev.status && !ev.content && !ev.attachments?.length) {
+    const at = turnFooterIndex(rows);
+    if (at < 0) return rows;
+    const next = [...rows];
+    next[at] = { ...rows[at]!, status: ev.status };
+    return next;
+  }
   if (ev.kind === "activity" && ev.activity) {
     const last = rows[rows.length - 1];
     if (last && last.kind === "activity" && last.fold) {
@@ -281,10 +343,11 @@ export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): Transcript
  *  represented by `seeded` (or is transient activity) — with ONE exception:
  *  approval prompts never enter history, so an unresolved approval row that
  *  arrived on this stream is carried over from `current`. Frames after the
- *  barrier raced the server's read and are re-applied, deduplicating a
- *  reply the page already mirrors by content, so a reply can neither vanish
- *  (`setRows(history)` over a just-folded answer — the "TG has it, web shows
- *  a bare completed turn" report) nor double. Pure — unit-testable. */
+ *  barrier raced the server's read and are re-applied, minus the replies the
+ *  page already mirrors ({@link mirroredLateReplies}), so a reply can neither
+ *  vanish (`setRows(history)` over a just-folded answer — the "TG has it,
+ *  web shows a bare completed turn" report) nor double. Pure —
+ *  unit-testable. */
 export function mergeHistory(
   current: TranscriptRow[],
   seeded: TranscriptRow[],
@@ -305,28 +368,105 @@ export function mergeHistory(
       next = appendRow(next, row);
     }
   }
+  const mirrored = mirroredLateReplies(seeded, events, barrier);
   for (const ev of events.slice(barrier)) {
-    const isApproval = ev.options !== undefined && ev.options.length > 0;
-    if (
-      ev.kind === "answer" &&
-      !isApproval &&
-      ev.content &&
-      seeded.some((r) => r.kind === "assistant" && r.content === ev.content)
-    ) {
-      continue; // already mirrored into this page
-    }
+    if (mirrored.has(ev)) continue; // already mirrored into this page
     if (ev.id && next.some((r) => r.id === ev.id)) continue;
     next = appendEvent(next, ev);
   }
   return next;
 }
 
+/** A text reply a history page can hold (approval prompts never enter it). */
+function isMirrorableReply(ev: SessionEvent): boolean {
+  return ev.kind === "answer" && !(ev.options && ev.options.length > 0) && !!ev.content;
+}
+
+/** Whether a live reply is the one a history row mirrors. The IM leg may
+ *  decorate what the page stores raw: a leading `[sid project vendor role] `
+ *  context tag and a trailing `\n\n<status line>`. */
+function mirrors(stored: string, live: string): boolean {
+  if (live === stored) return true;
+  const body = live.replace(/^\[[^\]\n]*\] /, "");
+  return body === stored || body.startsWith(`${stored}\n\n`);
+}
+
+/** Match `texts` in order into `replies`, skipping replies that match
+ *  nothing, each text taking the EARLIEST reply left; `null` when some text
+ *  finds none. */
+function matchInOrder(texts: readonly string[], replies: readonly SessionEvent[]): SessionEvent[] | null {
+  const matched: SessionEvent[] = [];
+  let at = 0;
+  for (const text of texts) {
+    while (at < replies.length && !mirrors(text, replies[at]!.content)) at += 1;
+    if (at === replies.length) return null;
+    matched.push(replies[at]!);
+    at += 1;
+  }
+  return matched;
+}
+
+/** The late replies (`events[barrier..]`) that `seeded` already holds.
+ *
+ *  The page's replies end with the late ones the gateway mirrored before the
+ *  server read turns.jsonl — the FIRST mirrored late replies, in order. Late
+ *  replies the page never stores (a ⏱️ heads-up, a slash-command reply) can
+ *  sit anywhere among them, so the page's tail is matched as an in-order
+ *  SUBSEQUENCE of the late replies, never as a contiguous run (#209).
+ *
+ *  How long that tail is, content alone cannot always say — a session may
+ *  say the same line twice. The frames that arrived BEFORE the request
+ *  anchor it: the page holds each of those, so the newest one the page holds
+ *  sits right before the tail. Where the anchor still leaves a choice, the
+ *  shorter tail wins: a doubled line beats a lost one. With nothing to
+ *  anchor on (a fresh mount), the longest matching tail is taken. */
+function mirroredLateReplies(
+  seeded: readonly TranscriptRow[],
+  events: readonly SessionEvent[],
+  barrier: number,
+): Set<SessionEvent> {
+  const page = seeded.filter((row) => row.kind === "assistant" && row.content).map((row) => row.content);
+  const late = events.slice(barrier).filter(isMirrorableReply);
+  let longest = Math.min(page.length, late.length);
+  while (longest > 0 && !matchInOrder(page.slice(page.length - longest), late)) longest -= 1;
+  let tail = longest;
+  const anchor = events
+    .slice(0, barrier)
+    .filter(isMirrorableReply)
+    .reverse()
+    .find((ev) => page.some((text) => mirrors(text, ev.content)));
+  if (anchor) {
+    // The anchor sits right before the tail; failing that (rows the stream
+    // never delivered in between), somewhere before it.
+    let adjacent = -1;
+    for (let length = 0; length <= longest && adjacent < 0; length += 1) {
+      const before = page[page.length - length - 1];
+      if (before !== undefined && mirrors(before, anchor.content)) adjacent = length;
+    }
+    const lastSeen = page.findLastIndex((text) => mirrors(text, anchor.content));
+    tail = adjacent >= 0 ? adjacent : Math.min(longest, page.length - 1 - lastSeen);
+  }
+  return new Set(matchInOrder(page.slice(page.length - tail), late) ?? []);
+}
+
 /** Seed a transcript from mirrored history (`GET /sessions/{sid}`). Each
  *  turn yields a user row (when it had a prompt) then an assistant row
- *  (when it had a reply). Used to populate a reopened per-session page
- *  before the live SSE takes over. */
-export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
+ *  (when it had a reply). A reply without a status is one the session gave
+ *  mid-turn — a normal bubble; a closing row with a status but no reply
+ *  (#209) draws nothing and footers the turn's last reply instead. When the
+ *  NEXT (newer) page opened with such a closing row, pass its status as
+ *  `closedBy` ({@link leadingClosingStatus}) so this page's last reply gets
+ *  it. Used to populate a reopened per-session page before the live SSE
+ *  takes over, and for each "load earlier" page. */
+export function historyToRows(
+  events: SessionHistoryEvent[],
+  closedBy?: TurnStatus,
+): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
+  const footer = (status: TurnStatus) => {
+    const at = turnFooterIndex(rows);
+    if (at >= 0) rows[at] = { ...rows[at]!, status };
+  };
   for (const ev of events) {
     if (ev.user) {
       rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user, ts: ev.ts });
@@ -340,9 +480,32 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
         status: ev.status,
         attachments: ev.attachments,
       });
+    } else if (ev.status) {
+      footer(ev.status);
     }
   }
+  if (closedBy) footer(closedBy);
   return rows;
+}
+
+/** The status of a closing row that OPENS a history page, before any row of
+ *  its own to footer: it closes the turn whose last reply is on the earlier
+ *  page, which {@link historyToRows} is handed as `closedBy`. */
+export function leadingClosingStatus(events: SessionHistoryEvent[]): TurnStatus | undefined {
+  for (const ev of events) {
+    if (ev.user || ev.assistant || (ev.attachments && ev.attachments.length > 0)) return undefined;
+    if (ev.status) return ev.status;
+  }
+  return undefined;
+}
+
+/** The last `count` mirrored turns that have something to show — a closing
+ *  row (#209) carries only a status, and would be a blank line. */
+export function recentHistoryTurns(
+  events: SessionHistoryEvent[],
+  count: number,
+): SessionHistoryEvent[] {
+  return events.filter((ev) => ev.user || ev.assistant).slice(-count);
 }
 
 /** Load a sid's persisted transcript from localStorage. Returns `[]` on

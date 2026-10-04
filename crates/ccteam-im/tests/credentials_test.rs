@@ -25,8 +25,8 @@ fn round_trip_all_platforms() {
         }),
         slack: Some(SlackCreds {
             bot_token: "xoxb-x".into(),
-            signing_secret: Some("sig".into()),
-            poll_channels: vec!["C123".into()],
+            app_token: "xapp-x".into(),
+            allowed_user_ids: vec!["U123".into()],
         }),
         discord: None,
         lark: Some(LarkCreds {

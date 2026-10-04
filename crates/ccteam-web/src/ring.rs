@@ -262,6 +262,7 @@ mod tests {
 
     fn ev(id: &str, sid: &str) -> GatewayEvent {
         GatewayEvent {
+            interim: false,
             id: id.to_string(),
             channel: "web".to_string(),
             chat_id: "c".to_string(),

@@ -5,7 +5,7 @@
 //! ```json
 //! {
 //!   "telegram": { "bot_token": "...", "allowed_chat_ids": ["12345"] },
-//!   "slack":    { "bot_token": "xoxb-...", "signing_secret": "..." },
+//!   "slack":    { "bot_token": "xoxb-...", "app_token": "xapp-...", "allowed_user_ids": ["U..."] },
 //!   "discord":  { "bot_token": "...", "authorized_user_ids": ["..."] },
 //!   "lark":     { "app_id": "cli_...", "app_secret": "...", "allowed_user_ids": ["ou_..."] }
 //! }
@@ -26,8 +26,8 @@ pub struct Credentials {
     /// Telegram bot credentials (long-polling getUpdates).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramCreds>,
-    /// Slack bot credentials (HTTP chat.postMessage + signing-secret
-    /// HMAC verify on incoming events).
+    /// Slack app credentials (Socket Mode inbound + Web API outbound; one
+    /// Slack thread per agent session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackCreds>,
     /// Discord bot credentials (REST messages API).
@@ -51,19 +51,21 @@ pub struct TelegramCreds {
     pub allowed_chat_ids: Vec<String>,
 }
 
-/// Slack bot credentials.
+/// Slack app credentials.
+///
+/// Inbound arrives over Socket Mode (an outbound WSS long-connection opened
+/// with the app-level token), so there is no public endpoint and no signing
+/// secret to verify; outbound uses the bot token against the Web API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SlackCreds {
-    /// `xoxb-...` bot token.
+    /// `xoxb-...` bot token (Web API: post, update, react, files).
     pub bot_token: String,
-    /// Used to verify the `X-Slack-Signature` header on incoming
-    /// webhook events. Required when running the inbound HTTP
-    /// receiver; optional when running pure HTTP polling.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signing_secret: Option<String>,
-    /// Channels the daemon should poll. Empty = polling disabled.
+    /// `xapp-...` app-level token with `connections:write` (Socket Mode).
+    pub app_token: String,
+    /// Slack user ids (`U...`) allowed to drive the bot. Empty = closed
+    /// (deny all), `"*"` = open — the same fail-closed semantics as Lark.
     #[serde(default)]
-    pub poll_channels: Vec<String>,
+    pub allowed_user_ids: Vec<String>,
 }
 
 /// Discord bot credentials.
@@ -233,6 +235,34 @@ mod tests {
         save(&path, &original).unwrap();
         let back = load(Some(&path)).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn round_trip_slack_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("c.json");
+        let original = Credentials {
+            slack: Some(SlackCreds {
+                bot_token: "xoxb-1-abc".into(),
+                app_token: "xapp-1-def".into(),
+                allowed_user_ids: vec!["U0ALICE".into(), "U0BOB".into()],
+            }),
+            ..Default::default()
+        };
+        save(&path, &original).unwrap();
+        let back = load(Some(&path)).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn slack_allowlist_defaults_empty_fail_closed() {
+        let json = r#"{"slack":{"bot_token":"xoxb-1","app_token":"xapp-1"}}"#;
+        let creds: Credentials = serde_json::from_str(json).unwrap();
+        let slack = creds.slack.expect("slack block parsed");
+        assert!(
+            slack.allowed_user_ids.is_empty(),
+            "allowed_user_ids defaults empty (channel layer = closed)"
+        );
     }
 
     #[test]

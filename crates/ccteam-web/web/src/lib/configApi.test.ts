@@ -13,6 +13,10 @@ import {
   getImConfig,
   pollTelegramChatId,
   saveLark,
+  saveSlack,
+  getSlackAppManifest,
+  getSlackUserIdCandidates,
+  putSlackAllowedUsers,
   saveTelegramToken,
   startTelegramChatId,
 } from "./configApi";
@@ -44,6 +48,12 @@ describe("configApi", () => {
         use_feishu: true,
         allowed_user_id_count: 2,
       },
+      slack: {
+        configured: true,
+        bot_token_last4: "…bot1",
+        app_token_last4: "…app1",
+        allowed_user_ids: ["U0ALICE"],
+      },
       transport_warning: "no TLS",
     };
     const fetchMock = vi.mocked(globalThis.fetch);
@@ -70,15 +80,24 @@ describe("configApi", () => {
       "use_feishu",
       "allowed_user_id_count",
     ]);
+    expect(got.slack).not.toHaveProperty("bot_token");
+    expect(got.slack).not.toHaveProperty("app_token");
+    expect(Object.keys(got.slack ?? {})).toEqual([
+      "configured",
+      "bot_token_last4",
+      "app_token_last4",
+      "allowed_user_ids",
+    ]);
   });
 
   it("getImConfig tolerates null provider blocks", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-      jsonResponse(200, { telegram: null, lark: null, transport_warning: "" }),
+      jsonResponse(200, { telegram: null, lark: null, slack: null, transport_warning: "" }),
     );
     const got = await getImConfig();
     expect(got.telegram).toBeNull();
     expect(got.lark).toBeNull();
+    expect(got.slack).toBeNull();
   });
 
   it("saveTelegramToken PUTs {bot_token} to /config/im/telegram", async () => {
@@ -211,6 +230,76 @@ describe("configApi", () => {
         use_feishu: true,
       }),
     ).rejects.toThrow("Lark credentials rejected: bad app_secret");
+  });
+
+  it("saveSlack PUTs both tokens + the member-id allowlist to /config/im/slack", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        ok: true,
+        restart_required: false,
+        team: "Acme",
+        bot_user: "ccteam",
+        note: "applied live",
+      }),
+    );
+    const got = await saveSlack({
+      bot_token: "xoxb-1",
+      app_token: "xapp-1",
+      allowed_user_ids: ["U0ALICE", "U0BOB"],
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/config/im/slack", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        bot_token: "xoxb-1",
+        app_token: "xapp-1",
+        allowed_user_ids: ["U0ALICE", "U0BOB"],
+      }),
+    });
+    expect(got.team).toBe("Acme");
+    expect(got.bot_user).toBe("ccteam");
+  });
+
+  it("getSlackAppManifest asks for the named app's manifest + create link", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { manifest: { display_information: { name: "cct2" } }, create_url: "https://api.slack.com/apps?new_app=1" }),
+    );
+    const got = await getSlackAppManifest("cct 2");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/config/im/slack/app-manifest?name=cct%202");
+    expect(got.create_url).toContain("new_app=1");
+  });
+
+  it("putSlackAllowedUsers replaces only the member-id allowlist", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { ok: true, allowed_user_ids: ["U1"], restart_required: false, note: "ok" }),
+    );
+    await putSlackAllowedUsers(["U1"]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/config/im/slack/allowed-users");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ allowed_user_ids: ["U1"] });
+  });
+
+  it("getSlackUserIdCandidates polls the global bot's rejected senders since a cutoff", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { candidates: [] }));
+    await getSlackUserIdCandidates(1700);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/config/im/slack/user-id-candidates?since=1700",
+    );
+  });
+
+  it("saveSlack surfaces the server {error} on 400 (rejected token)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(400, { error: "Slack credentials rejected: invalid_auth" }),
+    );
+    await expect(
+      saveSlack({ bot_token: "xoxb-bad", app_token: "xapp-1", allowed_user_ids: [] }),
+    ).rejects.toThrow("Slack credentials rejected: invalid_auth");
   });
 
   it("maps 401 → UNAUTHENTICATED across read + write helpers", async () => {

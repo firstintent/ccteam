@@ -227,11 +227,77 @@ describe('frame translation', () => {
     data: JSON.stringify(data),
   })
 
-  it('treats kind:"answer" as the reliable turn-completion signal', () => {
-    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'hi' }))).toEqual([
-      { kind: 'graph' },
-      { kind: 'turn_done', sid: 's1' },
-    ])
+  /** The upstream `TurnStatus` object a structured turn's closing answer carries. */
+  const STATUS = {
+    model: 'opus',
+    context: { used_tokens: 42_000, window_tokens: 200_000, source: 'derived' },
+    turn: 3,
+    cost_usd: 0.25,
+    tokens_total: 9000,
+  }
+
+  it('treats every answer not marked interim as a completed turn, status or not', () => {
+    const done = [{ kind: 'graph' }, { kind: 'turn_done', sid: 's1' }]
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'hi', status: STATUS }))).toEqual(done)
+    // The status-only closing frame (nothing left to say) ends the turn too.
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: '', status: STATUS }))).toEqual(done)
+    // A terminal-protocol reply, a slash-command receipt, a notice: no status, still the end.
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'switched model → opus' }))).toEqual(done)
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'x', interim: false }))).toEqual(done)
+  })
+
+  it('an interim answer completes nothing: no turn_done, no tree re-read', () => {
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'looking at the tests', interim: true }))).toEqual([])
+  })
+
+  it('one long turn feeds the badge exactly once, however much it says mid-turn', () => {
+    const turn = [
+      frame({ kind: 'answer', sid: 's1', id: 'a1', content: 'first I will read the code', interim: true }),
+      frame({ kind: 'progress', sid: 's1', content: '↳ Read(src/bff.ts)', done: true }),
+      frame({ kind: 'answer', sid: 's1', id: 'a2', content: 'now the tests', interim: true }),
+      frame({ kind: 'progress', sid: 's1', content: '✅ done', done: true }),
+      frame({ kind: 'answer', sid: 's1', id: 'a3', content: 'all green', interim: true }),
+      frame({ kind: 'answer', sid: 's1', id: 'a4', content: '', status: STATUS }),
+    ]
+    const events = turn.flatMap(translateGlobal)
+    expect(events.filter(event => event.kind === 'turn_done')).toEqual([{ kind: 'turn_done', sid: 's1' }])
+    // A final progress card is not a turn end either, so the tree is re-read once.
+    expect(events.filter(event => event.kind === 'graph')).toHaveLength(1)
+  })
+
+  it('carries the interim mark and the closing status (an object) through to the chat', () => {
+    expect(translateSession('s1', frame({ kind: 'answer', sid: 's1', id: 'a4', content: '', status: STATUS }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: {
+        kind: 'answer',
+        id: 'a4',
+        content: '',
+        status: {
+          model: 'opus',
+          context: { usedTokens: 42_000, windowTokens: 200_000, source: 'derived' },
+          turn: 3,
+          costUsd: 0.25,
+          tokensTotal: 9000,
+        },
+      },
+    }])
+    // Null-valued fields drop out rather than becoming NaN/'' noise.
+    expect(translateSession('s1', frame({
+      kind: 'answer', sid: 's1', id: 'a5', content: 'x',
+      status: { model: null, context: null, turn: 1, cost_usd: null, tokens_total: null },
+    }))).toEqual([{ kind: 'session', sid: 's1', event: { kind: 'answer', id: 'a5', content: 'x', status: { turn: 1 } } }])
+    expect(translateSession('s1', frame({ kind: 'answer', sid: 's1', id: 'a1', content: 'mid-turn', interim: true }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: { kind: 'answer', id: 'a1', content: 'mid-turn', interim: true },
+    }])
+    // Only a literal `true` marks a message interim.
+    expect(translateSession('s1', frame({ kind: 'answer', sid: 's1', id: 'a2', content: 'end', interim: 'yes' }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: { kind: 'answer', id: 'a2', content: 'end' },
+    }])
   })
 
   it('does not mistake a human-in-the-loop prompt for a completed turn', () => {

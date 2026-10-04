@@ -528,6 +528,10 @@ fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
 struct ChatSendFileTarget {
     channel: String,
     chat_id: String,
+    /// The firing session's own platform thread (Slack), so the file lands
+    /// where that session lives. `None` on a single-stream channel and for a
+    /// per-user delivery target (no session behind it).
+    thread_ts: Option<String>,
     /// Present for a live ccteam session. The server-resolved project path is
     /// the only authority the web staging/persistence path trusts.
     session: Option<crate::gateway::SessionResolve>,
@@ -538,6 +542,7 @@ impl ChatSendFileTarget {
         Self {
             channel,
             chat_id,
+            thread_ts: None,
             session: None,
         }
     }
@@ -662,7 +667,11 @@ async fn resolve_live_reply_target(
         return None;
     }
     let guard = gw.lock().await;
-    let (channel, chat_id) = guard.reply_target_for(sid)?;
+    let crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    } = guard.reply_target_for(sid)?;
     // IM delivery historically needs only the live reply binding. Project
     // metadata is an additional requirement solely for the web copy/read
     // path, so do not make Telegram/Lark depend on it.
@@ -674,6 +683,7 @@ async fn resolve_live_reply_target(
     Some(ChatSendFileTarget {
         channel,
         chat_id,
+        thread_ts,
         session,
     })
 }
@@ -691,6 +701,17 @@ async fn run_chat_send_file(
         .as_ref()
         .map(|target| (target.channel.clone(), target.chat_id.clone()));
     let mut event = build_send_file_event(args, seq, event_target)?;
+    event.thread_ts = live_target
+        .as_ref()
+        .and_then(|target| target.thread_ts.clone());
+    // A file the session sends from inside its running turn is part of that
+    // turn, not its end (#209): a reader that took it for the boundary
+    // dropped Stop for the rest of the turn.
+    if let (Some(gateway), Some(caller)) =
+        (gateway, args.get("_caller_sid").and_then(|v| v.as_str()))
+    {
+        event.interim = gateway.lock().await.session_turn_in_flight(caller);
+    }
     if event.channel == "web" {
         let session = live_target
             .as_ref()
@@ -908,6 +929,7 @@ fn build_send_file_event(
         )
     })?;
     Ok(crate::gateway::GatewayEvent {
+        interim: false,
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
         channel,
         chat_id,
@@ -1043,7 +1065,12 @@ async fn execute_interaction_ask(
         }
         _ => None,
     };
-    let Some((channel, chat_id)) = live_target else {
+    let Some(crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    }) = live_target
+    else {
         return err_resp(format!(
             "interaction/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
         ));
@@ -1073,6 +1100,7 @@ async fn execute_interaction_ask(
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
             // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.
@@ -1100,10 +1128,11 @@ async fn execute_interaction_ask(
     // Render the buttons in IM.
     if sink
         .send(GatewayEvent {
+            interim: false,
             id: format!("interaction-{token}"),
             channel,
             chat_id,
-            thread_ts: None,
+            thread_ts,
             content: question.clone(),
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
@@ -1247,7 +1276,12 @@ async fn execute_permission_ask(
         }
         _ => (None, None),
     };
-    let Some((channel, chat_id)) = dest else {
+    let Some(crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    }) = dest
+    else {
         return err_resp(format!(
             "permission/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
         ));
@@ -1295,6 +1329,7 @@ async fn execute_permission_ask(
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
             // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.
@@ -1330,10 +1365,11 @@ async fn execute_permission_ask(
     // Render the approve/deny buttons in IM.
     if sink
         .send(GatewayEvent {
+            interim: false,
             id: format!("permission-{token}"),
             channel,
             chat_id,
-            thread_ts: None,
+            thread_ts,
             content: title,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
@@ -3991,13 +4027,15 @@ async fn finish_dispatch_wait(
             // we cannot name is reported as absent, not as somebody else's.
             // Without one — an admin caller waiting on the child's next
             // boundary — the newest row is what was waited for.
+            // …widened to the whole execution turn it closed: a long turn
+            // reaches the ledger in pieces (#209), and its answer is all of
+            // them (issue #192), not the piece that happened to be last.
             let last = match answered_turn.as_deref() {
-                Some(turn_id) => all.into_iter().find(|t| t.turn_id == turn_id),
-                None if request_id.is_none() => {
-                    all.into_iter().rev().find(|t| !t.assistant.is_empty())
-                }
+                Some(turn_id) => all.iter().find(|t| t.turn_id == turn_id),
+                None if request_id.is_none() => all.iter().rev().find(|t| !t.assistant.is_empty()),
                 None => None,
-            };
+            }
+            .map(|answered| crate::delegation::turn_answer_record(&all, answered));
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as agent_read/collect (tokens present
             // even for vendors with no USD price table).
@@ -4094,8 +4132,12 @@ fn exact_collected_turn(
         .find(|turn| is_transcript_row(turn))
         .map(|turn| turn.turn_id.clone());
     let row = all.iter().find(|turn| turn.turn_id == turn_id)?;
+    // The row's whole execution turn (#209): a completion's "read the rest"
+    // pointer names the turn's last row, and must return the same folded
+    // answer the notification counted, not only its last piece.
+    let row = crate::delegation::turn_answer_record(all, row);
     Some(TranscriptPage {
-        rows: vec![collected_turn_row(row)],
+        rows: vec![collected_turn_row(&row)],
         cursor: Some(row.turn_id.clone()),
         remaining: 0,
         latest,
@@ -12048,13 +12090,18 @@ mod session_tool_tests {
         );
         assert_eq!(r["status"], json!("completed"), "narrated: {r}");
         let result = r["result_text"].as_str().unwrap();
+        // #209 — a short turn's messages reach the boundary folded into ONE
+        // answer (every line, in order), so the wait returns the whole turn —
+        // ending on its final message, never cut off at the interim note.
         assert!(
-            result.contains("echo: do the wave"),
-            "wait returns the FINAL answer, not the interim note: {result}"
+            result.trim_end().ends_with("echo: do the wave"),
+            "wait returns the turn's answer through its FINAL message: {result}"
         );
         assert!(
-            !result.contains("interim narration checkpoint"),
-            "the interim note must not be mistaken for the result: {result}"
+            result
+                .find("interim narration checkpoint")
+                .is_none_or(|at| at < result.find("echo: do the wave").unwrap()),
+            "the interim note is folded ahead of the result, never mistaken for it: {result}"
         );
 
         // Async leg (notify path) on a FRESH narrating child: exactly ONE

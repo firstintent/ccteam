@@ -74,7 +74,9 @@ import {
   type TeamNode,
   type TranscriptRow,
   type TurnAttachmentInput,
+  type TurnStatus,
   type VendorAvailability,
+  isTurnBoundary,
 } from './shared/contract.js'
 import { SseHub, type SseFrame, type UpstreamSource } from './sse.js'
 
@@ -991,7 +993,9 @@ export function attachmentRefs(value: unknown, sid: string): AttachmentRef[] | u
 /**
  * One upstream history event carries BOTH halves of a turn (`user` +
  * `assistant`, either possibly empty), so it fans out into up to two contract
- * rows. Ids are suffixed to stay unique.
+ * rows. Ids are suffixed to stay unique. A long turn is several events — its
+ * interim answers and a closing one, whose `assistant` is EMPTY when the last
+ * thing said was already delivered mid-turn; an empty half is never a row.
  */
 export function transcriptRows(events: unknown[], sid = ''): TranscriptRow[] {
   const rows: TranscriptRow[] = []
@@ -1003,7 +1007,7 @@ export function transcriptRows(events: unknown[], sid = ''): TranscriptRow[] {
     const user = stringOf(row.user) ?? ''
     const assistant = stringOf(row.assistant) ?? ''
     const vendor = emptyToUndefined(stringOf(row.vendor))
-    const status = emptyToUndefined(stringOf(row.status))
+    const status = turnStatusOf(row.status)
     const attachments = attachmentRefs(row.attachments, sid)
     const usageRow = asRecord(row.usage)
     const usage = usageRow === undefined
@@ -1043,10 +1047,12 @@ export function transcriptRows(events: unknown[], sid = ''): TranscriptRow[] {
  * and lifecycle frames for whichever sid they concern (clients filter).
  *
  * `session_lifecycle` and `delegation` change the tree's shape; a completed
- * turn changes its cost/turn counters. Turn completion is `kind:"answer"`
- * (the finalizing `progress`+`done` frame is only emitted when the turn had
- * tool activity, so it is a hint, not the signal). An `answer` carrying
- * `options` is a human-in-the-loop prompt, not a finished turn.
+ * turn changes its cost/turn counters. Turn completion is any `answer` that
+ * is not marked `interim` ({@link isTurnBoundary}) — status or not, content
+ * or not. The rest completes nothing: an `interim` answer is the session
+ * talking while it works, an `answer` with `options` is a human-in-the-loop
+ * prompt, and `progress`+`done` only makes one status card final (a long
+ * turn seals several), so none of them feeds the badge or re-reads the tree.
  */
 export function translateGlobal(frame: SseFrame): PanelEvent[] {
   if (frame.event === 'reconnect_hint' || frame.event === 'gateway_unavailable') return []
@@ -1082,12 +1088,11 @@ export function translateGlobal(frame: SseFrame): PanelEvent[] {
       },
     ]
   }
-  if (kind === 'answer' && data.options === undefined) {
+  if (kind === 'answer' && isTurnBoundary(answerOf(sid ?? '', data))) {
     return sid === undefined
       ? [{ kind: 'graph' }]
       : [{ kind: 'graph' }, { kind: 'turn_done', sid }]
   }
-  if (kind === 'progress' && data.done === true) return [{ kind: 'graph' }]
   return []
 }
 
@@ -1104,20 +1109,7 @@ export function translateSession(sid: string, frame: SseFrame): PanelEvent[] {
   const kind = stringOf(data.kind)
   const ts = stringOf(data.ts)
   const wrap = (event: SessionEvent): PanelEvent[] => [{ kind: 'session', sid, event }]
-  if (kind === 'answer') {
-    const options = choiceOptions(data.options)
-    const token = stringOf(data.token)
-    return wrap({
-      kind: 'answer',
-      id: stringOf(data.id) ?? '',
-      content: stringOf(data.content) ?? '',
-      ...defined('ts', ts),
-      ...defined('status', emptyToUndefined(stringOf(data.status))),
-      ...defined('attachments', attachmentRefs(data.attachments, sid)),
-      ...(options.length > 0 ? { options } : {}),
-      ...defined('token', token),
-    })
-  }
+  if (kind === 'answer') return wrap(answerOf(sid, data))
   if (kind === 'activity') {
     const step = stepOf(data.activity, stringOf(data.content))
     return step === undefined ? [] : wrap({ kind: 'activity', step, ...defined('ts', ts) })
@@ -1132,6 +1124,54 @@ export function translateSession(sid: string, frame: SseFrame): PanelEvent[] {
       : wrap({ kind: 'lifecycle', state, ...defined('reason', emptyToUndefined(stringOf(data.reason))), ...defined('ts', ts) })
   }
   return []
+}
+
+/**
+ * One upstream `answer` payload as the contract's answer event — the single
+ * parser both streams share, so the global feed's boundary test and the
+ * session stream see the same event. Only a literal `interim: true` marks a
+ * mid-turn message; anything else is a turn-ending answer, as it always was.
+ */
+function answerOf(sid: string, data: Record<string, unknown>): Extract<SessionEvent, { kind: 'answer' }> {
+  const options = choiceOptions(data.options)
+  return {
+    kind: 'answer',
+    id: stringOf(data.id) ?? '',
+    content: stringOf(data.content) ?? '',
+    ...defined('ts', stringOf(data.ts)),
+    ...(data.interim === true ? { interim: true as const } : {}),
+    ...defined('status', turnStatusOf(data.status)),
+    ...defined('attachments', attachmentRefs(data.attachments, sid)),
+    ...(options.length > 0 ? { options } : {}),
+    ...defined('token', stringOf(data.token)),
+  }
+}
+
+/**
+ * Upstream `TurnStatus` (`{model, context: {used_tokens, window_tokens,
+ * source}, turn, cost_usd, tokens_total}`, any field null) → the contract's
+ * camelCase {@link TurnStatus}. The wire carries it as an OBJECT; absent /
+ * `null` / anything but an object is no status.
+ */
+export function turnStatusOf(value: unknown): TurnStatus | undefined {
+  const row = asRecord(value)
+  if (row === undefined) return undefined
+  const context = asRecord(row.context)
+  return {
+    ...defined('model', emptyToUndefined(stringOf(row.model))),
+    ...(context === undefined
+      ? {}
+      : {
+          context: {
+            ...defined('usedTokens', numberOf(context.used_tokens)),
+            ...defined('windowTokens', numberOf(context.window_tokens)),
+            ...defined('source', emptyToUndefined(stringOf(context.source))),
+          },
+        }),
+    ...defined('turn', numberOf(row.turn)),
+    ...defined('costUsd', numberOf(row.cost_usd)),
+    ...defined('tokensTotal', numberOf(row.tokens_total)),
+  }
 }
 
 function choiceOptions(value: unknown): ChoiceOption[] {

@@ -21,8 +21,8 @@ use anyhow::Context as _;
 use crate::latency::now_unix_ms;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind,
-    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OptionWeight, OutboundFile,
+    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -507,17 +507,13 @@ impl Channel for TelegramChannel {
             // Telegram supports reply_to_message_id for in-thread replies.
             "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
         });
-        // v0.8.5 D3 — render choice options as an inline keyboard (one button
-        // per row); the opaque `data` ("{token}:{idx}") rides `callback_data`
-        // (≤64B). The numbered-text fallback already lives in `content`, so
-        // button-less clients still work.
+        // v0.8.5 D3 — render choice options as an inline keyboard
+        // ([`keyboard_rows`]); the opaque `data` ("{token}:{idx}") rides
+        // `callback_data` (≤64B). The numbered-text fallback already lives in
+        // `content`, so button-less clients still work.
         if !message.options.is_empty() {
-            let rows: Vec<Vec<serde_json::Value>> = message
-                .options
-                .iter()
-                .map(|o| vec![serde_json::json!({ "text": o.label, "callback_data": o.data })])
-                .collect();
-            body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
+            body["reply_markup"] =
+                serde_json::json!({ "inline_keyboard": keyboard_rows(&message.options) });
         }
         let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
@@ -710,6 +706,10 @@ impl Channel for TelegramChannel {
         Some(MAX_MESSAGE_UTF16)
     }
 
+    fn native_buttons(&self) -> bool {
+        true
+    }
+
     async fn edit_message(
         &self,
         recipient: &str,
@@ -859,8 +859,77 @@ fn set_message_reaction_body(chat_id: &str, message_id: i64, add: bool) -> serde
     })
 }
 
+/// Inline-keyboard rows. A plain picker (every option `Normal`) keeps one
+/// button per row. Weighted options — a session's controls, the menu — lay
+/// out by [`OptionWeight`]: `Primary` two to a row, so they are the widest,
+/// then the rest three to a row with `Minor` last, the narrowest spot and the
+/// hardest to hit by mistake. Telegram sizes a button only by how many share
+/// its row.
+fn keyboard_rows(options: &[MessageOption]) -> Vec<Vec<serde_json::Value>> {
+    let button =
+        |o: &MessageOption| serde_json::json!({ "text": o.label, "callback_data": o.data });
+    if options.iter().all(|o| o.weight == OptionWeight::Normal) {
+        return options.iter().map(|o| vec![button(o)]).collect();
+    }
+    let of = |weight: OptionWeight| options.iter().filter(move |o| o.weight == weight);
+    let primary: Vec<&MessageOption> = of(OptionWeight::Primary).collect();
+    let rest: Vec<&MessageOption> = of(OptionWeight::Normal)
+        .chain(of(OptionWeight::Minor))
+        .collect();
+    primary
+        .chunks(2)
+        .chain(rest.chunks(3))
+        .map(|row| row.iter().map(|o| button(o)).collect())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn opt(data: &str, weight: OptionWeight) -> MessageOption {
+        MessageOption {
+            data: data.into(),
+            label: data.into(),
+            id: data.into(),
+            weight,
+        }
+    }
+
+    /// A plain picker stays one button per row; a session's controls put the
+    /// two main actions side by side (widest) and interrupt last in a row of
+    /// three (narrowest).
+    #[test]
+    fn keyboard_rows_size_buttons_by_weight() {
+        let labels = |rows: Vec<Vec<serde_json::Value>>| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|b| b["text"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .collect()
+        };
+        let picker = [
+            opt("a", OptionWeight::Normal),
+            opt("b", OptionWeight::Normal),
+        ];
+        assert_eq!(labels(keyboard_rows(&picker)), vec![vec!["a"], vec!["b"]]);
+
+        let controls = [
+            opt("status", OptionWeight::Primary),
+            opt("model", OptionWeight::Primary),
+            opt("interrupt", OptionWeight::Minor),
+            opt("sessions", OptionWeight::Normal),
+            opt("projects", OptionWeight::Normal),
+        ];
+        assert_eq!(
+            labels(keyboard_rows(&controls)),
+            vec![
+                vec!["status", "model"],
+                vec!["sessions", "projects", "interrupt"]
+            ]
+        );
+    }
     use super::*;
 
     #[test]

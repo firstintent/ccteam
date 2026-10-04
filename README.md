@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="ccteam mascot — a juggler bot keeping codex, grok and kimi in the air" />
   <h1>ccteam</h1>
-  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, Deepseek Harness) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, or a browser tab.</b></p>
+  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, Deepseek Harness) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, Slack, or a browser tab.</b></p>
   <p>
     <a href="https://github.com/firstintent/ccteam/actions/workflows/check.yml"><img src="https://github.com/firstintent/ccteam/actions/workflows/check.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/made%20with-Rust-b7410e" alt="Made with Rust" />
@@ -33,9 +33,9 @@ ccteam is the connective tissue they lack — identity, routing, delivery guaran
 
 ## Usage
 
-**1 · Remote control from Telegram / Lark**
+**1 · Remote control from Telegram / Lark / Slack**
 
-Paste a bot token once (Settings → Access) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast:
+Paste a bot token once (Settings → Access) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast. On Slack every session gets **its own thread**: a top-level message starts a session, a reply in its thread talks only to it, so parallel sessions never interleave (commands start with `!` there — `!status`, `!model` — since Slack keeps `/` for itself; Settings → Access creates the Slack app for you in one click):
 
 ```text
 /cd demo                        # pick a project; your next message talks to it

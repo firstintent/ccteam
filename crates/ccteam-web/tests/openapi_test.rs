@@ -167,6 +167,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/config/im/telegram/chat-id/start"),
         ("GET", "/api/v1/config/im/telegram/chat-id"),
         ("PUT", "/api/v1/config/im/lark"),
+        ("PUT", "/api/v1/config/im/slack"),
+        ("GET", "/api/v1/config/im/slack/app-manifest"),
+        ("GET", "/api/v1/config/im/slack/user-id-candidates"),
+        ("PUT", "/api/v1/config/im/slack/allowed-users"),
         // v0.8.9 Phase 2 — ccteam-hub plugin marketplace.
         ("GET", "/api/v1/marketplace"),
         ("GET", "/api/v1/marketplace/{id}/body"),

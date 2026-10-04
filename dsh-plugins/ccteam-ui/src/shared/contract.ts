@@ -246,13 +246,29 @@ export interface TurnUsage {
   outputTokens?: number
 }
 
+/**
+ * The per-turn status snapshot ccteam stamps on the answer that closes a
+ * structured turn (upstream `TurnStatus`: model, context window, turn number,
+ * cumulative cost and tokens). Advisory only: plenty of turn-ending answers
+ * carry none (terminal-protocol replies, slash-command receipts, notices), so
+ * it never decides whether a turn ended — {@link isTurnBoundary} does.
+ */
+export interface TurnStatus {
+  model?: string
+  context?: { usedTokens?: number; windowTokens?: number; source?: string }
+  turn?: number
+  costUsd?: number
+  tokensTotal?: number
+}
+
 export interface TranscriptRow {
   turnId: string
   role: 'user' | 'assistant'
   content: string
   ts?: string
   vendor?: string
-  status?: string
+  /** The closing snapshot, on the row that closed a structured turn. */
+  status?: TurnStatus
   attachments?: AttachmentRef[]
   usage?: TurnUsage
 }
@@ -366,10 +382,16 @@ export interface StatusResponse {
 /**
  * One per-session frame, translated from ccteam's session stream:
  * - `progress`: the running turn's narrative so far (a snapshot, not a delta;
- *   `done` closes the status line);
+ *   `done` means this status card is final — sealed mid-turn, or the last
+ *   one — never that the turn ended, and never that its steps finished:
+ *   steps finish on their own `activity` completions);
  * - `activity`: one structured step started/completed;
- * - `answer`: a delivered assistant message — the turn's result, or a
- *   human-in-the-loop prompt when `options` are present;
+ * - `answer`: something the session said. `interim: true` marks a message
+ *   said MID-TURN — the turn keeps running; any other answer ends its turn,
+ *   with or without a `status` snapshot (an empty `content` with a `status`
+ *   is the status-only closing frame: it ends the turn and shows nothing);
+ *   with `options` it is a human-in-the-loop prompt. {@link isTurnBoundary}
+ *   is the one test;
  * - `lifecycle`: the session changed state (started / evicted / stopped …).
  */
 export type SessionEvent =
@@ -380,7 +402,9 @@ export type SessionEvent =
     id: string
     content: string
     ts?: string
-    status?: string
+    /** Said mid-turn: the turn is still running. Absent on every turn-ending answer. */
+    interim?: true
+    status?: TurnStatus
     attachments?: AttachmentRef[]
     options?: ChoiceOption[]
     token?: string
@@ -388,8 +412,24 @@ export type SessionEvent =
   | { kind: 'lifecycle'; state: string; reason?: string; ts?: string }
 
 /**
+ * Whether a session frame ends its turn. ccteam delivers what a session says
+ * while a turn runs as answers marked `interim`; every other answer ends its
+ * turn — a structured turn's closing answer, a terminal-protocol reply, a
+ * slash-command receipt, a notice — whether or not it carries a `status`. A
+ * choice prompt (non-empty `options`) suspends the turn on a human; it does
+ * not end it. Both halves (the BFF's `turn_done` feed and the workbench's
+ * working state / reconcile) ask here.
+ */
+export function isTurnBoundary(event: SessionEvent): boolean {
+  return event.kind === 'answer'
+    && event.interim !== true
+    && (event.options === undefined || event.options.length === 0)
+}
+
+/**
  * One SSE frame from the host. `graph` frames invalidate the team tree;
- * `turn_done` marks a completed turn (badge counter feed); `delegation`
+ * `turn_done` marks a completed turn — at its turn-ending answer, never for
+ * an interim one (badge counter feed); `delegation`
  * frames narrate parent/child relations; `session` frames carry one
  * {@link SessionEvent} for the sid the client subscribed to. Unknown kinds
  * must be ignored by the client (forward-compat).

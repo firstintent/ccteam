@@ -58,7 +58,13 @@ import { useProjectsStore } from "../hooks/useProjectsStore";
 import { VendorChip } from "../components/VendorChip";
 import { copyText } from "../lib/clipboard";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
-import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
+import {
+  currentTurnFold,
+  emptyFold,
+  recentHistoryTurns,
+  renderFold,
+  type ActivityFold,
+} from "./chatTranscript";
 import { vendorDotClass } from "../lib/vendors";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
@@ -893,21 +899,19 @@ export default function AgentsView({
 
   const selectedNode = graph.nodes.find((node) => node.sid === selected) ?? null;
 
-  const activityFold: ActivityFold = useMemo(() => {
-    let fold = emptyFold();
-    if (!selected) return fold;
-    for (const ev of timestamped) {
-      if (ev.sid !== selected) continue;
-      if (ev.kind === "activity" && ev.activity) fold = foldActivity(fold, ev.activity);
-      else if (ev.kind === "answer") fold = emptyFold(); // a new answer ends the turn
-    }
-    return fold;
-  }, [timestamped, selected]);
+  // The selected session's current turn: interim answers keep counting, only
+  // the turn boundary starts a fresh fold (#209).
+  const activityFold: ActivityFold = useMemo(
+    () => (selected ? currentTurnFold(timestamped, selected) : emptyFold()),
+    [timestamped, selected],
+  );
 
   useEffect(() => {
     if (!selected || historyBySid[selected]) return;
     getHistory(selected)
-      .then((h) => setHistoryBySid((prev) => ({ ...prev, [selected]: h.events.slice(-3) })))
+      .then((h) =>
+        setHistoryBySid((prev) => ({ ...prev, [selected]: recentHistoryTurns(h.events, 3) })),
+      )
       .catch(() => setHistoryBySid((prev) => ({ ...prev, [selected]: [] })));
   }, [selected, historyBySid]);
 

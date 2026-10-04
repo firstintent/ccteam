@@ -16,6 +16,7 @@ import { renderToString } from "react-dom/server";
 import {
   LarkSection,
   MyImSection,
+  SlackSection,
   TelegramSection,
   UserManagementSection,
 } from "./SettingsPage";
@@ -84,6 +85,68 @@ describe("Settings sections", () => {
     expect(html).toContain('value=""');
     // Default textarea is empty → fail-closed warning is visible.
     expect(html).toContain("fail-closed");
+  });
+
+  it("SlackSection (bound) shows masked token tails and the allowed members, no secret field", () => {
+    const html = renderToString(
+      <SlackSection
+        status={{
+          configured: true,
+          bot_token_last4: "…bot1",
+          app_token_last4: "…app1",
+          allowed_user_ids: ["U0ALICE", "U0BOB"],
+        }}
+        onSaved={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="settings-slack"');
+    expect(html).toContain("已连接");
+    expect(html).toContain('data-testid="settings-slack-summary"');
+    expect(html).toContain("…bot1");
+    expect(html).toContain("…app1");
+    expect(html).toContain('data-testid="settings-slack-remove-U0ALICE"');
+    expect(html).toContain('data-testid="settings-slack-remove-U0BOB"');
+    expect(html).not.toContain('type="password"');
+  });
+
+  it("SlackSection (tokens saved, nobody allowed) asks for step 3 with sender capture", () => {
+    const html = renderToString(
+      <SlackSection
+        status={{
+          configured: true,
+          bot_token_last4: "…bot1",
+          app_token_last4: "…app1",
+          allowed_user_ids: [],
+        }}
+        onSaved={() => {}}
+      />,
+    );
+    expect(html).toContain("待绑定");
+    expect(html).toContain('data-testid="settings-slack-capture"');
+    expect(html).toContain('id="settings-slack-users"');
+    expect(html).toContain("未允许前 bot 谁也不回");
+  });
+
+  it("SlackSection (unconfigured) walks through create → tokens → allow", () => {
+    const html = renderToString(<SlackSection status={null} onSaved={() => {}} />);
+    expect(html).toContain('data-testid="settings-slack"');
+    expect(html).toContain("未配置");
+    // ① create the app from a link (the name drives its slash command)
+    expect(html).toContain('data-testid="settings-slack-step-create"');
+    expect(html).toContain('id="settings-slack-app-name"');
+    expect(html).toContain('data-testid="settings-slack-create"');
+    expect(html).toContain('data-testid="settings-slack-copy-manifest"');
+    // ② the two tokens start empty, each with where-to-find-it
+    expect(html).toContain('id="settings-slack-bot-token"');
+    expect(html).toContain('id="settings-slack-app-token"');
+    expect(html).toContain('placeholder="xoxb-…"');
+    expect(html).toContain('placeholder="xapp-…"');
+    expect(html).toContain("Bot User OAuth Token");
+    expect(html).toContain("connections:write");
+    expect(html).not.toMatch(/type="password"[^>]*value="[^"]+"/);
+    // ③ binding waits for saved tokens
+    expect(html).toContain('data-testid="settings-slack-step-bind"');
+    expect(html).not.toContain('data-testid="settings-slack-capture"');
   });
 
   it("MyImSection guides Telegram and Lark as two separate stepped cards", () => {

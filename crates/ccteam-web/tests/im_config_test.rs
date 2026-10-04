@@ -10,9 +10,10 @@
 //! - **Creds path:** every test points `AppState::with_creds_path` at a
 //!   tempdir file so the real `~/.ccteam/im/credentials.json` is never read
 //!   or written (CLAUDE.md test-isolation rule).
-//! - **Telegram/Lark HTTP:** an in-test axum mock stands in for the Bot /
-//!   Feishu API, injected via the `CCTEAM_TELEGRAM_API_BASE` /
-//!   `CCTEAM_LARK_API_BASE` env overrides. Those are process-global, so the
+//! - **Telegram/Lark/Slack HTTP:** an in-test axum mock stands in for the
+//!   Bot / Feishu / Slack Web API, injected via the
+//!   `CCTEAM_TELEGRAM_API_BASE` / `CCTEAM_LARK_API_BASE` /
+//!   `CCTEAM_SLACK_API_BASE` env overrides. Those are process-global, so the
 //!   env-mutating PUT tests are `#[serial]`. The async `chat_id` capture
 //!   test uses the `spawn_chat_id_poll_for_test` seam (explicit base, no
 //!   env) so it needs no serialization.
@@ -22,7 +23,7 @@ use std::time::Duration;
 
 use axum::{routing::get, routing::post, Json, Router};
 use ccteam_core::CcteamPaths;
-use ccteam_im::credentials::{self, Credentials, LarkCreds, TelegramCreds};
+use ccteam_im::credentials::{self, Credentials, LarkCreds, SlackCreds, TelegramCreds};
 use ccteam_web::{router_with_state, AppState, AuthState};
 use serde_json::Value;
 use serial_test::serial;
@@ -135,6 +136,40 @@ async fn spawn_lark_mock(code: i64) -> String {
     format!("http://{addr}")
 }
 
+/// Spawn an axum mock for the two Slack calls setup makes: `auth.test` (bot
+/// token) and `apps.connections.open` (app-level token). `bot_ok` / `app_ok`
+/// pick success vs `invalid_auth` for each.
+async fn spawn_slack_mock(bot_ok: bool, app_ok: bool) -> String {
+    let app = Router::new()
+        .route(
+            "/auth.test",
+            post(move || async move {
+                Json(if bot_ok {
+                    serde_json::json!({"ok": true, "team": "Acme", "user": "ccteam", "user_id": "UBOT"})
+                } else {
+                    serde_json::json!({"ok": false, "error": "invalid_auth"})
+                })
+            }),
+        )
+        .route(
+            "/apps.connections.open",
+            post(move || async move {
+                Json(if app_ok {
+                    serde_json::json!({"ok": true, "url": "wss://wss-primary.slack.com/link/?t=1"})
+                } else {
+                    serde_json::json!({"ok": false, "error": "invalid_auth"})
+                })
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    format!("http://{addr}")
+}
+
 // --------------------------------------------------------------------------
 // GET /config/im — masked read
 // --------------------------------------------------------------------------
@@ -154,6 +189,11 @@ async fn get_im_config_masks_secrets() {
             app_secret: "larkAPPSECRETvalue".into(),
             allowed_user_ids: vec!["ou_a".into(), "ou_b".into()],
             use_feishu: true,
+        }),
+        slack: Some(SlackCreds {
+            bot_token: "xoxb-SLACKBOTSECRETvalue".into(),
+            app_token: "xapp-SLACKAPPSECRETtail".into(),
+            allowed_user_ids: vec!["U0ALICE".into()],
         }),
         ..Default::default()
     };
@@ -177,6 +217,10 @@ async fn get_im_config_masks_secrets() {
         !raw.contains("larkAPPSECRETvalue"),
         "app_secret leaked into GET body: {raw}"
     );
+    assert!(
+        !raw.contains("SLACKBOTSECRET") && !raw.contains("SLACKAPPSECRET"),
+        "slack tokens leaked into GET body: {raw}"
+    );
     // And no `bot_token` / `app_secret` key at all.
     let v: Value = serde_json::from_str(&raw).unwrap();
     let tg = v.get("telegram").unwrap();
@@ -193,6 +237,15 @@ async fn get_im_config_masks_secrets() {
     assert!(lk.get("app_secret").is_none(), "no app_secret key");
     assert_eq!(lk.get("use_feishu").unwrap(), true);
     assert_eq!(lk.get("allowed_user_id_count").unwrap(), 2);
+    let sl = v.get("slack").unwrap();
+    assert!(sl.get("bot_token").is_none() && sl.get("app_token").is_none());
+    assert_eq!(sl.get("configured").unwrap(), true);
+    assert_eq!(sl.get("bot_token_last4").unwrap(), "…alue");
+    assert_eq!(sl.get("app_token_last4").unwrap(), "…tail");
+    assert_eq!(
+        sl.get("allowed_user_ids").unwrap(),
+        &serde_json::json!(["U0ALICE"])
+    );
     // transport (no-TLS) warning present.
     assert!(v.get("transport_warning").unwrap().as_str().unwrap().len() > 10);
 }
@@ -211,6 +264,7 @@ async fn get_im_config_empty_when_no_creds() {
     let v: Value = resp.json().await.unwrap();
     assert!(v.get("telegram").unwrap().is_null());
     assert!(v.get("lark").unwrap().is_null());
+    assert!(v.get("slack").unwrap().is_null());
 }
 
 // --------------------------------------------------------------------------
@@ -407,6 +461,105 @@ async fn put_lark_bad_creds_is_400_no_persist() {
 }
 
 // --------------------------------------------------------------------------
+// PUT /config/im/slack — validate both tokens + persist
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn put_slack_valid_tokens_persist_and_preserve_other_platforms() {
+    let base = spawn_slack_mock(true, true).await;
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &base);
+
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    credentials::save(
+        &creds_path,
+        &Credentials {
+            telegram: Some(TelegramCreds {
+                bot_token: "tg".into(),
+                allowed_chat_ids: vec!["42".into()],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = spawn_app(state).await;
+
+    let resp = client()
+        .put(format!("http://{addr}/api/v1/config/im/slack"))
+        .json(&serde_json::json!({
+            "bot_token": " xoxb-good ",
+            "app_token": "xapp-good",
+            "allowed_user_ids": ["U0ALICE", " ", "U0BOB "],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v.get("ok").unwrap(), true);
+    assert_eq!(v.get("restart_required").unwrap(), true);
+    assert_eq!(v.get("team").unwrap(), "Acme");
+    assert_eq!(v.get("bot_user").unwrap(), "ccteam");
+
+    let saved = credentials::load(Some(&creds_path)).unwrap();
+    let sl = saved.slack.expect("slack block persisted");
+    assert_eq!(sl.bot_token, "xoxb-good");
+    assert_eq!(sl.app_token, "xapp-good");
+    assert_eq!(sl.allowed_user_ids, vec!["U0ALICE", "U0BOB"]);
+    assert_eq!(
+        saved.telegram.unwrap().allowed_chat_ids,
+        vec!["42".to_string()],
+        "other platforms survive the merge"
+    );
+
+    std::env::remove_var("CCTEAM_SLACK_API_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn put_slack_rejected_app_token_is_400_no_persist() {
+    let base = spawn_slack_mock(true, false).await;
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &base);
+
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+
+    let resp = client()
+        .put(format!("http://{addr}/api/v1/config/im/slack"))
+        .json(&serde_json::json!({"bot_token": "xoxb-good", "app_token": "xapp-bad"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let v: Value = resp.json().await.unwrap();
+    let error = v.get("error").unwrap().as_str().unwrap();
+    assert!(
+        error.contains("Slack credentials rejected") && error.contains("apps.connections.open"),
+        "{error}"
+    );
+    assert!(!creds_path.exists(), "rejected tokens must not persist");
+
+    std::env::remove_var("CCTEAM_SLACK_API_BASE");
+}
+
+#[tokio::test]
+async fn put_slack_missing_token_is_400() {
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+    let resp = client()
+        .put(format!("http://{addr}/api/v1/config/im/slack"))
+        .json(&serde_json::json!({"bot_token": "xoxb-1", "app_token": "  "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(!creds_path.exists());
+}
+
+// --------------------------------------------------------------------------
 // Async telegram chat_id capture (no env — explicit-base test seam)
 // --------------------------------------------------------------------------
 
@@ -497,6 +650,144 @@ async fn chat_id_start_without_token_is_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+// --------------------------------------------------------------------------
+// Slack guided setup — create link, sender capture, allowlist-only update
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slack_manifest_comes_with_a_one_click_create_link() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+
+    let v: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/config/im/slack/app-manifest?name=My%20Team%20Bot"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let manifest = v.get("manifest").unwrap();
+    assert_eq!(manifest["display_information"]["name"], "My Team Bot");
+    assert_eq!(
+        manifest["features"]["bot_user"]["display_name"],
+        "my-team-bot"
+    );
+    assert_eq!(manifest["settings"]["socket_mode_enabled"], true);
+    assert_eq!(
+        manifest["features"]["slash_commands"][0]["command"], "/my-team-bot",
+        "the slash command follows the app name"
+    );
+
+    let create = reqwest::Url::parse(v["create_url"].as_str().unwrap()).unwrap();
+    assert_eq!(create.host_str(), Some("api.slack.com"));
+    let query: std::collections::HashMap<String, String> =
+        create.query_pairs().into_owned().collect();
+    assert_eq!(query.get("new_app").map(String::as_str), Some("1"));
+    let embedded: Value = serde_json::from_str(&query["manifest_json"]).unwrap();
+    assert_eq!(
+        &embedded, manifest,
+        "the link carries exactly the manifest shown"
+    );
+}
+
+#[tokio::test]
+async fn slack_allowed_users_update_keeps_the_tokens() {
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+    let url = format!("http://{addr}/api/v1/config/im/slack/allowed-users");
+
+    // No Slack app yet → nothing to bind to.
+    let r = client()
+        .put(&url)
+        .json(&serde_json::json!({"allowed_user_ids": ["U1"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    credentials::save(
+        &creds_path,
+        &Credentials {
+            slack: Some(SlackCreds {
+                bot_token: "xoxb-keep".into(),
+                app_token: "xapp-keep".into(),
+                allowed_user_ids: vec![],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let r = client()
+        .put(&url)
+        .json(&serde_json::json!({"allowed_user_ids": [" U0ALICE ", "", "U0BOB"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let saved = credentials::load(Some(&creds_path)).unwrap().slack.unwrap();
+    assert_eq!(saved.allowed_user_ids, vec!["U0ALICE", "U0BOB"]);
+    assert_eq!(saved.bot_token, "xoxb-keep");
+    assert_eq!(saved.app_token, "xapp-keep");
+}
+
+#[tokio::test]
+async fn slack_user_id_candidates_are_the_global_bots_rejected_senders() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let probe_dir = paths.im_state_dir();
+    std::fs::create_dir_all(&probe_dir).unwrap();
+    let probe = |channel: &str, sender: &str, ts: u64| {
+        serde_json::json!({
+            "channel": channel,
+            "sender_id": sender,
+            "chat_id": "D0DM",
+            "message_id": format!("{ts}.000100"),
+            "timestamp": ts,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        probe_dir.join("rejected-senders.jsonl"),
+        [
+            probe("slack", "U0OLD", 100),
+            probe("telegram", "339", 150),
+            probe("slack@u1", "U0TENANT", 160),
+            probe("slack", "U0NEW", 200),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let (state, _) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+
+    let v: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/config/im/slack/user-id-candidates?since=150"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = v["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["sender_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["U0NEW"],
+        "only the global Slack bot, since the cutoff"
+    );
 }
 
 // --------------------------------------------------------------------------

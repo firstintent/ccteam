@@ -463,6 +463,10 @@ where
     // Privilege is a NAMED chat, never "reached the bot": seed the operator
     // roster from the same credentials the channels above were built from.
     bind_operator_rosters(&mut *gateway.lock().await, &creds);
+    // Which channels render buttons is the provider's fact; hand it over so
+    // the gateway's pickers never branch on a platform name.
+    let button_caps = channel_button_caps(&shared_channels.read().unwrap());
+    bind_channel_buttons(&mut *gateway.lock().await, &button_caps);
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
     // our own (standalone `ccteam-im run`).
@@ -749,6 +753,11 @@ fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
     if let Some(lark) = creds.lark.as_ref() {
         rosters.push(("lark", lark.allowed_user_ids.clone()));
     }
+    // Slack names its owners by user id (`U…`), which the gateway matches
+    // against `ChatKey::user_id` (the inbound sender).
+    if let Some(slack) = creds.slack.as_ref() {
+        rosters.push(("slack", slack.allowed_user_ids.clone()));
+    }
     if let Some(discord) = creds.discord.as_ref() {
         rosters.push(("discord", discord.authorized_user_ids.clone()));
     }
@@ -766,6 +775,22 @@ fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
                  finds it is served as the operator; add your own chat id to close it"
             ),
         }
+    }
+}
+
+/// Each channel's [`Channel::native_buttons`], read out of `channels` so no
+/// lock is held while the gateway is updated.
+fn channel_button_caps(channels: &ChannelMap) -> Vec<(String, bool)> {
+    channels
+        .iter()
+        .map(|(name, ch)| (name.clone(), ch.native_buttons()))
+        .collect()
+}
+
+/// Report channel button capabilities to the gateway (startup + IM reload).
+fn bind_channel_buttons(gateway: &mut Gateway, caps: &[(String, bool)]) {
+    for (name, native) in caps {
+        gateway.bind_channel_buttons(name, *native);
     }
 }
 
@@ -817,6 +842,8 @@ async fn reload_im_channels(
             rebuilt.insert(name, ch);
         }
     }
+    // A rebuilt channel's button capability goes to the gateway with it.
+    bind_channel_buttons(&mut *gateway.lock().await, &channel_button_caps(&rebuilt));
     // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
     // and (re)publish its command menu.
     for (name, ch) in rebuilt.iter() {
@@ -970,22 +997,27 @@ fn build_telegram_channel(
     )))
 }
 
-/// Slack: HTTP `chat.postMessage` + channel polling. Discharges the old
-/// `TODO(V0.7-im-providers)` — the row was dark only because no creds
-/// block existed, not because the provider was missing.
+/// Slack: Socket Mode inbound + Web API outbound, one thread per session.
+///
+/// The allowlist is the operator's `SlackCreds.allowed_user_ids` alone (Slack
+/// user ids, fail-closed). Unlike Lark's parity-only union, registered bots'
+/// `im_chat_id`s (channel ids — a different namespace) are not mixed in.
 #[cfg(feature = "slack")]
 fn build_slack_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
-    _probe_path: Option<&Path>,
+    probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let slack = creds.slack.as_ref()?;
-    Some(Arc::new(
-        crate::transport::providers::slack::SlackChannel::new(
-            slack.bot_token.clone(),
-            slack.poll_channels.clone(),
-        ),
-    ))
+    let mut ch = crate::transport::providers::slack::SlackChannel::new(
+        slack.bot_token.clone(),
+        slack.app_token.clone(),
+        slack.allowed_user_ids.clone(),
+    );
+    if let Some(path) = probe_path {
+        ch = ch.with_probe_path(path.to_path_buf());
+    }
+    Some(Arc::new(ch))
 }
 
 /// Discord: REST messages API + per-channel polling. `DiscordCreds`
@@ -1439,6 +1471,12 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
+            // The thread reaches the gateway only from a channel whose
+            // contract is "one thread = one session" (Slack). Everyone else
+            // (Telegram, Lark, web) never passes one, whatever the platform
+            // happened to fill in — their routing stays the single stream.
+            let thread = inbound_session_thread(channel.as_ref(), &msg);
+
             let restore_incomplete = !*restore_complete.borrow();
             if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
                 // Startup restore deliberately runs outside the gateway lock
@@ -1467,6 +1505,7 @@ fn spawn_inbound_consumer(
                             &msg.channel,
                             &msg.reply_target,
                             &msg.sender,
+                            thread.as_deref(),
                             &msg.id,
                             &clean_payload,
                             &msg.attachments,
@@ -1524,6 +1563,7 @@ fn spawn_inbound_consumer(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
+                    thread.as_deref(),
                     &clean_payload,
                     msg.selection.is_some(),
                 )
@@ -1544,6 +1584,7 @@ fn spawn_inbound_consumer(
                         &msg.channel,
                         &msg.reply_target,
                         &msg.sender,
+                        thread.as_deref(),
                         &msg.id,
                         &clean_payload,
                         &msg.attachments,
@@ -1570,6 +1611,7 @@ fn spawn_inbound_consumer(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
+                    thread.as_deref(),
                     &msg.id,
                     &clean_payload,
                     &msg.attachments,
@@ -1588,6 +1630,19 @@ fn spawn_inbound_consumer(
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+/// The thread an inbound message hands the gateway: its platform thread when
+/// `channel` gives every session its own thread
+/// ([`crate::transport::Channel::session_threads`]), else `None` — so a channel
+/// without that contract routes as a single stream even if its provider filled
+/// in a thread id.
+fn inbound_session_thread(channel: &dyn Channel, msg: &ChannelMessage) -> Option<String> {
+    if channel.session_threads() {
+        msg.thread_ts.clone()
+    } else {
+        None
+    }
 }
 
 /// Send the outcome of one `handle_message`/`handle_message_shared` call to
@@ -1730,7 +1785,7 @@ fn spawn_gateway_event_consumer(
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
                 GatewayEventKind::ScheduledChanged => {}
-                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
+                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,
                 // never propagate, so a reaction can't break/delay the turn.
@@ -2123,6 +2178,30 @@ pub fn _link_check(_c: &Credentials) {}
 mod tests {
     use super::*;
 
+    /// Only a channel whose contract is "one thread = one session" hands the
+    /// gateway a thread; any other channel routes as a single stream even
+    /// when its provider filled in a thread id.
+    #[test]
+    fn only_a_session_threading_channel_hands_the_gateway_a_thread() {
+        use crate::transport::providers::mock::MockChannel;
+        let msg = ChannelMessage {
+            id: "m-1".into(),
+            sender: "alice".into(),
+            reply_target: "conv-1".into(),
+            content: "hi".into(),
+            channel: "mock".into(),
+            timestamp: 0,
+            thread_ts: Some("1700000000.000100".into()),
+            attachments: Vec::new(),
+            selection: None,
+        };
+        assert_eq!(inbound_session_thread(&MockChannel::new(), &msg), None);
+        assert_eq!(
+            inbound_session_thread(&MockChannel::new().with_session_threads(), &msg),
+            Some("1700000000.000100".to_string())
+        );
+    }
+
     /// v0.8.20 F2 — one channel per tenant bot, keyed `"<platform>@<tenant_id>"`
     /// (the unique routing key); a tenant with no IM creds yields no channel.
     #[cfg(feature = "telegram")]
@@ -2148,6 +2227,58 @@ mod tests {
         // The Channel reports the SAME unique name → inbound stamps it + replies
         // route back through this bot (not a colliding shared `"telegram"`).
         assert_eq!(chans[0].1.name(), format!("telegram@{}", a.id).as_str());
+    }
+
+    /// #19 — a Slack credentials block yields the Socket Mode channel under the
+    /// `"slack"` key, and that channel carries the one-thread-per-session
+    /// contract the inbound consumer keys on. No block → no channel.
+    #[cfg(feature = "slack")]
+    #[test]
+    fn build_slack_channel_from_creds_threads_sessions() {
+        assert!(build_slack_channel(&Credentials::default(), &[], None).is_none());
+        let creds = Credentials {
+            slack: Some(crate::credentials::SlackCreds {
+                bot_token: "xoxb-1".into(),
+                app_token: "xapp-1".into(),
+                allowed_user_ids: vec!["U1".into()],
+            }),
+            ..Default::default()
+        };
+        let ch = build_slack_channel(&creds, &[], None).expect("slack block → channel");
+        assert_eq!(ch.name(), "slack");
+        assert!(ch.session_threads());
+        assert!(ch.native_buttons());
+        assert!(ch.max_message_len().is_some());
+    }
+
+    /// The daemon hands every live channel's button capability to the
+    /// gateway: a provider that renders buttons is bound, one that does not
+    /// (the mock) is not.
+    #[test]
+    fn channel_button_caps_come_from_the_providers() {
+        let mut map: ChannelMap = HashMap::new();
+        let creds = Credentials {
+            slack: Some(crate::credentials::SlackCreds {
+                bot_token: "xoxb-1".into(),
+                app_token: "xapp-1".into(),
+                allowed_user_ids: vec!["U1".into()],
+            }),
+            ..Default::default()
+        };
+        map.insert(
+            "slack".into(),
+            build_slack_channel(&creds, &[], None).expect("slack channel"),
+        );
+        map.insert(
+            "mock".into(),
+            Arc::new(crate::transport::providers::mock::MockChannel::new()),
+        );
+        let mut caps = channel_button_caps(&map);
+        caps.sort();
+        assert_eq!(
+            caps,
+            vec![("mock".to_string(), false), ("slack".to_string(), true)]
+        );
     }
     use tempfile::TempDir;
 
@@ -2217,6 +2348,7 @@ mod tests {
         let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let reaction_event = |on: bool| GatewayEvent {
+            interim: false,
             id: format!("gateway-reaction-{on}"),
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),
@@ -2284,6 +2416,7 @@ mod tests {
         let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let ev = |on: bool| GatewayEvent {
+            interim: false,
             id: format!("r-{on}"),
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),

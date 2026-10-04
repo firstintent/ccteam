@@ -276,7 +276,9 @@ error is shown verbatim under the box.
 **Conversation**: user turns are bubbles; assistant turns render Markdown with
 DSH’s own renderer, streaming while the turn runs, with the turn’s steps
 (tool calls, commands, file edits, searches, thinking) as compact rows above
-the text — spinning while running, green when done. Human-in-the-loop prompts
+the text — spinning while running, green when done. What the session says
+mid-turn appears as its own reply while the turn keeps running (working state
+and **stop** stay up until the turn actually ends). Human-in-the-loop prompts
 appear as a card with the choices; pick one to answer. Queued turns say what
 they are queued behind; failures show their error kind; session lifecycle and
 delegation events show as small notes. While a turn runs the send button

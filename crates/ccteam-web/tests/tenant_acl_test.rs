@@ -65,6 +65,38 @@ async fn tenant_token_keeps_only_user_management_and_global_im_admin_only() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403, "tenant must be 403 on global IM config");
+    // …including the Slack write (denied before any token validation).
+    let r = c
+        .put(format!("http://{addr}/api/v1/config/im/slack"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .json(&serde_json::json!({"bot_token": "xoxb-1", "app_token": "xapp-1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "tenant must be 403 on the global Slack config"
+    );
+    // …and the Slack setup helpers (manifest link, sender capture, allowlist).
+    for (method, path) in [
+        ("GET", "/api/v1/config/im/slack/app-manifest"),
+        ("GET", "/api/v1/config/im/slack/user-id-candidates"),
+        ("PUT", "/api/v1/config/im/slack/allowed-users"),
+    ] {
+        let req = if method == "GET" {
+            c.get(format!("http://{addr}{path}"))
+        } else {
+            c.put(format!("http://{addr}{path}"))
+                .json(&serde_json::json!({"allowed_user_ids": ["U1"]}))
+        };
+        let r = req
+            .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "tenant must be 403 on {method} {path}");
+    }
 
     // Shared operational/library surfaces are available to every identity.
     for path in ["/api/v1/hosts", "/api/v1/status", "/api/v1/skills"] {

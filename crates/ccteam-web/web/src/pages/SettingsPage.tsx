@@ -1,5 +1,5 @@
 // v0.8.8 F4 — Settings panels: the admin's GLOBAL IM credentials
-// (Telegram + Lark), the tenant's self-serve 「我的 IM bot」, and the
+// (Telegram + Lark + Slack), the tenant's self-serve 「我的 IM bot」, and the
 // admin-only user management table. SettingsView places them: credentials
 // under 设置→接入 (admin), MyImSection under 设置→接入 (tenant), and
 // UserManagementSection on the standalone 管理员 · Admin tab.
@@ -41,14 +41,19 @@
 // re-run (cleanup `clearTimeout`) so navigating away never leaks a timer.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link2, MessageSquare, Send, Users } from "lucide-react";
+import { Hash, Link2, MessageSquare, Send, Users } from "lucide-react";
 import {
+  getSlackAppManifest,
+  getSlackUserIdCandidates,
   pollTelegramChatId,
+  putSlackAllowedUsers,
   saveLark,
+  saveSlack,
   saveTelegramToken,
   startTelegramChatId,
   type ChatIdPollStatus,
   type ImConfigStatus,
+  type SlackManifestResult,
 } from "../lib/configApi";
 import { copyText } from "../lib/clipboard";
 import { toastBus } from "../lib/toastBus";
@@ -655,6 +660,399 @@ export function LarkSection({
       <CardFooter>app secret 永不回显;重配显「(set, ····wxyz)」+ 空白框 · 下次重启生效</CardFooter>
     </Card>
   );
+}
+
+// --------------------------------------------------------------------------
+// Slack — Socket Mode; every agent session lives in its own Slack thread
+// --------------------------------------------------------------------------
+
+export function SlackSection({
+  lang = "zh",
+  status,
+  onSaved,
+}: {
+  lang?: Lang;
+  status: ImConfigStatus["slack"];
+  onSaved: () => void;
+}) {
+  void lang;
+  const configured = status?.configured ?? false;
+  const allowed = status?.allowed_user_ids ?? [];
+  const bound = configured && allowed.length > 0;
+
+  // ① The app: named here, created in Slack by one click (manifest prefilled).
+  const [appName, setAppName] = useState("ccteam");
+  const [manifest, setManifest] = useState<SlackManifestResult | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      getSlackAppManifest(appName.trim())
+        .then((res) => {
+          if (!cancelled) setManifest(res);
+        })
+        .catch(() => {
+          if (!cancelled) setManifest(null);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [appName]);
+  const slashCommand = slashCommandOf(manifest);
+
+  // ② The two tokens.
+  const [editingTokens, setEditingTokens] = useState(!configured);
+  const [botToken, setBotToken] = useState("");
+  const [appToken, setAppToken] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [pending, setPending] = useState(false);
+
+  // ③ Who the bot answers: DM it, your member id shows up, one click allows it.
+  const [captureSince, setCaptureSince] = useState<number | null>(null);
+  const candidates = useSenderCapture(
+    captureSince,
+    getSlackUserIdCandidates,
+    "Slack member id capture failed",
+  ).filter((c) => !allowed.includes(c.sender_id));
+  const [manualId, setManualId] = useState("");
+
+  function startCapture() {
+    setCaptureSince(Math.floor(Date.now() / 1000) - 2);
+  }
+
+  async function copyManifest() {
+    if (!manifest) return;
+    const ok = await copyText(JSON.stringify(manifest.manifest, null, 2));
+    if (ok) toastBus.handler?.info("manifest 已复制 —— 在 Slack「From a manifest」里粘贴(JSON)");
+    else toastBus.handler?.error("复制失败,请改用「在 Slack 中创建」");
+  }
+
+  async function saveTokens(e: React.FormEvent) {
+    e.preventDefault();
+    const bot = botToken.trim();
+    const app = appToken.trim();
+    if (pending || !bot || !app) return;
+    if (configured && !confirming) {
+      setConfirming(true);
+      return;
+    }
+    setPending(true);
+    setConfirming(false);
+    try {
+      const res = await saveSlack({ bot_token: bot, app_token: app, allowed_user_ids: allowed });
+      setBotToken("");
+      setAppToken("");
+      setEditingTokens(false);
+      // Fail-closed: an empty allowlist answers nobody — walk straight into ③.
+      if (allowed.length === 0) startCapture();
+      toastBus.handler?.info(
+        `已连接 ${res.team} · @${res.bot_user}` +
+          (allowed.length === 0 ? " —— 现在私聊 bot,完成第 3 步" : ""),
+      );
+      onSaved();
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function saveAllowlist(ids: string[]) {
+    if (pending) return;
+    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
+    setPending(true);
+    try {
+      const res = await putSlackAllowedUsers(normalized);
+      setManualId("");
+      if (normalized.length > 0) setCaptureSince(null);
+      toastBus.handler?.info(res.note || "allowlist 已保存");
+      onSaved();
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Card data-testid="settings-slack">
+      <CardHeader>
+        <Hash className="text-text-secondary" />
+        <CardTitle className="flex-1">Slack</CardTitle>
+        {bound ? (
+          <Badge variant="running">已连接</Badge>
+        ) : configured ? (
+          <Badge variant="accent">待绑定</Badge>
+        ) : (
+          <Badge variant="idle">未配置</Badge>
+        )}
+      </CardHeader>
+
+      <CardContent className="flex flex-col gap-4">
+        {/* ① Create the Slack app */}
+        <div className="flex flex-col gap-2" data-testid="settings-slack-step-create">
+          <StepHead n={1} title="在 Slack 创建 App" done={configured} />
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="flex min-w-40 flex-1 flex-col gap-1.5">
+              <Label htmlFor="settings-slack-app-name">App 名称</Label>
+              <Input
+                id="settings-slack-app-name"
+                value={appName}
+                onChange={(e) => setAppName(e.target.value)}
+                spellCheck={false}
+                placeholder="ccteam"
+                className="font-mono"
+              />
+            </div>
+            <Button
+              size="sm"
+              data-testid="settings-slack-create"
+              disabled={!manifest}
+              onClick={() => {
+                if (manifest) window.open(manifest.create_url, "_blank", "noopener,noreferrer");
+              }}
+            >
+              在 Slack 中创建 ↗
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              data-testid="settings-slack-copy-manifest"
+              disabled={!manifest}
+              onClick={() => void copyManifest()}
+            >
+              复制 manifest
+            </Button>
+          </div>
+          <p className="text-[10px] leading-relaxed text-text-dim">
+            斜杠命令随 App 名:<span className="font-mono text-text-secondary">{slashCommand}</span>
+            。每台 ccteam 用自己的 App(如 cct2、cct3;免费版一个工作区最多 10 个 App)。打开后选工作区 →
+            Create → 左侧 <b>Install App</b> → Install to Workspace → Allow。
+          </p>
+        </div>
+
+        {/* ② The two tokens */}
+        <div className="flex flex-col gap-2" data-testid="settings-slack-step-tokens">
+          <StepHead n={2} title="填入两个 token" done={configured && !editingTokens} />
+          {editingTokens ? (
+            <form onSubmit={saveTokens} className="flex flex-col gap-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  {/* Red line: token fields always start EMPTY. */}
+                  <Label htmlFor="settings-slack-bot-token">Bot token</Label>
+                  <Input
+                    id="settings-slack-bot-token"
+                    type="password"
+                    autoComplete="off"
+                    value={botToken}
+                    onChange={(e) => {
+                      setBotToken(e.target.value);
+                      if (confirming) setConfirming(false);
+                    }}
+                    disabled={pending}
+                    spellCheck={false}
+                    placeholder="xoxb-…"
+                    className="font-mono"
+                  />
+                  <p className="text-[10px] text-text-dim">
+                    OAuth &amp; Permissions → Bot User OAuth Token
+                  </p>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="settings-slack-app-token">App-level token</Label>
+                  <Input
+                    id="settings-slack-app-token"
+                    type="password"
+                    autoComplete="off"
+                    value={appToken}
+                    onChange={(e) => {
+                      setAppToken(e.target.value);
+                      if (confirming) setConfirming(false);
+                    }}
+                    disabled={pending}
+                    spellCheck={false}
+                    placeholder="xapp-…"
+                    className="font-mono"
+                  />
+                  <p className="text-[10px] text-text-dim">
+                    Basic Information → App-Level Tokens → Generate,scope 选 connections:write
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                {confirming ? (
+                  <span className="mr-auto text-[11px] font-mono text-status-error">
+                    覆盖已配置的 Slack token?
+                  </span>
+                ) : null}
+                {configured ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={pending}
+                    onClick={() => {
+                      setBotToken("");
+                      setAppToken("");
+                      setConfirming(false);
+                      setEditingTokens(false);
+                    }}
+                  >
+                    取消
+                  </Button>
+                ) : null}
+                <Button
+                  type="submit"
+                  size="sm"
+                  data-testid="settings-slack-save"
+                  variant={confirming ? "destructive" : "default"}
+                  disabled={pending || !botToken.trim() || !appToken.trim()}
+                >
+                  {pending ? "校验中…" : confirming ? "确认覆盖" : "保存并连接"}
+                </Button>
+              </div>
+            </form>
+          ) : (
+            <div data-testid="settings-slack-summary" className="flex flex-col gap-2">
+              <Readout>
+                <ReadoutRow
+                  label="bot token"
+                  value={status ? `(set, ${status.bot_token_last4})` : "—"}
+                  ok={configured}
+                />
+                <ReadoutRow
+                  label="app token"
+                  value={status ? `(set, ${status.app_token_last4})` : "—"}
+                  ok={configured}
+                />
+              </Readout>
+              <Button
+                variant="outline"
+                size="sm"
+                className="self-end"
+                onClick={() => setEditingTokens(true)}
+              >
+                更换 token
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* ③ Who the bot answers */}
+        <div
+          className={`flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2 ${
+            configured ? "" : "opacity-60"
+          }`}
+          data-testid="settings-slack-step-bind"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <StepHead n={3} title="允许谁使用" done={bound} />
+            {configured && captureSince === null ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                data-testid="settings-slack-capture"
+                onClick={startCapture}
+                disabled={pending}
+              >
+                发现我的 ID
+              </Button>
+            ) : null}
+          </div>
+          <p className="text-[10px] leading-relaxed text-text-dim">
+            私信这个 bot(或在频道里 @ 它),你的 Slack 成员 ID 会出现在下面,点一下即允许。
+            <span className="text-status-error">未允许前 bot 谁也不回。</span>
+          </p>
+          {captureSince !== null && candidates.length === 0 ? (
+            <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
+          ) : null}
+          {candidates.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              {candidates.map((c) => (
+                <button
+                  key={`${c.sender_id}:${c.message_id}`}
+                  type="button"
+                  data-testid={`settings-slack-candidate-${c.sender_id}`}
+                  onClick={() => void saveAllowlist([...allowed, c.sender_id])}
+                  disabled={pending}
+                  className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
+                >
+                  <span>{c.sender_id}</span>
+                  <span className="text-[10px] text-text-dim">允许</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {allowed.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5" data-testid="settings-slack-allowed">
+              {allowed.map((id) => (
+                <span
+                  key={id}
+                  className="flex items-center gap-1 rounded border border-surface-800 px-1.5 py-0.5 text-[11px] font-mono text-text-secondary"
+                >
+                  {id}
+                  <button
+                    type="button"
+                    aria-label={`移除 ${id}`}
+                    data-testid={`settings-slack-remove-${id}`}
+                    onClick={() => void saveAllowlist(allowed.filter((a) => a !== id))}
+                    disabled={pending}
+                    className="text-text-dim hover:text-status-error"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {configured ? (
+            <form
+              className="flex items-end gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (manualId.trim()) void saveAllowlist([...allowed, manualId]);
+              }}
+            >
+              <div className="flex flex-1 flex-col gap-1.5">
+                <Label htmlFor="settings-slack-users">或手填成员 ID</Label>
+                <Input
+                  id="settings-slack-users"
+                  value={manualId}
+                  onChange={(e) => setManualId(e.target.value)}
+                  disabled={pending}
+                  spellCheck={false}
+                  placeholder="U0123ABCD"
+                  className="font-mono"
+                />
+              </div>
+              <Button
+                type="submit"
+                variant="outline"
+                size="sm"
+                disabled={pending || !manualId.trim()}
+              >
+                添加
+              </Button>
+            </form>
+          ) : null}
+        </div>
+      </CardContent>
+
+      <CardFooter>
+        token 永不回显 · 顶层消息 = 新会话(独立线程)· 命令用 App 的斜杠命令,如 {slashCommand} projects
+      </CardFooter>
+    </Card>
+  );
+}
+
+/** The slash command a manifest declares (`/ccteam` until it loads). */
+function slashCommandOf(manifest: SlackManifestResult | null): string {
+  const features = manifest?.manifest?.features as
+    | { slash_commands?: { command?: string }[] }
+    | undefined;
+  return features?.slash_commands?.[0]?.command ?? "/ccteam";
 }
 
 // --------------------------------------------------------------------------

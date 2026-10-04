@@ -112,6 +112,7 @@ describe("AccessView", () => {
     const html = renderToString(<AccessView lang="zh" />);
     expect(html).toContain('data-testid="settings-telegram"');
     expect(html).toContain('data-testid="settings-lark"');
+    expect(html).toContain('data-testid="settings-slack"');
     expect(html).toContain('data-testid="access-login-links"');
     expect(html).toContain('data-testid="access-im"');
     expect(html).toContain('data-testid="access-mcp"');
@@ -141,6 +142,7 @@ describe("AccessView", () => {
     expect(html).toContain('data-testid="access-satellite"');
     expect(html).not.toContain('data-testid="settings-telegram"');
     expect(html).not.toContain('data-testid="settings-lark"');
+    expect(html).not.toContain('data-testid="settings-slack"');
     expect(html).not.toContain('data-testid="settings-transport-warning"');
     expect(html).not.toContain('data-testid="access-login-links"');
   });

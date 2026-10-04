@@ -32,7 +32,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::pending::InteractionOrigin;
-use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
+use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption, OptionWeight};
 use crate::BotRegistration;
 
 /// Resolve a live thread status after the caller has dropped the gateway
@@ -69,6 +69,15 @@ struct ChatKey {
     channel: String,
     chat_id: String,
     user_id: String,
+    /// The platform thread a message lives in, on a channel that gives every
+    /// agent session its own thread ([`crate::transport::Channel::session_threads`],
+    /// Slack). A thread is the session's TAB inside the conversation — the IM
+    /// twin of the web console's per-session tab: session FOCUS is per thread,
+    /// while ownership, ACL and the current project stay per conversation
+    /// (`chat_id`). `None` on every other channel, and on every owner/identity
+    /// key (see [`canonical_owner`]), so a single-stream chat is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread: Option<String>,
 }
 
 impl ChatKey {
@@ -77,7 +86,20 @@ impl ChatKey {
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             user_id: user_id.to_string(),
+            thread: None,
         }
+    }
+
+    /// The same conversation key, placed in `thread` (an empty id is no
+    /// thread: a provider without one must not mint an empty "tab").
+    fn with_thread(mut self, thread: Option<&str>) -> Self {
+        self.thread = thread.filter(|t| !t.is_empty()).map(str::to_string);
+        self
+    }
+
+    /// This key with its thread dropped — the conversation it belongs to.
+    fn conversation(&self) -> ChatKey {
+        self.clone().with_thread(None)
     }
 
     /// v0.8.18 柱2 — canonical owner identity (`"channel:chat_id"`) recorded on
@@ -112,28 +134,69 @@ impl ChatKey {
     /// answer on the web console and nothing on Telegram.
     ///
     /// Focus follows ownership: the chat is the unit, not one member of it.
+    /// This is the CONVERSATION scope — the thread is dropped too, because the
+    /// conversation's current project is shared by all of its threads.
     fn focus_key(&self) -> ChatKey {
         ChatKey::new(&self.channel, &self.chat_id, &self.chat_id)
     }
+
+    /// [`Self::focus_key`] with the thread KEPT — the THREAD scope session
+    /// focus is addressed by. On a channel without threads this is the very
+    /// same key, so a single-stream chat routes exactly as before.
+    fn thread_focus_key(&self) -> ChatKey {
+        self.focus_key().with_thread(self.thread.as_deref())
+    }
+}
+
+/// Which slice of a conversation one [`FocusRoutes`] table addresses. Chosen
+/// at construction — there is no default, because the wrong scope is a silent
+/// routing bug rather than a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusScope {
+    /// One route per conversation (`current_project`): every thread of a
+    /// conversation works in the same project.
+    Conversation,
+    /// One route per thread (`current_session`): a thread is a session's tab,
+    /// so each thread talks to its own session. Identical to `Conversation`
+    /// for a channel that never passes a thread.
+    Thread,
 }
 
 /// A per-chat FOCUS table — `current_project` (chat → the project it is
 /// working in) and `current_session` (chat → the session it is talking to).
 ///
-/// A type rather than a bare `BTreeMap` so [`ChatKey::focus_key`] normalization
-/// has exactly ONE home: the inner map is private and every accessor takes a
-/// plain `&ChatKey` and normalizes it here, so a reader or writer added later
-/// is covered by construction rather than by remembering. Both tables use it —
-/// they share the key shape, so they shared the split.
+/// A type rather than a bare `BTreeMap` so key normalization has exactly ONE
+/// home ([`Self::key`], per the table's [`FocusScope`]): the inner map is
+/// private and every accessor takes a plain `&ChatKey` and normalizes it here,
+/// so a reader or writer added later is covered by construction rather than by
+/// remembering. Both tables use it — they share the key shape and differ only
+/// in scope (`current_project` per conversation, `current_session` per thread).
 ///
 /// Cheap to clone (`Arc`): each detached event pump keeps its own handle to the
 /// session table to answer "is this session still its chat's focus?".
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct FocusRoutes {
+    scope: FocusScope,
     inner: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
 }
 
 impl FocusRoutes {
+    fn new(scope: FocusScope) -> Self {
+        Self {
+            scope,
+            inner: Arc::default(),
+        }
+    }
+
+    /// The ONE key normalization every accessor (and [`Self::load_saved`])
+    /// goes through: the chat, never a member of it, at this table's scope.
+    fn key(&self, chat: &ChatKey) -> ChatKey {
+        match self.scope {
+            FocusScope::Conversation => chat.focus_key(),
+            FocusScope::Thread => chat.thread_focus_key(),
+        }
+    }
+
     /// Read the table, RECOVERING a poisoned lock.
     ///
     /// A panic under the lock leaves a `BTreeMap` that is still structurally
@@ -159,7 +222,7 @@ impl FocusRoutes {
 
     /// What this chat is currently pointed at, if anything.
     fn get(&self, chat: &ChatKey) -> Option<String> {
-        self.read().get(&chat.focus_key()).cloned()
+        self.read().get(&self.key(chat)).cloned()
     }
 
     fn contains(&self, chat: &ChatKey) -> bool {
@@ -167,19 +230,53 @@ impl FocusRoutes {
     }
 
     /// Point this chat at `value`, replacing whatever it pointed at before.
-    fn set(&self, chat: &ChatKey, value: impl Into<String>) {
-        self.write().insert(chat.focus_key(), value.into());
+    ///
+    /// On the thread scope a session lives in ONE thread of a conversation:
+    /// binding it to this thread unbinds it from the conversation's other
+    /// threads, which are returned so the caller can tell them. Otherwise
+    /// the session's later output would follow whichever thread last drove it
+    /// and the thread the human knows it by would silently go quiet. Always
+    /// empty for a chat without a thread and on the conversation scope.
+    fn set(&self, chat: &ChatKey, value: impl Into<String>) -> Vec<ChatKey> {
+        let key = self.key(chat);
+        let value = value.into();
+        let mut map = self.write();
+        let mut displaced = Vec::new();
+        if self.scope == FocusScope::Thread && key.thread.is_some() {
+            map.retain(|other, v| {
+                let moved = *v == value
+                    && other.thread.is_some()
+                    && other.thread != key.thread
+                    && other.channel == key.channel
+                    && other.chat_id == key.chat_id;
+                if moved {
+                    displaced.push(other.clone());
+                }
+                !moved
+            });
+        }
+        map.insert(key, value);
+        displaced
     }
 
     fn remove(&self, chat: &ChatKey) {
-        self.write().remove(&chat.focus_key());
+        self.write().remove(&self.key(chat));
     }
 
     /// Is `sid` the session this chat is talking to right now?
     fn is_focused(&self, chat: &ChatKey, value: &str) -> bool {
+        self.read().get(&self.key(chat)).is_some_and(|v| v == value)
+    }
+
+    /// The threads of conversation `(channel, chat_id)` whose route points at
+    /// `value` — at most one, since [`Self::set`] moves a session rather than
+    /// copying it. Always empty for a channel that never passes a thread.
+    fn threads_bound_to(&self, channel: &str, chat_id: &str, value: &str) -> Vec<String> {
         self.read()
-            .get(&chat.focus_key())
-            .is_some_and(|v| v == value)
+            .iter()
+            .filter(|(chat, v)| chat.channel == channel && chat.chat_id == chat_id && *v == value)
+            .filter_map(|(chat, _)| chat.thread.clone())
+            .collect()
     }
 
     /// Drop every route whose VALUE fails `keep`.
@@ -233,7 +330,7 @@ impl FocusRoutes {
     ) {
         let mut collapsed: BTreeMap<ChatKey, (R, String)> = BTreeMap::new();
         for route in saved {
-            let key = route.chat.focus_key();
+            let key = self.key(&route.chat);
             let Some(candidate) = rank(&key, &route.value) else {
                 continue;
             };
@@ -244,10 +341,30 @@ impl FocusRoutes {
                 }
             }
         }
-        *self.write() = collapsed
+        let mut routes: BTreeMap<ChatKey, String> = collapsed
             .into_iter()
             .map(|(chat, (_, value))| (chat, value))
             .collect();
+        if self.scope == FocusScope::Thread {
+            // The restore path holds the same invariant [`Self::set`] does: a
+            // session lives in ONE thread of a conversation. Keys iterate in
+            // ascending thread order, so the last one seen per
+            // `(conversation, session)` is its most recent thread — keep that,
+            // drop the rest, whatever the file says.
+            let mut home: BTreeMap<(String, String, String), ChatKey> = BTreeMap::new();
+            for (chat, value) in routes.iter().filter(|(chat, _)| chat.thread.is_some()) {
+                home.insert(
+                    (chat.channel.clone(), chat.chat_id.clone(), value.clone()),
+                    chat.clone(),
+                );
+            }
+            routes.retain(|chat, value| {
+                chat.thread.is_none()
+                    || home.get(&(chat.channel.clone(), chat.chat_id.clone(), value.clone()))
+                        == Some(chat)
+            });
+        }
+        *self.write() = routes;
     }
 }
 
@@ -780,8 +897,15 @@ pub struct Gateway {
     /// [`Principal::Guest`] instead: it owns only what it creates and sees no
     /// project, so it cannot reach anything of the owner's or a tenant's.
     operator_chats: BTreeMap<String, OperatorBinding>,
+    /// Live channel names whose provider renders option buttons, as the
+    /// daemon reported them ([`Self::bind_channel_buttons`]). Empty until the
+    /// daemon binds its channel set — every chat then gets plain-text pickers.
+    button_channels: BTreeSet<String>,
+    /// conversation → its current project ([`FocusScope::Conversation`]: every
+    /// thread of a conversation works in the same project).
     current_project: FocusRoutes,
-    /// chat → its current/focused session id. Shared (`Arc<RwLock>` inside
+    /// chat → its current/focused session id, per THREAD on a channel that
+    /// threads sessions ([`FocusScope::Thread`]). Shared (`Arc<RwLock>` inside
     /// [`FocusRoutes`]) so the detached event pumps can read it to label
     /// *out-of-band* answers/errors — i.e. async events from a session that is
     /// no longer the chat's focus, which otherwise masquerade as the current
@@ -1395,8 +1519,9 @@ fn stranded_boundary_signals(
     // inventing a resolution off them is the mis-attribution this
     // design removes.
     //
-    // Within one execution turn the rows still fold (latest text
-    // wins, earlier ones counted as interim notes): after a
+    // Within one execution turn the rows still fold into ONE answer
+    // (every row, in order — #192/#209; earlier ones also counted as
+    // interim notes): after a
     // restart the child is idle by construction — its process died
     // with the daemon — so the "task finished / child idle" shape
     // is the honest one, and a chatty child cannot flood its
@@ -1421,11 +1546,15 @@ fn stranded_boundary_signals(
     }
     for (exec_turn_id, rows) in groups {
         let last = rows.last().expect("a group holds at least one row");
+        // The turn's answer is every row it wrote, not its last piece (#209),
+        // with the status its closing row carries — the same answer the live
+        // boundary and `agent{wait}` report (a failed turn is its failure row).
+        let answer = crate::delegation::turn_answer_record(all_turns, last);
         pending.push(crate::delegation::DelegationSignal {
             child_sid: child_sid.to_string(),
             turn_id: last.turn_id.clone(),
             exec_turn_id: Some(exec_turn_id),
-            tail: last.assistant.clone(),
+            tail: answer.assistant.clone(),
             vendor,
             host: host.to_string(),
             boundary: true,
@@ -1446,14 +1575,14 @@ fn stranded_boundary_signals(
                 || last.error.is_some(),
             interim_notes: rows.len().saturating_sub(1),
             covered_turns: rows.iter().map(|t| t.turn_id.clone()).collect(),
-            context_pct: crate::delegation::context_pct(last.status.as_ref()),
-            turn: last
+            context_pct: crate::delegation::context_pct(answer.status.as_ref()),
+            turn: answer
                 .status
                 .as_ref()
                 .map(|status| status.turn)
                 .unwrap_or_default(),
             error_kind: last.error_kind.clone(),
-            conclusion: last.conclusion.clone(),
+            conclusion: answer.conclusion.clone(),
         });
     }
     pending
@@ -1890,6 +2019,7 @@ impl DelegationProgressEmitter {
             .strip_prefix("delegation_")
             .unwrap_or(&record.event);
         let event = GatewayEvent {
+            interim: false,
             id: format!(
                 "delegation-{relation}-{}-{}-{}",
                 record.parent_sid,
@@ -2014,7 +2144,7 @@ pub enum GatewayEventKind {
     /// dispatched (filling the silent time-to-first-token gap); `on: false`
     /// removes it the moment the turn's first event appears. **IM-only**: the
     /// daemon egress maps it to the channel's `add_reaction`/`remove_reaction`
-    /// (default no-op for web/discord/slack), and the web SSE drops it (a
+    /// (default no-op for web/discord), and the web SSE drops it (a
     /// reaction has no web representation — web has its own UI). The
     /// `GatewayEvent` already carries `channel`/`chat_id`/`sid`; this only adds
     /// the inbound `message_id` to react to.
@@ -2082,6 +2212,13 @@ pub struct GatewayEvent {
     pub content: String,
     /// Per-turn status snapshot carried by answer events.
     pub status: Option<ccteam_harness::TurnStatus>,
+    /// An answer a structured turn delivered on its way, with that turn
+    /// still running (#209). Said positively, never inferred: plenty of
+    /// answers carry no `status` and end their exchange all the same (the
+    /// terminal protocol's replies, slash-command replies, recovered
+    /// answers), and a reader that took "no status" for "still running"
+    /// kept those sessions busy forever.
+    pub interim: bool,
     /// Answer (new message) vs. live progress (edited status message).
     pub kind: GatewayEventKind,
     /// Outbound file attachments (V0.8.4 P2b — `chat_send_file`). Empty
@@ -2175,6 +2312,10 @@ pub struct HitlPromptContext {
     pub channel: String,
     /// Platform chat/recipient id within `channel`.
     pub chat_id: String,
+    /// The session's own platform thread (Slack `thread_ts`), so the prompt
+    /// lands in the thread the session lives in. `None` on a single-stream
+    /// channel.
+    pub thread_ts: Option<String>,
     /// The session's role (persona), for the "session sX (role) wants to
     /// run …" label.
     pub role: String,
@@ -2182,6 +2323,31 @@ pub struct HitlPromptContext {
     /// `chat_permission_prompt_outstanding` operator-visibility line.
     /// `None` when the gateway was never given project paths (unit tests).
     pub progress_path: Option<PathBuf>,
+}
+
+/// A live session's delivery route ([`Gateway::reply_target_for`]): the
+/// frontend chat its output goes to, plus — on a channel that gives every
+/// session its own thread — that session's thread, so a file, a question or an
+/// approval prompt the session raises lands in the thread it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyTarget {
+    /// IM/web channel name.
+    pub channel: String,
+    /// Platform chat/recipient id within `channel`.
+    pub chat_id: String,
+    /// The session's platform thread (Slack `thread_ts`); `None` on a
+    /// single-stream channel.
+    pub thread_ts: Option<String>,
+}
+
+impl ReplyTarget {
+    fn from_key(key: &ChatKey) -> Self {
+        Self {
+            channel: key.channel.clone(),
+            chat_id: key.chat_id.clone(),
+            thread_ts: key.thread.clone(),
+        }
+    }
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -3021,11 +3187,16 @@ impl SpawnClaims {
     }
 
     /// Acquire (waiting if necessary) the single-flight claim for `chat`.
+    ///
+    /// Keyed exactly like the `current_session` slot the claim guards
+    /// ([`ChatKey::thread_focus_key`]): one claim per chat — per THREAD on a
+    /// channel that threads sessions, so two new threads spawn concurrently
+    /// while two messages racing into one new thread still spawn once.
     async fn lock_for(&self, chat: &ChatKey) -> tokio::sync::OwnedMutexGuard<()> {
         let entry = {
             let mut map = self.per_chat.lock().unwrap();
             Arc::clone(
-                map.entry(chat.clone())
+                map.entry(chat.thread_focus_key())
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
@@ -3115,7 +3286,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/use",
-        arg_hint: Some("<id|@role>"),
+        // No `|` inside `<…>`: Slack reads `<a|b>` as its own link syntax.
+        arg_hint: Some("<id> | @<role>"),
         // v0.8.23 review §3.2-5 — `@role` is a shorthand for "the most
         // recently active session with that role" (silent recency tie-break;
         // an unmatched role lists what IS available).
@@ -3221,12 +3393,70 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
 const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
 
-fn command_next_hint(cmd: &str) -> Option<&'static str> {
+/// What to offer after a command's reply. On a channel that renders buttons
+/// it becomes a row of buttons under the reply (see
+/// [`Gateway::reply_with_next_step`]); elsewhere the text footer
+/// ([`NextStep::hint`]), when there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextStep {
+    /// The chat's session was just created / switched / steered: its controls.
+    Session,
+    /// The chat's session set changed: the session list.
+    Sessions,
+    /// `/status` already shows the session: just its controls, no footer.
+    SessionControls,
+    /// `/help`: the main menu, so nothing has to be typed.
+    Menu,
+}
+
+impl NextStep {
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Session => Some(NEXT_HINT_STATUS),
+            Self::Sessions => Some(NEXT_HINT_SESSIONS),
+            Self::SessionControls | Self::Menu => None,
+        }
+    }
+}
+
+fn command_next_step(cmd: &str) -> Option<NextStep> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => NEXT_HINT_STATUS,
-        "/stop" | "/rename" | "/cd" | "/newproject" => NEXT_HINT_SESSIONS,
+        "/new" | "/use" | "/role" | "/interrupt" => NextStep::Session,
+        "/stop" | "/rename" | "/cd" | "/newproject" => NextStep::Sessions,
+        "/status" => NextStep::SessionControls,
+        "/help" => NextStep::Menu,
         _ => return None,
     })
+}
+
+/// A button click that stands for a typed command (`act:<what>`): the
+/// whitelist of commands a button may run, as the text a user would type.
+/// Anything else is refused — a button can do nothing typing could not.
+fn button_action_command(action: &str) -> Option<String> {
+    let command = match action {
+        "status" => "/status",
+        "sessions" => "/sessions",
+        "projects" => "/projects",
+        "help" => "/help",
+        "model" => "/model",
+        "interrupt" => "/interrupt",
+        _ => {
+            let vendor = action.strip_prefix("new:")?;
+            parse_vendor(vendor).ok()?;
+            return Some(format!("/new {vendor}"));
+        }
+    };
+    Some(command.to_string())
+}
+
+/// One `act:` button.
+fn action_option(data: &str, label: &str, weight: OptionWeight) -> MessageOption {
+    MessageOption {
+        data: format!("act:{data}"),
+        label: label.to_string(),
+        id: data.to_string(),
+        weight,
+    }
 }
 
 fn append_next_hint(reply: &mut String, hint: &str) {
@@ -3304,8 +3534,9 @@ impl Gateway {
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
             projects,
             operator_chats: BTreeMap::new(),
-            current_project: FocusRoutes::default(),
-            current_session: FocusRoutes::default(),
+            button_channels: BTreeSet::new(),
+            current_project: FocusRoutes::new(FocusScope::Conversation),
+            current_session: FocusRoutes::new(FocusScope::Thread),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
             rebuild_reservations: BTreeMap::new(),
@@ -4058,6 +4289,7 @@ impl Gateway {
     /// delivery). The durable twin is the progress event the caller appends.
     fn emit_session_lifecycle(&self, sid: &str, slug: &str, state: &str, reason: &str) {
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!(
                 "session-{state}-{sid}-{}",
                 chrono::Utc::now().timestamp_millis()
@@ -4347,11 +4579,7 @@ impl Gateway {
                 .sessions
                 .get(sid)
                 .and_then(|s| s.reply_to.lock().ok().map(|c| c.clone()))
-                .or_else(|| g.tenant_project_owner_reply_target(slug))
-                .or_else(|| {
-                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
-                })
-                .unwrap_or_else(web_api_chat);
+                .unwrap_or_else(|| g.owner_reply_target_for_meta(slug, &meta));
             (adapter, reply_to, g.delegation_tx.clone())
         };
         let recovered = adapter
@@ -4480,10 +4708,11 @@ impl Gateway {
                 ),
             );
             g.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("gateway-recovered-{turn_id}"),
                 channel: reply_to.channel.clone(),
                 chat_id: reply_to.chat_id.clone(),
-                thread_ts: None,
+                thread_ts: reply_to.thread.clone(),
                 content,
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
@@ -4540,13 +4769,7 @@ impl Gateway {
             } else {
                 match g.find_meta_for_sid(sid) {
                     Ok((slug, cwd, meta)) => {
-                        let reply_to = g
-                            .tenant_project_owner_reply_target(&slug)
-                            .or_else(|| {
-                                ChatKey::from_identity(&meta.owner)
-                                    .map(|owner| reply_target_for_owner(&owner))
-                            })
-                            .unwrap_or_else(web_api_chat);
+                        let reply_to = g.owner_reply_target_for_meta(&slug, &meta);
                         match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
                             Ok(plan) => Some((plan, reply_to)),
                             Err(err) if is_body_detached_error(&err) => {
@@ -4781,12 +5004,19 @@ impl Gateway {
         }
     }
 
-    /// True when this chat already has a current gateway session. `user_id` is
-    /// the caller's sender, not part of the focus identity (see
-    /// [`ChatKey::focus_key`]) — the chat's session is the chat's, whoever spoke.
-    pub fn has_current_session(&self, channel: &str, chat_id: &str, user_id: &str) -> bool {
+    /// True when this chat (this THREAD, on a channel that threads sessions)
+    /// already has a current gateway session. `user_id` is the caller's
+    /// sender, not part of the focus identity (see [`ChatKey::focus_key`]) —
+    /// the chat's session is the chat's, whoever spoke.
+    pub fn has_current_session(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        thread: Option<&str>,
+    ) -> bool {
         self.current_session
-            .contains(&ChatKey::new(channel, chat_id, user_id))
+            .contains(&ChatKey::new(channel, chat_id, user_id).with_thread(thread))
     }
 
     /// Route one inbound text message and return outbound replies. Thin
@@ -4800,7 +5030,7 @@ impl Gateway {
         user_id: &str,
         text: &str,
     ) -> Result<Vec<String>> {
-        self.handle_message(channel, chat_id, user_id, "", text, &[], None)
+        self.handle_message(channel, chat_id, user_id, None, "", text, &[], None)
             .await
     }
 
@@ -4810,6 +5040,13 @@ impl Gateway {
     /// file's on-disk path, so the agent `Read`s it — the load-bearing
     /// Read convention is taught by the daemon's MCP server instructions
     /// (the `initialize` response, on whichever transport the session holds).
+    ///
+    /// `thread` is the platform thread the message was posted in, passed ONLY
+    /// by a channel that gives every session its own thread
+    /// ([`crate::transport::Channel::session_threads`]); everyone else passes
+    /// `None` and routes exactly as a single stream. With a thread, session
+    /// focus (implicit spawn, `/use`, `/new`, `@handle`, nav buttons) is that
+    /// thread's own, while the project and ownership stay the conversation's.
     // v0.8.5 D3 added the `selection` arg (inbound option click); the
     // per-field inbound signature is the established shape (same as the
     // daemon's `deliver_progress`), so allow the arg count.
@@ -4819,12 +5056,37 @@ impl Gateway {
         channel: &str,
         chat_id: &str,
         user_id: &str,
+        thread: Option<&str>,
         message_id: &str,
         text: &str,
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
-        let chat = ChatKey::new(channel, chat_id, user_id);
+        let chat = ChatKey::new(channel, chat_id, user_id).with_thread(thread);
+        // An `act:` button stands for a command the user could have typed
+        // (`button_action_command`): run it exactly as typed, in this chat.
+        if let Some(action) = selection.and_then(|reply| reply.data.strip_prefix("act:")) {
+            let Some(command) = button_action_command(action) else {
+                return Ok(vec![format!("unknown action: {action}")]);
+            };
+            let needs_session = matches!(command.as_str(), "/model" | "/interrupt");
+            if needs_session && !self.current_session.contains(&chat) {
+                return Ok(vec![
+                    "这里现在没有会话 —— 发一条消息就会新建一个".to_string()
+                ]);
+            }
+            return Box::pin(self.handle_message(
+                channel,
+                chat_id,
+                user_id,
+                thread,
+                message_id,
+                &command,
+                &[],
+                None,
+            ))
+            .await;
+        }
         // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
         // resolves the session's pending choice — never treated as text.
         if let Some(reply) = selection {
@@ -4857,18 +5119,13 @@ impl Gateway {
                 "/inbox scheduled messages do not support files or skills"
             ));
         }
-        if let Some(mut reply) = self.handle_command(&chat, text).await? {
-            // Owner req — teach the next step: append a recommended-command
-            // footer as the reply's last line (see `command_next_hint`). IM only
-            // — the web console navigates by GUI and reaches commands via
-            // `submit_web_sid` in production, so it never gets the text footer.
-            if chat.channel != "web" {
-                if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
-                {
-                    append_next_hint(&mut reply, hint);
-                }
-            }
-            return Ok(vec![reply]);
+        if let Some(reply) = self.handle_command(&chat, text).await? {
+            // Owner req — teach the next step (`command_next_step`): buttons
+            // where the channel renders them, else a footer line. IM only — the
+            // web console navigates by GUI and reaches commands via
+            // `submit_web_sid` in production, so it never gets either.
+            let step = command_next_step(text.split_whitespace().next().unwrap_or(""));
+            return Ok(self.reply_with_next_step(&chat, reply, step));
         }
         // A gateway command may handle itself ENTIRELY via the event sink and
         // return no inline reply — a project / session picker delivered as
@@ -4880,7 +5137,7 @@ impl Gateway {
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
-                self.current_session.set(&chat, session_id);
+                self.focus_session(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -4890,7 +5147,7 @@ impl Gateway {
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
-                self.current_session.set(&chat, session_id);
+                self.focus_session(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -4928,7 +5185,10 @@ impl Gateway {
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
         let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
-        if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
+        if chat.channel != "web"
+            && !self.channel_supports_buttons(&chat.channel)
+            && text.split_whitespace().next() == Some("/model")
+        {
             if let Some(last) = replies.last_mut() {
                 append_next_hint(last, NEXT_HINT_STATUS);
             }
@@ -4965,13 +5225,14 @@ impl Gateway {
         channel: &str,
         chat_id: &str,
         user_id: &str,
+        thread: Option<&str>,
         text: &str,
         has_selection: bool,
     ) -> bool {
         if has_selection {
             return false;
         }
-        if self.has_current_session(channel, chat_id, user_id) {
+        if self.has_current_session(channel, chat_id, user_id, thread) {
             return false;
         }
         if Self::is_gateway_command(text) {
@@ -5006,12 +5267,13 @@ impl Gateway {
         channel: &str,
         chat_id: &str,
         user_id: &str,
+        thread: Option<&str>,
         message_id: &str,
         text: &str,
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
-        let chat = ChatKey::new(channel, chat_id, user_id);
+        let chat = ChatKey::new(channel, chat_id, user_id).with_thread(thread);
         // `/stop` before anything else: it is the one gateway command that has
         // to take a per-child claim, which means it cannot run inside a
         // `&mut Gateway` (issue #197 E). Handled here, where the lock can be
@@ -5031,7 +5293,7 @@ impl Gateway {
         let candidate = if candidate_shape {
             !crate::latency::gateway_lock(&gateway, "im.turn.candidate")
                 .await
-                .has_current_session(channel, chat_id, user_id)
+                .has_current_session(channel, chat_id, user_id, thread)
         } else {
             false
         };
@@ -5042,8 +5304,8 @@ impl Gateway {
                     .spawn_claims,
             );
             // Hold the per-chat claim across plan+spawn+apply so a second
-            // concurrent "no session yet" message for this SAME chat waits
-            // here instead of racing to spawn a duplicate session.
+            // concurrent "no session yet" message for this SAME chat (thread)
+            // waits here instead of racing to spawn a duplicate session.
             let _claim = claims.lock_for(&chat).await;
             let outcome = {
                 let mut g = crate::latency::gateway_lock(&gateway, "im.turn.spawn_plan").await;
@@ -5066,6 +5328,7 @@ impl Gateway {
                         .apply_new_session(*plan, thread, None, false, None)
                         .await?;
                     let sid = outcome.id.clone();
+                    g.announce_thread_session(&chat, &sid);
                     g.drain_and_dispatch_pending_turns(&sid).await;
                     sid
                 };
@@ -5080,6 +5343,7 @@ impl Gateway {
                 channel,
                 chat_id,
                 user_id,
+                thread,
                 message_id,
                 text,
                 attachments,
@@ -5139,15 +5403,11 @@ impl Gateway {
         Some(match Self::stop_session_shared(gateway, &sid).await {
             Err(error) => Err(error),
             Ok(outcome) => {
-                let mut reply = stop_command_receipt(&sid, was_detached, &outcome);
-                // The same next-step footer every other IM command gets: this
-                // leg answers ahead of `handle_command`, so it appends its own.
-                if chat.channel != "web" {
-                    if let Some(hint) = command_next_hint("/stop") {
-                        append_next_hint(&mut reply, hint);
-                    }
-                }
-                Ok(vec![reply])
+                let reply = stop_command_receipt(&sid, was_detached, &outcome);
+                // The same next step every other IM command gets: this leg
+                // answers ahead of `handle_command`, so it adds its own.
+                let g = crate::latency::gateway_lock(gateway, "im.stop.next_step").await;
+                Ok(g.reply_with_next_step(chat, reply, command_next_step("/stop")))
             }
         })
     }
@@ -5352,7 +5612,7 @@ impl Gateway {
                 // command then returns no inline reply. Every other channel
                 // (web's structured session frame, Lark's text-only send, the
                 // test mock) keeps the plain-text reply unchanged.
-                if Self::channel_supports_buttons(&chat.channel) {
+                if self.channel_supports_buttons(&chat.channel) {
                     let options = self.session_switch_options(chat, all);
                     self.emit_list_options(chat, text, options);
                     Ok(None)
@@ -5367,7 +5627,7 @@ impl Gateway {
                 // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
                 // delivered via the event sink. Others keep the bare
                 // newline-separated slug list as an inline reply.
-                if Self::channel_supports_buttons(&chat.channel) {
+                if self.channel_supports_buttons(&chat.channel) {
                     let options = self.project_switch_options(chat);
                     let cur = self.current_project_label(chat);
                     self.emit_list_options(
@@ -5551,13 +5811,14 @@ impl Gateway {
             if !acl_ok {
                 return Ok(format!("unknown session for this chat: {id}"));
             }
-            let caller_identity = canonical_owner(chat).identity();
+            // The caller's canonical identity, placed in the thread that asked
+            // (focus is per thread; the identity is the conversation's).
+            let caller = ChatKey::from_identity(&canonical_owner(chat).identity())
+                .unwrap_or_else(web_api_chat)
+                .with_thread(chat.thread.as_deref());
             // IM already owner-checked above, so no project-slug binding is
             // needed here — pass None.
-            match self
-                .resume_stopped_session(id, &caller_identity, None)
-                .await
-            {
+            match self.resume_stopped_session_as(id, caller, None).await {
                 Ok(resumed_sid) => {
                     // Move current project to this session's project, and bind
                     // the reply target to THIS chat key.
@@ -5574,7 +5835,7 @@ impl Gateway {
                         }
                         self.current_project.set(chat, proj);
                     }
-                    self.current_session.set(chat, resumed_sid.clone());
+                    self.focus_session(chat, resumed_sid.clone());
                     self.persist_routing()?;
                     return Ok(format!("resumed session {resumed_sid}"));
                 }
@@ -5591,7 +5852,7 @@ impl Gateway {
         // session's project, so a following /new (and /cd's default) lands in
         // the same project you just switched into — not the stale prior one.
         self.current_project.set(chat, project);
-        self.current_session.set(chat, sid.clone());
+        self.focus_session(chat, sid.clone());
         self.persist_routing()?;
         Ok(format!("using session {sid}"))
     }
@@ -5603,30 +5864,34 @@ impl Gateway {
     /// or reads as an unknown target.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
         if let Some(slug) = nav.strip_prefix("cd:") {
-            let mut reply = self.change_project(chat, slug)?;
-            if chat.channel != "web" {
-                append_next_hint(&mut reply, NEXT_HINT_SESSIONS);
-            }
-            return Ok(vec![reply]);
+            let reply = self.change_project(chat, slug)?;
+            return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Sessions)));
         }
         if let Some(sid) = nav.strip_prefix("use:") {
-            let mut reply = self.use_session(chat, sid).await?;
-            if chat.channel != "web" {
-                append_next_hint(&mut reply, NEXT_HINT_STATUS);
-            }
-            return Ok(vec![reply]);
+            let reply = self.use_session(chat, sid).await?;
+            return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Session)));
         }
         Ok(vec!["invalid selection".to_string()])
     }
 
-    /// Whether a channel renders message `options` as tappable inline-keyboard
-    /// buttons. Only Telegram does today: Lark's `send` ignores options, web
-    /// turns an options-bearing message into a choice-chip frame (which would
-    /// REPLACE its structured session list), and the test mock reads the plain
-    /// text reply. Keyed by platform so per-tenant bots (`"telegram@<tenant>"`)
-    /// are covered too. Extend as other providers gain native buttons.
-    fn channel_supports_buttons(channel: &str) -> bool {
-        crate::transport::platform_of(channel) == "telegram"
+    /// Record whether the live channel `name` (`"telegram"`, `"slack"`,
+    /// `"telegram@<tenant>"` …) renders option buttons — the provider's own
+    /// [`crate::transport::Channel::native_buttons`], reported by the daemon
+    /// whenever it (re)builds a channel. The gateway never names a platform.
+    pub fn bind_channel_buttons(&mut self, name: &str, native: bool) {
+        if native {
+            self.button_channels.insert(name.to_string());
+        } else {
+            self.button_channels.remove(name);
+        }
+    }
+
+    /// Whether a chat's channel renders message `options` as tappable
+    /// buttons ([`Self::bind_channel_buttons`]). A picker there is text +
+    /// buttons; everywhere else (web's structured session frame, a channel
+    /// whose clicks are not wired) it stays a plain-text reply.
+    fn channel_supports_buttons(&self, channel: &str) -> bool {
+        self.button_channels.contains(channel)
     }
 
     /// Project slugs `chat` may SEE — backs `/projects`, the `/cd` picker, and
@@ -5698,6 +5963,69 @@ impl Gateway {
             .map(|owner| reply_target_for_owner(&owner))
     }
 
+    /// Re-attach `sid`'s own thread to a reply `target` that carries none.
+    ///
+    /// A turn nobody typed in this thread (a delegation completion
+    /// notification, a drained internal turn, a web submit to an IM-owned
+    /// session) answers to an OWNER-derived target, and an owner is a
+    /// conversation, never a thread ([`canonical_owner`]). On a channel that
+    /// threads sessions that answer would land top-level and read as "not this
+    /// thread's focus" — dropping its IM leg — so the session's thread is put
+    /// back: the one thread of that conversation bound to `sid` (a session
+    /// lives in at most one, see [`FocusRoutes::set`]). Nothing bound (and
+    /// every single-stream channel) → `target` unchanged. The ONE place this
+    /// rule lives; every owner-derived reset goes through
+    /// [`Self::owner_reply_target`] / [`Self::owner_reply_target_for_meta`].
+    fn with_bound_thread(&self, target: ChatKey, sid: &str) -> ChatKey {
+        if target.thread.is_some() {
+            return target;
+        }
+        let bound = self
+            .current_session
+            .threads_bound_to(&target.channel, &target.chat_id, sid);
+        match bound.last() {
+            Some(thread) => target.with_thread(Some(thread)),
+            None => target,
+        }
+    }
+
+    /// Where a turn that did not come from a chat answers for a LIVE session:
+    /// the tenant project's web console for a tenant-owned project, else the
+    /// session owner's own frontend — with the session's thread re-attached
+    /// ([`Self::with_bound_thread`]).
+    fn owner_reply_target(&self, session: &GatewaySession) -> ChatKey {
+        let target = match self.tenant_project_owner_reply_target(&session.project) {
+            Some(target) => target,
+            None => {
+                // A session one of the owner's IM chats switched to (or last
+                // drove) and still has in focus lives THERE now — its
+                // follow-ups go to that chat, not back to the one that created
+                // it. One target, never a broadcast: seeing a session from
+                // several chats must not make it push to all of them.
+                let current = pump_target(session);
+                if current.channel != "web"
+                    && self.current_session.is_focused(&current, &session.id)
+                {
+                    return current;
+                }
+                reply_target_for_owner(&session.owner)
+            }
+        };
+        self.with_bound_thread(target, &session.id)
+    }
+
+    /// [`Self::owner_reply_target`] for a sid with no live record, resolved
+    /// from its `meta.json` owner (the admin web console when that is unset).
+    fn owner_reply_target_for_meta(&self, slug: &str, meta: &SessionMeta) -> ChatKey {
+        let target = self
+            .tenant_project_owner_reply_target(slug)
+            .or_else(|| {
+                ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+            })
+            .unwrap_or_else(web_api_chat);
+        self.with_bound_thread(target, &meta.sid)
+    }
+
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
     /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
     /// dropped (a pathologically long slug still shows in the text list).
@@ -5716,6 +6044,7 @@ impl Gateway {
                     format!("▸ {slug}")
                 };
                 MessageOption {
+                    weight: Default::default(),
                     data: format!("nav:cd:{slug}"),
                     label,
                     id: slug,
@@ -5798,6 +6127,7 @@ impl Gateway {
                     ));
                 }
                 MessageOption {
+                    weight: Default::default(),
                     data: format!("nav:use:{sid}"),
                     label,
                     id: sid.to_string(),
@@ -5807,6 +6137,93 @@ impl Gateway {
             .collect();
         left_align_option_labels(&mut options);
         options
+    }
+
+    /// Deliver a command's `reply` with its next step. Where the channel
+    /// renders buttons the step is a row of buttons under the reply, sent
+    /// through the event sink (so no inline reply comes back); elsewhere it is
+    /// the footer line [`NextStep::hint`]. The web console gets neither.
+    fn reply_with_next_step(
+        &self,
+        chat: &ChatKey,
+        mut reply: String,
+        step: Option<NextStep>,
+    ) -> Vec<String> {
+        let Some(step) = step.filter(|_| chat.channel != "web") else {
+            return vec![reply];
+        };
+        if self.channel_supports_buttons(&chat.channel) {
+            let options = self.next_step_options(chat, step);
+            if !options.is_empty() {
+                self.emit_list_options(chat, reply, options);
+                return Vec::new();
+            }
+        }
+        if let Some(hint) = step.hint() {
+            append_next_hint(&mut reply, hint);
+        }
+        vec![reply]
+    }
+
+    /// The buttons for a [`NextStep`]: a session's controls (status, model,
+    /// interrupt) when the chat has one, the session/project lists, or the
+    /// main menu.
+    fn next_step_options(&self, chat: &ChatKey, step: NextStep) -> Vec<MessageOption> {
+        use OptionWeight::{Minor, Normal, Primary};
+        let lists = |weight| {
+            vec![
+                action_option("sessions", "🧵 会话", weight),
+                action_option("projects", "📁 项目", weight),
+            ]
+        };
+        match step {
+            NextStep::Session | NextStep::SessionControls => {
+                if self.current_session.contains(chat) {
+                    // Status and model are what a thread reaches for; interrupt
+                    // is easy to regret, so it is the smallest, last button.
+                    let mut controls = vec![
+                        action_option("status", "📊 状态", Primary),
+                        action_option("model", "🧠 模型", Primary),
+                    ];
+                    controls.extend(lists(Normal));
+                    controls.push(action_option("interrupt", "⏹ 中断", Minor));
+                    controls
+                } else {
+                    lists(Primary)
+                }
+            }
+            NextStep::Sessions => lists(Primary),
+            NextStep::Menu => vec![
+                action_option("projects", "📁 项目", Primary),
+                action_option("sessions", "🧵 会话", Primary),
+                action_option("status", "📊 状态", Normal),
+                action_option("new:claude", "＋ Claude", Normal),
+                action_option("new:codex", "＋ Codex", Normal),
+            ],
+        }
+    }
+
+    /// A thread whose first message just spawned its session opens with a
+    /// one-line header and that session's controls, so status / model /
+    /// interrupt are a tap away for the rest of the thread. Threads only: a
+    /// single-stream chat has no "top of the session" to put them at.
+    fn announce_thread_session(&self, chat: &ChatKey, sid: &str) {
+        if chat.thread.is_none() || !self.channel_supports_buttons(&chat.channel) {
+            return;
+        }
+        let Some(session) = self.sessions.get(sid) else {
+            return;
+        };
+        let header = format!(
+            "🧵 会话 {sid} · 项目 {} · {}",
+            session.project,
+            vendor_str(session.vendor)
+        );
+        self.emit_list_options(
+            chat,
+            header,
+            self.next_step_options(chat, NextStep::Session),
+        );
     }
 
     /// Emit a picker message (a project/session list) carrying inline `options`
@@ -5820,10 +6237,11 @@ impl Gateway {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
-            thread_ts: None,
+            thread_ts: chat.thread.clone(),
             content,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
@@ -5923,6 +6341,7 @@ impl Gateway {
                 let outcome = self
                     .apply_new_session(*plan, thread, None, false, None)
                     .await?;
+                self.announce_thread_session(chat, &outcome.id);
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
@@ -6590,7 +7009,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session.set(&reply_to, id.clone());
+        self.focus_session(&reply_to, id.clone());
         if !capacity_checked {
             self.persist_routing()?;
         }
@@ -6744,7 +7163,9 @@ impl Gateway {
             .await?;
         // Replace the record in place: same sid, new role/handle/thread, fresh
         // pane counters; replies route back to the owner (the chat that drives
-        // it), matching `start_session`.
+        // it), matching `start_session` — in the thread this `/role` was typed
+        // in, on a channel that threads sessions.
+        let reply_to = self.with_bound_thread(owner.clone(), &sid);
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -6763,7 +7184,7 @@ impl Gateway {
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(owner)),
+                reply_to: Arc::new(std::sync::Mutex::new(reply_to)),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
@@ -6777,7 +7198,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session.set(chat, sid.clone());
+        self.focus_session(chat, sid.clone());
         self.persist_routing()?;
         // v0.8.21 Wave-2 — keep meta.json (the session SoT) in sync: `/role`
         // changed the role, so a daemon restart must rebuild at the NEW role.
@@ -6810,6 +7231,37 @@ impl Gateway {
         }
         self.spawn_event_pump(&sid);
         Ok(sid)
+    }
+
+    /// Bind `chat` (a thread, on a channel that threads sessions) to `sid`.
+    /// The ONE writer of `current_session`: a session lives in one thread of
+    /// a conversation ([`FocusRoutes::set`]), so a thread it leaves is told —
+    /// otherwise the human keeps writing there and gets a fresh session with
+    /// no idea why.
+    fn focus_session(&self, chat: &ChatKey, sid: impl Into<String>) {
+        let sid = sid.into();
+        for left in self.current_session.set(chat, sid.clone()) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            self.emit_user_signal(GatewayEvent {
+                interim: false,
+                id: format!("gateway-moved-{sid}-{nanos}"),
+                channel: left.channel.clone(),
+                chat_id: left.chat_id.clone(),
+                thread_ts: left.thread.clone(),
+                content: format!(
+                    "↪ {sid} moved to another thread. This thread has no session now — your next message here starts a new one."
+                ),
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                status: None,
+                sid: None,
+                slug: None,
+            });
+        }
     }
 
     fn emit_user_signal(&self, event: GatewayEvent) {
@@ -6963,13 +7415,8 @@ impl Gateway {
                 .and_then(|dir| {
                     ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
                 })
-                .map(|turns| {
-                    turns
-                        .iter()
-                        .filter(|turn| !turn.assistant.is_empty())
-                        .count() as u64
-                })
-                .unwrap_or(0); // assistant-row count → monotonic turn number
+                .map(|turns| last_answer_seq(&session_id, &turns))
+                .unwrap_or(0);
             let mut vendor_turn: u64 = project_dir
                 .as_ref()
                 .and_then(|dir| {
@@ -6999,6 +7446,9 @@ impl Gateway {
             // boundary's final answer — plus every mirrored turn id (batch
             // dedup bookkeeping) and the interim count.
             let mut turn_last_answer: Option<(String, String)> = None;
+            // Every text row the open turn has written, in order — its answer
+            // when it closes (a long turn is written in pieces, #209).
+            let mut turn_said: Vec<String> = Vec::new();
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
             // Assistant messages a turn-bounded protocol produced that are
@@ -7125,9 +7575,27 @@ impl Gateway {
                     }
                 };
 
+                // Held-text release timer, armed only while a structured turn
+                // holds something it has said. The hold may delay a message by
+                // one heartbeat, never longer: waiting for the NEXT vendor event
+                // to notice the deadline left a line said just before a silent
+                // twenty-minute tool call unsent until the tool returned (#209).
+                let hold_deadline = held_since
+                    .filter(|_| structured_turn_open && !pending_answers.is_empty())
+                    .map(|held| held + heartbeat_interval);
+
                 tokio::select! {
                     biased;
-                    maybe = events.next(), if streaming => {
+                    wake = next_pump_wake(&mut events, hold_deadline), if streaming => {
+                        // A due hold enters the SAME delivery path a vendor
+                        // event does, as an inert marker that skips everything
+                        // a vendor event means (liveness, heartbeat rows,
+                        // accounting): the clock ran out, the vendor did
+                        // nothing.
+                        let (maybe, vendor_event) = match wake {
+                            PumpWake::Vendor(maybe) => (maybe, true),
+                            PumpWake::HoldDue => (Some(hold_due_marker()), false),
+                        };
                         let Some(evt) = maybe else {
                             streaming = false;
                             if reporting {
@@ -7212,6 +7680,7 @@ impl Gateway {
                             }
                             continue;
                         };
+                        if vendor_event {
                         // First event on a rebuilt attachment — but only a
                         // non-`Error` one proves it. A failed re-dial surfaces as
                         // a single `Error` followed by the stream ending again,
@@ -7286,6 +7755,9 @@ impl Gateway {
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id, opening } = &evt {
                             structured_turn_open = true;
+                            // What an earlier stretch said outside any turn is
+                            // not this turn's answer.
+                            turn_said.clear();
                             // The execution turn a delegation request is bound
                             // to. Recording it here is what lets a boundary
                             // resolve exactly the requests that asked for THIS
@@ -7359,16 +7831,13 @@ impl Gateway {
                             .ok()
                             .and_then(|mut p| p.take());
                         if let Some(ack_msg_id) = pending_ack {
-                            let ack_target = session
-                                .reply_to
-                                .lock()
-                                .map(|k| k.clone())
-                                .unwrap_or_else(|_| session.owner.clone());
+                            let ack_target = pump_target(&session);
                             if !tx.send(GatewayEvent {
+                                interim: false,
                                 id: format!("gateway-reaction-clear-{session_id}-{ack_msg_id}"),
                                 channel: ack_target.channel.clone(),
                                 chat_id: ack_target.chat_id.clone(),
-                                thread_ts: None,
+                                thread_ts: ack_target.thread.clone(),
                                 content: String::new(),
                                 kind: GatewayEventKind::Reaction {
                                     message_id: ack_msg_id,
@@ -7720,9 +8189,16 @@ impl Gateway {
                                 }
                             }
                         }
+                        }
+                        // What the turn's boundary may name as its conclusion
+                        // when the vendor names none: the last message of a
+                        // folded batch (see `fold_held`).
+                        let mut held_last: Option<String> = None;
                         let mut answer_texts = match &evt {
                             ThreadEvent::ItemCompleted { item } => match &item.details {
-                                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => {
+                                // A message of nothing but whitespace says
+                                // nothing: never a blank chat message or row.
+                                ThreadItemDetails::AgentMessage(text) if !text.trim().is_empty() => {
                                     if session.protocol.is_terminal() || !structured_turn_open {
                                         vec![text.clone()]
                                     } else {
@@ -7736,11 +8212,19 @@ impl Gateway {
                                 _ => Vec::new(),
                             },
                             ThreadEvent::TurnCompleted { .. } => {
-                                std::mem::take(&mut pending_answers)
+                                let (text, last) = fold_held(std::mem::take(&mut pending_answers));
+                                held_last = last;
+                                text.into_iter().collect()
                             }
+                            // What the turn said before it failed is still
+                            // what it said — output that was produced and paid
+                            // for. It goes out as an ordinary message AHEAD of
+                            // the failure instead of being discarded with it.
                             ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => {
-                                pending_answers.clear();
-                                vec![err.message.clone()]
+                                let (text, _) = fold_held(std::mem::take(&mut pending_answers));
+                                text.into_iter()
+                                    .chain(std::iter::once(err.message.clone()))
+                                    .collect()
                             }
                             _ => Vec::new(),
                         };
@@ -7757,19 +8241,25 @@ impl Gateway {
                         //     so its text is a reply to a human, not narration;
                         //   - or the hold has outlived one liveness heartbeat,
                         //     the same window that says a working turn may not
-                        //     go silent to the outside longer than that.
+                        //     go silent to the outside longer than that —
+                        //     noticed by the next vendor event or, when the
+                        //     vendor is silent, by the hold timer itself.
+                        // What is released goes out FOLDED into one message:
+                        // a working session narrates in short lines, and a
+                        // chat that gets one message per heartbeat can follow
+                        // it without being buzzed once per line.
                         // Cost of releasing: this turn's rows carry no status
                         // (`is_final_answer` needs the boundary), so the
-                        // boundary pays it back as a closing status line. The
-                        // total number of chat messages is unchanged — the
-                        // hold only ever delayed them.
+                        // boundary pays it back as a closing status line.
                         if answer_texts.is_empty()
                             && !pending_answers.is_empty()
-                            && (session.steered_this_turn.load(Ordering::SeqCst)
+                            && (!vendor_event
+                                || session.steered_this_turn.load(Ordering::SeqCst)
                                 || held_since
                                     .is_some_and(|held| held.elapsed() >= heartbeat_interval))
                         {
-                            answer_texts = std::mem::take(&mut pending_answers);
+                            let (text, _) = fold_held(std::mem::take(&mut pending_answers));
+                            answer_texts = text.into_iter().collect();
                             released_mid_turn = true;
                         }
                         if pending_answers.is_empty() {
@@ -7819,6 +8309,29 @@ impl Gateway {
                             turn_had_answer = true;
                         }
                         if is_turn_boundary && answer_texts.is_empty() {
+                            // The turn has ended visibly even though no answer
+                            // rides its boundary: disarm the stall watchdog here,
+                            // or a turn whose every line went out mid-turn is
+                            // reported silent — and STUCK — minutes after it
+                            // finished.
+                            session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            // The boundary closes the turn's last progress card
+                            // even when no answer rides it — otherwise the card
+                            // stays open, and the NEXT turn's steps edit it.
+                            if progress_on && fold.has_activity() && !fold.done() {
+                                fold.mark_done();
+                                if !flush_progress(
+                                    &tx, &session, &session_id, epoch, &fold,
+                                    &mut last_sent, &mut last_emit, &mut dirty,
+                                ) {
+                                    break;
+                                }
+                                epoch = epoch.saturating_add(1);
+                            }
+                            fold = crate::progress::ProgressFold::new();
+                            dirty = false;
+                            last_emit = None;
+                            last_sent = None;
                             let live_status = resolved_thread_status(
                                 Arc::clone(&session.adapter),
                                 session.thread.clone(),
@@ -7854,11 +8367,7 @@ impl Gateway {
                             };
                             turn_last_context_pct =
                                 crate::delegation::context_pct(Some(&status));
-                            let chat_key = session
-                                .reply_to
-                                .lock()
-                                .map(|key| key.clone())
-                                .unwrap_or_else(|_| session.owner.clone());
+                            let chat_key = pump_target(&session);
                             // A turn whose text went out mid-turn (GitHub #206)
                             // still owes the chat its CLOSING receipt: the
                             // status line an in-boundary answer carries along.
@@ -7889,25 +8398,105 @@ impl Gateway {
                                         &status,
                                     )
                                 });
-                            let owes_closing = released_mid_turn || !turn_had_answer;
-                            let web_status_frame = chat_key.channel == "web" && owes_closing;
-                            if web_status_frame || closing_line.is_some() {
-                                let status_only = GatewayEvent {
-                                    id: format!("gateway-event-{session_id}-status-{vendor_turn}"),
-                                    channel: chat_key.channel,
-                                    chat_id: chat_key.chat_id,
-                                    thread_ts: None,
-                                    content: closing_line.unwrap_or_default(),
+                            // The durable half of the same receipt: every row this
+                            // turn wrote went out mid-turn without a status, so
+                            // without a closing row nothing on disk says the turn
+                            // ended — a reload showed no footer, and the completed
+                            // turn count (status-bearing rows) came up short.
+                            // Empty `assistant`: it says nothing new, and every
+                            // reader of answers already skips such a row.
+                            if released_mid_turn {
+                                if let Some(dir) = project_dir.as_ref() {
+                                    seq = seq.saturating_add(1);
+                                    let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+                                        exec_turn_id: thread_event_turn_id(&evt)
+                                            .map(str::to_string)
+                                            .or_else(|| open_exec_turn.clone()),
+                                        continues_exec_turn: open_continues_from.clone(),
+                                        turn_id: format!("{session_id}-{seq}"),
+                                        ts: chrono::Utc::now(),
+                                        vendor: vendor_str(session.vendor).to_string(),
+                                        role: session.role.clone(),
+                                        user: String::new(),
+                                        assistant: String::new(),
+                                        usage: turn_terminal_accounting(&evt)
+                                            .map(|(_, usage, _)| ccteam_harness::execution::turn_status::usage_value(usage))
+                                            .unwrap_or(serde_json::Value::Null),
+                                        status: Some(status.clone()),
+                                        tool_calls: Vec::new(),
+                                        attachments: Vec::new(),
+                                        outcome: None,
+                                        error_kind: None,
+                                        error: None,
+                                        conclusion: match &evt {
+                                            ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
+                                            _ => None,
+                                        },
+                                    };
+                                    if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                        dir,
+                                        &session_id,
+                                        &record,
+                                    ) {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
+                                        );
+                                    }
+                                }
+                            }
+                            let status_id = format!("gateway-event-{session_id}-status-{vendor_turn}");
+                            // The IM status line is text for a phone, and ONLY
+                            // for the phone: on the web stream it rendered as a
+                            // bubble holding nothing but a status line.
+                            if let Some(line) = closing_line {
+                                let receipt = GatewayEvent {
+                                    interim: false,
+                                    id: status_id.clone(),
+                                    channel: chat_key.channel.clone(),
+                                    chat_id: chat_key.chat_id.clone(),
+                                    thread_ts: chat_key.thread.clone(),
+                                    content: line,
                                     kind: GatewayEventKind::Answer,
                                     attachments: Vec::new(),
                                     options: Vec::new(),
-                                    status: Some(status),
+                                    status: Some(status.clone()),
                                     sid: Some(session_id.clone()),
                                     slug: Some(session.project.clone()),
                                 };
-                                if !tx.send(status_only) {
+                                if !tx.send_delivery_only(receipt) {
                                     break;
                                 }
+                            }
+                            // Every boundary publishes exactly ONE status-bearing
+                            // Answer: here, a content-less frame — the one signal
+                            // a reader has that the turn is over, since an Answer
+                            // without a status is a message the turn said on its
+                            // way (#209). Delivered to a web chat that is owed a
+                            // receipt; published to every other reader.
+                            let owes_closing = released_mid_turn || !turn_had_answer;
+                            let frame = GatewayEvent {
+                                interim: false,
+                                id: status_id,
+                                channel: chat_key.channel.clone(),
+                                chat_id: chat_key.chat_id.clone(),
+                                thread_ts: chat_key.thread.clone(),
+                                content: String::new(),
+                                kind: GatewayEventKind::Answer,
+                                attachments: Vec::new(),
+                                options: Vec::new(),
+                                status: Some(status),
+                                sid: Some(session_id.clone()),
+                                slug: Some(session.project.clone()),
+                            };
+                            let published = if chat_key.channel == "web" && owes_closing {
+                                tx.send(frame)
+                            } else {
+                                tx.send_broadcast_only(frame)
+                            };
+                            if !published {
+                                break;
                             }
                         }
                         if !answer_texts.is_empty()
@@ -7916,24 +8505,59 @@ impl Gateway {
                           let answer_count = answer_texts.len();
                           // The turn's conclusion rides its boundary event and belongs
                           // to the FINAL answer row of the turn only (issue #196).
+                          // The vendor's own marker first; else the last message of
+                          // the batch this boundary folded — the text after the
+                          // last tool call, which is what a bounded excerpt should
+                          // lead with (issue #196). Never a copy of the row itself.
                           let turn_conclusion = match &evt {
-                              ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
+                              ThreadEvent::TurnCompleted { conclusion, .. } => {
+                                  conclusion.clone().or_else(|| held_last.clone())
+                              }
                               _ => None,
-                          };
+                          }
+                          .filter(|conclusion| {
+                              answer_texts
+                                  .last()
+                                  .is_none_or(|text| conclusion.trim() != text.trim())
+                          });
                           for (answer_index, text) in answer_texts.into_iter().enumerate() {
                             let is_final_answer = is_turn_boundary
                                 && answer_index.saturating_add(1) == answer_count;
+                            // Only a structured turn that goes on after this
+                            // message makes it interim (#209); every other
+                            // answer ends what its reader is waiting on.
+                            let interim = !is_final_answer
+                                && structured_turn_open
+                                && !session.protocol.is_terminal();
+                            // A failure batch leads with what the turn said before
+                            // it failed: that row is ordinary narration. Only the
+                            // failure row itself closes the turn.
                             let boundary_origin = match &evt {
-                                ThreadEvent::TurnFailed { turn_id, .. } => {
+                                ThreadEvent::TurnFailed { turn_id, .. } if is_final_answer => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
                                 }
-                                ThreadEvent::Error(_) => Some(take_turn_origin(&session, open_exec_turn.as_deref())),
+                                ThreadEvent::Error(_) if is_final_answer => {
+                                    Some(take_turn_origin(&session, open_exec_turn.as_deref()))
+                                }
                                 _ => None,
                             };
                             // ----- ANSWER (or error) -----
-                            // Finalize this turn's status epoch first.
+                            // Finalize this answer's status epoch first. A message
+                            // a structured turn says on its way (#209) only SEALS
+                            // the card — the work above it is over, the turn is
+                            // not — so no reader takes an interim line for the end
+                            // of the turn. Without an open structured turn (or on
+                            // the terminal protocol) the answer is the only end
+                            // this pump will ever see, and it stays `done`.
                             if progress_on && fold.has_activity() && !fold.done() {
-                                fold.mark_done();
+                                if is_final_answer
+                                    || !structured_turn_open
+                                    || session.protocol.is_terminal()
+                                {
+                                    fold.mark_done();
+                                } else {
+                                    fold.seal();
+                                }
                                 if !flush_progress(
                                     &tx, &session, &session_id, epoch, &fold,
                                     &mut last_sent, &mut last_emit, &mut dirty,
@@ -7948,7 +8572,13 @@ impl Gateway {
                             last_sent = None;
 
                             seq = seq.saturating_add(1);
-                            session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            // The turn watchdog reads a move here as "the turn
+                            // answered" and disarms: a message the turn says on
+                            // its way is not that, or its first line would
+                            // silence the stall warning for the rest of the turn.
+                            if !interim {
+                                session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            }
                             let (status, meta_status) = if is_final_answer {
                                 let live_status = resolved_thread_status(
                                     Arc::clone(&session.adapter),
@@ -8046,7 +8676,7 @@ impl Gateway {
                             // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
                             // 只 warn,绝不阻断回复投递。
                             if let Some(dir) = project_dir.as_ref() {
-                                let failure = thread_event_failure(&evt);
+                                let failure = thread_event_failure(&evt).filter(|_| is_final_answer);
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                                     // Which EXECUTION turn produced this row.
                                     // A restart reconcile rebinds an
@@ -8108,16 +8738,18 @@ impl Gateway {
                                         // any interim notes); an ordinary assistant
                                         // message is only remembered as the boundary
                                         // candidate flushed on `TurnCompleted` above.
-                                        let is_boundary_evt = matches!(
-                                            &evt,
-                                            ThreadEvent::TurnFailed { .. }
-                                                | ThreadEvent::Error(_)
-                                        );
+                                        let is_boundary_evt = is_final_answer
+                                            && matches!(
+                                                &evt,
+                                                ThreadEvent::TurnFailed { .. }
+                                                    | ThreadEvent::Error(_)
+                                            );
                                         turn_covered.push(record.turn_id.clone());
                                         if is_boundary_evt {
                                             let notes = turn_notes;
                                             turn_notes = 0;
                                             turn_last_answer = None;
+                                            turn_said.clear();
                                             let covered = std::mem::take(&mut turn_covered);
                                             if let Some(dtx) = delegation_tx.as_ref() {
                                                 let _ = dtx.send(crate::delegation::DelegationPulse::Signal(crate::delegation::DelegationSignal {
@@ -8158,6 +8790,7 @@ impl Gateway {
                                                 record.turn_id.clone(),
                                                 text.clone(),
                                             ));
+                                            turn_said.push(text.clone());
                                         }
                                     }
                                     Err(err) => {
@@ -8180,13 +8813,11 @@ impl Gateway {
                                 );
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
-                            // fallback, same as pump_target) and reuse it for the
-                            // focus check below.
-                            let chat_key = session
-                                .reply_to
-                                .lock()
-                                .map(|k| k.clone())
-                                .unwrap_or_else(|_| session.owner.clone());
+                            // fallback) and reuse it for the focus check below. It
+                            // carries the session's thread, so on a channel that
+                            // threads sessions "focused" means "this thread's
+                            // session" and the answer lands in that thread.
+                            let chat_key = pump_target(&session);
                             if boundary_origin.is_some() {
                                 mirror_last_answer = None;
                             } else {
@@ -8194,6 +8825,7 @@ impl Gateway {
                             }
                             let channel = chat_key.channel.clone();
                             let chat_id = chat_key.chat_id.clone();
+                            let thread_ts = chat_key.thread.clone();
                             // v0.8.10 routing-isolation — when this session is NOT the
                             // chat's current focus (the user has since /use'd or
                             // messaged a different sid), its async answer/error still
@@ -8256,10 +8888,11 @@ impl Gateway {
                                 || channel == "web"
                                 || latest_turn_origin(&session) == TurnOrigin::User;
                             let answer = GatewayEvent {
+                                interim,
                                 id: format!("gateway-event-{session_id}-{seq}"),
                                 channel,
                                 chat_id,
-                                thread_ts: None,
+                                thread_ts,
                                 content,
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
@@ -8295,17 +8928,26 @@ impl Gateway {
                             let completed_origin = take_turn_origin(&session, Some(turn_id));
                             let mirror_answer = mirror_last_answer.take();
                             let finished = turn_last_answer.take();
+                            let said = std::mem::take(&mut turn_said);
                             let covered = std::mem::take(&mut turn_covered);
                             let notes = turn_notes;
                             turn_notes = 0;
-                            if let (Some(dtx), Some((final_turn, final_text))) =
+                            if let (Some(dtx), Some((final_turn, _))) =
                                 (delegation_tx.as_ref(), finished.as_ref())
                             {
+                                // The parent is told the whole turn — every row
+                                // it wrote, in order — not the last piece a long
+                                // turn happened to end on (#209, issue #192).
+                                let parts: Vec<&str> = said.iter().map(String::as_str).collect();
+                                let (tail, conclusion) = crate::delegation::fold_turn_answer(
+                                    &parts,
+                                    turn_conclusion.as_deref(),
+                                );
                                 let _ = dtx.send(crate::delegation::DelegationPulse::Signal(crate::delegation::DelegationSignal {
                                     child_sid: session_id.clone(),
                                     turn_id: final_turn.clone(),
                                     exec_turn_id: Some(turn_id.clone()),
-                                    tail: final_text.clone(),
+                                    tail,
                                     vendor: pump_vendor,
                                     host: pump_host.clone(),
                                     boundary: true,
@@ -8316,7 +8958,7 @@ impl Gateway {
                                     context_pct: turn_last_context_pct.take(),
                                     turn: vendor_turn,
                                     error_kind: None,
-                                    conclusion: turn_conclusion.clone(),
+                                    conclusion,
                                 }));
                             }
                             if let Some((final_text, reply_to)) = mirror_answer {
@@ -8336,6 +8978,10 @@ impl Gateway {
                             open_continues_from = None;
                           }
                           if matches!(&evt, ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)) {
+                            // Cleared here, not only on a durable failure row:
+                            // a row that failed to append must not carry this
+                            // turn's text into the next one's answer.
+                            turn_said.clear();
                             structured_turn_open = false;
                             open_exec_turn = None;
                             open_continues_from = None;
@@ -8345,7 +8991,7 @@ impl Gateway {
                             released_mid_turn = false;
                             held_since = None;
                           }
-                        } else if progress_on {
+                        } else if progress_on && vendor_event {
                             // ----- PROGRESS (IM, unchanged) -----
                             // The fold drives the IM status string; its dirty
                             // signal gates the throttled status edit exactly as
@@ -9064,6 +9710,7 @@ impl Gateway {
 
     fn emit_scheduled_changed(&self, item: &crate::scheduled::ScheduledItem) {
         let _ = self.events_broadcast.send(GatewayEvent {
+            interim: false,
             id: format!("scheduled-changed-{}-{}", item.sid, item.id),
             channel: "web".to_string(),
             chat_id: "web-api".to_string(),
@@ -9193,11 +9840,16 @@ impl Gateway {
         if let (Some(channel), Some(chat_id)) =
             (&entry.item.reply_channel, &entry.item.reply_chat_id)
         {
+            // The notice is about this session, so it goes to the thread the
+            // session lives in (on a channel that threads sessions).
+            let target =
+                self.with_bound_thread(ChatKey::new(channel, chat_id, chat_id), &entry.item.sid);
             self.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("scheduled-failed-{}", entry.item.id),
-                channel: channel.clone(),
-                chat_id: chat_id.clone(),
-                thread_ts: None,
+                channel: target.channel,
+                chat_id: target.chat_id,
+                thread_ts: target.thread,
                 content: format!(
                     "⏰ {} failed to send to {}: {} (kept in /inbox for 24h)",
                     entry.item.id, entry.item.sid, reason
@@ -9926,10 +10578,11 @@ impl Gateway {
                 *pending = Some(message_id.to_string());
             }
             self.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("gateway-reaction-add-{session_id}-{message_id}"),
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
-                thread_ts: None,
+                thread_ts: chat.thread.clone(),
                 content: String::new(),
                 kind: GatewayEventKind::Reaction {
                     message_id: message_id.to_string(),
@@ -10250,10 +10903,11 @@ impl Gateway {
         let body = render_choice_text(&prompt);
         if let Some(tx) = self.event_sink.clone() {
             let _ = tx.send(GatewayEvent {
+                interim: false,
                 id: format!("gateway-choice-{session_id}-{}", prompt.token),
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
-                thread_ts: None,
+                thread_ts: chat.thread.clone(),
                 content: body,
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
@@ -10416,6 +11070,7 @@ impl Gateway {
             "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); neither the credential ccteam handed this session nor `/mcp` process provenance ever reached it (vendor kept a same-named `ccteam` entry AND the peer could not be resolved to this session's process tree — non-linux daemon host, or its MCP client never dialed in)"
         );
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("principal-unused-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -10714,12 +11369,13 @@ impl Gateway {
         // tenant's console), so a `/sessions` list — or a `/use` on a listed
         // sid, which re-points `reply_to` — crossed users.
         let (user_id, is_admin) = self.project_acl_identity(chat);
-        ccteam_core::identity::can_see_session_owner(
-            &canonical_owner(chat).identity(),
-            &user_id,
-            is_admin,
-            owner_identity,
-        )
+        let viewer = canonical_owner(chat).identity();
+        ccteam_core::identity::can_see_session_owner(&viewer, &user_id, is_admin, owner_identity)
+            || ccteam_core::identity::operator_im_pool_sees(
+                &viewer,
+                self.is_named_operator_chat(chat),
+                owner_identity,
+            )
     }
 
     /// Session ownership inherits the project principal. The stored owner is
@@ -10828,6 +11484,20 @@ impl Gateway {
         }
     }
 
+    /// Whether this chat is EXPLICITLY named in its global bot's operator
+    /// roster — [`Self::is_operator_chat`] minus the open-mode fallback that
+    /// treats an unconfigured bot's every sender as the operator. What the
+    /// owner's shared IM session pool keys on: a stranger who reached an
+    /// unconfigured bot must not see the owner's sessions.
+    fn is_named_operator_chat(&self, chat: &ChatKey) -> bool {
+        match self.operator_chats.get(&chat.channel) {
+            Some(OperatorBinding::Named(named)) => {
+                named.contains(&chat.chat_id) || named.contains(&chat.user_id)
+            }
+            _ => false,
+        }
+    }
+
     /// Bind `platform`'s operator roster from that global bot's credential
     /// allowlist, and report what the binding means so the daemon can warn.
     pub fn bind_operator_allowlist<I: IntoIterator<Item = String>>(
@@ -10890,6 +11560,27 @@ impl Gateway {
     /// id. When none exists, clear the active session so the next message spawns
     /// one on demand in `project`. Backs `/cd` so the project switch is real.
     fn adopt_session_in_project(&mut self, chat: &ChatKey, project: &str) -> Option<String> {
+        // A thread is one session's own tab: adopting the project's session
+        // here would pull a session that already lives in another thread into
+        // this one. The thread keeps its session only if that session is in
+        // `project`; otherwise it is freed, so its next message starts a
+        // session there — what a new thread does anyway.
+        if chat.thread.is_some() {
+            let kept = self.current_session.get(chat).filter(|sid| {
+                self.sessions
+                    .get(sid)
+                    .map(|s| s.project == project)
+                    .unwrap_or_else(|| {
+                        self.owned_released_metas(chat)
+                            .iter()
+                            .any(|(slug, meta)| slug == project && &meta.sid == sid)
+                    })
+            });
+            if kept.is_none() {
+                self.current_session.remove(chat);
+            }
+            return kept;
+        }
         // Own = owned by the chat's CANONICAL identity (`user:<id>` for web /
         // tenant bots, the chat itself for the admin/global IM bot). Owner is the
         // synthetic `user:` channel, never the querier's delivery channel, so we
@@ -10916,7 +11607,7 @@ impl Gateway {
             });
         match &adopted {
             Some(id) => {
-                self.current_session.set(chat, id.clone());
+                self.focus_session(chat, id.clone());
             }
             None => {
                 self.current_session.remove(chat);
@@ -12334,6 +13025,20 @@ impl Gateway {
     ) -> Result<String> {
         let caller = ChatKey::from_identity(caller_identity)
             .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        self.resume_stopped_session_as(sid, caller, expected_slug)
+            .await
+    }
+
+    /// [`Self::resume_stopped_session`] for a caller already resolved to a
+    /// concrete chat key — one that may carry a THREAD, which an identity
+    /// string (`"channel:chat_id"`) cannot, so the resumed session's focus
+    /// lands in the thread that asked for it rather than at conversation level.
+    async fn resume_stopped_session_as(
+        &mut self,
+        sid: &str,
+        caller: ChatKey,
+        expected_slug: Option<&str>,
+    ) -> Result<String> {
         // Guard: already live.
         if self.sessions.contains_key(sid) {
             return Ok(sid.to_string());
@@ -12357,7 +13062,7 @@ impl Gateway {
         // mints a fresh secret, inserts into the live map, starts the pump.
         self.rebuild_session_from_meta(&slug, cwd, &meta, caller.clone())
             .await?;
-        self.current_session.set(&caller, sid);
+        self.focus_session(&caller, sid);
         self.persist_routing()?;
         Ok(sid.to_string())
     }
@@ -12372,6 +13077,21 @@ impl Gateway {
         expected_slug: Option<&str>,
         deadline: GatewayDeadline,
     ) -> Result<String> {
+        let caller = ChatKey::from_identity(caller_identity)
+            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        Self::resume_stopped_session_shared_as(gateway, sid, caller, expected_slug, deadline).await
+    }
+
+    /// [`Self::resume_stopped_session_shared`] for a caller already resolved
+    /// to a concrete chat key — one that may carry the session's THREAD, which
+    /// an identity string (`"channel:chat_id"`) cannot.
+    async fn resume_stopped_session_shared_as(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        caller: ChatKey,
+        expected_slug: Option<&str>,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
         let claims = {
             let guard = deadline.lock(&gateway).await?;
             Arc::clone(&guard.spawn_claims)
@@ -12379,8 +13099,6 @@ impl Gateway {
         let _claim = tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for_sid(sid))
             .await
             .map_err(|_| GatewayRequestError::QueueDeadline)?;
-        let caller = ChatKey::from_identity(caller_identity)
-            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
         let plan = {
             let mut guard = deadline.lock(&gateway).await?;
             if guard.sessions.contains_key(sid) {
@@ -12426,7 +13144,7 @@ impl Gateway {
             guard
                 .apply_rebuilt_session(plan, thread, caller.clone(), true)
                 .await?;
-            guard.current_session.set(&caller, sid);
+            guard.focus_session(&caller, sid);
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid.to_string())
@@ -12530,7 +13248,7 @@ impl Gateway {
         self.rebuild_session_from_meta(slug, cwd.clone(), &meta, caller.clone())
             .await?;
         self.persist_session_meta(&cwd, &meta)?;
-        self.current_session.set(&caller, sid.clone());
+        self.focus_session(&caller, sid.clone());
         self.persist_routing()?;
         Ok(sid)
     }
@@ -12659,7 +13377,7 @@ impl Gateway {
         catalog.write(&cwd, &meta)?;
         {
             let guard = gateway.lock().await;
-            guard.current_session.set(&caller, sid.clone());
+            guard.focus_session(&caller, sid.clone());
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid)
@@ -12864,9 +13582,9 @@ impl Gateway {
     /// `owner` fallback exactly like the private [`pump_target`] free fn.
     /// Returns `None` when the sid is not tracked (the caller then falls back to
     /// the on-disk `resolve_home_chat` registry). Read-only, holds no `.await`.
-    pub fn reply_target_for(&self, sid: &str) -> Option<(String, String)> {
+    pub fn reply_target_for(&self, sid: &str) -> Option<ReplyTarget> {
         let session = self.sessions.get(sid)?;
-        Some(pump_target(session))
+        Some(ReplyTarget::from_key(&pump_target(session)))
     }
 
     /// v0.8.22 P0-2 — everything a HITL approval prompt needs for `sid`, in
@@ -12878,7 +13596,11 @@ impl Gateway {
     /// (no chat to ask) instead of panicking. Read-only, holds no `.await`.
     pub fn hitl_prompt_context_for(&self, sid: &str) -> Option<HitlPromptContext> {
         let session = self.sessions.get(sid)?;
-        let (channel, chat_id) = pump_target(session);
+        let ReplyTarget {
+            channel,
+            chat_id,
+            thread_ts,
+        } = ReplyTarget::from_key(&pump_target(session));
         let progress_path = self
             .project_paths
             .as_ref()
@@ -12886,6 +13608,7 @@ impl Gateway {
         Some(HitlPromptContext {
             channel,
             chat_id,
+            thread_ts,
             role: session.role.clone(),
             progress_path,
         })
@@ -13164,6 +13887,7 @@ impl Gateway {
             });
         }
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("session-evicted-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -15707,29 +16431,24 @@ impl Gateway {
     ) -> Result<TurnReceipt> {
         let origin = intent.origin;
         // Resolve the reply route and cold-resume an absent entry without
-        // holding the registry over the vendor handshake.
-        let absent_resume_identity = {
+        // holding the registry over the vendor handshake. The route is the
+        // owner-derived one with the session's thread kept, so the resume
+        // re-points nothing but the thread the session already lives in.
+        let absent_resume_target = {
             let guard = deadline.lock(&gateway).await?;
             if guard.sessions.contains_key(sid) {
                 None
             } else if let Ok((slug, _, meta)) = guard.find_meta_for_sid(sid) {
-                let reply = guard
-                    .tenant_project_owner_reply_target(&slug)
-                    .or_else(|| {
-                        ChatKey::from_identity(&meta.owner)
-                            .map(|owner| reply_target_for_owner(&owner))
-                    })
-                    .unwrap_or_else(web_api_chat);
-                Some(reply.identity())
+                Some(guard.owner_reply_target_for_meta(&slug, &meta))
             } else {
                 return Err(anyhow!("unknown session: {sid}"));
             }
         };
-        if let Some(identity) = absent_resume_identity {
-            if let Err(err) = Self::resume_stopped_session_shared(
+        if let Some(reply_to) = absent_resume_target {
+            if let Err(err) = Self::resume_stopped_session_shared_as(
                 Arc::clone(&gateway),
                 sid,
-                &identity,
+                reply_to.clone(),
                 None,
                 deadline,
             )
@@ -15740,7 +16459,6 @@ impl Gateway {
                     // tell the caller (receipt over the session's SSE, handle
                     // back to the API/MCP caller).
                     let guard = deadline.lock(&gateway).await?;
-                    let reply_to = ChatKey::from_identity(&identity).unwrap_or_else(web_api_chat);
                     let (receipt, id) = guard.queue_behind_detached_body(
                         sid, &text, &reply_to, false, intent, request_id,
                     )?;
@@ -15873,9 +16591,7 @@ impl Gateway {
                 .get(sid)
                 .cloned()
                 .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
-            let chat = guard
-                .tenant_project_owner_reply_target(&session.project)
-                .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+            let chat = guard.owner_reply_target(&session);
             if let Ok(mut target) = session.reply_to.lock() {
                 *target = chat.clone();
             }
@@ -15980,10 +16696,11 @@ impl Gateway {
                 let body = render_choice_text(&prompt);
                 if let Some(tx) = event_sink {
                     let _ = tx.send(GatewayEvent {
+                        interim: false,
                         id: format!("gateway-choice-{sid}-{}", prompt.token),
                         channel: chat.channel,
                         chat_id: chat.chat_id,
-                        thread_ts: None,
+                        thread_ts: chat.thread,
                         content: body,
                         kind: GatewayEventKind::Answer,
                         attachments: Vec::new(),
@@ -16012,9 +16729,10 @@ impl Gateway {
             .get(sid)
             .cloned()
             .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
-        let reply_to = self
-            .tenant_project_owner_reply_target(&session.project)
-            .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+        // Owner-derived, with the session's thread kept: an internal turn's
+        // answer (a delegation completion notification) belongs in the thread
+        // the session lives in, where it is that thread's focus.
+        let reply_to = self.owner_reply_target(&session);
         if let Ok(mut target) = session.reply_to.lock() {
             *target = reply_to;
         }
@@ -16185,14 +16903,9 @@ impl Gateway {
         // turn. Project ownership selects the concrete reply frontend; an empty
         // `message_id` and a web target suppress the IM-only 👀 ack reaction.
         let reply_to = if let Some(session) = self.sessions.get(sid) {
-            self.tenant_project_owner_reply_target(&session.project)
-                .unwrap_or_else(|| reply_target_for_owner(&session.owner))
+            self.owner_reply_target(session)
         } else if let Ok((slug, _, meta)) = self.find_meta_for_sid(sid) {
-            self.tenant_project_owner_reply_target(&slug)
-                .or_else(|| {
-                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
-                })
-                .unwrap_or_else(web_api_chat)
+            self.owner_reply_target_for_meta(&slug, &meta)
         } else {
             web_api_chat()
         };
@@ -16264,7 +16977,7 @@ impl Gateway {
             // the IM current-session semantics.
             if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
                 self.current_project.set(&chat, project);
-                self.current_session.set(&chat, sid);
+                self.focus_session(&chat, sid);
             }
             if let Some(reply) = self.handle_command(&chat, &text).await? {
                 self.emit_sid_answer(sid, 0, reply);
@@ -16286,6 +16999,7 @@ impl Gateway {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("gateway-directive-{sid}-{nanos}-{i}"),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
@@ -17047,6 +17761,7 @@ impl Gateway {
     /// `session_lifecycle` listener refreshes the rail with no client change.
     fn emit_session_renamed(&self, sid: &str, slug: &str) {
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("session-renamed-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -17492,6 +18207,9 @@ fn web_api_chat() -> ChatKey {
 /// frontend chat, e.g. the web console's channel `"web"`), NOT the owner (see
 /// `pump_target`). So the owner tag stays clear (`user:<id>`) while web SSE / IM
 /// delivery is untouched.
+///
+/// Never carries a thread: ownership is per CONVERSATION, so a session created
+/// in one thread is owned — and reachable — from every thread of it.
 fn canonical_owner(chat: &ChatKey) -> ChatKey {
     if let Some(tid) = crate::transport::tenant_of_bot_channel(&chat.channel) {
         // A per-tenant IM bot → its tenant identity.
@@ -17501,8 +18219,9 @@ fn canonical_owner(chat: &ChatKey) -> ChatKey {
         // frontend chat itself (channel "web") remains the delivery `reply_to`.
         ChatKey::new("user", &chat.chat_id, &chat.chat_id)
     } else {
-        // The admin/global IM bot, etc. — owns by the chat itself.
-        chat.clone()
+        // The admin/global IM bot, etc. — owns by the chat itself (its
+        // conversation, not one of its threads).
+        chat.conversation()
     }
 }
 
@@ -17753,10 +18472,7 @@ fn emit_turn_stall_warning(
     // produced NO events for the whole window is FLAGGED, not killed — a
     // long silent command (a benchmark, a big build) is real work, and an
     // `esc` here mis-kills it. The user `/stop`s if it is genuinely stuck.
-    let (channel, chat_id) = match session.reply_to.lock() {
-        Ok(target) => (target.channel.clone(), target.chat_id.clone()),
-        Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
-    };
+    let target = pump_target(session);
     // Carry the two facts ccteam actually owns about the silence: how long the
     // turn has been running and what the last thing it did was. Without them
     // the warning cannot be told apart from a legitimately quiet build — and a
@@ -17786,10 +18502,12 @@ fn emit_turn_stall_warning(
          tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
     );
     let _ = tx.send(GatewayEvent {
+        // A heads-up about a turn that is still running, not its end (#209).
+        interim: true,
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
-        channel,
-        chat_id,
-        thread_ts: None,
+        channel: target.channel,
+        chat_id: target.chat_id,
+        thread_ts: target.thread,
         content,
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
@@ -18124,13 +18842,16 @@ enum RespawnModel<'a> {
     FromRole(Option<String>),
 }
 
-/// Resolve a session pump's live reply target `(channel, chat_id)`,
-/// honoring a `/cd`-updated `reply_to` and falling back to the owner.
-fn pump_target(session: &GatewaySession) -> (String, String) {
-    match session.reply_to.lock() {
-        Ok(target) => (target.channel.clone(), target.chat_id.clone()),
-        Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
-    }
+/// Resolve a session pump's live reply target, honoring a `/cd`-updated
+/// `reply_to` and falling back to the owner. The key carries the session's
+/// thread (on a channel that threads sessions), so every event built from it
+/// stamps `thread_ts` from it and lands in that thread.
+fn pump_target(session: &GatewaySession) -> ChatKey {
+    session
+        .reply_to
+        .lock()
+        .map(|target| target.clone())
+        .unwrap_or_else(|_| session.owner.clone())
 }
 
 fn take_turn_origin(session: &GatewaySession, turn_id: Option<&str>) -> TurnOrigin {
@@ -18206,6 +18927,7 @@ fn mirror_internal_web_answer(
         return;
     };
     let _ = tx.send_delivery_only(GatewayEvent {
+        interim: false,
         id: format!("gateway-mirror-{session_id}-{seq}"),
         channel,
         chat_id,
@@ -18237,15 +18959,16 @@ fn emit_progress(
     content: &str,
     done: bool,
 ) -> bool {
-    let (channel, chat_id) = pump_target(session);
+    let target = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
     // `send` returns false only when the mpsc consumer is gone; surface that as
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
+        interim: false,
         id: format!("gateway-progress-{status_key}"),
-        channel,
-        chat_id,
-        thread_ts: None,
+        channel: target.channel,
+        chat_id: target.chat_id,
+        thread_ts: target.thread,
         content: content.to_string(),
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
@@ -18268,14 +18991,15 @@ fn emit_activity(
     epoch: u64,
     activity: SessionActivity,
 ) -> bool {
-    let (channel, chat_id) = pump_target(session);
+    let target = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
     let content = activity.summary.clone();
     tx.send(GatewayEvent {
+        interim: false,
         id: format!("gateway-activity-{status_key}-{}", activity.item_id),
-        channel,
-        chat_id,
-        thread_ts: None,
+        channel: target.channel,
+        chat_id: target.chat_id,
+        thread_ts: target.thread,
         content,
         sid: Some(session_id.to_string()),
         kind: GatewayEventKind::Activity {
@@ -18362,6 +19086,87 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::TurnCompleted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
+    }
+}
+
+/// The highest `<sid>-<N>` row id this pump family has written — where a new
+/// pump resumes numbering. COUNTING rows was a proxy that held only while
+/// every such row had text: a closing row (empty `assistant`, #209) is not
+/// counted, so the next pump re-issued its id — and a turn id already in
+/// `notified_turns` silently swallows the completion that reuses it.
+fn last_answer_seq(
+    session_id: &str,
+    turns: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+) -> u64 {
+    let prefix = format!("{session_id}-");
+    turns
+        .iter()
+        .filter_map(|turn| turn.turn_id.strip_prefix(&prefix)?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// What woke the event pump's stream branch: the vendor, or the deadline of
+/// text it is holding (#209).
+enum PumpWake {
+    /// The vendor stream's next item (`None` = the stream ended).
+    Vendor(Option<ThreadEvent>),
+    /// Held text has waited one heartbeat with the vendor silent.
+    HoldDue,
+}
+
+/// The vendor's next event, or [`PumpWake::HoldDue`] once `hold_deadline`
+/// passes first. Both halves are cancel-safe (a stream's `next` and a sleep),
+/// so losing the pump's outer `select!` to another branch drops nothing.
+async fn next_pump_wake(
+    events: &mut futures::stream::BoxStream<'static, ThreadEvent>,
+    hold_deadline: Option<Instant>,
+) -> PumpWake {
+    let Some(deadline) = hold_deadline else {
+        return PumpWake::Vendor(events.next().await);
+    };
+    tokio::select! {
+        biased;
+        evt = events.next() => PumpWake::Vendor(evt),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => PumpWake::HoldDue,
+    }
+}
+
+/// The event a due hold is carried through the pump as. It matches no arm
+/// that reads vendor facts — no answer, no boundary, no accounting — and the
+/// pump skips every vendor-only step for it, so it can only release what is
+/// already held.
+fn hold_due_marker() -> ThreadEvent {
+    ThreadEvent::ItemUpdated {
+        item: ccteam_harness::ThreadItem {
+            id: String::new(),
+            details: ThreadItemDetails::Reasoning(String::new()),
+        },
+    }
+}
+
+/// Fold held messages into ONE delivery, paragraph by paragraph. Returns the
+/// folded text (`None` when nothing was held) and, when more than one message
+/// was folded, the last of them — the text after the turn's last tool call,
+/// which is what its boundary names as the conclusion when the vendor names
+/// none (issue #196).
+fn fold_held(held: Vec<String>) -> (Option<String>, Option<String>) {
+    let held: Vec<String> = held
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    match held.len() {
+        0 => (None, None),
+        1 => (held.into_iter().next(), None),
+        _ => {
+            let last = held.last().cloned();
+            let text = held
+                .iter()
+                .map(|part| part.trim())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (Some(text), last)
+        }
     }
 }
 
@@ -19225,6 +20030,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
             id: opt.id.clone(),
@@ -19244,15 +20050,19 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
 fn render_help() -> String {
-    let mut s = String::from("Gateway commands:");
-    for c in GATEWAY_COMMANDS {
-        match c.arg_hint {
-            Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
-            None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
-        }
-    }
-    s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
-    s
+    // A short, task-grouped list — not the full reference (that is `ccteam`'s
+    // docs and each command's own usage error). Grouped by what a person
+    // wants to do; on a channel with buttons `/help` also carries the main
+    // menu, so most of this need not be typed at all.
+    [
+        "常用命令",
+        "会话  /new [harness] [model=…] · /use <id> · /sessions · /status",
+        "控制  /interrupt · /stop <id> · /rename <标题> · /role <角色>",
+        "项目  /projects · /cd <项目> · /newproject <slug> <路径>",
+        "定时  /inbox",
+        "其他命令(如 /model /compact)会转给当前会话的 agent。",
+    ]
+    .join("\n")
 }
 
 fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
@@ -20415,6 +21225,7 @@ mod tests {
                 "mock",
                 "chat-1",
                 "alice",
+                None,
                 "",
                 "/stop s1",
                 &[],
@@ -21269,6 +22080,7 @@ mod tests {
 
     fn fake_event(sid: Option<&str>) -> GatewayEvent {
         GatewayEvent {
+            interim: false,
             id: "e1".into(),
             channel: "web".into(),
             chat_id: "web-api".into(),
@@ -25168,6 +25980,7 @@ mod tests {
                 "telegram",
                 "chat-7",
                 "alice",
+                None,
                 "tg-555",
                 "do a thing",
                 &[],
@@ -25363,22 +26176,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first_turn = [
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-        ];
-        assert!(first_turn[..2].iter().all(|event| event.status.is_none()));
+        // #209 — what a short turn said is held to its boundary and goes out
+        // FOLDED: one message, every line in order, one status tail.
+        let ev = &recv_answer(&mut events).await;
+        let order = ["checkpoint 1\n\n", "checkpoint 2\n\n", "echo: hello"]
+            .map(|line| ev.content.find(line));
         assert!(
-            first_turn[..2]
-                .iter()
-                .all(|event| !event.content.contains("\n\n→ ")),
-            "interim messages carry no status tail: {first_turn:?}"
-        );
-        let ev = &first_turn[2];
-        assert!(
-            ev.content.contains("echo: hello"),
-            "answer still carries the real reply text: {}",
+            order.iter().all(Option::is_some) && order.is_sorted(),
+            "the folded answer carries every message, in order: {}",
             ev.content
         );
         // The echo is the LAST block of the answer. Split it off rather than
@@ -25417,36 +26222,36 @@ mod tests {
             .iter()
             .filter(|turn| !turn.assistant.is_empty())
             .collect();
-        assert_eq!(assistant.len(), 3);
-        assert!(assistant[..2].iter().all(|turn| turn.status.is_none()));
+        assert_eq!(assistant.len(), 1, "one folded row: {assistant:?}");
         assert_eq!(
-            assistant[2].status.as_ref().map(|status| status.turn),
+            assistant[0].status.as_ref().map(|status| status.turn),
             Some(1)
         );
-        assert_ne!(assistant[2].usage, serde_json::Value::Null);
+        assert!(
+            assistant[0]
+                .conclusion
+                .as_deref()
+                .is_some_and(|conclusion| conclusion.ends_with("echo: hello")
+                    && !conclusion.contains("checkpoint")),
+            "a folded row names its last message as the conclusion: {assistant:?}"
+        );
+        assert_ne!(assistant[0].usage, serde_json::Value::Null);
 
         gateway
             .handle_text("mock", "chat-1", "alice", "second")
             .await
             .unwrap();
-        let second_turn = [
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-        ];
-        assert!(second_turn[..2].iter().all(|event| event.status.is_none()));
+        let second = recv_answer(&mut events).await;
         assert_eq!(
-            second_turn[2].status.as_ref().map(|status| status.turn),
+            second.status.as_ref().map(|status| status.turn),
             Some(2),
             "three assistant messages still count as one vendor turn"
         );
         assert_eq!(
-            second_turn
-                .iter()
-                .filter(|event| event.content.contains("\n\n→ "))
-                .count(),
+            second.content.matches("\n\n→ ").count(),
             1,
-            "one IM status tail per vendor turn"
+            "one IM status tail per vendor turn: {}",
+            second.content
         );
     }
 
@@ -26010,7 +26815,7 @@ mod tests {
     /// recover through the poison rather than degrade.
     #[tokio::test]
     async fn a_poisoned_focus_lock_still_records_the_chats_session() {
-        let routes = FocusRoutes::default();
+        let routes = FocusRoutes::new(FocusScope::Thread);
         let chat = ChatKey::new("telegram", "339498819", "cryptorobsu");
 
         // Poison the lock the way a panic under it would.
@@ -26131,6 +26936,10 @@ mod tests {
         assert_eq!(web[0].chat_id, "web-api");
         assert_eq!(web[0].content, "background checkpoint");
         assert_eq!(web[1].content, "background final");
+        assert!(
+            web.iter().all(|event| !event.interim),
+            "no structured turn is open, so nothing says the turn goes on: {web:?}"
+        );
         let mirror = answers
             .iter()
             .find(|event| event.channel == "telegram")
@@ -26150,6 +26959,14 @@ mod tests {
             recv_answer(&mut broadcast).await,
         ];
         assert!(web_broadcast.iter().all(|event| event.channel == "web"));
+        // #209 — the boundary publishes its ONE status-bearing Answer (the
+        // interim lines above carry none): a content-less frame, never the
+        // mirror's text.
+        let boundary = recv_answer(&mut broadcast).await;
+        assert!(
+            boundary.content.is_empty() && boundary.status.is_some(),
+            "{boundary:?}"
+        );
         while let Ok(event) = broadcast.try_recv() {
             assert!(
                 !matches!(event.kind, GatewayEventKind::Answer),
@@ -26319,7 +27136,7 @@ mod tests {
     /// ("IM chat 之间互相隔离" — the 档0 rule the v0.8.13 same-project sharing
     /// was reverted for; do not let project inheritance quietly re-add it).
     #[tokio::test]
-    async fn operator_and_unowned_projects_keep_per_im_chat_isolation() {
+    async fn the_owners_named_chats_share_sessions_a_guest_sees_none() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, _project_dir) = mirror_test_paths(&tmp);
         seed_owned_project(&paths, "ops", Some("user:web-api")); // operator pool
@@ -26354,14 +27171,23 @@ mod tests {
                 gateway.chat_can_access(&rob, gateway.sessions.get(&mine).unwrap()),
                 "{slug}: a chat sees its own session"
             );
+            // Owner 2026-10-05: the owner's NAMED IM chats share one pool.
             assert!(
-                !gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
-                "{slug}: an admin chat must NOT see another admin chat's session"
+                gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
+                "{slug}: a named operator chat sees the owner's other chat's session"
             );
             assert!(
-                !gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
-                "{slug}: isolation is symmetric"
+                gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: sharing is symmetric"
             );
+            // A chat the allowlist does not name is a guest: it sees neither.
+            let guest = ChatKey::new("telegram", "333", "mallory");
+            for sid in [&mine, &theirs] {
+                assert!(
+                    !gateway.chat_can_access(&guest, gateway.sessions.get(sid).unwrap()),
+                    "{slug}: a guest must not see the owner's {sid}"
+                );
+            }
         }
     }
 
@@ -27505,12 +28331,321 @@ mod tests {
         assert!(answer.status.is_none(), "a mid-turn row carries no status");
     }
 
+    /// #209 — a new pump numbers rows after the highest one on disk. Counting
+    /// text rows re-issued a closing row's id after every resume, and a turn id
+    /// already in `notified_turns` silently swallowed the completion reusing it.
+    #[test]
+    fn a_new_pump_numbers_past_every_row_it_wrote() {
+        let row = |id: &str, text: &str| ccteam_harness::execution::turns_mirror::TurnRecord {
+            exec_turn_id: None,
+            continues_exec_turn: None,
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: text.into(),
+            usage: serde_json::Value::Null,
+            status: None,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
+            conclusion: None,
+        };
+        let rows = vec![
+            row("s7-1", "released mid-turn"),
+            row("s7-2", "released mid-turn"),
+            row("s7-3", ""),
+            row("input-18d8", ""),
+            row("s7-recovered-1790000000000", "recovered"),
+            row("interrupted:sj-1", "cut"),
+            row("s70-9", "another session's prefix"),
+        ];
+        assert_eq!(last_answer_seq("s7", &rows), 3);
+        assert_eq!(last_answer_seq("s7", &[]), 0);
+    }
+
+    /// #209 — the parent hears the WHOLE turn: a long turn reaches the ledger
+    /// in pieces, and telling the parent only the last piece dropped the reply
+    /// its child gave to a mid-turn steer (issue #192).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_written_in_pieces_reports_every_piece_to_its_parent() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
+        gateway.set_delegation_notifier_tx(dtx);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let identity = "alpha-reviewer-s1".to_string();
+        {
+            let mut queued = fake.events.lock().await;
+            for event in [
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-pieces".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "replied to the steer",
+                ),
+                agent_msg(|item| ThreadEvent::ItemCompleted { item }, "all green"),
+                ThreadEvent::TurnCompleted {
+                    turn_id: "t-pieces".into(),
+                    usage: Default::default(),
+                    model: None,
+                    conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
+                },
+            ] {
+                queued.push_back((identity.clone(), event));
+            }
+        }
+        fake.wake(&identity);
+
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(crate::delegation::DelegationPulse::Signal(signal)) = drx.recv().await {
+                    if signal.boundary {
+                        return signal;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the boundary signals the parent");
+        assert_eq!(signal.tail, "replied to the steer\n\nall green");
+        assert_eq!(signal.conclusion.as_deref(), Some("all green"));
+        // Only the boundary tells the watchdog the turn answered: its two
+        // interim lines never did, and the answer-less boundary still does.
+        let visible = gateway.sessions["s1"].visible_events.load(Ordering::SeqCst);
+        assert_eq!(
+            visible, 1,
+            "the boundary, and only the boundary, disarms the watchdog"
+        );
+    }
+
+    /// #209 — the hold is bounded by a CLOCK, not by the vendor's next event.
+    /// A session that says "running the suite now" and then sits in a silent
+    /// twenty-minute tool produces no event at all; waiting for one to notice
+    /// the expired hold kept the line unsent until the tool returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_vendor_cannot_hold_what_its_session_said() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let heartbeat = std::time::Duration::from_millis(150);
+        gateway.set_turn_heartbeat_interval(heartbeat);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let asked = Instant::now();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+
+        // The fake says one line and then nothing, and never ends the turn.
+        let answer = recv_answer(&mut events).await;
+        assert!(answer.content.contains("echo: long job"), "{answer:?}");
+        assert!(
+            answer.status.is_none(),
+            "the turn is still running: {answer:?}"
+        );
+        assert!(answer.interim, "and it says so: {answer:?}");
+        assert!(
+            asked.elapsed() >= heartbeat,
+            "it was held for one heartbeat first, to fold what follows"
+        );
+        assert!(gateway.session_turn_in_flight("s1"));
+    }
+
+    /// #209 — a message a structured turn says on its way closes the progress
+    /// card above it WITHOUT calling the turn done: web readers counted a
+    /// `✅ done` card as the end of the turn and dropped Stop mid-turn. Only the
+    /// boundary writes `✅ done`, and an answer-less boundary still closes its
+    /// card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interim_message_seals_its_card_and_only_the_boundary_is_done() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let identity = "alpha-reviewer-s1".to_string();
+        let tool = |id: &str, done: bool| {
+            let item = ThreadItem {
+                id: id.into(),
+                details: ThreadItemDetails::ToolCall {
+                    name: "Bash".into(),
+                    args: serde_json::json!({"command": "make test"}),
+                },
+            };
+            if done {
+                ThreadEvent::ItemCompleted { item }
+            } else {
+                ThreadEvent::ItemStarted { item }
+            }
+        };
+        {
+            let mut queued = fake.events.lock().await;
+            for event in [
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-cards".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+                tool("tool-1", false),
+                tool("tool-1", true),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "tests are running",
+                ),
+                tool("tool-2", false),
+                tool("tool-2", true),
+                ThreadEvent::TurnCompleted {
+                    turn_id: "t-cards".into(),
+                    usage: Default::default(),
+                    model: None,
+                    conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
+                },
+            ] {
+                queued.push_back((identity.clone(), event));
+            }
+        }
+        fake.wake(&identity);
+
+        let mut finals: Vec<(String, bool)> = Vec::new();
+        let mut boundary_seen = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !boundary_seen {
+                let ev = events.recv().await.expect("broadcast open");
+                match &ev.kind {
+                    GatewayEventKind::Progress { done: true, .. } => {
+                        finals.push((ev.content.clone(), false));
+                    }
+                    GatewayEventKind::Answer if ev.status.is_some() => boundary_seen = true,
+                    GatewayEventKind::Answer => finals.push((ev.content.clone(), true)),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn reaches its boundary");
+        assert_eq!(
+            finals,
+            vec![
+                ("↳ 1 tools · 0 files".to_string(), false),
+                ("tests are running".to_string(), true),
+                ("✅ done · 1 tools · 0 files".to_string(), false),
+            ],
+            "sealed card, the message, then the boundary's done card"
+        );
+    }
+
+    /// #209 — what a turn said before it failed was produced and paid for; the
+    /// failure used to `clear()` it with the hold. It goes out as ordinary
+    /// narration AHEAD of the failure row, and only the failure row is marked
+    /// failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_turn_still_delivers_what_it_said_first() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let identity = "alpha-reviewer-s1".to_string();
+        {
+            let mut queued = fake.events.lock().await;
+            queued.push_back((
+                identity.clone(),
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-fail".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+            ));
+            queued.push_back((
+                identity.clone(),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "checking the logs",
+                ),
+            ));
+            queued.push_back((
+                identity.clone(),
+                ThreadEvent::TurnFailed {
+                    turn_id: "t-fail".into(),
+                    err: ccteam_harness::ThreadErrorEvent {
+                        kind: "vendor_error".into(),
+                        message: "the provider fell over".into(),
+                    },
+                    usage: Default::default(),
+                    model: None,
+                },
+            ));
+        }
+        fake.wake(&identity);
+
+        let said = recv_answer(&mut events).await;
+        assert_eq!(said.content, "checking the logs", "{said:?}");
+        assert!(said.status.is_none() && said.interim, "{said:?}");
+        let failed = recv_answer(&mut events).await;
+        assert!(
+            failed.content.contains("the provider fell over"),
+            "{failed:?}"
+        );
+        assert!(!failed.interim, "{failed:?}");
+        assert!(
+            failed.status.is_some(),
+            "the failure is the boundary: {failed:?}"
+        );
+
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let rows: Vec<_> = rows
+            .iter()
+            .filter(|row| !row.assistant.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].assistant, "checking the logs");
+        assert_eq!(
+            rows[0].outcome, None,
+            "narration is not the failure: {rows:?}"
+        );
+        assert_eq!(rows[1].outcome.as_deref(), Some("failed"), "{rows:?}");
+    }
+
     /// GitHub #206 — text released mid-turn leaves the boundary with nothing
     /// to attach the turn's status line to, so the boundary owes the chat its
     /// CLOSING receipt: a chat that read live narration for hours must still
     /// learn the turn ended, with the model / ctx / turn / cost it ended on.
     /// The receipt is the status line ALONE — never a second copy of text the
-    /// chat already has.
+    /// chat already has. #209 — and the line is phone text, delivered to the
+    /// IM chat only; the web stream gets the same boundary as a content-less
+    /// status frame, not a bubble holding nothing but a status line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_turn_released_mid_flight_closes_with_its_status_line() {
         let fake = Arc::new(
@@ -27530,36 +28665,64 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
+        while rx.try_recv().is_ok() {}
         let mut events = gateway.subscribe_events();
         gateway
             .handle_text("mock", "chat-1", "alice", "long job")
             .await
             .unwrap();
 
+        // The IM chat: the released text, then the status line alone.
+        let delivered = recv_sink_answers(&mut rx, 2).await;
+        assert!(delivered[0].content.contains("echo: long job"));
+        assert!(delivered[0].status.is_none(), "{delivered:?}");
+        let receipt = &delivered[1];
+        assert!(
+            receipt
+                .content
+                .starts_with("→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6"),
+            "the boundary pays back the status line: {receipt:?}"
+        );
+        assert!(
+            !receipt.content.contains("echo: long job"),
+            "and never re-sends text the chat already has: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.status.as_ref().map(|status| status.turn),
+            Some(1),
+            "the receipt carries the ended turn's own status"
+        );
+
+        // The web stream: the same text, then a content-less boundary frame.
         let answer = recv_answer(&mut events).await;
         assert!(answer.content.contains("echo: long job"));
         let closing = recv_answer(&mut events).await;
         assert!(
-            closing
-                .content
-                .starts_with("→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6"),
-            "the boundary pays back the status line: {closing:?}"
+            closing.content.is_empty(),
+            "no status-line bubble on the web: {closing:?}"
         );
+        assert_eq!(closing.status.as_ref().map(|status| status.turn), Some(1));
         assert!(
-            !closing.content.contains("echo: long job"),
-            "and never re-sends text the chat already has: {closing:?}"
+            answer.interim && !closing.interim,
+            "{answer:?} / {closing:?}"
         );
+
+        // …and the ledger says the turn ended: a status-bearing closing row.
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let closing_row = rows.last().expect("rows");
+        assert!(closing_row.assistant.is_empty(), "{rows:?}");
         assert_eq!(
-            closing.status.as_ref().map(|status| status.turn),
+            closing_row.status.as_ref().map(|status| status.turn),
             Some(1),
-            "the receipt carries the ended turn's own status"
+            "{rows:?}"
         );
     }
 
@@ -27715,6 +28878,7 @@ mod tests {
                 "telegram",
                 "chat-a",
                 "alice",
+                None,
                 "a-1",
                 "hi there",
                 &[],
@@ -27747,6 +28911,7 @@ mod tests {
             "telegram",
             "chat-b",
             "bob",
+            None,
             "b-1",
             "still there?",
             &[],
@@ -27802,6 +28967,7 @@ mod tests {
                     "telegram",
                     "chat-new",
                     "carol",
+                    None,
                     &format!("m-{i}"),
                     &format!("msg {i}"),
                     &[],
@@ -28191,7 +29357,11 @@ mod tests {
         // The live target is the driving chat — resolved purely from memory.
         assert_eq!(
             gateway.reply_target_for(&sid),
-            Some(("telegram".to_string(), "chat-99".to_string()))
+            Some(ReplyTarget {
+                channel: "telegram".to_string(),
+                chat_id: "chat-99".to_string(),
+                thread_ts: None,
+            })
         );
         // An untracked sid → None (caller falls back to registry).
         assert_eq!(gateway.reply_target_for("s99"), None);
@@ -28479,9 +29649,10 @@ mod tests {
         assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
-    /// Clickable project picker: on Telegram, `/projects` is delivered as a
-    /// header + one inline "switch" button per project (`nav:cd:<slug>`), so
-    /// the command returns NO inline reply (the buttons ride the event sink).
+    /// Clickable project picker: on a channel the daemon reported as
+    /// button-capable (Telegram here), `/projects` is delivered as a header +
+    /// one inline "switch" button per project (`nav:cd:<slug>`), so the
+    /// command returns NO inline reply (the buttons ride the event sink).
     /// Non-button channels (the test mock, web, Lark) keep the plain slug list.
     #[tokio::test]
     async fn telegram_projects_delivers_switch_buttons() {
@@ -28489,6 +29660,7 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.register_project("beta", proj.path());
+        gateway.bind_channel_buttons("telegram", true);
         let mut events = gateway.subscribe_events();
 
         // Telegram → the reply is empty; the list + buttons arrive as an Answer.
@@ -28522,6 +29694,260 @@ mod tests {
         assert_eq!(mock, vec!["alpha\nbeta"]);
     }
 
+    /// Buttons are the provider's capability, not a platform name: a threaded
+    /// channel the daemon reported as button-capable (Slack) gets the project
+    /// picker as buttons IN the thread the command came from, and a tapped
+    /// `nav:cd:` switches the conversation's project; once the capability is
+    /// withdrawn the same command is a plain list again.
+    #[tokio::test]
+    async fn a_button_capable_threaded_channel_gets_a_clickable_picker() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.register_project("beta", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("100.1"),
+                "100.1",
+                "/projects",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "picker rides the event sink: {replies:?}"
+        );
+        let ev = recv_answer(&mut events).await;
+        assert_eq!(ev.channel, "slack");
+        assert_eq!(
+            ev.thread_ts.as_deref(),
+            Some("100.1"),
+            "in the command's thread"
+        );
+        assert!(
+            ev.options.iter().any(|o| o.data == "nav:cd:beta"),
+            "options: {:?}",
+            ev.options
+        );
+
+        let tap = ChoiceReply {
+            data: "nav:cd:beta".into(),
+        };
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("100.1"),
+                "100.1",
+                "",
+                &[],
+                Some(&tap),
+            )
+            .await
+            .unwrap();
+        let other_thread = ChatKey::new("slack", "C1", "U1").with_thread(Some("200.2"));
+        assert_eq!(
+            gateway.current_project.get(&other_thread),
+            Some("beta".to_string()),
+            "the tap switched the conversation's project"
+        );
+
+        gateway.bind_channel_buttons("slack", false);
+        let replies = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("300.3"),
+                "300.3",
+                "/projects",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["alpha\nbeta"]);
+    }
+
+    /// Buttons over typing: on a button-capable channel a command's next step
+    /// is a row of buttons (a session's controls, the menu) instead of a
+    /// `→ /status` footer, and an `act:` tap runs the whitelisted command it
+    /// stands for exactly as if it were typed.
+    #[tokio::test]
+    async fn next_steps_are_buttons_and_a_tap_runs_the_command() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        // `/help` → the main menu, no footer.
+        let replies = gateway
+            .handle_message("slack", "C1", "U1", Some("1.1"), "1.1", "/help", &[], None)
+            .await
+            .unwrap();
+        assert!(replies.is_empty(), "rides the sink: {replies:?}");
+        let ev = recv_answer(&mut events).await;
+        let menu: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            menu,
+            vec![
+                "act:projects",
+                "act:sessions",
+                "act:status",
+                "act:new:claude",
+                "act:new:codex"
+            ]
+        );
+
+        // A tap on `＋ Codex` is `/new codex`, in the thread it was tapped in.
+        let tap = |data: &str| ChoiceReply { data: data.into() };
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "",
+                &[],
+                Some(&tap("act:new:codex")),
+            )
+            .await
+            .unwrap();
+        let thread = ChatKey::new("slack", "C1", "U1").with_thread(Some("1.1"));
+        let sid = gateway
+            .current_session
+            .get(&thread)
+            .expect("the tap created a session");
+        assert_eq!(gateway.sessions[&sid].vendor, AgentVendor::Codex);
+        // …and its receipt carries the session's controls instead of a footer.
+        let ev = recv_answer(&mut events).await;
+        assert!(ev.content.contains(&sid), "receipt: {}", ev.content);
+        assert!(
+            !ev.content.contains("→ /status"),
+            "no typed footer: {}",
+            ev.content
+        );
+        let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            controls,
+            vec![
+                "act:status",
+                "act:model",
+                "act:sessions",
+                "act:projects",
+                "act:interrupt"
+            ]
+        );
+        assert_eq!(ev.thread_ts.as_deref(), Some("1.1"));
+
+        // Only whitelisted actions run; session actions need a session.
+        let refused = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "",
+                &[],
+                Some(&tap("act:stop s1")),
+            )
+            .await
+            .unwrap();
+        assert!(refused[0].contains("unknown action"), "{refused:?}");
+        let starts = fake.starts.load(Ordering::SeqCst);
+        let empty = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("9.9"),
+                "9.9",
+                "",
+                &[],
+                Some(&tap("act:model")),
+            )
+            .await
+            .unwrap();
+        assert!(empty[0].contains("没有会话"), "{empty:?}");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            starts,
+            "a model tap in a thread without a session spawns nothing"
+        );
+
+        // A channel without buttons keeps the typed footer.
+        let plain = gateway
+            .handle_text("mock", "chat-9", "bob", "/new claude")
+            .await
+            .unwrap();
+        assert!(plain[0].contains("→ /status"), "{plain:?}");
+    }
+
+    /// A thread whose first plain message spawns its session opens with a
+    /// header carrying that session's controls — in that thread.
+    #[tokio::test]
+    async fn a_new_thread_session_opens_with_its_controls() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("7.7"),
+                "7.7",
+                "fix the bug",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let ev = recv_answer(&mut events).await;
+        assert!(
+            ev.content.starts_with("🧵 会话 s1"),
+            "header: {}",
+            ev.content
+        );
+        assert_eq!(ev.thread_ts.as_deref(), Some("7.7"));
+        let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            controls,
+            vec![
+                "act:status",
+                "act:model",
+                "act:sessions",
+                "act:projects",
+                "act:interrupt"
+            ]
+        );
+
+        // A single-stream chat gets no header.
+        gateway.bind_channel_buttons("telegram", true);
+        gateway
+            .handle_text("telegram", "42", "bob", "hello")
+            .await
+            .unwrap();
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| e.content.starts_with("🧵 会话")),
+            "no header outside a thread"
+        );
+    }
+
     /// Clickable session picker: on Telegram, `/sessions` is delivered as the
     /// usual text list PLUS one inline "switch" button per live session
     /// (`nav:use:<sid>`), so the command returns no inline reply. The mock
@@ -28531,6 +29957,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.bind_channel_buttons("telegram", true);
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -28695,11 +30122,13 @@ mod tests {
         // Padding: mixed CJK/Latin rows end up the same display width.
         let mut opts = vec![
             MessageOption {
+                weight: Default::default(),
                 data: "a".into(),
                 label: "▸ s39 · grok · 「当前是什么模型」".into(),
                 id: "s39".into(),
             },
             MessageOption {
+                weight: Default::default(),
                 data: "b".into(),
                 label: "▸ s43 · claude · 「Completed the full reques…".into(),
                 id: "s43".into(),
@@ -28736,6 +30165,7 @@ mod tests {
                 "telegram",
                 "chat-1",
                 "alice",
+                None,
                 "",
                 "",
                 &[],
@@ -28760,6 +30190,7 @@ mod tests {
                 "telegram",
                 "chat-1",
                 "alice",
+                None,
                 "",
                 "",
                 &[],
@@ -28779,6 +30210,7 @@ mod tests {
                 "telegram",
                 "chat-1",
                 "alice",
+                None,
                 "",
                 "",
                 &[],
@@ -31137,6 +32569,7 @@ mod tests {
                 "mock",
                 "chat-1",
                 "alice",
+                None,
                 "",
                 "",
                 &[],
@@ -32344,12 +33777,22 @@ mod tests {
             .unwrap();
         assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
 
-        // /help advertises /role.
-        assert!(
-            render_help().contains("/role"),
-            "render_help should list /role: {}",
-            render_help()
-        );
+        // /help is a short, grouped list that still names the everyday
+        // commands — and no `<a|b>` hint, which Slack would turn into a link.
+        let help = render_help();
+        for cmd in [
+            "/new",
+            "/use",
+            "/status",
+            "/role",
+            "/cd",
+            "/stop",
+            "/interrupt",
+        ] {
+            assert!(help.contains(cmd), "help names {cmd}: {help}");
+        }
+        assert!(help.lines().count() <= 8, "help stays short: {help}");
+        assert!(!help.contains("<id|"), "{help}");
     }
 
     /// V0.8.6 fix #5 — `/role` to a missing role must NOT destroy the live
@@ -32781,6 +34224,7 @@ mod tests {
                 "telegram",
                 "chat-9",
                 "bob",
+                None,
                 "",
                 "",
                 &[],
@@ -32829,6 +34273,7 @@ mod tests {
                 "telegram",
                 "chat-9",
                 "bob",
+                None,
                 "",
                 "",
                 &[],
@@ -33061,6 +34506,7 @@ mod tests {
                 "telegram",
                 "chat-1",
                 "bob",
+                None,
                 "",
                 "",
                 &[],
@@ -36904,6 +38350,7 @@ mod tests {
             "mock",
             "chat-1",
             "alice",
+            None,
             "",
             "/stop s1",
             &[],
@@ -37639,7 +39086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_list_reuses_own_plus_web_pool_acl() {
+    async fn inbox_list_reuses_the_owners_pools_acl() {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_role(tmp.path(), "reviewer");
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -37689,7 +39136,8 @@ mod tests {
             .unwrap();
         assert!(listed[0].contains("own-message"), "{listed:?}");
         assert!(listed[0].contains("web-pool-message"), "{listed:?}");
-        assert!(!listed[0].contains("foreign-message"), "{listed:?}");
+        // chat-2 is the owner's other NAMED chat: its schedule is in the pool.
+        assert!(listed[0].contains("foreign-message"), "{listed:?}");
     }
 
     #[tokio::test]
@@ -37832,5 +39280,618 @@ mod tests {
             .item
             .failed_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    // ---- threaded channels (Slack): one thread = one session (#19) ----------
+
+    /// One inbound message posted in `thread` of the conversation `conv-1` —
+    /// the shape the daemon hands over for a channel whose
+    /// `session_threads()` is true.
+    async fn say_in_thread(gateway: &mut Gateway, thread: &str, text: &str) -> Vec<String> {
+        gateway
+            .handle_message("mock", "conv-1", "alice", Some(thread), "", text, &[], None)
+            .await
+            .unwrap()
+    }
+
+    fn thread_key(thread: &str) -> ChatKey {
+        ChatKey::new("mock", "conv-1", "alice").with_thread(Some(thread))
+    }
+
+    /// The next sink (IM leg) `Answer` whose content contains `needle`.
+    async fn recv_sink_answer_containing(
+        sink: &mut tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+        needle: &str,
+    ) -> GatewayEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = sink.recv().await.expect("gateway sink remains open");
+                if matches!(ev.kind, GatewayEventKind::Answer) && ev.content.contains(needle) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("an IM-leg answer containing {needle:?} arrives"))
+    }
+
+    /// A gateway whose every spawn gets its own fake (own event queue) that
+    /// closes each turn, wired to an IM sink — the setup the answer-path
+    /// tests below share.
+    fn threaded_answer_gateway(
+        dir: &Path,
+    ) -> (Gateway, tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>) {
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", dir);
+        gateway.register_project("alpha", dir);
+        let (tx, sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        (gateway, sink)
+    }
+
+    /// A thread is a session's tab: a new thread's first plain message spawns
+    /// a session of its own and binds the thread to it, each thread keeps
+    /// talking to its own session, and the project is the CONVERSATION's — a
+    /// thread that never typed `/cd` works where another thread `/cd`'d.
+    #[tokio::test]
+    async fn each_thread_of_a_conversation_spawns_and_keeps_its_own_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let alpha = tempfile::TempDir::new().unwrap();
+        let beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.path());
+        gateway.register_project("beta", beta.path());
+
+        say_in_thread(&mut gateway, "100.1", "/cd beta").await;
+        say_in_thread(&mut gateway, "100.1", "hello from A").await;
+        say_in_thread(&mut gateway, "200.2", "hello from B").await;
+
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "a new thread spawns its own session"
+        );
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string())
+        );
+        for sid in ["s1", "s2"] {
+            assert_eq!(
+                gateway.sessions[sid].project, "beta",
+                "{sid} works in the conversation's project"
+            );
+        }
+
+        // B's spawn re-pointed only B: A's next message still reaches s1.
+        say_in_thread(&mut gateway, "100.1", "again from A").await;
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
+        let last = fake.submissions.lock().await.last().cloned().unwrap();
+        assert!(
+            last.0.ends_with("-s1") && last.1.contains("again from A"),
+            "A's follow-up goes to A's session: {last:?}"
+        );
+
+        // The conversation itself is nobody's tab, and the ACL re-check keeps
+        // every thread route (ownership is the conversation's, not a thread's).
+        assert_eq!(
+            gateway
+                .current_session
+                .get(&ChatKey::new("mock", "conv-1", "alice")),
+            None
+        );
+        gateway.drop_dead_session_routes();
+        assert_eq!(
+            gateway
+                .current_session
+                .threads_bound_to("mock", "conv-1", "s1"),
+            vec!["100.1".to_string()]
+        );
+        assert_eq!(
+            gateway.current_project.get(&thread_key("300.3")),
+            Some("beta".to_string()),
+            "a brand-new thread already works in the conversation's project"
+        );
+    }
+
+    /// `/cd` in a thread never pulls a session that lives in another thread
+    /// into this one: a fresh thread stays free (its next message spawns), a
+    /// thread whose session is already in the project keeps it, and a thread
+    /// whose session is elsewhere is freed for a new session in the project.
+    #[tokio::test]
+    async fn cd_in_a_thread_never_adopts_another_threads_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let alpha = tempfile::TempDir::new().unwrap();
+        let beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.path());
+        gateway.register_project("alpha", alpha.path());
+        gateway.register_project("beta", beta.path());
+
+        say_in_thread(&mut gateway, "100.1", "hello from A").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+
+        // A fresh thread `/cd`s into s1's project: s1 stays A's alone.
+        let reply = say_in_thread(&mut gateway, "200.2", "/cd alpha").await;
+        assert!(
+            reply[0].contains("next message starts a session there"),
+            "{reply:?}"
+        );
+        assert_eq!(gateway.current_session.get(&thread_key("200.2")), None);
+        say_in_thread(&mut gateway, "200.2", "hello from B").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string()),
+            "the fresh thread gets a session of its own"
+        );
+
+        // A thread whose session is already in the project keeps it.
+        say_in_thread(&mut gateway, "100.1", "/cd alpha").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+
+        // A thread whose session is elsewhere is freed, not re-pointed.
+        say_in_thread(&mut gateway, "100.1", "/cd beta").await;
+        assert_eq!(gateway.current_session.get(&thread_key("100.1")), None);
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string()),
+            "another thread's session is untouched"
+        );
+        say_in_thread(&mut gateway, "100.1", "now in beta").await;
+        let sid = gateway.current_session.get(&thread_key("100.1")).unwrap();
+        assert_eq!(gateway.sessions[&sid].project, "beta");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 3);
+    }
+
+    /// Two first messages racing into ONE new thread spawn once (the claim is
+    /// per thread, like the focus slot it guards); first messages in two
+    /// different new threads each get their own session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_first_messages_spawn_once_per_thread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_delay(std::time::Duration::from_millis(80)),
+        );
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        let mut tasks = Vec::new();
+        for (i, thread) in ["100.1", "100.1", "200.2", "200.2"].into_iter().enumerate() {
+            let gw = Arc::clone(&gateway);
+            tasks.push(tokio::spawn(async move {
+                Gateway::handle_message_shared(
+                    gw,
+                    "mock",
+                    "conv-1",
+                    "alice",
+                    Some(thread),
+                    &format!("m-{i}"),
+                    &format!("msg {i}"),
+                    &[],
+                    None,
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            let r = t.await.unwrap();
+            assert!(r.is_ok(), "every racing first message succeeds: {r:?}");
+        }
+
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "one spawn per new thread, never two for the same thread"
+        );
+        assert_eq!(fake.submissions.lock().await.len(), 4, "no message dropped");
+        let g = gateway.lock().await;
+        let a = g.current_session.get(&thread_key("100.1")).unwrap();
+        let b = g.current_session.get(&thread_key("200.2")).unwrap();
+        assert_ne!(a, b, "each thread is bound to its own session");
+    }
+
+    /// The answer of a thread's own session lands IN that thread and needs no
+    /// `[sid …]` label — the thread is its tab, so it is "focused" there even
+    /// though another thread of the same conversation spawned more recently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_threads_answer_lands_in_its_thread_unlabelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gateway, mut sink) = threaded_answer_gateway(tmp.path());
+
+        say_in_thread(&mut gateway, "100.1", "first in A").await;
+        recv_sink_answer_containing(&mut sink, "first in A").await;
+        say_in_thread(&mut gateway, "200.2", "first in B").await;
+        recv_sink_answer_containing(&mut sink, "first in B").await;
+
+        say_in_thread(&mut gateway, "100.1", "ping from A").await;
+        let answer = recv_sink_answer_containing(&mut sink, "ping from A").await;
+        assert_eq!(answer.sid.as_deref(), Some("s1"));
+        assert_eq!(answer.thread_ts.as_deref(), Some("100.1"));
+        assert!(
+            !answer.content.starts_with("[s1 "),
+            "a thread's own session is not a second speaker there: {}",
+            answer.content
+        );
+    }
+
+    /// `docs-local/issues/#14①` on a threaded channel: an INTERNAL turn (a
+    /// delegation completion notification) resets `reply_to` to the owner,
+    /// and an owner is a conversation, never a thread. Without re-attaching the
+    /// session's thread the answer read as "not focused" (no thread route
+    /// points at the bare conversation) and lost its IM leg; with it, it lands
+    /// in the thread the session lives in. Both the lock-narrowed notifier path
+    /// and the inline submit path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_internal_turns_answer_reaches_the_sessions_thread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gateway, mut sink) = threaded_answer_gateway(tmp.path());
+        say_in_thread(&mut gateway, "100.1", "first in A").await;
+        recv_sink_answer_containing(&mut sink, "first in A").await;
+        say_in_thread(&mut gateway, "200.2", "first in B").await;
+        recv_sink_answer_containing(&mut sink, "first in B").await;
+
+        gateway
+            .submit_to_sid("s2", "s8 done · turn 1\nanswer".into())
+            .await
+            .unwrap();
+        let inline = recv_sink_answer_containing(&mut sink, "s8 done").await;
+        assert_eq!(inline.sid.as_deref(), Some("s2"));
+        assert_eq!(inline.thread_ts.as_deref(), Some("200.2"));
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            "s1",
+            "s9 done · turn 1\nanswer".into(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        let delivered = recv_sink_answer_containing(&mut sink, "s9 done").await;
+        assert_eq!(delivered.sid.as_deref(), Some("s1"));
+        assert_eq!(delivered.thread_ts.as_deref(), Some("100.1"));
+        assert!(
+            !delivered.content.starts_with("[s1 "),
+            "the thread's own session is not labelled: {}",
+            delivered.content
+        );
+    }
+
+    /// The owner's IM chats share one session POOL but never one push: a
+    /// session the owner's Telegram chat created is listed and `/use`-able from
+    /// the owner's Slack, and once Slack switched to it its follow-ups (an
+    /// internal turn's answer) go to Slack ONLY — until Telegram drives it
+    /// again. A sender who is not a named operator still sees nothing.
+    #[tokio::test]
+    async fn the_owners_chats_share_sessions_but_a_session_pushes_to_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gateway, mut sink) = threaded_answer_gateway(tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
+        gateway.bind_operator_allowlist("slack", ["U1".to_string()]);
+
+        gateway
+            .handle_text("telegram", "339", "339", "hello from telegram")
+            .await
+            .unwrap();
+        recv_sink_answer_containing(&mut sink, "hello from telegram").await;
+        let tg = ChatKey::new("telegram", "339", "339");
+        let sid = gateway
+            .current_session
+            .get(&tg)
+            .expect("telegram spawned a session");
+
+        // Slack (the owner, named by member id) sees and takes it.
+        let listed = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "/sessions",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.join("\n").contains(&sid),
+            "listed on Slack: {listed:?}"
+        );
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                &format!("/use {sid}"),
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A follow-up nobody typed goes where the session was switched to.
+        gateway
+            .submit_to_sid(&sid, "s9 done · turn 1\nanswer".into())
+            .await
+            .unwrap();
+        let follow_up = recv_sink_answer_containing(&mut sink, "s9 done").await;
+        assert_eq!(follow_up.channel, "slack");
+        assert_eq!(follow_up.thread_ts.as_deref(), Some("1.1"));
+        assert!(
+            !std::iter::from_fn(|| sink.try_recv().ok())
+                .any(|e| e.channel == "telegram" && e.content.contains("s9 done")),
+            "never a second push to Telegram"
+        );
+
+        // Telegram drives it again → its follow-ups come back to Telegram.
+        gateway
+            .handle_text("telegram", "339", "339", "back on telegram")
+            .await
+            .unwrap();
+        recv_sink_answer_containing(&mut sink, "back on telegram").await;
+        gateway
+            .submit_to_sid(&sid, "s10 done · turn 1\nanswer".into())
+            .await
+            .unwrap();
+        let back = recv_sink_answer_containing(&mut sink, "s10 done").await;
+        assert_eq!(back.channel, "telegram");
+
+        // Someone the Slack allowlist does not name sees nothing of it.
+        let stranger = gateway
+            .handle_message(
+                "slack",
+                "C2",
+                "U9",
+                Some("2.2"),
+                "2.2",
+                "/sessions",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !stranger.join("\n").contains(&sid),
+            "a guest sees no owner session: {stranger:?}"
+        );
+    }
+
+    /// The reattach rule itself: an owner target gets back the one thread the
+    /// session lives in; binding the session to another thread MOVES it (the
+    /// left thread is reported, never kept as a second tab); no tab (and every
+    /// single-stream chat) leaves the target as it was.
+    #[tokio::test]
+    async fn an_owner_target_gets_the_sessions_own_thread_back() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(fake, "alpha", tmp.path());
+        let owner = ChatKey::new("mock", "conv-1", "alice");
+        assert!(gateway
+            .current_session
+            .set(&thread_key("100.1"), "s1")
+            .is_empty());
+        gateway.current_session.set(&thread_key("300.3"), "s2");
+        assert_eq!(
+            gateway
+                .with_bound_thread(owner.clone(), "s1")
+                .thread
+                .as_deref(),
+            Some("100.1")
+        );
+
+        let left = gateway.current_session.set(&thread_key("050.5"), "s1");
+        assert_eq!(
+            left,
+            vec![thread_key("100.1").thread_focus_key()],
+            "binding s1 elsewhere reports the thread it left"
+        );
+        assert_eq!(gateway.current_session.get(&thread_key("100.1")), None);
+        assert_eq!(
+            gateway
+                .with_bound_thread(owner.clone(), "s1")
+                .thread
+                .as_deref(),
+            Some("050.5"),
+            "the session follows its one thread"
+        );
+        assert_eq!(
+            gateway
+                .with_bound_thread(owner.clone(), "s2")
+                .thread
+                .as_deref(),
+            Some("300.3"),
+            "another session's thread is untouched"
+        );
+        assert_eq!(gateway.with_bound_thread(owner.clone(), "s7"), owner);
+
+        let telegram = ChatKey::new("telegram", "339", "339");
+        let other_tg = ChatKey::new("telegram", "440", "440");
+        gateway.current_session.set(&telegram, "s1");
+        assert!(
+            gateway.current_session.set(&other_tg, "s1").is_empty(),
+            "single-stream chats never move each other's focus"
+        );
+        assert_eq!(gateway.current_session.get(&telegram), Some("s1".into()));
+        assert_eq!(
+            gateway.with_bound_thread(telegram.clone(), "s1"),
+            telegram,
+            "a single-stream chat is untouched"
+        );
+    }
+
+    /// Restoring `routing.json` keeps the one-thread-per-session invariant
+    /// even when the file names a session in two threads: the most recent
+    /// thread keeps it, the other is freed; other conversations, other
+    /// sessions and single-stream chats are untouched.
+    #[test]
+    fn restored_routes_keep_one_thread_per_session() {
+        let routes = FocusRoutes::new(FocusScope::Thread);
+        let route = |chat: ChatKey, value: &str| SavedGatewayRoute {
+            chat,
+            value: value.to_string(),
+        };
+        let other_conv = ChatKey::new("mock", "conv-2", "bob").with_thread(Some("100.1"));
+        let telegram_a = ChatKey::new("telegram", "339", "339");
+        let telegram_b = ChatKey::new("telegram", "440", "440");
+        routes.load_saved(
+            vec![
+                route(thread_key("100.1"), "s1"),
+                route(thread_key("300.3"), "s1"),
+                route(thread_key("200.2"), "s2"),
+                route(other_conv.clone(), "s1"),
+                route(telegram_a.clone(), "s1"),
+                route(telegram_b.clone(), "s1"),
+            ],
+            |_, _| Some(0),
+        );
+        assert_eq!(routes.get(&thread_key("100.1")), None);
+        assert_eq!(routes.get(&thread_key("300.3")), Some("s1".into()));
+        assert_eq!(routes.get(&thread_key("200.2")), Some("s2".into()));
+        assert_eq!(routes.get(&other_conv), Some("s1".into()));
+        assert_eq!(routes.get(&telegram_a), Some("s1".into()));
+        assert_eq!(routes.get(&telegram_b), Some("s1".into()));
+    }
+
+    /// Ownership is the conversation's: a session started in thread A is
+    /// listed in thread B and `@handle`-addressable from it (no spawn) — and
+    /// addressing it there MOVES it: it lives in one thread at a time, and the
+    /// thread it left is told so (its next message starts a fresh session).
+    #[tokio::test]
+    async fn a_session_from_one_thread_is_listed_and_usable_from_another() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        say_in_thread(&mut gateway, "100.1", "hello from A").await;
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        let listed = say_in_thread(&mut gateway, "200.2", "/sessions").await;
+        assert!(
+            listed.join("\n").contains("s1"),
+            "thread B lists the conversation's session: {listed:?}"
+        );
+        say_in_thread(&mut gateway, "200.2", "@s1 over here").await;
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "@handle from another thread reaches the conversation's session"
+        );
+        let last = fake.submissions.lock().await.last().cloned().unwrap();
+        assert!(last.0.ends_with("-s1") && last.1.contains("over here"));
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s1".to_string())
+        );
+
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            None,
+            "s1 moved: thread A is no longer its tab"
+        );
+
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        say_in_thread(&mut gateway, "300.3", "/use s1").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("300.3")),
+            Some("s1".to_string())
+        );
+        assert_eq!(gateway.current_session.get(&thread_key("200.2")), None);
+        let notice = recv_sink_answer_containing(&mut sink, "moved to another thread").await;
+        assert_eq!(
+            notice.thread_ts.as_deref(),
+            Some("200.2"),
+            "the thread s1 left is told, in that thread"
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // Later output follows s1's one thread, not the thread it left.
+        let owner = ChatKey::new("mock", "conv-1", "conv-1");
+        assert_eq!(
+            gateway.with_bound_thread(owner, "s1").thread.as_deref(),
+            Some("300.3")
+        );
+    }
+
+    /// `routing.json` round-trips both scopes: session rows keep their thread,
+    /// the project row is the conversation's and carries none — and a
+    /// single-stream key serializes exactly as before (no `thread` field).
+    #[tokio::test]
+    async fn routing_json_keeps_thread_session_routes_and_the_conversation_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.register_project("beta", beta.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            say_in_thread(&mut gateway, "100.1", "/cd beta").await;
+            say_in_thread(&mut gateway, "100.1", "hello from A").await;
+            say_in_thread(&mut gateway, "200.2", "hello from B").await;
+        }
+
+        let raw = std::fs::read_to_string(crate::routing_state_path_in(tmp.path())).unwrap();
+        let saved: RoutingState = serde_json::from_str(&raw).unwrap();
+        let sessions: BTreeMap<Option<String>, String> = saved
+            .current_session
+            .iter()
+            .map(|route| (route.chat.thread.clone(), route.value.clone()))
+            .collect();
+        assert_eq!(
+            sessions,
+            BTreeMap::from([
+                (Some("100.1".to_string()), "s1".to_string()),
+                (Some("200.2".to_string()), "s2".to_string()),
+            ])
+        );
+        assert!(
+            saved
+                .current_project
+                .iter()
+                .all(|route| route.chat.thread.is_none() && route.value == "beta"),
+            "the project route is the conversation's"
+        );
+        assert!(
+            serde_json::to_value(ChatKey::new("telegram", "339", "339"))
+                .unwrap()
+                .get("thread")
+                .is_none(),
+            "a single-stream key keeps its old on-disk shape"
+        );
+
+        let mut restored = Gateway::new(fake, "alpha", alpha);
+        restored.register_project("beta", beta);
+        restored.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(
+            restored.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+        assert_eq!(
+            restored.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string())
+        );
+        assert_eq!(
+            restored.current_project.get(&thread_key("300.3")),
+            Some("beta".to_string())
+        );
     }
 }

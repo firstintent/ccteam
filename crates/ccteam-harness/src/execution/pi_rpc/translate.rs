@@ -76,14 +76,31 @@ impl PiTurnTranslator {
                     settled: false,
                 }
             }
-            PiEvent::MessageEnd { message } => {
-                if let Err(error) = active.ingest_message(&message) {
+            PiEvent::MessageEnd { message } => match active.ingest_message(&message) {
+                // A message that hands over to a tool call is complete and
+                // the turn goes on: report it now, not at `agent_settled`,
+                // which only ever sees the LAST message — every earlier one
+                // was overwritten and never reached anyone (#209).
+                Ok(Some(text)) => {
+                    active.item_seq += 1;
+                    TranslateOutput {
+                        events: vec![ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: format!("{}-agent-{}", active.turn_id, active.item_seq),
+                                details: ThreadItemDetails::AgentMessage(text),
+                            },
+                        }],
+                        settled: false,
+                    }
+                }
+                Ok(None) => TranslateOutput::default(),
+                Err(error) => {
                     // `agent_settled` remains the sole normal terminal; a bad
                     // message poisons the pending outcome instead of ending it.
                     active.protocol_error = Some(error);
+                    TranslateOutput::default()
                 }
-                TranslateOutput::default()
-            }
+            },
             PiEvent::CompactionEnd { usage } => {
                 if let Some(usage) = usage {
                     active.add_usage(usage);
@@ -239,7 +256,9 @@ impl PiTurnTranslator {
 }
 
 impl TurnBuffer {
-    fn ingest_message(&mut self, message: &Value) -> Result<(), String> {
+    /// Fold one finished message into the turn. `Some(text)` = a message the
+    /// turn has moved past (it handed over to a tool call), reportable now.
+    fn ingest_message(&mut self, message: &Value) -> Result<Option<String>, String> {
         match message.get("role").and_then(Value::as_str) {
             Some("assistant") => {
                 let usage: PiUsage =
@@ -255,7 +274,7 @@ impl TurnBuffer {
                 self.model = Some(format!("{provider}/{model}"));
                 let stop_reason = required_string(message, "stopReason")?;
                 if stop_reason == "pending" {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let content = message
                     .get("content")
@@ -270,15 +289,22 @@ impl TurnBuffer {
                 let has_tool_call = content
                     .iter()
                     .any(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"));
+                let handed_over = stop_reason == "toolUse" && has_tool_call;
+                let text = (!text.trim().is_empty()).then_some(text);
                 self.terminal = Some(TerminalMessage {
                     stop_reason,
                     error_message: message
                         .get("errorMessage")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    text: (!text.is_empty()).then_some(text),
+                    // Reported here when it is reported now, so the settle
+                    // path can never report it a second time.
+                    text: if handed_over { None } else { text.clone() },
                     has_tool_call,
                 });
+                if handed_over {
+                    return Ok(text);
+                }
             }
             Some("toolResult") => {
                 if let Some(usage) = message.get("usage") {
@@ -289,7 +315,7 @@ impl TurnBuffer {
             }
             _ => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     fn add_usage(&mut self, usage: PiUsage) {
@@ -403,6 +429,60 @@ mod tests {
             panic!("expected a TurnCompleted, got {:?}", settled.events);
         };
         assert_eq!(*continuation, crate::TurnContinuation::Settled);
+    }
+
+    fn said(events: &[ThreadEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ThreadEvent::ItemCompleted { item } => match &item.details {
+                    ThreadItemDetails::AgentMessage(text) => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #209 — `agent_settled` only ever sees the LAST message: an earlier one
+    /// that handed over to a tool call was overwritten and never reached the
+    /// chat, the transcript or a parent. It is complete when it ends, so it is
+    /// reported then — once.
+    #[test]
+    fn a_message_that_hands_over_to_a_tool_is_reported_when_it_ends() {
+        let mut translator = PiTurnTranslator::default();
+        translator.begin("t-mid".into()).unwrap();
+        translator.ingest(PiEvent::AgentStart);
+        let first = translator.ingest(assistant(
+            "toolUse",
+            "checking the logs",
+            true,
+            usage(1, 1, 0.1, 0),
+        ));
+        assert_eq!(said(&first.events), vec!["checking the logs".to_string()]);
+        assert!(!first.settled);
+        let last = translator.ingest(assistant("stop", "found it", false, usage(1, 1, 0.1, 0)));
+        assert!(
+            said(&last.events).is_empty(),
+            "the final message waits for settle"
+        );
+        let settled = translator.ingest(PiEvent::AgentSettled);
+        assert_eq!(said(&settled.events), vec!["found it".to_string()]);
+
+        // A turn that settles right after a handed-over message reports it
+        // exactly once.
+        let mut translator = PiTurnTranslator::default();
+        translator.begin("t-pre".into()).unwrap();
+        translator.ingest(PiEvent::AgentStart);
+        let preamble = translator.ingest(assistant(
+            "toolUse",
+            "running it",
+            true,
+            usage(1, 1, 0.1, 0),
+        ));
+        assert_eq!(said(&preamble.events), vec!["running it".to_string()]);
+        let settled = translator.ingest(PiEvent::AgentSettled);
+        assert!(said(&settled.events).is_empty(), "{:?}", settled.events);
     }
 
     #[test]

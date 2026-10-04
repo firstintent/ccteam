@@ -1,20 +1,20 @@
 # ccteam User Manual
 
-**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, or a browser tab.**
+**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, Slack, or a browser tab.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
 | Surface | Best for | Section |
 |---|---|---|
 | **Web console** | Create projects, start sessions, install plugins, configure IM, inspect status - the easiest default path | [1. Web console](#1-web-console-recommended) |
-| **Telegram / Lark** | Mobile control, file exchange, tool approvals | [2. Telegram / Lark](#2-telegram--lark) |
+| **Telegram / Lark / Slack** | Mobile control, file exchange, tool approvals — on Slack every session gets its own thread | [2. Telegram / Lark / Slack](#2-telegram--lark--slack) |
 | **CLI** | Scripts, ops, advanced headless use | [3. CLI](#3-cli-advanced) |
 
 ---
 
 ## Core Concepts
 
-- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group. Each chat has its own current project, current session, and session list. Chats are isolated from each other.
+- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group, or one Slack channel/DM. Each chat has its own current project, current session, and session list. Other people's chats are isolated from each other; **your own** IM chats (the ones a bot allowlist names as you) see each other's sessions — but a session only ever pushes to **one** chat: the one that last messaged it or switched to it. On Slack the current session is per **thread** — every session gets a thread of its own ([Slack: One Thread per Session](#slack-one-thread-per-session)).
 - **project** = a local code directory registered with a short slug.
 - **session** = one independent agent conversation with its own context, like a native Claude Code session. A project can have many sessions running side by side. Each session has a durable handle `s<N>` that survives restarts and is never reused.
 - **role** = an optional persona bound at session start, loaded from `.claude/agents/<role>.md`. The default is **roleless**: the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`. Personas are installed from the marketplace or written by you; ccteam seeds none.
@@ -192,16 +192,17 @@ The **Team** page is the multi-vendor cockpit, three tabs:
 
 The **Marketplace** page (under **Workflow**; the Skills tab opens first, and the project picker appears only for project-scoped types like agents) browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
 
-### Configure Telegram / Lark
+### Configure Telegram / Lark / Slack
 
 Open **Settings** and enter IM credentials:
 
 - **Telegram:** paste the bot token, save it, then send the bot a message. The page polls and captures your chat id.
 - **Lark/Feishu:** enter App ID, App Secret, region (Feishu China / Lark international), and allowed users.
+- **Slack:** a three-step card — create the app from a one-click link (manifest prefilled), paste the bot and app-level tokens, then DM the bot and click your member id to allow it. Details in [Setup](#setup).
 
 Secrets are masked (`...last4`) and never returned in plaintext. **Restart the daemon after changing global IM credentials** because they are loaded at startup. The page will show `restart required`. Per-user IM bots are hot-reloaded; see [Multi-User](#multi-user).
 
-Detailed bot setup is in [2. Telegram / Lark](#setup).
+Detailed bot setup is in [2. Telegram / Lark / Slack](#setup).
 
 ### Multi-User
 
@@ -241,9 +242,9 @@ Mcp-Session-Id: <the id the daemon returned at initialize>
 
 ---
 
-## 2. Telegram / Lark
+## 2. Telegram / Lark / Slack
 
-After connecting IM, you can drive sessions, send files, and approve tools from your phone. The easiest setup is [Web console Settings](#configure-telegram--lark). You can also use the `ccteam config` menu or write the credentials file manually.
+After connecting IM, you can drive sessions, send files, and approve tools from your phone. The easiest setup is [Web console Settings](#configure-telegram--lark--slack). You can also use the `ccteam config` menu or write the credentials file manually.
 
 ### Setup
 
@@ -281,11 +282,30 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 - `allowed_user_ids` is an open_id allowlist (`ou_...`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). To get your open_id, start with an empty list, message the bot, find `ignoring ou_xxxx (not in allowed_users)` in logs, and add that `ou_xxxx`.
 - The `"*"` wildcard lets **anyone** message the bot. It names nobody, so nobody is served as the owner through it: every sender is a guest who owns only what it creates and sees no project. The daemon warns about this at startup — put your own `ou_...` in the list to take the bot back.
 
-> Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu and Telegram are peers: text, rich text, images, and files are supported.
+**Slack** gives **every session its own thread**, so parallel sessions never interleave in one stream. It connects over **Socket Mode** (an outbound WebSocket — no public callback URL). Set it up in **Settings → Access → Slack**, a guided three-step card:
+
+1. **Create the app.** Name it (say `ccteam`, or `cct2` on a second machine) and click **Create in Slack**: Slack's create-app page opens with the whole manifest filled in — Socket Mode, the scopes and events ccteam needs, option buttons, the DM tab, and a slash command named after the app (`/ccteam`, `/cct2`). Pick the workspace, **Create**, then **Install App → Install to Workspace → Allow**.
+2. **Paste the two tokens.** *Bot token* = **OAuth & Permissions → Bot User OAuth Token** (`xoxb-…`); *App-level token* = **Basic Information → App-Level Tokens → Generate** with the `connections:write` scope (`xapp-…`). Saving checks both with Slack and connects at once — no restart.
+3. **Allow yourself.** DM the bot (or @-mention it in a channel): your member id (`U…`) shows up on the card, one click allows it. Until someone is allowed the bot answers **no one** (fail closed). The allowlist is also the **owner roster**: an allowed member is served as the box owner.
+
+Then invite the bot to a channel (`/invite @ccteam`) or DM it. It answers every message from allowed members in the channels it is in, so a dedicated channel (or the DM) works best.
+
+- **Several ccteam machines in one workspace:** give each independent ccteam its own app (`cct2`, `cct3`, …) — Socket Mode spreads one app's events across all its connections, so two daemons cannot share an app. Each app gets its own slash command. Slack's free plan allows up to 10 apps per workspace. Machines joined to one ccteam as satellites need no app of their own: that ccteam's app already reaches their projects.
+
+> Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu, Telegram, and Slack are peers: text, rich text, images, and files are supported.
+
+### Slack: One Thread per Session
+
+- A **top-level message** starts a new thread; the first ordinary message in a thread with no session starts a roleless session in the channel's current project (exactly like a fresh Telegram chat). Post another top-level message and a second session runs beside the first.
+- A **reply in a thread** goes to that thread's session. Everything that session produces — answers, the live progress card, approval buttons, files, the answer it gives after a delegate reports back — lands in its own thread.
+- The **channel** is the chat for ownership and the current project: `/cd` in any thread switches the project for the whole channel (that thread keeps its session only if the session is in the new project; otherwise its next message starts one there), and `/sessions` lists every session the channel owns. A session lives in **one thread at a time**: `/use <sid>` (or `@<handle>`) in a thread moves that session into it, and the thread it left says so (a new message there starts a fresh session). `/new …` in a thread starts a new session in that thread.
+- **Mostly you tap.** A thread whose first message starts a session opens with a header and the session's buttons — **📊 Status · 🧠 Model · ⏹ Interrupt** — and the replies to `new` / `use` / `status` carry the same row. The app's slash command on its own (`/ccteam`) posts a menu: **📁 Projects · 🧵 Sessions · 📊 Status · ＋ Claude · ＋ Codex**. Long lists (projects, sessions, model × effort) come as a dropdown.
+- **Commands start with `!` on Slack.** Slack keeps `/` for itself (it swallows any message starting with one, and an app's slash command cannot run inside a thread at all), so type `!` where Telegram types `/`: `!status`, `!model`, `!compact`, `!interrupt` in a session's thread act on that session; `!projects`, `!cd demo`, `!sessions`, `!new codex` as a top-level message open a thread for the reply — `!new codex` creates the codex session right there, and `!use s12` moves an existing session into it. ccteam's own replies name commands the same way (`→ !status`). The app's slash command (`/ccteam`, or `/cct2` for an app named cct2) also works in the channel.
+- Sessions hired by other agents get no thread of their own; give one a thread with a top-level `!use <sid>` when you want to talk to it.
 
 ### Gateway Commands
 
-Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`.
+Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`. On Slack type `!` instead of `/` (`!status`, `!model`) — see [Slack: One Thread per Session](#slack-one-thread-per-session).
 
 ```text
 # Projects
@@ -368,8 +388,8 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 - **Messages without a prefix** go to the current session.
 - **Non-gateway slash commands** (`/compact`, `/clear`, `/goal`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons. Claude executes a slash command only when idle, so one sent while a turn is running is queued and delivered right after that turn ends (you get a receipt); plain text sent mid-turn is still steered into the running turn. `/goal` is the vendor's own goal, so it behaves like the vendor's: Codex starts working toward the objective on its own as soon as it is set and keeps going until it reports the goal met (`/goal clear` stops it), and `/status` shows the goal for both harnesses — with the reason when the vendor has stopped advancing it.
 - **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files back to chat.
-- **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
-- **A long turn is never silent.** A turn's messages are normally batched to its end so the last one can carry the status line, but that wait is bounded: text a session produces after it absorbed your mid-turn message goes to the chat at once (you asked, it answered — nothing waits for a boundary that may be hours away, or that a Stop hook may refuse entirely), and anything held longer than a minute while the turn runs on is delivered on its own. When a turn's text went out that way, the turn's end arrives as the status line alone, never as a second copy of what you already read.
+- **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. When the session says something mid-turn, that card is closed as `↳ 3 tools · 1 files` and a fresh one follows the message; the turn's last card reads `✅ done`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
+- **A long turn is never silent.** What a session says reaches the chat while its turn is still running, on every harness (claude, codex, grok, opencode, kimi, dsh, pi). A turn's messages are held briefly and folded into one, so a short turn still arrives as a single reply carrying the status line; the hold is bounded: text a session produces after it absorbed your mid-turn message goes out at once (you asked, it answered — nothing waits for a boundary that may be hours away, or that a Stop hook may refuse entirely), and anything held for a minute goes out on its own, even while the session sits in a long silent tool call — so a long turn reads as a running commentary of at most one message a minute. When a turn's text went out that way, its end arrives as the status line alone, never as a second copy of what you already read. The web console shows the same messages as they arrive and keeps the turn marked running (Stop stays available) until the turn actually ends. A turn that fails still delivers what it said before the failure.
 
 ### Human-in-the-Loop (HITL)
 

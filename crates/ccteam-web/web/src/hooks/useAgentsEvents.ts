@@ -19,8 +19,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createAuthedEventSource } from "../lib/authedEventSource";
-import { shouldAcceptEventSeq } from "./useSessionEvents";
-import type { SessionActivity } from "./useSessionEvents";
+import { parseEventOptions, shouldAcceptEventSeq } from "./useSessionEvents";
+import type { SessionActivity, SessionEventOption } from "./useSessionEvents";
 
 /** One frame off the global SSE stream: every ordinary per-session event
  *  (`answer`/`progress`/`activity`, now carrying `slug`) PLUS a delegation
@@ -33,10 +33,21 @@ export interface AgentsEvent {
   id?: string;
   sid?: string;
   slug?: string;
-  kind: "answer" | "progress" | "activity" | "delegation" | "session_lifecycle";
+  kind:
+    | "answer"
+    | "progress"
+    | "activity"
+    | "delegation"
+    | "session_lifecycle"
+    | "scheduled_changed";
   content: string;
   done?: boolean;
   activity?: SessionActivity;
+  /** Answer-only (#209): said mid-turn, the turn is still running
+   *  (`isTurnBoundary`). */
+  interim?: boolean;
+  /** Answer-only: an approval prompt's options — the turn waits on a human. */
+  options?: SessionEventOption[];
   /** Delegation-only: one of spawned|dispatched|completed|notified|
    *  collected|stopped|denied. */
   relation?: string;
@@ -86,7 +97,9 @@ export function parseAgentsEvent(raw: string): AgentsEvent | null {
           ? "delegation"
           : obj.kind === "session_lifecycle"
             ? "session_lifecycle"
-          : "answer";
+            : obj.kind === "scheduled_changed"
+              ? "scheduled_changed"
+              : "answer";
   const event: AgentsEvent = {
     kind,
     content: typeof obj.content === "string" ? obj.content : "",
@@ -95,6 +108,9 @@ export function parseAgentsEvent(raw: string): AgentsEvent | null {
   if (typeof obj.sid === "string") event.sid = obj.sid;
   if (typeof obj.slug === "string") event.slug = obj.slug;
   if (obj.done === true) event.done = true;
+  if (obj.interim === true) event.interim = true;
+  const options = parseEventOptions(obj.options);
+  if (options) event.options = options;
   if (typeof obj.activity === "object" && obj.activity !== null) {
     const a = obj.activity as Record<string, unknown>;
     event.activity = {

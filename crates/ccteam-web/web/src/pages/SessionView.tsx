@@ -25,7 +25,12 @@ import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
-import { foldSessionLiveness, useSessionEvents } from "../hooks/useSessionEvents";
+import {
+  foldSessionLiveness,
+  turnInFlight,
+  useSessionEvents,
+  type TurnMark,
+} from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
@@ -42,11 +47,13 @@ import {
   type OutboundAttachmentRef,
   type SessionView as SessionSummary,
   type ScheduledItem,
+  type TurnStatus,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
   appendRow,
   historyToRows,
+  leadingClosingStatus,
   loadRows,
   mergeHistory,
   nextRowId,
@@ -197,7 +204,9 @@ export default function SessionView({
   // wins over what the user typed.
   const [editingTitle, setEditingTitle] = useState(false);
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
-  const [busyMark, setBusyMark] = useState<number | null>(null);
+  // The turn this page sent, as a watermark into the SSE buffer (see
+  // `turnInFlight`); `null` = no turn of ours is running.
+  const [turnMark, setTurnMark] = useState<TurnMark | null>(null);
   const [busySince, setBusySince] = useState<number | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
@@ -219,6 +228,9 @@ export default function SessionView({
     hasMore: false,
     nextBefore: null as string | null,
     loadingEarlier: false,
+    // The oldest loaded page opened with a closing row (#209): its status
+    // footers the last reply of the next earlier page.
+    closedBy: undefined as TurnStatus | undefined,
   });
   useEffect(() => {
     eventsRef.current = events;
@@ -247,15 +259,18 @@ export default function SessionView({
             setRows((current) => mergeHistory(current, seeded, events, barrier));
             foldedRef.current = events.length;
           }
-          const latest = [...seeded].reverse().find((row) => row.kind === "assistant" && row.status);
-          if (latest?.status) {
-            setStatusModel(latest.status.model ?? null);
-            setCtxPct(contextPct(latest.status.context));
+          // Newest turn status in the page — a status-only closing row counts
+          // even when it had no reply of its own to footer (#209).
+          const latest = [...h.events].reverse().find((ev) => ev.status)?.status;
+          if (latest) {
+            setStatusModel(latest.model ?? null);
+            setCtxPct(contextPct(latest.context));
           }
           setHistoryPage({
             hasMore: h.has_more === true,
             nextBefore: h.next_before ?? null,
             loadingEarlier: false,
+            closedBy: leadingClosingStatus(h.events),
           });
           setHistoryError(null);
         })
@@ -289,12 +304,13 @@ export default function SessionView({
     getHistory(sid, { before })
       .then((history) => {
         if (request !== historyRequestRef.current) return;
-        const earlier = historyToRows(history.events);
+        const earlier = historyToRows(history.events, historyPage.closedBy);
         if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
         setHistoryPage({
           hasMore: history.has_more === true,
           nextBefore: history.next_before ?? null,
           loadingEarlier: false,
+          closedBy: leadingClosingStatus(history.events),
         });
       })
       .catch(() => {
@@ -322,9 +338,20 @@ export default function SessionView({
     saveRows(sid, rows);
   }, [sid, rows]);
 
+  // ---- working state of the turn we sent (#209) ------------------------------
+  // Ends on the first answer that ends the exchange (`isTurnBoundary`): any
+  // answer the server does not mark interim, with or without a status. An
+  // interim line (the session talking mid-turn; Stop + the cursor must stay),
+  // an approval prompt, or a sealed progress card (`done` closes one card,
+  // not the turn) does not end it.
+  const busy = turnInFlight(events, turnMark);
+  if (turnMark !== null && !busy) {
+    // Retire the finished turn's watermark (render-phase adjust) so its
+    // boundary aging out of the ring can never resurrect it.
+    setTurnMark(null);
+  }
+
   // ---- per-session status (model + effort + ctx%) --------------------------
-  const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
-  const busy = busyMark !== null && doneCount === busyMark;
   const lastEventTs = events.length > 0 ? events[events.length - 1]?.ts : undefined;
   useEffect(() => {
     let cancelled = false;
@@ -423,10 +450,13 @@ export default function SessionView({
         .filter(Boolean);
       const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
       pushRow({ kind: "user", content: shown });
-      setBusyMark(doneCount);
+      // The frames this tree RENDERED, not `eventsRef` — that ref catches up
+      // in an effect, and a send landing between a commit and its effects
+      // would anchor behind a boundary already on screen (ending busy at once).
+      setTurnMark({ after: events[events.length - 1] ?? null });
       setBusySince(Date.now());
       submitTurn(sid, content, attachments).catch((e) => {
-        setBusyMark(null);
+        setTurnMark(null);
         setBusySince(null);
         const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
@@ -435,7 +465,7 @@ export default function SessionView({
         });
       });
     },
-    [sid, pushRow, doneCount],
+    [sid, pushRow, events],
   );
 
   // ---- resolve a HITL approval prompt (gateway pending machinery) ----------

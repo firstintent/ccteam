@@ -27,6 +27,7 @@ import type {
   TurnUsage,
   VendorAvailability,
 } from '../shared/contract.js'
+import { isTurnBoundary } from '../shared/contract.js'
 
 /** The seven spawnable vendors, in display order. */
 export const VENDORS: readonly string[] = ['claude', 'codex', 'grok', 'opencode', 'kimi', 'pi', 'dsh']
@@ -107,12 +108,22 @@ export type ChatRow =
     lifecycle?: { state: string; reason?: string }
   }
 
-/** The in-flight assistant turn (narrative snapshot + structured steps). */
+/**
+ * The in-flight assistant turn (narrative snapshot + structured steps). An
+ * interim answer settles what came before it into its own row, so `live` is
+ * what happened since the session last said something.
+ */
 export interface LiveTurn {
   id: string
   content: string
   steps: Step[]
   startedAt: number
+  /**
+   * Item ids an interim answer already settled into its row this turn. Their
+   * late events belong to that row, not here; scoped to the turn because
+   * some vendors number tool calls per response, so ids repeat across turns.
+   */
+  settled?: string[]
 }
 
 /** Per-sid chat state. */
@@ -122,6 +133,14 @@ export interface ChatState {
   activity: Activity | undefined
   /** A choice prompt is pending (the working indicator yields to it). */
   waiting: boolean
+  /**
+   * Step ids of the turn that just ended, kept until a new turn is under way
+   * (a send, an interim answer or prompt, tool activity never seen before).
+   * Between turns a late event for one of them, a liveness pulse, or the
+   * card such a pulse folds into belongs to the ended turn and must not
+   * reopen a working turn. null before any turn ended in view.
+   */
+  ended: string[] | null
   loading: boolean
   loadingOlder: boolean
   error: string | null
@@ -337,6 +356,7 @@ const EMPTY_CHAT: ChatState = {
   live: null,
   activity: undefined,
   waiting: false,
+  ended: null,
   loading: false,
   loadingOlder: false,
   error: null,
@@ -397,12 +417,21 @@ export function rowFromTranscript(row: TranscriptRow): ChatRow {
   }
 }
 
+/** A row as the daemon has it on disk (neither optimistic nor settled from the stream). */
+function isCanonicalRow(row: ChatRow): boolean {
+  return (row.kind === 'user' && row.local !== true) || (row.kind === 'assistant' && row.ephemeral !== true)
+}
+
 /**
  * Reconcile a freshly loaded canonical page with what the chat already
- * shows: optimistic local user rows whose text arrived drop out; ephemeral
- * assistant rows settled from the stream hand their steps to the canonical
- * row carrying the same text and drop out; choice/system rows survive after
- * the canonical rows.
+ * shows. Provisional rows — optimistic local user rows and assistant rows
+ * settled from the stream — give way to the canonical row that says the same
+ * thing, handing over their steps (live-only knowledge). Every row with no
+ * canonical counterpart — a steps-only or file-only row, a pending choice, a
+ * lifecycle note, a message not on disk yet — keeps its PLACE, next to the
+ * row it followed: a later page must neither sink it under newer turns nor
+ * give its steps to another turn's answer. Canonical rows outside this page
+ * (paged in earlier) stay in front of it.
  */
 function reconcile(existing: ChatRow[], canonical: ChatRow[]): ChatRow[] {
   // Steps are live-only knowledge: a canonical row re-read from disk carries
@@ -416,41 +445,65 @@ function reconcile(existing: ChatRow[], canonical: ChatRow[]): ChatRow[] {
     const steps = rememberedSteps.get(row.id)
     return steps === undefined ? row : { ...row, steps }
   })
-  const canonicalUserTexts = new Set(rows.filter(r => r.kind === 'user').map(r => r.content))
-  const lastAssistantIndex = (() => {
-    for (let i = rows.length - 1; i >= 0; i -= 1) if (rows[i]!.kind === 'assistant') return i
-    return -1
-  })()
-  const tail: ChatRow[] = []
+  const pageIndex = new Map(rows.map((row, i) => [row.id, i]))
+  // A turn settles several provisional rows and short lines repeat
+  // ("Checking…", "Done."), so pair them from the newest end, each canonical
+  // row claimed once — and never one the chat already shows as itself.
+  const claimed = new Set<number>()
   for (const row of existing) {
-    if (row.kind === 'user') {
-      if (row.local === true && !canonicalUserTexts.has(row.content)) tail.push(row)
+    const at = isCanonicalRow(row) ? pageIndex.get(row.id) : undefined
+    if (at !== undefined) claimed.add(at)
+  }
+  const pairs = new Map<ChatRow, number>()
+  for (let e = existing.length - 1; e >= 0; e -= 1) {
+    const row = existing[e]!
+    const provisional = (row.kind === 'user' && row.local === true)
+      || (row.kind === 'assistant' && row.ephemeral === true && row.content !== '')
+    if (!provisional) continue
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const canon = rows[i]!
+      if (claimed.has(i) || canon.kind !== row.kind || canon.content !== row.content) continue
+      claimed.add(i)
+      pairs.set(row, i)
+      break
+    }
+  }
+  // Walk the chat in order: a matched row moves the anchor to its canonical
+  // place; an unmatched one is kept right after the anchor (or, before any
+  // match, right before the first one — else at the end, the newest place).
+  const front: ChatRow[] = []
+  const before = new Map<number, ChatRow[]>()
+  const after = new Map<number, ChatRow[]>()
+  let pending: ChatRow[] = []
+  let anchor: number | 'front' | null = null
+  for (const row of existing) {
+    const at = isCanonicalRow(row) ? pageIndex.get(row.id) : pairs.get(row)
+    if (at !== undefined) {
+      const canon = rows[at]!
+      if (row.kind === 'assistant' && row.ephemeral === true && row.steps.length > 0
+        && canon.kind === 'assistant' && canon.steps.length === 0) {
+        rows[at] = { ...canon, steps: row.steps }
+      }
+      if (pending.length > 0) before.set(at, [...(before.get(at) ?? []), ...pending])
+      pending = []
+      anchor = at
       continue
     }
-    if (row.kind === 'assistant') {
-      if (row.ephemeral !== true) continue
-      const target = rows.findIndex(r => r.kind === 'assistant' && r.content === row.content)
-      if (target !== -1) {
-        const canon = rows[target]!
-        if (canon.kind === 'assistant' && row.steps.length > 0 && canon.steps.length === 0) {
-          rows[target] = { ...canon, steps: row.steps }
-        }
-        continue
-      }
-      if (lastAssistantIndex !== -1 && row.steps.length > 0) {
-        const canon = rows[lastAssistantIndex]!
-        if (canon.kind === 'assistant' && canon.steps.length === 0 && row.content === '') {
-          rows[lastAssistantIndex] = { ...canon, steps: row.steps }
-          continue
-        }
-      }
-      tail.push(row)
+    if (isCanonicalRow(row)) {
+      front.push(row)
+      anchor = 'front'
       continue
     }
     if (row.kind === 'choice' && row.resolved !== undefined) continue
-    tail.push(row)
+    if (anchor === null) pending.push(row)
+    else if (anchor === 'front') front.push(row)
+    else after.set(anchor, [...(after.get(anchor) ?? []), row])
   }
-  return [...rows, ...tail]
+  const merged = front
+  rows.forEach((row, i) => {
+    merged.push(...(before.get(i) ?? []), row, ...(after.get(i) ?? []))
+  })
+  return [...merged, ...pending]
 }
 
 /** Lifecycle states worth a transcript row. */
@@ -472,29 +525,140 @@ function completeSteps(steps: Step[]): Step[] {
     : steps.map(s => (s.status === 'completed' ? s : { ...s, status: 'completed' }))
 }
 
+type AnswerEvent = Extract<SessionEvent, { kind: 'answer' }>
+type AssistantRow = Extract<ChatRow, { kind: 'assistant' }>
+
+/**
+ * An assistant row with nothing to show — no text, no attachment, no step —
+ * is not a row: a status-only closing frame (or history's empty closing row)
+ * must not leave an invisible entry in the transcript.
+ */
+function isBlankAssistant(row: ChatRow): boolean {
+  return row.kind === 'assistant'
+    && row.content === ''
+    && row.steps.length === 0
+    && (row.attachments === undefined || row.attachments.length === 0)
+}
+
+function answerRow(event: AnswerEvent, steps: Step[]): AssistantRow {
+  return {
+    kind: 'assistant',
+    id: `answer-${event.id}`,
+    content: event.content,
+    steps,
+    ephemeral: true,
+    ...(event.ts === undefined ? {} : { ts: event.ts }),
+    ...(event.attachments === undefined ? {} : { attachments: event.attachments }),
+  }
+}
+
+/**
+ * ACP's throttled liveness pulse (`{turn}-live-{kind}`, `pending-live-…` when
+ * no turn buffer is open): proof that bytes streamed, never that a new turn
+ * began.
+ */
+function isLivenessPulse(itemId: string): boolean {
+  return itemId.includes('-live-')
+}
+
+/** Index of the newest assistant row holding a step; -1 when none. */
+function stepRow(rows: ChatRow[], itemId: string): number {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i]!
+    if (row.kind === 'assistant' && row.steps.some(s => s.itemId === itemId)) return i
+  }
+  return -1
+}
+
+/**
+ * Something the session said mid-turn. It shows at once, carrying the steps
+ * that FINISHED before it (each on its own completion event — a running tool
+ * stays live however long it takes), and the turn keeps running: the working
+ * row, its timer and Stop stay up, the queued chip stays (the turn it waits
+ * behind is not over), and a pending choice keeps waiting on its human. The
+ * narrative snapshot is dropped with the settled steps — it described them,
+ * not what comes next.
+ */
+function settleInterim(chat: ChatState, event: AnswerEvent): ChatState {
+  const id = `answer-${event.id}`
+  if (chat.rows.some(r => r.id === id)) return chat
+  const done = chat.live === null ? [] : chat.live.steps.filter(s => s.status === 'completed')
+  const row = answerRow(event, done)
+  if (isBlankAssistant(row)) return chat
+  const live = chat.live === null
+    ? null
+    : {
+        ...chat.live,
+        content: '',
+        steps: chat.live.steps.filter(s => s.status !== 'completed'),
+        settled: [...(chat.live.settled ?? []), ...done.map(s => s.itemId)],
+      }
+  return { ...chat, rows: [...chat.rows, row], live, activity: 'working', ended: null }
+}
+
+/**
+ * A turn-ending answer. Whatever is still running settles here, and only
+ * here: its text (when it has any) is the final answer and takes those steps;
+ * an EMPTY one (the status-only closing frame) shows nothing of its own — the
+ * leftover steps become their own row, where the live block already showed
+ * them, and with none there is no row at all — and still ends the turn.
+ */
+function closeTurn(chat: ChatState, event: AnswerEvent): ChatState {
+  const notices = chat.notices.filter(notice => notice.kind !== 'queued')
+  const steps = chat.live === null ? [] : [...(chat.live.settled ?? []), ...chat.live.steps.map(s => s.itemId)]
+  const ended: ChatState = { ...chat, live: null, activity: 'idle', waiting: false, notices, ended: steps }
+  const id = `answer-${event.id}`
+  if (chat.rows.some(r => r.id === id)) return ended
+  const row = answerRow(event, chat.live === null ? [] : completeSteps(chat.live.steps))
+  return isBlankAssistant(row) ? ended : { ...ended, rows: [...chat.rows, row] }
+}
+
 function applySessionEvent(chat: ChatState, action: Extract<Action, { type: 'session_event' }>): ChatState {
   const event = action.event
   switch (event.kind) {
     case 'progress': {
-      const live: LiveTurn = chat.live ?? { id: `live-${action.now}`, content: '', steps: [], startedAt: action.now }
-      const nextLive: LiveTurn = {
-        ...live,
-        content: event.content !== '' ? event.content : live.content,
-        steps: event.done ? completeSteps(live.steps) : live.steps,
+      // A `done` card is only final — sealed mid-turn by a timer that fires
+      // whatever is running, or the turn's last card. It finishes no step,
+      // ends no turn and answers no pending choice.
+      if (event.done) {
+        if (chat.live === null || event.content === '' || event.content === chat.live.content) return chat
+        return { ...chat, live: { ...chat.live, content: event.content } }
       }
-      return { ...chat, live: nextLive, activity: event.done ? chat.activity : 'working', waiting: false }
+      // Between turns a card is what a stray pulse folded into, not a turn.
+      if (chat.live === null && chat.ended !== null) return chat
+      const live: LiveTurn = chat.live ?? { id: `live-${action.now}`, content: '', steps: [], startedAt: action.now }
+      const nextLive: LiveTurn = { ...live, content: event.content !== '' ? event.content : live.content }
+      return { ...chat, live: nextLive, activity: 'working', waiting: false }
     }
     case 'activity': {
+      // A step already settled into a row — by an interim answer this turn,
+      // or by the turn that just ended — is final: a late completion may
+      // refresh it there, but nothing turns it back into a spinner, copies it
+      // into the live turn, or reopens a working turn for it.
+      const itemId = event.step.itemId
+      const settled = chat.live === null
+        ? chat.ended?.includes(itemId) === true
+        : chat.live.settled?.includes(itemId) === true && !chat.live.steps.some(s => s.itemId === itemId)
+      if (settled) {
+        const at = stepRow(chat.rows, itemId)
+        const row = at === -1 ? undefined : chat.rows[at]
+        if (event.step.status !== 'completed' || row?.kind !== 'assistant') return chat
+        const rows = chat.rows.slice()
+        rows[at] = { ...row, steps: upsertStep(row.steps, event.step) }
+        return { ...chat, rows }
+      }
+      // Between turns a liveness pulse is the ended turn's stray, not a new one.
+      if (chat.live === null && chat.ended !== null && isLivenessPulse(itemId)) return chat
       const live: LiveTurn = chat.live ?? { id: `live-${action.now}`, content: '', steps: [], startedAt: action.now }
       return {
         ...chat,
         live: { ...live, steps: upsertStep(live.steps, event.step) },
         activity: 'working',
         waiting: false,
+        ended: null,
       }
     }
     case 'answer': {
-      const notices = chat.notices.filter(notice => notice.kind !== 'queued')
       if (event.options !== undefined && event.options.length > 0 && event.token !== undefined) {
         const row: ChatRow = {
           kind: 'choice',
@@ -504,20 +668,10 @@ function applySessionEvent(chat: ChatState, action: Extract<Action, { type: 'ses
           token: event.token,
         }
         if (chat.rows.some(r => r.id === row.id)) return chat
-        return { ...chat, rows: [...chat.rows, row], notices, activity: 'idle', waiting: true }
+        const notices = chat.notices.filter(notice => notice.kind !== 'queued')
+        return { ...chat, rows: [...chat.rows, row], notices, activity: 'idle', waiting: true, ended: null }
       }
-      const steps = chat.live === null ? [] : completeSteps(chat.live.steps)
-      const settled: ChatRow = {
-        kind: 'assistant',
-        id: `answer-${event.id}`,
-        content: event.content,
-        steps,
-        ephemeral: true,
-        ...(event.ts === undefined ? {} : { ts: event.ts }),
-        ...(event.attachments === undefined ? {} : { attachments: event.attachments }),
-      }
-      if (chat.rows.some(r => r.id === settled.id)) return { ...chat, live: null, activity: 'idle', waiting: false, notices }
-      return { ...chat, rows: [...chat.rows, settled], live: null, activity: 'idle', waiting: false, notices }
+      return isTurnBoundary(event) ? closeTurn(chat, event) : settleInterim(chat, event)
     }
     case 'lifecycle': {
       // Only transitions a reader must know about become rows; bookkeeping
@@ -675,7 +829,7 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
     }
     case 'history_loaded': {
       const chat = chatOf(state, action.sid)
-      const canonical = action.rows.map(rowFromTranscript)
+      const canonical = action.rows.map(rowFromTranscript).filter(row => !isBlankAssistant(row))
       if (action.older === true) {
         const known = new Set(chat.rows.map(r => r.id))
         const fresh = canonical.filter(r => !known.has(r.id))
@@ -689,13 +843,10 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       }
       // Rows already paged in (older than this page) stay in front of the page.
       const pageIds = new Set(canonical.map(r => r.id))
-      const isCanonical = (r: ChatRow): boolean =>
-        (r.kind === 'user' && r.local !== true) || (r.kind === 'assistant' && r.ephemeral !== true)
-      const paged = chat.rows.filter(r => isCanonical(r) && !pageIds.has(r.id))
-      const merged = reconcile(chat.rows.filter(r => !paged.includes(r)), canonical)
+      const paged = chat.rows.filter(r => isCanonicalRow(r) && !pageIds.has(r.id))
       return withChat(state, action.sid, {
         ...chat,
-        rows: [...paged, ...merged],
+        rows: reconcile(chat.rows, canonical),
         loading: false,
         error: null,
         ...(chat.nextBefore === undefined || paged.length === 0
@@ -722,7 +873,7 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
         ...(action.attachments === undefined || action.attachments.length === 0 ? {} : { attachments: action.attachments }),
       }
       return {
-        ...withChat(state, action.sid, { ...chat, rows: [...chat.rows, row], notices: [], waiting: false }),
+        ...withChat(state, action.sid, { ...chat, rows: [...chat.rows, row], notices: [], waiting: false, ended: null }),
         nextLocalId: state.nextLocalId + 1,
       }
     }
@@ -763,7 +914,7 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       return withChat(state, action.sid, {
         ...chat,
         rows,
-        ...(action.type === 'choice_resolved' ? { waiting: false, activity: 'working' as Activity } : {}),
+        ...(action.type === 'choice_resolved' ? { waiting: false, activity: 'working' as Activity, ended: null } : {}),
       })
     }
     case 'delegation': {

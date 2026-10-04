@@ -9,10 +9,10 @@
 //! - **No event_bus / security / config coupling.** ccteam-im has
 //!   its own credentials + ACL + sanitize layers; providers stay
 //!   plain reqwest clients.
-//! - **No Socket Mode / gateway WebSockets.** Slack + Discord both
-//!   use HTTP polling. Telegram uses `getUpdates` long-polling. None
-//!   of the V0.6 scope needs a public HTTPS endpoint, which keeps
-//!   ops surface to "edit credentials.json, run daemon".
+//! - **No public endpoint.** Every inbound path is outbound-initiated:
+//!   Telegram `getUpdates` long-polling, Lark and Slack (Socket Mode)
+//!   WebSocket long-connections, Discord HTTP polling — which keeps ops
+//!   surface to "edit credentials.json, run daemon".
 //!
 //! See `providers/mock.rs` for the in-memory test channel.
 
@@ -465,6 +465,34 @@ pub struct MessageOption {
     /// the SAME token-keyed pending the IM callback does, never a turn.
     #[serde(default)]
     pub id: String,
+    /// How prominently to present this option ([`OptionWeight`]). Pickers
+    /// leave it `Normal`; a session's controls mark their main actions and
+    /// the one that is easy to regret.
+    #[serde(default, skip_serializing_if = "OptionWeight::is_normal")]
+    pub weight: OptionWeight,
+}
+
+/// How prominently a channel should present one option. Channel-neutral: a
+/// provider maps it to whatever its buttons can do (Telegram: row layout;
+/// Slack: button style + a confirm step) and may ignore it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionWeight {
+    /// An ordinary option — every picker's.
+    #[default]
+    Normal,
+    /// A main action: as large / prominent as the channel allows.
+    Primary,
+    /// Easy to regret on a mis-tap (interrupt): kept small, and asks first
+    /// where the channel can.
+    Minor,
+}
+
+impl OptionWeight {
+    /// `serde` skip predicate: `Normal` is the default and stays off the wire.
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
 }
 
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
@@ -583,6 +611,29 @@ pub trait Channel: Send + Sync {
         None
     }
 
+    /// Whether this channel gives every agent session its own platform thread
+    /// (Slack). When `true`, the daemon hands each inbound message's
+    /// [`ChannelMessage::thread_ts`] to the gateway, which then scopes session
+    /// focus to the thread (one thread = one session) while ownership, ACL and
+    /// the current project stay per conversation. **Default `false`**: a
+    /// channel without that contract (Telegram, Lark, web) never passes a
+    /// thread, so its routing is exactly the single-stream behaviour.
+    fn session_threads(&self) -> bool {
+        false
+    }
+
+    /// Whether this channel renders [`SendMessage::options`] as tappable
+    /// buttons whose click comes back as a [`ChannelMessage::selection`]
+    /// (Telegram inline keyboard, Slack Block Kit). The daemon reports it to
+    /// the gateway ([`crate::gateway::Gateway::bind_channel_buttons`]), which
+    /// then delivers its pickers (`/projects`, `/sessions`) as text + buttons
+    /// instead of a plain list — so the gateway never names a platform.
+    /// **Default `false`**: Lark's picker card is not wired for these clicks,
+    /// web turns options into a choice-chip frame, and the mock reads text.
+    fn native_buttons(&self) -> bool {
+        false
+    }
+
     /// Edit a previously-sent message in place (V0.8.4 P1 — live progress
     /// status). Returns the platform message id (usually `message_id`
     /// unchanged). The **default degrades gracefully** to appending a new
@@ -617,7 +668,7 @@ pub trait Channel: Send + Sync {
     /// so there is no generic emoji argument). Returns an opaque `handle` the
     /// provider needs to remove it later (e.g. Feishu's `reaction_id`), or
     /// `None` when the provider clears a reaction by `(chat, message)` alone
-    /// (Telegram). **Default no-op `Ok(None)`** — web/discord/slack/mock/ws
+    /// (Telegram, Slack). **Default no-op `Ok(None)`** — web/discord/mock/ws
     /// keep it (reactions are an IM-only affordance), so they need no change.
     /// Fire-and-forget at the call site: a reaction failure must NEVER break or
     /// delay turn/answer delivery.
