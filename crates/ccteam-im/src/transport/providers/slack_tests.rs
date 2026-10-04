@@ -537,29 +537,37 @@ fn button_click_threads_on_the_clicked_messages_thread() {
 }
 
 #[test]
-fn a_few_options_render_as_one_row_of_buttons() {
-    let options = options(3);
+fn a_plain_picker_is_one_button_per_row_with_readable_labels() {
+    let mut options = options(3);
+    // The gateway pads labels with U+2800 to left-align Telegram buttons.
+    options[1].label = "💤 s676 claude (model)\u{2800}\u{2800}\u{2800}".into();
     let blocks = message_blocks("**bold** text", &options);
-    assert_eq!(blocks.len(), 2, "markdown + one actions row");
+    assert_eq!(blocks.len(), 4, "markdown + one row per option");
     assert_eq!(
         blocks[0],
         json!({ "type": "markdown", "text": "**bold** text" })
     );
-    let buttons = blocks[1]["elements"].as_array().unwrap();
-    assert_eq!(buttons.len(), 3);
-    assert_eq!(buttons[0]["type"], "button");
-    assert_eq!(buttons[2]["value"], "tok:2");
-    let ids: HashSet<&str> = buttons
+    for (row, block) in blocks[1..].iter().enumerate() {
+        let elements = block["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1, "row {row} holds one button");
+        assert_eq!(elements[0]["type"], "button");
+        assert_eq!(elements[0]["value"], format!("tok:{row}"));
+    }
+    assert_eq!(
+        blocks[2]["elements"][0]["text"]["text"], "💤 s676 claude (model)",
+        "title shown, padding gone"
+    );
+    let ids: HashSet<&str> = blocks[1..]
         .iter()
-        .map(|e| e["action_id"].as_str().unwrap())
+        .map(|b| b["elements"][0]["action_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids.len(), 3, "action_ids are unique within the message");
 
     assert!(message_blocks("", &[]).is_empty());
 }
 
-/// A long list (a project picker, model × effort) is a dropdown, not a wall
-/// of buttons; Slack caps one dropdown at 100 options.
+/// A list past 20 options is a dropdown, not a wall of buttons; Slack caps
+/// one dropdown at 100 options.
 #[test]
 fn many_options_render_as_a_dropdown() {
     let options: Vec<MessageOption> = (0..130)
@@ -1256,7 +1264,7 @@ async fn send_posts_a_markdown_block_with_buttons_into_the_thread() {
         json!({ "type": "markdown", "text": "**done**\n1. a\n2. b" })
     );
     assert_eq!(body["blocks"][1]["type"], "actions");
-    assert_eq!(body["blocks"][1]["elements"][1]["value"], "tok:1");
+    assert_eq!(body["blocks"][2]["elements"][0]["value"], "tok:1");
 }
 
 #[tokio::test]

@@ -73,8 +73,10 @@ const SLACK_MAX_ATTACHMENT_BYTES: u64 = 30 * 1024 * 1024;
 /// Reaction name of the 👀 "received, processing" ack.
 const SLACK_ACK_REACTION: &str = "eyes";
 
-/// More options than this render as a dropdown instead of buttons.
-const SLACK_MAX_BUTTONS: usize = 6;
+/// A picker longer than this renders as a dropdown instead of a list of
+/// buttons (Slack caps a message at 50 blocks; a list this long is better
+/// searched than scrolled).
+const SLACK_MAX_LIST_BUTTONS: usize = 20;
 
 /// Slack's cap on the options of one `static_select`.
 const SLACK_SELECT_MAX_OPTIONS: usize = 100;
@@ -545,29 +547,29 @@ fn decode_block_actions(payload: &Value) -> Option<ButtonClick> {
 }
 
 /// Blocks for one outbound message: a `markdown` block carrying `content`,
-/// then the options — as one row of buttons when there are a few, as a dropdown when there are more than
-/// [`SLACK_MAX_BUTTONS`] (a project list or a model × effort picker would
-/// otherwise bury the thread under a wall of buttons). Either way the
-/// option's opaque `data` comes back verbatim on click; `action_id`s are
-/// unique within the message as Slack requires.
+/// then the options. A plain picker (a project / session / model list) is
+/// one button per row — like Telegram, so every label (a session's title
+/// included) is readable at a glance — and a dropdown past
+/// [`SLACK_MAX_LIST_BUTTONS`]. Weighted options (a session's controls, the
+/// menu) are one row of buttons, styled by weight. Either way the option's
+/// opaque `data` comes back verbatim on click; `action_id`s are unique within
+/// the message as Slack requires.
 fn message_blocks(content: &str, options: &[MessageOption]) -> Vec<Value> {
     let mut blocks = Vec::new();
     if !content.is_empty() {
         blocks.push(json!({ "type": "markdown", "text": content }));
     }
-    if options.len() > SLACK_MAX_BUTTONS {
+    if options.is_empty() {
+        return blocks;
+    }
+    let weighted = options.iter().any(|o| o.weight != OptionWeight::Normal);
+    if !weighted && options.len() > SLACK_MAX_LIST_BUTTONS {
         for (index, chunk) in options.chunks(SLACK_SELECT_MAX_OPTIONS).enumerate() {
             let choices: Vec<Value> = chunk
                 .iter()
                 .map(|option| {
-                    let label: String = option
-                        .label
-                        .trim()
-                        .chars()
-                        .take(SLACK_BUTTON_LABEL_MAX_CHARS)
-                        .collect();
                     json!({
-                        "text": { "type": "plain_text", "text": label, "emoji": true },
+                        "text": { "type": "plain_text", "text": slack_label(option), "emoji": true },
                         "value": option.data,
                     })
                 })
@@ -584,48 +586,70 @@ fn message_blocks(content: &str, options: &[MessageOption]) -> Vec<Value> {
         }
         return blocks;
     }
-    if options.is_empty() {
-        return blocks;
-    }
     let buttons: Vec<Value> = options
         .iter()
         .enumerate()
-        .map(|(index, option)| {
-            let label: String = option
-                .label
-                .chars()
-                .take(SLACK_BUTTON_LABEL_MAX_CHARS)
-                .collect();
-            let label = if label.trim().is_empty() {
-                format!("{}", index + 1)
-            } else {
-                label
-            };
-            let mut button = json!({
-                "type": "button",
-                "text": { "type": "plain_text", "text": label, "emoji": true },
-                "value": option.data,
-                "action_id": format!("ccteam_opt_{index}"),
-            });
-            // Slack cannot size a button: a main action gets the highlighted
-            // style, one that is easy to regret asks before it acts.
-            match option.weight {
-                OptionWeight::Primary => button["style"] = json!("primary"),
-                OptionWeight::Minor => {
-                    button["confirm"] = json!({
-                        "title": { "type": "plain_text", "text": "确认" },
-                        "text": { "type": "plain_text", "text": format!("{} — 确定吗?", label.trim()) },
-                        "confirm": { "type": "plain_text", "text": "确定" },
-                        "deny": { "type": "plain_text", "text": "取消" },
-                    });
-                }
-                OptionWeight::Normal => {}
-            }
-            button
-        })
+        .map(|(index, option)| slack_button(index, option))
         .collect();
-    blocks.push(json!({ "type": "actions", "elements": buttons }));
+    if weighted {
+        blocks.push(json!({ "type": "actions", "elements": buttons }));
+    } else {
+        // One `actions` block per button: Slack wraps buttons side by side
+        // otherwise, and a list reads top to bottom.
+        blocks.extend(
+            buttons
+                .into_iter()
+                .map(|button| json!({ "type": "actions", "elements": [button] })),
+        );
+    }
     blocks
+}
+
+/// An option's label as Slack shows it: trimmed (including the invisible
+/// U+2800 padding the gateway adds to left-align Telegram's buttons), capped
+/// at Slack's 75 characters, and never blank.
+fn slack_label(option: &MessageOption) -> String {
+    let label: String = option
+        .label
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{2800}')
+        .chars()
+        .take(SLACK_BUTTON_LABEL_MAX_CHARS)
+        .collect();
+    if label.is_empty() {
+        option
+            .data
+            .chars()
+            .take(SLACK_BUTTON_LABEL_MAX_CHARS)
+            .collect()
+    } else {
+        label
+    }
+}
+
+/// One option as a Slack button. Slack cannot size a button: a main action
+/// gets the highlighted style, one that is easy to regret asks before it
+/// acts.
+fn slack_button(index: usize, option: &MessageOption) -> Value {
+    let label = slack_label(option);
+    let mut button = json!({
+        "type": "button",
+        "text": { "type": "plain_text", "text": label, "emoji": true },
+        "value": option.data,
+        "action_id": format!("ccteam_opt_{index}"),
+    });
+    match option.weight {
+        OptionWeight::Primary => button["style"] = json!("primary"),
+        OptionWeight::Minor => {
+            button["confirm"] = json!({
+                "title": { "type": "plain_text", "text": "确认" },
+                "text": { "type": "plain_text", "text": format!("{label} — 确定吗?") },
+                "confirm": { "type": "plain_text", "text": "确定" },
+                "deny": { "type": "plain_text", "text": "取消" },
+            });
+        }
+        OptionWeight::Normal => {}
+    }
+    button
 }
 
 /// `chat.postMessage` body. `rich` = Markdown block + buttons; plain = the
