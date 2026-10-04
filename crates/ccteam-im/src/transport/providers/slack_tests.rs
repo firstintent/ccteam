@@ -1419,3 +1419,99 @@ async fn health_check_follows_auth_test() {
     let bad = MockHttp::start_sync(|_| api_err("invalid_auth")).await;
     assert!(!channel(&bad.base, &[]).health_check().await);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `!` stands in for `/` (Slack swallows `/…`, and app slash commands cannot
+// run in threads)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_bang_command_reaches_the_gateway_as_a_slash_command() {
+    let as_text = |text: &str| {
+        decode_message_event(&msg_event(ALLOWED, "C1", "channel", "5.5", text), &bot())
+            .unwrap()
+            .text
+    };
+    assert_eq!(as_text("!model"), "/model");
+    assert_eq!(as_text("!status"), "/status");
+    assert_eq!(as_text("!new codex"), "/new codex");
+    assert_eq!(
+        as_text(" /compact"),
+        "/compact",
+        "the leading-space form still works"
+    );
+    assert_eq!(as_text("!!! nice"), "!!! nice", "prose stays prose");
+    assert_eq!(as_text("! ok"), "! ok");
+    assert_eq!(
+        as_text("hello !status"),
+        "hello !status",
+        "only at the start"
+    );
+}
+
+#[test]
+fn replies_name_ccteam_commands_with_the_bang_sigil() {
+    let names: Vec<String> = ["status", "sessions", "use", "stop", "cd"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let rw = |t: &str| rewrite_command_sigils(t, &names);
+    assert_eq!(
+        rw("created s1\n↓ 查看状态 → /status"),
+        "created s1\n↓ 查看状态 → !status"
+    );
+    assert_eq!(
+        rw("无当前会话 —— /use <id> 选一个驱动(/sessions 看全部)"),
+        "无当前会话 —— !use <id> 选一个驱动(!sessions 看全部)"
+    );
+    assert_eq!(rw("run `/stop s3` now"), "run `!stop s3` now");
+    assert_eq!(
+        rw("see /home/stop and /status.json"),
+        "see /home/stop and /status.json"
+    );
+    assert_eq!(
+        rw("/stopped /cd-x"),
+        "/stopped /cd-x",
+        "only whole command names"
+    );
+    assert_eq!(
+        rw("/model and /compact"),
+        "/model and /compact",
+        "not ccteam commands"
+    );
+    assert_eq!(
+        rw("```\n/status\n```\nthen /status."),
+        "```\n/status\n```\nthen !status.",
+        "fenced code is verbatim"
+    );
+}
+
+#[tokio::test]
+async fn sends_use_the_registered_command_names() {
+    let api = MockHttp::start_sync(default_api).await;
+    let ch = channel(&api.base, &[]);
+    // Before the daemon registers the gateway's commands nothing is rewritten.
+    ch.send(&SendMessage::new("→ /status", "C1")).await.unwrap();
+    ch.register_commands(&[
+        CommandSpec {
+            name: "/status".into(),
+            description: "fleet health".into(),
+        },
+        CommandSpec {
+            name: "/sessions".into(),
+            description: "list".into(),
+        },
+    ])
+    .await
+    .unwrap();
+    ch.send(&SendMessage::new("→ /status · /sessions", "C1"))
+        .await
+        .unwrap();
+    ch.edit_message("C1", "9.9", "card → /status")
+        .await
+        .unwrap();
+    let posts = api.calls("chat.postMessage");
+    assert_eq!(posts[0].json()["text"], "→ /status");
+    assert_eq!(posts[1].json()["text"], "→ !status · !sessions");
+    assert_eq!(api.calls("chat.update")[0].json()["text"], "card → !status");
+}

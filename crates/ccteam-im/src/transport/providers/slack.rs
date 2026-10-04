@@ -54,7 +54,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use crate::onboarding::{client_for_api_base, SLACK_API_BASE};
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, MessageOption, OutboundFile, RejectedSenderNotifier,
+    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OutboundFile, RejectedSenderNotifier,
     RejectedSenderProbe, SendMessage,
 };
 
@@ -288,7 +288,7 @@ fn decode_message_event(event: &Value, bot: &BotIdentity) -> Option<DecodedMessa
     // user typed stays text. `trim` (not just `trim_end`) is what lets
     // ` /status` — typed with a leading space to get past Slack's own slash
     // interception — reach the gateway as the `/status` command.
-    let text = unescape_entities(&stripped).trim().to_string();
+    let text = command_from_sigil(unescape_entities(&stripped).trim().to_string());
 
     let files: Vec<PendingFile> = event
         .get("files")
@@ -411,6 +411,81 @@ fn slash_content(text: &str) -> String {
         text
     } else {
         format!("/{text}")
+    }
+}
+
+/// The character a Slack user starts a ccteam command with. Slack keeps `/`
+/// for itself — it swallows any message that starts with one, and an app's
+/// own slash command cannot run inside a thread at all — so `!status`,
+/// `!model`, `!compact` stand in for `/status` & co. everywhere on Slack, in a
+/// session's thread included.
+const COMMAND_SIGIL: char = '!';
+
+/// `!word …` → `/word …` (a letter must follow, so `!!!` or `! wow` stay
+/// prose); anything else unchanged.
+fn command_from_sigil(text: String) -> String {
+    let mut chars = text.chars();
+    if chars.next() == Some(COMMAND_SIGIL) && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        format!("/{}", &text[COMMAND_SIGIL.len_utf8()..])
+    } else {
+        text
+    }
+}
+
+/// Rewrite references to ccteam's own commands (`names`, without the `/`)
+/// from `/name` to `!name`, so a hint like `→ /status` names what a Slack user
+/// can actually type. Only a `/` that starts a token is touched, and only when
+/// the whole word is one of `names` (`/home/stop`, `/status.json`, `/stopped`
+/// stay as they are); fenced code blocks are left verbatim.
+fn rewrite_command_sigils(text: &str, names: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+        } else if in_fence {
+            out.push_str(line);
+        } else {
+            rewrite_line_sigils(line, names, &mut out);
+        }
+    }
+    out
+}
+
+fn rewrite_line_sigils(line: &str, names: &[String], out: &mut String) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_token = i == 0
+            || chars[i - 1].is_whitespace()
+            || matches!(
+                chars[i - 1],
+                '(' | '[' | '`' | '"' | '\'' | '「' | '“' | '：' | ':'
+            );
+        if c == '/' && starts_token {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let word: String = chars[i + 1..j].iter().collect();
+            let whole_word = match chars.get(j) {
+                None => true,
+                Some('/') | Some('-') => false,
+                Some('.') => !chars.get(j + 1).is_some_and(|n| n.is_alphanumeric()),
+                Some(_) => true,
+            };
+            if whole_word && names.contains(&word) {
+                out.push(COMMAND_SIGIL);
+                out.push_str(&word);
+                i = j;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
     }
 }
 
@@ -620,6 +695,9 @@ pub struct SlackChannel {
     /// [`RejectedSenderNotifier`], which appends the same probe itself.
     probe_path: Option<PathBuf>,
     rejected_senders: RejectedSenderNotifier,
+    /// ccteam's own command names (no `/`), as the daemon registers them —
+    /// what [`rewrite_command_sigils`] turns into `!name` on the way out.
+    command_names: RwLock<Vec<String>>,
     name: String,
 }
 
@@ -639,8 +717,23 @@ impl SlackChannel {
             staging_dir: inbound_staging_dir(),
             probe_path: None,
             rejected_senders: RejectedSenderNotifier::default(),
+            command_names: RwLock::new(Vec::new()),
             name: "slack".to_string(),
         }
+    }
+
+    /// [`rewrite_command_sigils`] with the registered names; `None` when
+    /// nothing changes.
+    async fn localize_commands(&self, text: &str) -> Option<String> {
+        if !text.contains('/') {
+            return None;
+        }
+        let names = self.command_names.read().await;
+        if names.is_empty() {
+            return None;
+        }
+        let out = rewrite_command_sigils(text, &names);
+        (out != text).then_some(out)
     }
 
     fn http_for(api_base: &str) -> reqwest::Client {
@@ -1325,6 +1418,17 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let localized;
+        let message = match self.localize_commands(&message.content).await {
+            Some(content) => {
+                localized = SendMessage {
+                    content,
+                    ..message.clone()
+                };
+                &localized
+            }
+            None => message,
+        };
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
         }
@@ -1360,6 +1464,17 @@ impl Channel for SlackChannel {
         true
     }
 
+    /// Slack has no command menu to fill; it keeps the names so replies can
+    /// point at `!name` instead of a `/name` Slack would swallow.
+    async fn register_commands(&self, cmds: &[CommandSpec]) -> anyhow::Result<()> {
+        *self.command_names.write().await = cmds
+            .iter()
+            .map(|c| c.name.trim_start_matches('/').to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        Ok(())
+    }
+
     fn native_buttons(&self) -> bool {
         true
     }
@@ -1370,6 +1485,8 @@ impl Channel for SlackChannel {
         message_id: &str,
         content: &str,
     ) -> anyhow::Result<Option<String>> {
+        let localized = self.localize_commands(content).await;
+        let content = localized.as_deref().unwrap_or(content);
         let rich = update_body(recipient, message_id, content, true);
         match self.call_bot("chat.update", ApiBody::Json(&rich)).await {
             Ok(_) => {}
