@@ -653,6 +653,144 @@ async fn chat_id_start_without_token_is_400() {
 }
 
 // --------------------------------------------------------------------------
+// Slack guided setup — create link, sender capture, allowlist-only update
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slack_manifest_comes_with_a_one_click_create_link() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+
+    let v: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/config/im/slack/app-manifest?name=My%20Team%20Bot"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let manifest = v.get("manifest").unwrap();
+    assert_eq!(manifest["display_information"]["name"], "My Team Bot");
+    assert_eq!(
+        manifest["features"]["bot_user"]["display_name"],
+        "my-team-bot"
+    );
+    assert_eq!(manifest["settings"]["socket_mode_enabled"], true);
+    assert_eq!(
+        manifest["features"]["slash_commands"][0]["command"], "/my-team-bot",
+        "the slash command follows the app name"
+    );
+
+    let create = reqwest::Url::parse(v["create_url"].as_str().unwrap()).unwrap();
+    assert_eq!(create.host_str(), Some("api.slack.com"));
+    let query: std::collections::HashMap<String, String> =
+        create.query_pairs().into_owned().collect();
+    assert_eq!(query.get("new_app").map(String::as_str), Some("1"));
+    let embedded: Value = serde_json::from_str(&query["manifest_json"]).unwrap();
+    assert_eq!(
+        &embedded, manifest,
+        "the link carries exactly the manifest shown"
+    );
+}
+
+#[tokio::test]
+async fn slack_allowed_users_update_keeps_the_tokens() {
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+    let url = format!("http://{addr}/api/v1/config/im/slack/allowed-users");
+
+    // No Slack app yet → nothing to bind to.
+    let r = client()
+        .put(&url)
+        .json(&serde_json::json!({"allowed_user_ids": ["U1"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    credentials::save(
+        &creds_path,
+        &Credentials {
+            slack: Some(SlackCreds {
+                bot_token: "xoxb-keep".into(),
+                app_token: "xapp-keep".into(),
+                allowed_user_ids: vec![],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let r = client()
+        .put(&url)
+        .json(&serde_json::json!({"allowed_user_ids": [" U0ALICE ", "", "U0BOB"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let saved = credentials::load(Some(&creds_path)).unwrap().slack.unwrap();
+    assert_eq!(saved.allowed_user_ids, vec!["U0ALICE", "U0BOB"]);
+    assert_eq!(saved.bot_token, "xoxb-keep");
+    assert_eq!(saved.app_token, "xapp-keep");
+}
+
+#[tokio::test]
+async fn slack_user_id_candidates_are_the_global_bots_rejected_senders() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let probe_dir = paths.im_state_dir();
+    std::fs::create_dir_all(&probe_dir).unwrap();
+    let probe = |channel: &str, sender: &str, ts: u64| {
+        serde_json::json!({
+            "channel": channel,
+            "sender_id": sender,
+            "chat_id": "D0DM",
+            "message_id": format!("{ts}.000100"),
+            "timestamp": ts,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        probe_dir.join("rejected-senders.jsonl"),
+        [
+            probe("slack", "U0OLD", 100),
+            probe("telegram", "339", 150),
+            probe("slack@u1", "U0TENANT", 160),
+            probe("slack", "U0NEW", 200),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let (state, _) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+
+    let v: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/config/im/slack/user-id-candidates?since=150"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = v["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["sender_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["U0NEW"],
+        "only the global Slack bot, since the cutoff"
+    );
+}
+
+// --------------------------------------------------------------------------
 // Web-token gate
 // --------------------------------------------------------------------------
 

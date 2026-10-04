@@ -472,7 +472,7 @@ fn last4(s: &str) -> String {
     chars[start..].iter().collect()
 }
 
-fn probe_path(app: &AppState) -> std::path::PathBuf {
+pub(crate) fn probe_path(app: &AppState) -> std::path::PathBuf {
     app.paths.im_state_dir().join("rejected-senders.jsonl")
 }
 
@@ -480,7 +480,7 @@ fn probe_path(app: &AppState) -> std::path::PathBuf {
 /// sender and capped. One reader for every platform: the daemon writes a single
 /// `RejectedSenderProbe` shape, so Lark `open_id` discovery and Telegram
 /// `chat_id` discovery differ only in the `channel` key passed in.
-fn read_sender_candidates(
+pub(crate) fn read_sender_candidates(
     path: &std::path::Path,
     channel: &str,
     since: Option<u64>,

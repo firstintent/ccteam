@@ -14,6 +14,9 @@ import {
   pollTelegramChatId,
   saveLark,
   saveSlack,
+  getSlackAppManifest,
+  getSlackUserIdCandidates,
+  putSlackAllowedUsers,
   saveTelegramToken,
   startTelegramChatId,
 } from "./configApi";
@@ -257,6 +260,37 @@ describe("configApi", () => {
     });
     expect(got.team).toBe("Acme");
     expect(got.bot_user).toBe("ccteam");
+  });
+
+  it("getSlackAppManifest asks for the named app's manifest + create link", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { manifest: { display_information: { name: "cct2" } }, create_url: "https://api.slack.com/apps?new_app=1" }),
+    );
+    const got = await getSlackAppManifest("cct 2");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/config/im/slack/app-manifest?name=cct%202");
+    expect(got.create_url).toContain("new_app=1");
+  });
+
+  it("putSlackAllowedUsers replaces only the member-id allowlist", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { ok: true, allowed_user_ids: ["U1"], restart_required: false, note: "ok" }),
+    );
+    await putSlackAllowedUsers(["U1"]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/config/im/slack/allowed-users");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ allowed_user_ids: ["U1"] });
+  });
+
+  it("getSlackUserIdCandidates polls the global bot's rejected senders since a cutoff", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { candidates: [] }));
+    await getSlackUserIdCandidates(1700);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/v1/config/im/slack/user-id-candidates?since=1700",
+    );
   });
 
   it("saveSlack surfaces the server {error} on 400 (rejected token)", async () => {

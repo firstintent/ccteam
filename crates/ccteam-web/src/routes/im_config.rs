@@ -742,6 +742,150 @@ pub(crate) async fn handle_put_slack(
 }
 
 // --------------------------------------------------------------------------
+// Slack guided setup: create the app from a link, capture who to allow
+// --------------------------------------------------------------------------
+
+/// `GET /config/im/slack/app-manifest` query.
+#[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct SlackManifestQuery {
+    /// The Slack app's display name (default `ccteam`).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `GET /config/im/slack/app-manifest` response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SlackManifestResponse {
+    /// The app manifest ccteam needs (JSON — Slack's manifest editor takes it
+    /// as is).
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
+    /// Opens Slack's "create app" flow with the manifest filled in.
+    pub create_url: String,
+}
+
+/// `GET /api/v1/config/im/slack/app-manifest` — the manifest for a new Slack
+/// app and a one-click link that creates it, so setup never starts from a
+/// hand-copied YAML. The manifest's one home is
+/// [`ccteam_im::onboarding::slack_app_manifest`].
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/im/slack/app-manifest",
+    tag = "config",
+    params(SlackManifestQuery),
+    responses(
+        (status = 200, description = "Manifest + create-app link", body = SlackManifestResponse),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_get_slack_manifest(
+    Extension(identity): Extension<Identity>,
+    axum::extract::Query(query): axum::extract::Query<SlackManifestQuery>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let name = query.name.unwrap_or_default();
+    Json(SlackManifestResponse {
+        manifest: ccteam_im::onboarding::slack_app_manifest(&name),
+        create_url: ccteam_im::onboarding::slack_create_app_url(&name),
+    })
+    .into_response()
+}
+
+/// `GET /api/v1/config/im/slack/user-id-candidates` — Slack member ids the
+/// global Slack bot saw and REJECTED (not on its allowlist yet), newest
+/// first. The setup card polls it after the tokens are saved: DM the bot,
+/// your own `U…` appears, one click allows it. The rejected messages reached
+/// no agent.
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/im/slack/user-id-candidates",
+    tag = "config",
+    params(("since" = Option<u64>, Query, description = "Only candidates at/after this Unix timestamp")),
+    responses(
+        (status = 200, description = "Recent rejected Slack senders", body = super::users::SenderCandidatesResponse),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_get_slack_user_id_candidates(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    axum::extract::Query(query): axum::extract::Query<super::users::CandidateQuery>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    Json(super::users::SenderCandidatesResponse {
+        candidates: super::users::read_sender_candidates(
+            &super::users::probe_path(&app),
+            "slack",
+            query.since,
+        ),
+    })
+    .into_response()
+}
+
+/// `PUT /config/im/slack/allowed-users` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SlackAllowedUsersForm {
+    /// The full desired allowlist of Slack member ids (`U…`).
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
+/// `PUT /api/v1/config/im/slack/allowed-users` — replace only the Slack
+/// allowlist (also the owner roster) of the configured app. The tokens are
+/// never echoed, so binding a member id must not require re-entering them.
+#[utoipa::path(
+    put,
+    path = "/api/v1/config/im/slack/allowed-users",
+    tag = "config",
+    request_body(content = SlackAllowedUsersForm, description = "Full desired allowed_user_ids list"),
+    responses(
+        (status = 200, description = "Allowlist saved; `{ok, allowed_user_ids, reloaded, note}`", body = serde_json::Value),
+        (status = 400, description = "No Slack app configured yet"),
+        (status = 403, description = "Not an admin"),
+    ),
+)]
+pub(crate) async fn handle_put_slack_allowed_users(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(form): Json<SlackAllowedUsersForm>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let mut creds = match load_creds(&app) {
+        Ok(c) => c,
+        Err(e) => return json_500(e),
+    };
+    let Some(slack) = creds.slack.as_mut() else {
+        return json_400("no Slack app configured; save the bot and app-level tokens first".into());
+    };
+    let mut ids: Vec<String> = form
+        .allowed_user_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.dedup();
+    slack.allowed_user_ids = ids.clone();
+    if let Err(e) = save_creds(&app, &creds) {
+        return json_500(e);
+    }
+    let reloaded = nudge_im_reload(&app).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "allowed_user_ids": ids,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+        "note": reload_note(reloaded),
+    }))
+    .into_response()
+}
+
+// --------------------------------------------------------------------------
 // Test-only seam: drive the async poll against a mock base
 // --------------------------------------------------------------------------
 

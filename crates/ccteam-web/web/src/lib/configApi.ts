@@ -22,6 +22,8 @@
 // (e.g. "Telegram token rejected: ..."), so we surface that text rather
 // than a bare "HTTP 400".
 
+import type { SenderCandidatesResponse } from "./usersApi";
+
 /** Masked Telegram status (`im_config::TelegramStatus`). No token field. */
 export interface TelegramStatus {
   /** Always `true` when present (a block exists on disk). */
@@ -250,4 +252,48 @@ export function saveLark(input: LarkSaveInput): Promise<LarkSaveResult> {
  *  `apps.connections.open`) + persist. 400 surfaces the validator's reason. */
 export function saveSlack(input: SlackSaveInput): Promise<SlackSaveResult> {
   return putJson<SlackSaveResult>("/api/v1/config/im/slack", input);
+}
+
+/** `GET /config/im/slack/app-manifest` response: the manifest a new ccteam
+ *  Slack app needs + a link that opens Slack's create-app flow with it. */
+export interface SlackManifestResult {
+  manifest: Record<string, unknown>;
+  create_url: string;
+}
+
+/** `GET /api/v1/config/im/slack/app-manifest?name=` — the manifest for an
+ *  app called `name` (its slash command is `/` + the name) and a one-click
+ *  create link, so setup never starts from a hand-copied YAML. */
+export function getSlackAppManifest(name: string): Promise<SlackManifestResult> {
+  return getJson<SlackManifestResult>(
+    `/api/v1/config/im/slack/app-manifest?name=${encodeURIComponent(name)}`,
+  );
+}
+
+/** `GET /api/v1/config/im/slack/user-id-candidates` — poll while binding:
+ *  DM the bot and your own `U…` shows up here. Those messages reached no
+ *  agent. Same candidate shape as the tenant capture endpoints. */
+export function getSlackUserIdCandidates(
+  since?: number,
+): Promise<SenderCandidatesResponse> {
+  const qs = since ? `?since=${encodeURIComponent(String(since))}` : "";
+  return getJson<SenderCandidatesResponse>(
+    `/api/v1/config/im/slack/user-id-candidates${qs}`,
+  );
+}
+
+/** `PUT /config/im/slack/allowed-users` success body. */
+export interface SlackAllowedUsersResult {
+  ok: boolean;
+  allowed_user_ids: string[];
+  restart_required: boolean;
+  note: string;
+}
+
+/** `PUT /api/v1/config/im/slack/allowed-users` — replace only the member-id
+ *  allowlist (also the owner roster); the tokens stay as saved. */
+export function putSlackAllowedUsers(ids: string[]): Promise<SlackAllowedUsersResult> {
+  return putJson<SlackAllowedUsersResult>("/api/v1/config/im/slack/allowed-users", {
+    allowed_user_ids: ids,
+  });
 }
