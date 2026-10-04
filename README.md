@@ -35,7 +35,7 @@ ccteam is the connective tissue they lack — identity, routing, delivery guaran
 
 **1 · Remote control from Telegram / Lark / Slack**
 
-Paste a bot token once (Settings → Access) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast. On Slack every session gets **its own thread**: a top-level message starts a session, a reply in its thread talks only to it, so parallel sessions never interleave (commands go through the app's slash command, `/ccteam` by default; Settings → Access creates the Slack app for you in one click):
+Paste a bot token once (Settings → Access) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast. On Slack every session gets **its own thread**: a top-level message starts a session, a reply in its thread talks only to it, so parallel sessions never interleave (commands start with `!` there — `!status`, `!model` — since Slack keeps `/` for itself; Settings → Access creates the Slack app for you in one click):
 
 ```text
 /cd demo                        # pick a project; your next message talks to it

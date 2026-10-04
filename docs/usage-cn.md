@@ -291,12 +291,12 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 - **顶层消息**开一个新线程;没有会话的线程里第一条普通消息会在本频道当前项目里新建一个 roleless 会话(与 Telegram 新 chat 首条消息同一条路)。再发一条顶层消息,第二个会话就与第一个并行。
 - **线程内回复**只发给该线程的会话。该会话产生的一切——回答、实时进度卡、审批按钮、文件、委派回报后的回答——都进它自己的线程。
 - 归属与当前项目以**频道**为单位:在任一线程里 `/cd` 会切换整个频道的项目(该线程的会话若不在新项目里,线程即释放,下一条消息在新项目里新建会话),`/sessions` 列出频道拥有的全部会话。一个会话**同一时刻只住一个线程**:在线程里 `/use <sid>`(或 `@<handle>`)会把该会话搬进这个线程,它离开的线程会收到提示(在那里再发消息会新建会话);线程里 `/new …` 在该线程新建会话。
-- Slack 会拦截以 `/` 开头的消息,所以网关命令走 App 的**斜杠命令**(名为 ccteam 的 App 是 `/ccteam`,名为 cct2 的是 `/cct2`):`/ccteam new codex`、`/ccteam sessions`、`/ccteam cd demo`。ccteam 会先发一条锚点消息并在它的线程里回复——`/ccteam new codex` 就把新 codex 会话建在这个新线程里,`/ccteam use s12` 则把已有会话搬进一个新线程。在线程里给该会话发命令,前面加一个空格(` /status`、` /compact`)。
-- 由其他 agent 雇来的会话没有自己的线程;想跟它说话就 `/ccteam use <sid>` 给它开一个。
+- **Slack 上命令用 `!` 开头**。Slack 把 `/` 留给自己(以 `/` 开头的消息都会被它拦下,App 的斜杠命令在线程里根本不能用),所以 Telegram 里打 `/` 的地方在 Slack 打 `!`:会话线程里发 `!status`、`!model`、`!compact`、`!interrupt` 作用于该会话;顶层发 `!projects`、`!cd demo`、`!sessions`、`!new codex` 会开一个线程回复——`!new codex` 就把新 codex 会话建在这个线程里,`!use s12` 则把已有会话搬进来。ccteam 自己回复里提到的命令也写成这样(`→ !status`)。App 的斜杠命令(`/ccteam`,名为 cct2 的 App 是 `/cct2`)在频道里同样可用。
+- 由其他 agent 雇来的会话没有自己的线程;想跟它说话就在顶层发 `!use <sid>` 给它开一个。
 
 ### 网关命令
 
-聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。Slack 上用 App 的斜杠命令发,如 `/ccteam <命令>`(线程里则在命令前加一个空格),见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程)。
+聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。Slack 上把 `/` 换成 `!`(`!status`、`!model`),见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程)。
 
 ```text
 # 项目
