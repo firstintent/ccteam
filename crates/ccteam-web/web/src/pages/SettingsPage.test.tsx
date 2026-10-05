@@ -36,6 +36,7 @@ describe("Settings sections", () => {
           configured: true,
           bot_token_last4: "…wxyz",
           chat_id_count: 1,
+          allowed_chat_ids: ["42"],
           require_mention: false,
         }}
         onSaved={() => {}}
@@ -83,6 +84,7 @@ describe("Settings sections", () => {
           app_id_last4: "…cli9",
           use_feishu: true,
           allowed_user_id_count: 2,
+          allowed_user_ids: ["ou_1", "ou_2"],
           require_mention: true,
         }}
         onSaved={() => {}}
@@ -246,6 +248,7 @@ const telegramStatus = (require_mention: boolean): NonNullable<ImConfigStatus["t
   configured: true,
   bot_token_last4: "…wxyz",
   chat_id_count: 1,
+  allowed_chat_ids: ["42"],
   require_mention,
 });
 const larkStatus = (require_mention: boolean): NonNullable<ImConfigStatus["lark"]> => ({
@@ -253,6 +256,7 @@ const larkStatus = (require_mention: boolean): NonNullable<ImConfigStatus["lark"
   app_id_last4: "…cli9",
   use_feishu: true,
   allowed_user_id_count: 2,
+  allowed_user_ids: ["ou_1", "ou_2"],
   require_mention,
 });
 const slackStatus = (require_mention: boolean): NonNullable<ImConfigStatus["slack"]> => ({
@@ -412,6 +416,38 @@ describe("require @-mention switch", () => {
     expect(switchOf("my-im-slack-require-mention")!.getAttribute("aria-checked")).toBe("true");
     await act(async () => switchOf("my-im-lark-require-mention")!.click());
     expect(String(putCalls()[0][0])).toBe("/api/v1/me/im/lark/require-mention");
+  });
+
+  it("tenant cards: a reload shows what is saved — fingerprints and the bound allowlists", async () => {
+    globalThis.fetch = fetchFor({
+      telegram: telegramStatus(false),
+      lark: larkStatus(false),
+      slack: slackStatus(false),
+      transport_warning: "",
+    });
+    await mount(<MyImSection />);
+    const text = (id: string) => container.querySelector(`[data-testid="${id}"]`)?.textContent ?? "";
+    expect(text("my-im-telegram-saved")).toContain("…wxyz");
+    expect(text("my-im-lark-saved")).toContain("…cli9");
+    expect(text("my-im-slack-saved")).toContain("…bot1");
+    expect(text("my-im-slack-saved")).toContain("…app1");
+    // The allowlist editors start from the saved lists (the PUTs replace the
+    // whole list), and the tokens are still never echoed back.
+    expect(text("my-im-telegram-bind")).toContain("42");
+    const field = (id: string) => container.querySelector<HTMLTextAreaElement>(`#${id}`)!.value;
+    expect(field("my-im-lark-users")).toBe("ou_1\nou_2");
+    expect(field("my-im-slack-users")).toBe("U0ALICE");
+    expect(field("my-im-slack-bot-token")).toBe("");
+    expect(field("my-im-slack-app-token")).toBe("");
+  });
+
+  it("tenant cards: nothing saved → no saved line and empty allowlists", async () => {
+    globalThis.fetch = fetchFor({ telegram: null, lark: null, slack: null, transport_warning: "" });
+    await mount(<MyImSection />);
+    for (const p of ["telegram", "lark", "slack"]) {
+      expect(container.querySelector(`[data-testid="my-im-${p}-saved"]`)).toBeNull();
+    }
+    expect(container.querySelector<HTMLTextAreaElement>("#my-im-slack-users")!.value).toBe("");
   });
 
   it("a failed PUT keeps the old value and toasts the reason (owner and tenant alike)", async () => {

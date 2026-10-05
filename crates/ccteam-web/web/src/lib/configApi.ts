@@ -35,6 +35,9 @@ export interface TelegramStatus {
   bot_token_last4: string;
   /** How many `chat_id`s are bound (the allowlist length). */
   chat_id_count: number;
+  /** The bound `chat_id`s (not secrets) — allowlist PUTs replace the whole
+   *  list, so an editor starts from these. */
+  allowed_chat_ids: string[];
   /** Groups/channels: `true` = only answer messages that @-mention the bot;
    *  `false` (default) = answer every allowed member. DMs always answer. */
   require_mention: boolean;
@@ -50,6 +53,8 @@ export interface LarkStatus {
   use_feishu: boolean;
   /** How many `open_id`s are allowlisted. */
   allowed_user_id_count: number;
+  /** The allowlisted `open_id`s (not secrets). */
+  allowed_user_ids: string[];
   /** Same @-mention gate as Telegram (`TelegramStatus.require_mention`). */
   require_mention: boolean;
 }

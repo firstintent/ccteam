@@ -1227,6 +1227,16 @@ async fn a_tenant_reads_and_flips_the_require_mention_switch_of_their_own_bots()
         .unwrap();
     assert_eq!(me["telegram"]["chat_id_count"], 1, "{me}");
     assert_eq!(me["lark"]["allowed_user_id_count"], 2, "{me}");
+    // The saved allowlists come back too: the allowlist PUTs replace the whole
+    // list, so the card has to start from what is already bound.
+    assert_eq!(
+        me["telegram"]["allowed_chat_ids"],
+        serde_json::json!(["42"])
+    );
+    assert_eq!(
+        me["lark"]["allowed_user_ids"],
+        serde_json::json!(["ou_1", "ou_2"])
+    );
     assert_eq!(
         me["slack"]["allowed_user_ids"],
         serde_json::json!(["U0ALICE"])

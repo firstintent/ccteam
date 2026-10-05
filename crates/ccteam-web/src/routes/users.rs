@@ -534,12 +534,12 @@ pub(crate) async fn handle_get_me_im(
         tenant
             .telegram
             .as_ref()
-            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids.len(), t.require_mention)),
+            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids.clone(), t.require_mention)),
         tenant.lark.as_ref().map(|l| {
             lark_status(
                 &l.app_id,
                 l.use_feishu,
-                l.allowed_user_ids.len(),
+                l.allowed_user_ids.clone(),
                 l.require_mention,
             )
         }),

@@ -168,6 +168,9 @@ pub struct TelegramStatus {
     pub bot_token_last4: String,
     /// How many `chat_id`s are bound (the allowlist length).
     pub chat_id_count: usize,
+    /// The bound `chat_id`s themselves (not secrets) — an allowlist PUT
+    /// replaces the whole list, so an editor must start from what is saved.
+    pub allowed_chat_ids: Vec<String>,
     /// Whether a group chat / channel message must @-mention the bot to be
     /// answered (`false` = every message from an allowed sender is).
     pub require_mention: bool,
@@ -185,6 +188,9 @@ pub struct LarkStatus {
     pub use_feishu: bool,
     /// How many `open_id`s are allowlisted.
     pub allowed_user_id_count: usize,
+    /// The allowlisted `open_id`s themselves (not secrets), for the same
+    /// replace-the-whole-list reason as [`TelegramStatus::allowed_chat_ids`].
+    pub allowed_user_ids: Vec<String>,
     /// Whether a group chat / channel message must @-mention the bot to be
     /// answered (`false` = every message from an allowed sender is).
     pub require_mention: bool,
@@ -356,12 +362,12 @@ pub(crate) async fn handle_get_im_config(
     Json(ImConfigStatus {
         telegram: creds
             .telegram
-            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids.len(), t.require_mention)),
+            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids, t.require_mention)),
         lark: creds.lark.map(|l| {
             lark_status(
                 &l.app_id,
                 l.use_feishu,
-                l.allowed_user_ids.len(),
+                l.allowed_user_ids,
                 l.require_mention,
             )
         }),
@@ -383,13 +389,14 @@ pub(crate) async fn handle_get_im_config(
 /// shape from the one place that knows what is secret.
 pub(crate) fn telegram_status(
     bot_token: &str,
-    chat_id_count: usize,
+    allowed_chat_ids: Vec<String>,
     require_mention: bool,
 ) -> TelegramStatus {
     TelegramStatus {
         configured: true,
         bot_token_last4: mask_last4(bot_token),
-        chat_id_count,
+        chat_id_count: allowed_chat_ids.len(),
+        allowed_chat_ids,
         require_mention,
     }
 }
@@ -397,14 +404,15 @@ pub(crate) fn telegram_status(
 pub(crate) fn lark_status(
     app_id: &str,
     use_feishu: bool,
-    allowed_user_id_count: usize,
+    allowed_user_ids: Vec<String>,
     require_mention: bool,
 ) -> LarkStatus {
     LarkStatus {
         configured: true,
         app_id_last4: mask_last4(app_id),
         use_feishu,
-        allowed_user_id_count,
+        allowed_user_id_count: allowed_user_ids.len(),
+        allowed_user_ids,
         require_mention,
     }
 }
@@ -1084,6 +1092,7 @@ mod tests {
             configured: true,
             bot_token_last4: "…wxyz".into(),
             chat_id_count: 1,
+            allowed_chat_ids: vec!["42".into()],
             require_mention: false,
         };
         let v = serde_json::to_value(&s).unwrap();

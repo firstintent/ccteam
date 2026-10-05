@@ -1308,7 +1308,10 @@ export function MyImSection() {
 }
 
 /** What a tenant card gets from `MyImSection`: its own bot's masked status
- *  (`null` = not configured yet) + a refetch to call once a credential saved. */
+ *  (`null` = not configured yet) + a refetch to call once a credential saved.
+ *  The status is the truth for every step's "done" and every allowlist field —
+ *  a reload must show what is saved, and the allowlist PUTs replace the whole
+ *  list, so an editor that starts empty would silently drop who is bound. */
 interface MyImCardProps<S> {
   status: S;
   onSaved: () => void;
@@ -1320,6 +1323,12 @@ function MyTelegramCard({ status, onSaved }: MyImCardProps<ImConfigStatus["teleg
   const [tokenSaved, setTokenSaved] = useState(false);
   const [captureSince, setCaptureSince] = useState<number | null>(null);
   const [allowed, setAllowed] = useState<string[]>([]);
+  const savedChats = (status?.allowed_chat_ids ?? []).join("\n");
+  const [syncedChats, setSyncedChats] = useState("");
+  if (savedChats !== syncedChats) {
+    setSyncedChats(savedChats);
+    setAllowed(savedChats ? savedChats.split("\n") : []);
+  }
   const candidates = useSenderCapture(
     captureSince,
     getMyTelegramChatIdCandidates,
@@ -1363,6 +1372,7 @@ function MyTelegramCard({ status, onSaved }: MyImCardProps<ImConfigStatus["teleg
       const res = await putMyTelegramAllowedChats(normalized);
       setAllowed(normalized);
       setCaptureSince(null);
+      onSaved();
       toastBus.handler?.info(res.note || "chat_id 已保存,bot 现在只回你");
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
@@ -1381,7 +1391,12 @@ function MyTelegramCard({ status, onSaved }: MyImCardProps<ImConfigStatus["teleg
         </div>
 
         <form onSubmit={saveToken} className="flex flex-col gap-1.5">
-          <StepHead n={1} title="保存 bot token" done={tokenSaved} />
+          <StepHead n={1} title="保存 bot token" done={tokenSaved || status !== null} />
+          {status ? (
+            <p className="text-[10px] font-mono text-status-running" data-testid="my-im-telegram-saved">
+              已保存 bot token({status.bot_token_last4});重新填写即替换
+            </p>
+          ) : null}
           <div className="flex items-center gap-2">
             <Input
               id="my-im-telegram-token"
@@ -1484,6 +1499,18 @@ function MyLarkCard({ status, onSaved }: MyImCardProps<ImConfigStatus["lark"]>) 
   const [credsSaved, setCredsSaved] = useState(false);
   const [usersRaw, setUsersRaw] = useState("");
   const [allowlistSaved, setAllowlistSaved] = useState(false);
+  const savedUsers = (status?.allowed_user_ids ?? []).join("\n");
+  const [syncedUsers, setSyncedUsers] = useState("");
+  if (savedUsers !== syncedUsers) {
+    setSyncedUsers(savedUsers);
+    setUsersRaw(savedUsers);
+  }
+  const savedFeishu = status?.use_feishu;
+  const [syncedFeishu, setSyncedFeishu] = useState<boolean | undefined>(undefined);
+  if (savedFeishu !== syncedFeishu) {
+    setSyncedFeishu(savedFeishu);
+    if (savedFeishu !== undefined) setUseFeishu(savedFeishu);
+  }
   const [captureSince, setCaptureSince] = useState<number | null>(null);
   const candidates = useSenderCapture(
     captureSince,
@@ -1530,6 +1557,7 @@ function MyLarkCard({ status, onSaved }: MyImCardProps<ImConfigStatus["lark"]>) 
       setUsersRaw(normalized.join("\n"));
       setAllowlistSaved(true);
       setCaptureSince(null);
+      onSaved();
       toastBus.handler?.info(res.note || "open_id 已保存到 allowlist");
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
@@ -1549,7 +1577,13 @@ function MyLarkCard({ status, onSaved }: MyImCardProps<ImConfigStatus["lark"]>) 
         </div>
 
         <form onSubmit={saveCreds} className="flex flex-col gap-2">
-          <StepHead n={1} title="保存 App 凭据" done={credsSaved} />
+          <StepHead n={1} title="保存 App 凭据" done={credsSaved || status !== null} />
+          {status ? (
+            <p className="text-[10px] font-mono text-status-running" data-testid="my-im-lark-saved">
+              已保存 App({status.app_id_last4} · {status.use_feishu ? "飞书" : "Lark intl"}
+              );重新填写即替换
+            </p>
+          ) : null}
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="my-im-lark-id">App ID</Label>
@@ -1605,7 +1639,11 @@ function MyLarkCard({ status, onSaved }: MyImCardProps<ImConfigStatus["lark"]>) 
           data-testid="my-im-lark-bind"
         >
           <div className="flex items-center justify-between gap-2">
-            <StepHead n={2} title="允许 open_id(发现或手填)" done={allowlistSaved} />
+            <StepHead
+              n={2}
+              title="允许 open_id(发现或手填)"
+              done={allowlistSaved || (status?.allowed_user_ids.length ?? 0) > 0}
+            />
             {captureSince === null ? (
               <Button
                 type="button"
@@ -1699,6 +1737,12 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
   const [tokensSaved, setTokensSaved] = useState(false);
   const [allowlistSaved, setAllowlistSaved] = useState(false);
   const [usersRaw, setUsersRaw] = useState("");
+  const savedUsers = (status?.allowed_user_ids ?? []).join("\n");
+  const [syncedUsers, setSyncedUsers] = useState("");
+  if (savedUsers !== syncedUsers) {
+    setSyncedUsers(savedUsers);
+    setUsersRaw(savedUsers);
+  }
   const [captureSince, setCaptureSince] = useState<number | null>(null);
   const candidates = useSenderCapture(
     captureSince,
@@ -1764,6 +1808,7 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
       setUsersRaw(normalized.join("\n"));
       setAllowlistSaved(true);
       setCaptureSince(null);
+      onSaved();
       toastBus.handler?.info(res.note || "成员 ID 已保存");
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
@@ -1783,7 +1828,7 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
         </div>
 
         <div className="flex flex-col gap-2" data-testid="my-im-slack-create">
-          <StepHead n={1} title="在 Slack 创建 App" done={tokensSaved} />
+          <StepHead n={1} title="在 Slack 创建 App" done={tokensSaved || status !== null} />
           <div className="flex flex-wrap items-end gap-2">
             <div className="flex min-w-40 flex-1 flex-col gap-1.5">
               <Label htmlFor="my-im-slack-app-name">App 名称</Label>
@@ -1814,7 +1859,13 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
         </div>
 
         <form onSubmit={saveTokens} className="flex flex-col gap-2">
-          <StepHead n={2} title="填入两个 token" done={tokensSaved} />
+          <StepHead n={2} title="填入两个 token" done={tokensSaved || status !== null} />
+          {status ? (
+            <p className="text-[10px] font-mono text-status-running" data-testid="my-im-slack-saved">
+              已保存 bot token({status.bot_token_last4})· app token({status.app_token_last4}
+              );重新填写即替换
+            </p>
+          ) : null}
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="my-im-slack-bot-token">Bot token</Label>
@@ -1866,7 +1917,11 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
           data-testid="my-im-slack-bind"
         >
           <div className="flex items-center justify-between gap-2">
-            <StepHead n={3} title="允许你自己的成员 ID" done={allowlistSaved} />
+            <StepHead
+              n={3}
+              title="允许你自己的成员 ID"
+              done={allowlistSaved || (status?.allowed_user_ids.length ?? 0) > 0}
+            />
             {captureSince === null ? (
               <Button
                 type="button"

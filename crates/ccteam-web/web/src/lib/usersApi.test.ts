@@ -237,6 +237,7 @@ describe("per-user require-@-mention (symmetric with the admin's /config/im)", (
         configured: true,
         bot_token_last4: "…wxyz",
         chat_id_count: 1,
+        allowed_chat_ids: ["42"],
         require_mention: true,
       },
       lark: null,

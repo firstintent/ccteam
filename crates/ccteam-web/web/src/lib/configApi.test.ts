@@ -46,6 +46,7 @@ describe("configApi", () => {
         configured: true,
         bot_token_last4: "…wxyz",
         chat_id_count: 1,
+        allowed_chat_ids: ["42"],
         require_mention: false,
       },
       lark: {
@@ -53,6 +54,7 @@ describe("configApi", () => {
         app_id_last4: "…cli9",
         use_feishu: true,
         allowed_user_id_count: 2,
+        allowed_user_ids: ["ou_1", "ou_2"],
         require_mention: true,
       },
       slack: {
@@ -81,6 +83,7 @@ describe("configApi", () => {
       "configured",
       "bot_token_last4",
       "chat_id_count",
+      "allowed_chat_ids",
       "require_mention",
     ]);
     expect(Object.keys(got.lark ?? {})).toEqual([
@@ -88,6 +91,7 @@ describe("configApi", () => {
       "app_id_last4",
       "use_feishu",
       "allowed_user_id_count",
+      "allowed_user_ids",
       "require_mention",
     ]);
     expect(got.slack).not.toHaveProperty("bot_token");
