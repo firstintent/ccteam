@@ -40,6 +40,12 @@ pub struct TenantTelegram {
     /// bound (the global/owner Telegram bot has separate legacy semantics).
     #[serde(default)]
     pub allowed_chat_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 /// v0.8.20 F2 — a tenant's OWN Lark/Feishu app (the per-user IM bot).
@@ -54,6 +60,12 @@ pub struct TenantLark {
     /// `true` → Feishu (CN); `false` → Lark intl. Defaults true (CN-first).
     #[serde(default = "default_true")]
     pub use_feishu: bool,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 /// A tenant's OWN Slack app (the per-user IM bot, symmetric with
@@ -66,6 +78,12 @@ pub struct TenantSlack {
     /// Slack member ids (`U…`) allowed to drive the bot. Empty = closed.
     #[serde(default)]
     pub allowed_user_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 fn default_true() -> bool {
@@ -341,6 +359,28 @@ impl TenantRegistry {
 mod tests {
     use super::*;
 
+    /// A tenant file written before the switch existed has no `require_mention`
+    /// key: every IM reads it as off (answer everything), and an on value
+    /// survives the file round trip.
+    #[test]
+    fn require_mention_defaults_off_and_round_trips() {
+        let legacy = r#"{"id":"u1","handle":"a","web_token":"t","created_at":"2026-01-01T00:00:00Z",
+            "telegram":{"bot_token":"b"},
+            "lark":{"app_id":"a","app_secret":"s"},
+            "slack":{"bot_token":"b","app_token":"x"}}"#;
+        let mut t: Tenant = serde_json::from_str(legacy).unwrap();
+        assert!(!t.telegram.as_ref().unwrap().require_mention);
+        assert!(!t.lark.as_ref().unwrap().require_mention);
+        assert!(!t.slack.as_ref().unwrap().require_mention);
+        t.telegram.as_mut().unwrap().require_mention = true;
+        t.lark.as_mut().unwrap().require_mention = true;
+        t.slack.as_mut().unwrap().require_mention = true;
+        let back: Tenant = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert!(back.telegram.unwrap().require_mention);
+        assert!(back.lark.unwrap().require_mention);
+        assert!(back.slack.unwrap().require_mention);
+    }
+
     #[test]
     fn add_mints_unique_id_and_token() {
         let mut reg = TenantRegistry::default();
@@ -435,6 +475,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "111:AAA".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
         );
         stale.save_one(&dir, &alice.id).unwrap();
@@ -492,6 +533,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "123:abc".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
         ));
         assert_eq!(
@@ -514,6 +556,7 @@ mod tests {
                 app_secret: "s".into(),
                 allowed_user_ids: vec![],
                 use_feishu: true,
+                require_mention: false,
             }),
         ));
         assert!(reg.by_id(&a.id).unwrap().lark.is_some());
@@ -534,6 +577,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "t".into(),
                 allowed_chat_ids: vec![],
+                require_mention: false,
             }),
         );
         reg.save(&dir).unwrap();

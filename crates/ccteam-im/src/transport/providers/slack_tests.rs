@@ -1628,3 +1628,167 @@ fn button_weight_maps_to_style_and_a_confirm_step() {
     assert_eq!(buttons[2]["confirm"]["confirm"]["text"], "确定");
     assert_eq!(buttons[2]["confirm"]["deny"]["text"], "取消");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `require_mention` — channel chatter vs. a message that addresses the bot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// "Ambient" is a channel / private-channel / group-DM message that does not
+/// @-mention the bot; a DM never is. The fact is reported either way — the
+/// policy, not the decoder, decides what to do with it.
+#[test]
+fn channel_messages_are_ambient_until_they_mention_the_bot() {
+    for channel_type in ["channel", "group", "mpim"] {
+        let plain = msg_event(ALLOWED, "C1", channel_type, "1.1", "anyone around?");
+        let d = decode_message_event(&plain, &bot()).unwrap();
+        assert!(d.ambient, "{channel_type}: no mention is ambient");
+        assert!(!d.in_thread, "a top-level message only opens a thread");
+
+        let addressed = msg_event(ALLOWED, "C1", channel_type, "1.2", "<@UBOT> status?");
+        let d = decode_message_event(&addressed, &bot()).unwrap();
+        assert!(!d.ambient, "{channel_type}: an @-mention addresses the bot");
+
+        // Mentioning someone else addresses someone else.
+        let other = msg_event(ALLOWED, "C1", channel_type, "1.3", "<@UOTHER> status?");
+        assert!(decode_message_event(&other, &bot()).unwrap().ambient);
+    }
+    let dm = msg_event(ALLOWED, "D1", "im", "2.1", "hi");
+    assert!(!decode_message_event(&dm, &bot()).unwrap().ambient);
+
+    let mut reply = msg_event(ALLOWED, "C1", "channel", "3.2", "and another thing");
+    reply["thread_ts"] = json!("3.1");
+    let d = decode_message_event(&reply, &bot()).unwrap();
+    assert!(
+        d.ambient && d.in_thread,
+        "a thread reply is still ambient chatter"
+    );
+}
+
+/// Default policy: everything an allowed member says is delivered; the
+/// ambient fact rides along for the daemon.
+#[tokio::test]
+async fn by_default_ambient_channel_messages_are_delivered() {
+    let api = MockHttp::start_sync(default_api).await;
+    let ch = channel(&api.base, &[ALLOWED]);
+    assert!(!ch.mention_policy().require_mention);
+    let msg = ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload("Ev1", msg_event(ALLOWED, "C1", "channel", "1.1", "chatter")),
+        ))
+        .await
+        .expect("answered by default");
+    assert!(msg.ambient);
+}
+
+/// `require_mention`: ambient top-level chatter is dropped before anything is
+/// downloaded; a mention, a DM and a thread reply (the daemon decides whether
+/// that thread is held) get through.
+#[tokio::test]
+async fn require_mention_drops_ambient_chatter_before_downloading_its_files() {
+    let api = MockHttp::start_sync(|req| match req.path.as_str() {
+        "/files/F1/shot.png" => Resp {
+            status: 200,
+            headers: vec![("Content-Type".into(), "image/png".into())],
+            body: b"\x89PNG".to_vec(),
+        },
+        _ => default_api(req),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ch = channel(&api.base, &[ALLOWED])
+        .with_require_mention(true)
+        .with_staging_dir(tmp.path().to_path_buf());
+    assert!(ch.mention_policy().require_mention);
+
+    // Ambient top-level chatter WITH a file: dropped, file never fetched.
+    let mut chatter = msg_event(ALLOWED, "C1", "channel", "1.1", "look at this");
+    chatter["subtype"] = json!("file_share");
+    chatter["files"] = json!([
+        { "id": "F1", "name": "shot.png", "mimetype": "image/png", "size": 4,
+          "url_private_download": format!("{}/files/F1/shot.png", api.base) },
+    ]);
+    assert!(ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev1", chatter)))
+        .await
+        .is_none());
+    assert!(
+        api.requests()
+            .iter()
+            .all(|r| !r.path.starts_with("/files/")),
+        "a dropped message must not cost a download"
+    );
+
+    // Addressed: delivered, file and all.
+    let mut mention = msg_event(ALLOWED, "C1", "channel", "2.1", "<@UBOT> look at this");
+    mention["subtype"] = json!("file_share");
+    mention["files"] = json!([
+        { "id": "F1", "name": "shot.png", "mimetype": "image/png", "size": 4,
+          "url_private_download": format!("{}/files/F1/shot.png", api.base) },
+    ]);
+    let msg = ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev2", mention)))
+        .await
+        .expect("a mention is answered");
+    assert!(!msg.ambient);
+    assert_eq!(msg.attachments.len(), 1);
+
+    // A DM is never ambient.
+    let dm = ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload("Ev3", msg_event(ALLOWED, "D1", "im", "3.1", "hi")),
+        ))
+        .await
+        .expect("a DM is answered");
+    assert!(!dm.ambient);
+
+    // An ambient reply inside a thread goes on to the daemon, which knows
+    // whether the gateway holds that thread.
+    let mut reply = msg_event(ALLOWED, "C1", "channel", "4.2", "and another thing");
+    reply["thread_ts"] = json!("2.1");
+    let msg = ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev4", reply)))
+        .await
+        .expect("a thread reply is left to the daemon");
+    assert!(msg.ambient);
+    assert_eq!(msg.thread_ts.as_deref(), Some("2.1"));
+
+    // Slash commands and button clicks address the app by construction.
+    let click = ch
+        .handle_envelope(&envelope(
+            "interactive",
+            click_payload(ALLOWED, "C1", "5.5", Some("2.1")),
+        ))
+        .await
+        .expect("a click is answered");
+    assert!(!click.ambient);
+}
+
+/// The allowlist still runs first: an ambient message from a stranger leaves
+/// its probe (the web binding flow reads it) even though it is also dropped.
+#[tokio::test]
+async fn require_mention_does_not_hide_strangers_from_the_binding_probe() {
+    let api = MockHttp::start_sync(default_api).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let probe = tmp.path().join("probe.jsonl");
+    let ch = channel(&api.base, &[ALLOWED])
+        .with_require_mention(true)
+        .with_probe_path(probe.clone());
+    assert!(ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload(
+                "Ev1",
+                msg_event("USTRANGER", "C1", "channel", "1.1", "hello")
+            ),
+        ))
+        .await
+        .is_none());
+    assert!(
+        std::fs::read_to_string(&probe)
+            .unwrap_or_default()
+            .contains("USTRANGER"),
+        "the rejected sender is recorded"
+    );
+}

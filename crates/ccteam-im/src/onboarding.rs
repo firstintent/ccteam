@@ -129,6 +129,7 @@ pub async fn telegram_setup_with_base(
         creds: TelegramCreds {
             bot_token: token.into(),
             allowed_chat_ids: vec![owner_chat_id.to_string()],
+            require_mention: false,
         },
         bot_username,
     })
@@ -349,6 +350,7 @@ pub async fn lark_setup_with_base(
             app_secret: app_secret.into(),
             allowed_user_ids,
             use_feishu,
+            require_mention: false,
         },
     })
 }
@@ -607,6 +609,7 @@ pub async fn slack_setup_with_base(
             bot_token: bot_token.into(),
             app_token: app_token.into(),
             allowed_user_ids,
+            require_mention: false,
         },
         team: auth.team.unwrap_or_default(),
         bot_user: auth.user.unwrap_or_default(),

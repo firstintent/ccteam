@@ -355,6 +355,8 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
                         .as_ref()
                         .map(|t| t.allowed_chat_ids.clone())
                         .unwrap_or_default(),
+                    // A token change must not reset the group-reply switch.
+                    require_mention: current.telegram.as_ref().is_some_and(|t| t.require_mention),
                 }),
                 Err(err) => {
                     return (
@@ -374,6 +376,7 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
             app_secret: l.app_secret,
             allowed_user_ids: normalize_lark_user_ids(l.allowed_user_ids),
             use_feishu: l.use_feishu,
+            require_mention: current.lark.as_ref().is_some_and(|c| c.require_mention),
         }),
     };
     let slack = match form.slack {
@@ -402,6 +405,7 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
                     bot_token: result.creds.bot_token,
                     app_token: result.creds.app_token,
                     allowed_user_ids: result.creds.allowed_user_ids,
+                    require_mention: current.slack.as_ref().is_some_and(|c| c.require_mention),
                 }),
                 Err(err) => {
                     return (
@@ -491,6 +495,144 @@ pub(crate) async fn handle_put_me_im(
             .into_response();
     }
     apply_tenant_im(&app, &identity.id, form).await
+}
+
+/// `GET /api/v1/me/im` — the caller's OWN per-user IM bots, masked (never a
+/// token), in the same shape as the owner's `GET /config/im`: which bots exist,
+/// who they answer, and whether each one needs an @-mention in a group.
+#[utoipa::path(
+    get,
+    path = "/api/v1/me/im",
+    tag = "users",
+    responses(
+        (status = 200, description = "Masked per-user IM status", body = super::im_config::ImConfigStatus),
+        (status = 400, description = "Admin caller (uses /config/im)"),
+        (status = 404, description = "Caller is not a registered tenant"),
+    ),
+)]
+pub(crate) async fn handle_get_me_im(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    if identity.is_admin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the owner's bot is the global bot — read it via /api/v1/config/im"})),
+        )
+            .into_response();
+    }
+    let reg = TenantRegistry::load(&app.paths.users_dir());
+    let Some(tenant) = reg.by_id(&identity.id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {}", identity.id)})),
+        )
+            .into_response();
+    };
+    use super::im_config::{im_status, lark_status, slack_status, telegram_status};
+    Json(im_status(
+        tenant
+            .telegram
+            .as_ref()
+            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids.len(), t.require_mention)),
+        tenant.lark.as_ref().map(|l| {
+            lark_status(
+                &l.app_id,
+                l.use_feishu,
+                l.allowed_user_ids.len(),
+                l.require_mention,
+            )
+        }),
+        tenant.slack.as_ref().map(|s| {
+            slack_status(
+                &s.bot_token,
+                &s.app_token,
+                s.allowed_user_ids.clone(),
+                s.require_mention,
+            )
+        }),
+    ))
+    .into_response()
+}
+
+/// `PUT /api/v1/me/im/{platform}/require-mention` — flip the group-reply
+/// switch of the caller's OWN bot on one IM, without re-entering its tokens.
+#[utoipa::path(
+    put,
+    path = "/api/v1/me/im/{platform}/require-mention",
+    tag = "users",
+    params(("platform" = String, Path, description = "telegram | lark | slack")),
+    request_body(content = super::im_config::RequireMentionForm, description = "The desired switch value"),
+    responses(
+        (status = 200, description = "Saved; `{ok, platform, require_mention, reloaded, note}`", body = serde_json::Value),
+        (status = 400, description = "Admin caller / unknown platform / that bot is not configured yet"),
+        (status = 404, description = "Caller is not a registered tenant"),
+        (status = 500, description = "Registry write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_me_require_mention(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(platform): Path<String>,
+    Json(form): Json<super::im_config::RequireMentionForm>,
+) -> Response {
+    if identity.is_admin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the owner's bot is the global bot — set it via /api/v1/config/im"})),
+        )
+            .into_response();
+    }
+    let path = app.paths.users_dir();
+    let mut reg = TenantRegistry::load(&path);
+    let Some(mut tenant) = reg.by_id(&identity.id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {}", identity.id)})),
+        )
+            .into_response();
+    };
+    let slot = match platform.as_str() {
+        "telegram" => tenant.telegram.as_mut().map(|c| &mut c.require_mention),
+        "lark" => tenant.lark.as_mut().map(|c| &mut c.require_mention),
+        "slack" => tenant.slack.as_mut().map(|c| &mut c.require_mention),
+        _ => return super::im_config::unknown_platform_400(&platform),
+    };
+    let Some(slot) = slot else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("no {platform} bot configured; save its credentials first")})),
+        )
+            .into_response();
+    };
+    *slot = form.require_mention;
+    reg.set_telegram(&identity.id, tenant.telegram);
+    reg.set_lark(&identity.id, tenant.lark);
+    reg.set_slack(&identity.id, tenant.slack);
+    if let Err(err) = reg.save_one(&path, &identity.id) {
+        tracing::error!(%err, "PUT /api/v1/me/im/{{platform}}/require-mention: registry save failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{err}")})),
+        )
+            .into_response();
+    }
+    let reloaded = match app.gateway.as_ref() {
+        Some(gw) => gw.lock().await.request_im_reload(),
+        None => false,
+    };
+    Json(json!({
+        "ok": true,
+        "platform": platform,
+        "require_mention": form.require_mention,
+        "reloaded": reloaded,
+        "note": if reloaded {
+            "saved; your bot listener is (re)starting now"
+        } else {
+            "saved; takes effect on the next daemon reload/restart"
+        },
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

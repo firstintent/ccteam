@@ -54,8 +54,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use crate::onboarding::{client_for_api_base, SLACK_API_BASE};
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OptionWeight, OutboundFile,
-    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, MentionPolicy, MessageOption, OptionWeight,
+    OutboundFile, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// Per-message ceiling in **UTF-16 code units**. Slack caps the cumulative
@@ -236,6 +236,13 @@ struct DecodedMessage {
     thread_ts: Option<String>,
     text: String,
     mentions_bot: bool,
+    /// The event is a reply inside an existing thread (it carried a parent
+    /// `thread_ts`) — as opposed to a top-level message, which only opens
+    /// one. Only a reply can continue a conversation the gateway holds.
+    in_thread: bool,
+    /// A channel / private-channel / group-DM message that does not @-mention
+    /// the bot ([`ChannelMessage::ambient`]).
+    ambient: bool,
     files: Vec<PendingFile>,
 }
 
@@ -251,6 +258,7 @@ impl DecodedMessage {
             thread_ts: self.thread_ts,
             attachments: Vec::new(),
             selection: None,
+            ambient: self.ambient,
         }
     }
 }
@@ -319,6 +327,8 @@ fn decode_message_event(event: &Value, bot: &BotIdentity) -> Option<DecodedMessa
         thread_ts,
         text,
         mentions_bot,
+        in_thread: parent.is_some(),
+        ambient: channel_type != "im" && !mentions_bot,
         files,
     })
 }
@@ -753,6 +763,8 @@ pub struct SlackChannel {
     bot_token: String,
     app_token: String,
     allowed_users: Vec<String>,
+    /// Whether a channel message must @-mention the bot to be answered.
+    mention_policy: MentionPolicy,
     api_base: String,
     http: reqwest::Client,
     /// `auth.test` result, fetched once per listener (re-fetched only if a
@@ -785,6 +797,7 @@ impl SlackChannel {
             bot_token,
             app_token,
             allowed_users: allowed_user_ids,
+            mention_policy: MentionPolicy::default(),
             api_base: SLACK_API_BASE.to_string(),
             http: Self::http_for(SLACK_API_BASE),
             bot: RwLock::new(None),
@@ -822,6 +835,14 @@ impl SlackChannel {
     /// Override the channel-map key (a per-tenant bot's `"slack@<tenant>"`).
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Answer a channel message only when it @-mentions the bot (or continues
+    /// a thread the gateway already holds a session in) — the credentials'
+    /// `require_mention`. DMs, slash commands and button clicks are unaffected.
+    pub fn with_require_mention(mut self, require_mention: bool) -> Self {
+        self.mention_policy = MentionPolicy { require_mention };
         self
     }
 
@@ -1204,6 +1225,16 @@ impl SlackChannel {
             .await;
             return None;
         }
+        // Ambient chatter that cannot continue a held thread is dropped here,
+        // before its files are downloaded; a reply inside a thread is left to
+        // the daemon, which knows whether the gateway holds that thread.
+        if self
+            .mention_policy
+            .drops_early(decoded.ambient, decoded.in_thread)
+        {
+            tracing::debug!(ts = %decoded.ts, "slack: ambient channel message dropped (require_mention)");
+            return None;
+        }
         let files = decoded.files.clone();
         let mut message = decoded.into_channel_message(&self.name);
         for file in &files {
@@ -1283,6 +1314,7 @@ impl SlackChannel {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
     }
 
@@ -1316,6 +1348,7 @@ impl SlackChannel {
             thread_ts: click.thread_ts,
             attachments: Vec::new(),
             selection: Some(ChoiceReply { data: click.value }),
+            ambient: false,
         })
     }
 
@@ -1543,6 +1576,10 @@ impl Channel for SlackChannel {
 
     fn session_threads(&self) -> bool {
         true
+    }
+
+    fn mention_policy(&self) -> MentionPolicy {
+        self.mention_policy
     }
 
     /// Slack has no command menu to fill; it keeps the names so replies can

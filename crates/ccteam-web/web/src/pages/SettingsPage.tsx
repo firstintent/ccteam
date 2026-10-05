@@ -46,6 +46,7 @@ import {
   getSlackAppManifest,
   getSlackUserIdCandidates,
   pollTelegramChatId,
+  putRequireMention,
   putSlackAllowedUsers,
   saveLark,
   saveSlack,
@@ -53,6 +54,7 @@ import {
   startTelegramChatId,
   type ChatIdPollStatus,
   type ImConfigStatus,
+  type ImPlatform,
   type SlackManifestResult,
 } from "../lib/configApi";
 import { copyText } from "../lib/clipboard";
@@ -60,6 +62,7 @@ import { toastBus } from "../lib/toastBus";
 import {
   createUser,
   deleteUser,
+  getMyIm,
   getMyLarkOpenIdCandidates,
   getMySlackUserIdCandidates,
   getMyTelegramChatIdCandidates,
@@ -67,12 +70,14 @@ import {
   listUsers,
   putMyIm,
   putMyLarkAllowedUsers,
+  putMyRequireMention,
   putMySlackAllowedUsers,
   putMyTelegramAllowedChats,
   type SenderCandidate,
   type TenantView,
 } from "../lib/usersApi";
 import { makeT, type Lang } from "../lib/i18n";
+import { cn } from "../lib/utils";
 import {
   Badge,
   Button,
@@ -110,6 +115,97 @@ function ReadoutRow({ label, value, ok }: { label: string; value: string; ok?: b
 /** Compact label→value status stack shared by the collapsed summaries. */
 function Readout({ children }: { children: React.ReactNode }) {
   return <div className="flex flex-col gap-2 text-[11px]">{children}</div>;
+}
+
+// --------------------------------------------------------------------------
+// Require @-mention in groups/channels — one row, six cards (the owner's
+// three global bots + a tenant's three own bots). Off (default): the bot
+// answers every message an allowed member sends in a group/channel it is in;
+// on: only messages that @-mention it. DMs always answer; on Slack a thread
+// the bot already holds a session in continues without the @. The daemon
+// hot-applies the flip; standalone web answers `restart_required` and says so
+// in `note`, which we toast like the allowlist savers do.
+// --------------------------------------------------------------------------
+
+function RequireMentionRow({
+  platform,
+  value,
+  save,
+  testid,
+  className,
+}: {
+  platform: ImPlatform;
+  /** The server's current value (from the masked status). */
+  value: boolean;
+  /** `putRequireMention` / `putMyRequireMention` bound to `platform`. */
+  save: (require_mention: boolean) => Promise<{ require_mention: boolean; note?: string }>;
+  testid: string;
+  className?: string;
+}) {
+  // Local copy so a successful PUT shows at once (no round trip); a refetched
+  // server value still wins — React's adjust-state-on-prop-change pattern,
+  // not a setState-in-effect.
+  const [checked, setChecked] = useState(value);
+  const [seen, setSeen] = useState(value);
+  if (seen !== value) {
+    setSeen(value);
+    setChecked(value);
+  }
+  const [pending, setPending] = useState(false);
+
+  async function toggle() {
+    if (pending) return;
+    setPending(true);
+    try {
+      const res = await save(!checked);
+      setChecked(res.require_mention);
+      toastBus.handler?.info(
+        res.note ||
+          (res.require_mention
+            ? "已开启:群聊/频道里只回 @ 机器人的消息"
+            : "已关闭:群聊/频道里每条消息都回"),
+      );
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <div className={cn("flex items-start justify-between gap-3", className)}>
+      <div className="flex flex-col gap-1">
+        <Label htmlFor={testid} className="text-text-secondary">
+          群聊/频道里需要 @ 机器人才回复
+        </Label>
+        <p className="text-[10px] leading-relaxed text-text-dim">
+          关闭(默认):允许名单里的人在群聊/频道里发的每条消息都会回复。开启:只回复 @
+          了机器人的消息;私聊不受影响
+          {platform === "slack" ? ";机器人已有会话的线程里可免 @ 继续对话" : ""}
+        </p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        id={testid}
+        aria-checked={checked}
+        data-testid={testid}
+        onClick={() => void toggle()}
+        disabled={pending}
+        className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border outline-none transition-colors focus-visible:ring-2 focus-visible:ring-brand-500/60 disabled:cursor-default disabled:opacity-40 ${
+          checked ? "border-brand-500 bg-brand-500" : "border-surface-700 bg-surface-800"
+        }`}
+      >
+        <span
+          aria-hidden="true"
+          className={`size-3.5 rounded-full transition-transform ${
+            checked ? "translate-x-4.5 bg-surface-900" : "translate-x-0.5 bg-text-dim"
+          }`}
+        />
+      </button>
+    </div>
+  );
 }
 
 // --------------------------------------------------------------------------
@@ -341,6 +437,16 @@ export function TelegramSection({
           </Button>
         </CardContent>
       )}
+
+      {configured && status ? (
+        <RequireMentionRow
+          className="border-t border-surface-800 px-4 py-3"
+          platform="telegram"
+          value={status.require_mention}
+          save={(v) => putRequireMention("telegram", v)}
+          testid="settings-telegram-require-mention"
+        />
+      ) : null}
 
       <ChatIdCapture status={chatIdStatus} chatIdLast4={chatIdLast4} onRetry={retryCapture} />
 
@@ -658,6 +764,16 @@ export function LarkSection({
           </Button>
         </CardContent>
       )}
+
+      {configured && status ? (
+        <RequireMentionRow
+          className="border-t border-surface-800 px-4 py-3"
+          platform="lark"
+          value={status.require_mention}
+          save={(v) => putRequireMention("lark", v)}
+          testid="settings-lark-require-mention"
+        />
+      ) : null}
 
       <CardFooter>app secret 永不回显;重配显「(set, ····wxyz)」+ 空白框 · 下次重启生效</CardFooter>
     </Card>
@@ -1039,6 +1155,15 @@ export function SlackSection({
               </Button>
             </form>
           ) : null}
+          {configured && status ? (
+            <RequireMentionRow
+              className="border-t border-surface-800 pt-2"
+              platform="slack"
+              value={status.require_mention}
+              save={(v) => putRequireMention("slack", v)}
+              testid="settings-slack-require-mention"
+            />
+          ) : null}
         </div>
       </CardContent>
 
@@ -1144,6 +1269,22 @@ function StepHead({ n, title, done }: { n: number; title: string; done?: boolean
 }
 
 export function MyImSection() {
+  // The tenant's own masked status (`/me/im`): which bots exist + their
+  // @-mention gate. Loaded once here and refreshed after a card saves a
+  // credential, so a freshly connected bot shows its row without a reload.
+  const [mine, setMine] = useState<ImConfigStatus | null>(null);
+  const reload = useCallback(() => {
+    getMyIm()
+      .then(setMine)
+      .catch((err) => {
+        if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+        toastBus.handler?.error(err instanceof Error ? err.message : "could not load my IM bots");
+      });
+  }, []);
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
   return (
     <section data-testid="settings-my-im" className="flex flex-col gap-4">
       <div className="flex flex-col gap-1">
@@ -1159,14 +1300,21 @@ export function MyImSection() {
         </p>
       </div>
 
-      <MyTelegramCard />
-      <MyLarkCard />
-      <MySlackCard />
+      <MyTelegramCard status={mine?.telegram ?? null} onSaved={reload} />
+      <MyLarkCard status={mine?.lark ?? null} onSaved={reload} />
+      <MySlackCard status={mine?.slack ?? null} onSaved={reload} />
     </section>
   );
 }
 
-function MyTelegramCard() {
+/** What a tenant card gets from `MyImSection`: its own bot's masked status
+ *  (`null` = not configured yet) + a refetch to call once a credential saved. */
+interface MyImCardProps<S> {
+  status: S;
+  onSaved: () => void;
+}
+
+function MyTelegramCard({ status, onSaved }: MyImCardProps<ImConfigStatus["telegram"]>) {
   const [token, setToken] = useState("");
   const [pending, setPending] = useState(false);
   const [tokenSaved, setTokenSaved] = useState(false);
@@ -1191,6 +1339,7 @@ function MyTelegramCard() {
       const res = await putMyIm({ telegram_bot_token: tok });
       setToken("");
       setTokenSaved(true);
+      onSaved();
       if (res.telegram_unbound) {
         // Fail-closed: an unbound bot answers nobody — walk straight into ②.
         startCapture();
@@ -1312,13 +1461,22 @@ function MyTelegramCard() {
           ) : captureSince !== null ? (
             <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
           ) : null}
+          {status || tokenSaved ? (
+            <RequireMentionRow
+              className="border-t border-surface-800 pt-2"
+              platform="telegram"
+              value={status?.require_mention ?? false}
+              save={(v) => putMyRequireMention("telegram", v)}
+              testid="my-im-telegram-require-mention"
+            />
+          ) : null}
         </div>
       </div>
     </Card>
   );
 }
 
-function MyLarkCard() {
+function MyLarkCard({ status, onSaved }: MyImCardProps<ImConfigStatus["lark"]>) {
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
   const [useFeishu, setUseFeishu] = useState(true);
@@ -1351,6 +1509,7 @@ function MyLarkCard() {
       setAppId("");
       setAppSecret("");
       setCredsSaved(true);
+      onSaved();
       // Fail-closed: an empty allowlist answers nobody — walk straight into ②.
       if (userIds.length === 0) startCapture();
       toastBus.handler?.info("Lark 凭据已保存 —— 现在完成第 2 步,允许你自己的 open_id");
@@ -1513,6 +1672,15 @@ function MyLarkCard() {
               保存 allowlist
             </Button>
           </div>
+          {status || credsSaved ? (
+            <RequireMentionRow
+              className="border-t border-surface-800 pt-2"
+              platform="lark"
+              value={status?.require_mention ?? false}
+              save={(v) => putMyRequireMention("lark", v)}
+              testid="my-im-lark-require-mention"
+            />
+          ) : null}
         </div>
       </div>
     </Card>
@@ -1522,7 +1690,7 @@ function MyLarkCard() {
 /** A regular user's OWN Slack app — the same three steps the owner's admin
  *  card walks (create from a link → tokens → allow yourself), against the
  *  caller's own `/me/im` endpoints. */
-function MySlackCard() {
+function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>) {
   const [appName, setAppName] = useState("ccteam");
   const [manifest, setManifest] = useState<SlackManifestResult | null>(null);
   const [botToken, setBotToken] = useState("");
@@ -1571,6 +1739,7 @@ function MySlackCard() {
       setBotToken("");
       setAppToken("");
       setTokensSaved(true);
+      onSaved();
       // Fail-closed: an app that allows nobody answers nobody — walk into ③.
       if (res.slack_unbound) startCapture();
       toastBus.handler?.info(
@@ -1758,6 +1927,15 @@ function MySlackCard() {
               保存 allowlist
             </Button>
           </div>
+          {status || tokensSaved ? (
+            <RequireMentionRow
+              className="border-t border-surface-800 pt-2"
+              platform="slack"
+              value={status?.require_mention ?? false}
+              save={(v) => putMyRequireMention("slack", v)}
+              testid="my-im-slack-require-mention"
+            />
+          ) : null}
         </div>
       </div>
     </Card>

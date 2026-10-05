@@ -2010,7 +2010,10 @@ pub fn run_config_set_im_token(token: &str) -> Result<String> {
     let creds_path = ccteam_im::credentials::default_path();
     let mut creds = ccteam_im::credentials::load(Some(&creds_path))
         .context("load existing IM credentials before merge")?;
-    creds.telegram = Some(result.creds);
+    let mut telegram = result.creds;
+    // Re-running setup must not reset the group-reply switch.
+    telegram.require_mention = creds.telegram.as_ref().is_some_and(|t| t.require_mention);
+    creds.telegram = Some(telegram);
     ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
 
     // Best-effort in-place reload of a running daemon's IM listeners (no
@@ -2107,7 +2110,10 @@ pub fn run_config_set_lark_creds_with_base(
     } else {
         "Lark (intl, open.larksuite.com)"
     };
-    creds.lark = Some(result.creds);
+    let mut lark = result.creds;
+    // Re-running setup must not reset the group-reply switch.
+    lark.require_mention = creds.lark.as_ref().is_some_and(|l| l.require_mention);
+    creds.lark = Some(lark);
     ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
 
     // Best-effort in-place reload of a running daemon's IM listeners (no
@@ -2196,7 +2202,10 @@ pub fn run_config_set_slack_creds_with_base(
     let mut creds = ccteam_im::credentials::load(Some(&creds_path))
         .context("load existing IM credentials before merge")?;
     let allow_count = result.creds.allowed_user_ids.len();
-    creds.slack = Some(result.creds);
+    let mut slack = result.creds;
+    // Re-running setup must not reset the group-reply switch.
+    slack.require_mention = creds.slack.as_ref().is_some_and(|s| s.require_mention);
+    creds.slack = Some(slack);
     ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
 
     // Best-effort live reload; skipped on the test seam (see the Lark twin).
@@ -5100,6 +5109,7 @@ mod tests {
             telegram: Some(ccteam_im::credentials::TelegramCreds {
                 bot_token: "tg-seed-token".into(),
                 allowed_chat_ids: vec!["111".into()],
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -5307,6 +5317,7 @@ mod tests {
                 app_secret: "seed_secret".into(),
                 allowed_user_ids: vec!["ou_seed".into()],
                 use_feishu: true,
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -5353,6 +5364,42 @@ mod tests {
         assert_eq!(slack.allowed_user_ids, vec!["U0ALICE", "U0BOB"]);
         let lark = reloaded.lark.expect("lark must survive the merge");
         assert_eq!(lark.app_id, "cli_seed");
+    }
+
+    /// Re-running `config set slack` (a rotated token) must not reset the
+    /// group-reply switch the owner turned on in the web console.
+    #[test]
+    fn re_running_slack_setup_keeps_the_require_mention_switch() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let seed = ccteam_im::credentials::Credentials {
+            slack: Some(ccteam_im::credentials::SlackCreds {
+                bot_token: "xoxb-old".into(),
+                app_token: "xapp-old".into(),
+                allowed_user_ids: vec!["U0ALICE".into()],
+                require_mention: true,
+            }),
+            ..Default::default()
+        };
+        ccteam_im::credentials::save(&creds_path, &seed).unwrap();
+        let base = spawn_slack_http(&[
+            ("/auth.test", SLACK_AUTH_OK),
+            ("/apps.connections.open", SLACK_SOCKET_OK),
+        ]);
+        run_config_set_slack_creds_with_base(
+            "xoxb-new",
+            "xapp-new",
+            vec!["U0ALICE".into()],
+            &base,
+            Some(&creds_path),
+        )
+        .expect("re-run succeeds");
+        let slack = ccteam_im::credentials::load(Some(&creds_path))
+            .unwrap()
+            .slack
+            .unwrap();
+        assert_eq!(slack.bot_token, "xoxb-new");
+        assert!(slack.require_mention, "the switch survives a token change");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //   403 → throw Error("FORBIDDEN")        (caller is a tenant, not the admin)
 //   other non-2xx → throw Error("HTTP <status>")
 
+import type { ImConfigStatus, ImPlatform } from "./configApi";
 import { httpError } from "./httpError";
 
 /** One tenant as `GET /api/v1/users` returns it — never carries the token. */
@@ -189,6 +190,30 @@ export function putMySlackAllowedUsers(
     "PUT",
     { allowed_user_ids },
   );
+}
+
+/** `GET /api/v1/me/im` — the caller's OWN bots, masked exactly like the
+ *  admin's `getImConfig` (same shape; a platform is `null` until the tenant
+ *  configured it; never a secret). The admin gets 400 — the owner's bots
+ *  live under `/config/im`. */
+export function getMyIm(): Promise<ImConfigStatus> {
+  return getJson<ImConfigStatus>("/api/v1/me/im");
+}
+
+/** `PUT /api/v1/me/im/{platform}/require-mention` — flip only the caller's
+ *  own @-mention gate for groups/channels (tokens and allowlists untouched).
+ *  400 when that bot isn't configured yet. */
+export function putMyRequireMention(
+  platform: ImPlatform,
+  require_mention: boolean,
+): Promise<{
+  ok: boolean;
+  platform: ImPlatform;
+  require_mention: boolean;
+  reloaded: boolean;
+  note?: string;
+}> {
+  return sendJson(`/api/v1/me/im/${platform}/require-mention`, "PUT", { require_mention });
 }
 
 async function getJson<T>(url: string): Promise<T> {

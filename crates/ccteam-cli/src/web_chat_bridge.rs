@@ -150,6 +150,7 @@ fn to_im_message(message: WebChannelMessage) -> ChannelMessage {
         attachments: Vec::new(),
         // v0.8.5 D3: a chip click carries its opaque "{token}:{idx}".
         selection: message.selection.map(|data| ChoiceReply { data }),
+        ambient: false,
     }
 }
 

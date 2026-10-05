@@ -832,6 +832,7 @@ async fn tenant_telegram_binds_its_own_chat_and_starts_unbound() {
         Some(ccteam_core::tenants::TenantTelegram {
             bot_token: "111:AAA".into(),
             allowed_chat_ids: Vec::new(),
+            require_mention: false,
         }),
     );
     reg.save(&paths.users_dir()).unwrap();

@@ -912,6 +912,10 @@ async fn reload_im_channels(
     );
 }
 
+/// Bound on the inbound consumer's memory of threads an addressed message has
+/// claimed (see `spawn_inbound_consumer`).
+const ADDRESSED_THREADS_CAP: usize = 4096;
+
 /// V0.6.1 F132 — channel-listener mpsc buffer. 64 is enough headroom
 /// for a slow consumer to lag behind a burst without dropping; if it
 /// fills the listener `await`s on `send`, which is what we want
@@ -1006,10 +1010,13 @@ fn build_telegram_channel(
     _probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let tg = creds.telegram.as_ref()?;
-    Some(Arc::new(TelegramChannel::new(
-        tg.bot_token.clone(),
-        telegram_effective_allowlist(&tg.allowed_chat_ids, bots),
-    )))
+    Some(Arc::new(
+        TelegramChannel::new(
+            tg.bot_token.clone(),
+            telegram_effective_allowlist(&tg.allowed_chat_ids, bots),
+        )
+        .with_require_mention(tg.require_mention),
+    ))
 }
 
 /// Slack: Socket Mode inbound + Web API outbound, one thread per session.
@@ -1028,7 +1035,8 @@ fn build_slack_channel(
         slack.bot_token.clone(),
         slack.app_token.clone(),
         slack.allowed_user_ids.clone(),
-    );
+    )
+    .with_require_mention(slack.require_mention);
     if let Some(path) = probe_path {
         ch = ch.with_probe_path(path.to_path_buf());
     }
@@ -1081,7 +1089,8 @@ fn build_lark_channel(
         lark.app_secret.clone(),
         allowed,
         lark.use_feishu,
-    );
+    )
+    .with_require_mention(lark.require_mention);
     if let Some(path) = probe_path {
         ch = ch.with_open_id_probe_path(path.to_path_buf());
     }
@@ -1191,6 +1200,7 @@ fn build_tenant_channels(
                 let mut ch =
                     TelegramChannel::new(tg.bot_token.clone(), tg.allowed_chat_ids.clone())
                         .fail_closed()
+                        .with_require_mention(tg.require_mention)
                         .with_name(name.clone());
                 if let Some(path) = probe_path {
                     ch = ch.with_rejected_sender_probe_path(path.to_path_buf());
@@ -1207,7 +1217,8 @@ fn build_tenant_channels(
                     lk.app_secret.clone(),
                     lk.allowed_user_ids.clone(),
                     lk.use_feishu,
-                );
+                )
+                .with_require_mention(lk.require_mention);
                 if let Some(path) = probe_path {
                     ch = ch.with_open_id_probe_path(path.to_path_buf());
                 }
@@ -1227,6 +1238,7 @@ fn build_tenant_channels(
                     sl.app_token.clone(),
                     sl.allowed_user_ids.clone(),
                 )
+                .with_require_mention(sl.require_mention)
                 .with_name(name.clone());
                 if let Some(path) = probe_path {
                     ch = ch.with_probe_path(path.to_path_buf());
@@ -1450,6 +1462,9 @@ fn spawn_inbound_consumer(
     restore_complete: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Threads (channel, conversation, thread) an addressed message has
+        // claimed — see the `require_mention` gate below.
+        let mut addressed_threads: HashSet<(String, String, String)> = HashSet::new();
         while let Some(msg) = rx.recv().await {
             let cid = msg.id.clone();
             let route_t0 = std::time::Instant::now();
@@ -1474,6 +1489,56 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
+
+            // The thread reaches the gateway only from a channel whose
+            // contract is "one thread = one session" (Slack). Everyone else
+            // (Telegram, Lark, web) never passes one, whatever the platform
+            // happened to fill in — their routing stays the single stream.
+            let thread = inbound_session_thread(channel.as_ref(), &msg);
+
+            // Ambient group/channel chatter under `require_mention` is
+            // answered only when it continues a thread the gateway already
+            // holds a session in. Decided BEFORE the security layer so that
+            // chatter never spends the sender's rate-limit budget.
+            let policy = channel.mention_policy();
+            if policy.require_mention {
+                let thread_key = thread
+                    .as_deref()
+                    .map(|t| (msg.channel.clone(), msg.reply_target.clone(), t.to_string()));
+                if msg.ambient {
+                    // Held = the gateway has a current session in that thread,
+                    // or an addressed message already claimed it (its session
+                    // may still be spawning off this loop, so the gateway
+                    // cannot know yet).
+                    let held = match &thread_key {
+                        Some(key) if addressed_threads.contains(key) => true,
+                        Some((_, _, t)) => gateway.lock().await.has_current_session(
+                            &msg.channel,
+                            &msg.reply_target,
+                            &msg.sender,
+                            Some(t),
+                        ),
+                        None => false,
+                    };
+                    if !policy.admits(msg.ambient, held) {
+                        tracing::debug!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "imd: ambient message dropped (require_mention, no held thread)"
+                        );
+                        continue;
+                    }
+                } else if let Some(key) = thread_key {
+                    // Only the in-flight-spawn window needs this memory (the
+                    // gateway's own focus covers a settled thread), so a
+                    // bounded set that resets when full never loses a held
+                    // thread.
+                    if addressed_threads.len() >= ADDRESSED_THREADS_CAP {
+                        addressed_threads.clear();
+                    }
+                    addressed_threads.insert(key);
+                }
+            }
 
             // (v0.8.5 B1 / B1b) A non-text message legitimately carries empty
             // `content`: a selection callback (inline-button / web-chip click —
@@ -1504,12 +1569,6 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
-
-            // The thread reaches the gateway only from a channel whose
-            // contract is "one thread = one session" (Slack). Everyone else
-            // (Telegram, Lark, web) never passes one, whatever the platform
-            // happened to fill in — their routing stays the single stream.
-            let thread = inbound_session_thread(channel.as_ref(), &msg);
 
             let restore_incomplete = !*restore_complete.borrow();
             if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
@@ -2228,6 +2287,7 @@ mod tests {
             thread_ts: Some("1700000000.000100".into()),
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         };
         assert_eq!(inbound_session_thread(&MockChannel::new(), &msg), None);
         assert_eq!(
@@ -2248,6 +2308,7 @@ mod tests {
             Some(ccteam_core::tenants::TenantTelegram {
                 bot_token: "123:abc".into(),
                 allowed_chat_ids: vec![],
+                require_mention: false,
             }),
         );
         let _bob = reg.add("bob"); // no IM creds → no channel
@@ -2277,6 +2338,7 @@ mod tests {
                 bot_token: "xoxb-a".into(),
                 app_token: "xapp-a".into(),
                 allowed_user_ids: vec!["U0ALICE".into()],
+                require_mention: false,
             }),
         );
         let chans = build_tenant_channels(&reg, None);
@@ -2300,6 +2362,7 @@ mod tests {
                 bot_token: "xoxb-1".into(),
                 app_token: "xapp-1".into(),
                 allowed_user_ids: vec!["U1".into()],
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -2308,6 +2371,83 @@ mod tests {
         assert!(ch.session_threads());
         assert!(ch.native_buttons());
         assert!(ch.max_message_len().is_some());
+    }
+
+    /// The `require_mention` switch reaches the live channel of EVERY IM that
+    /// has one — the owner's global bot and each tenant's own bot alike — so
+    /// the setting means the same thing wherever it is configured.
+    #[cfg(all(feature = "telegram", feature = "lark", feature = "slack"))]
+    #[test]
+    fn require_mention_reaches_every_ims_channel_global_and_tenant() {
+        use ccteam_core::tenants::{TenantLark, TenantSlack, TenantTelegram};
+        for on in [false, true] {
+            let creds = Credentials {
+                telegram: Some(crate::credentials::TelegramCreds {
+                    bot_token: "123:abc".into(),
+                    allowed_chat_ids: vec!["1".into()],
+                    require_mention: on,
+                }),
+                lark: Some(crate::credentials::LarkCreds {
+                    app_id: "cli_x".into(),
+                    app_secret: "s".into(),
+                    allowed_user_ids: vec!["ou_1".into()],
+                    use_feishu: true,
+                    require_mention: on,
+                }),
+                slack: Some(crate::credentials::SlackCreds {
+                    bot_token: "xoxb-1".into(),
+                    app_token: "xapp-1".into(),
+                    allowed_user_ids: vec!["U1".into()],
+                    require_mention: on,
+                }),
+                ..Default::default()
+            };
+            let mut seen = Vec::new();
+            for (name, builder) in CHANNEL_BUILDERS {
+                if !["telegram", "lark", "slack"].contains(name) {
+                    continue;
+                }
+                let ch = builder(&creds, &[], None).expect("block → channel");
+                assert_eq!(ch.mention_policy().require_mention, on, "global {name}");
+                seen.push(*name);
+            }
+            assert_eq!(seen.len(), 3, "all three IMs covered: {seen:?}");
+
+            let mut reg = ccteam_core::tenants::TenantRegistry::default();
+            let t = reg.add("alice");
+            reg.set_telegram(
+                &t.id,
+                Some(TenantTelegram {
+                    bot_token: "123:abc".into(),
+                    allowed_chat_ids: vec!["1".into()],
+                    require_mention: on,
+                }),
+            );
+            reg.set_lark(
+                &t.id,
+                Some(TenantLark {
+                    app_id: "cli_x".into(),
+                    app_secret: "s".into(),
+                    allowed_user_ids: vec!["ou_1".into()],
+                    use_feishu: true,
+                    require_mention: on,
+                }),
+            );
+            reg.set_slack(
+                &t.id,
+                Some(TenantSlack {
+                    bot_token: "xoxb-1".into(),
+                    app_token: "xapp-1".into(),
+                    allowed_user_ids: vec!["U1".into()],
+                    require_mention: on,
+                }),
+            );
+            let chans = build_tenant_channels(&reg, None);
+            assert_eq!(chans.len(), 3, "one channel per tenant IM");
+            for (name, ch) in &chans {
+                assert_eq!(ch.mention_policy().require_mention, on, "tenant {name}");
+            }
+        }
     }
 
     /// The daemon hands every live channel's capabilities — buttons, a thread
@@ -2320,6 +2460,7 @@ mod tests {
                 bot_token: "xoxb-1".into(),
                 app_token: "xapp-1".into(),
                 allowed_user_ids: vec!["U1".into()],
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -2562,6 +2703,7 @@ mod tests {
                 size: Some(908),
             }],
             selection: None,
+            ambient: false,
         };
         // The consumer's gate input: a captionless attachment counts as non-text.
         let has_nontext = msg.selection.is_some() || !msg.attachments.is_empty();

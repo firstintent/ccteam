@@ -109,6 +109,46 @@ pub struct ChannelMessage {
     /// text. `None` for ordinary messages.
     #[serde(default)]
     pub selection: Option<ChoiceReply>,
+    /// A group-chat / channel message that does NOT address the bot (no
+    /// @-mention of it, not a reply to it) — "ambient" chatter in a space the
+    /// bot merely sits in. A DM, a slash command and an option click are never
+    /// ambient. Every provider reports this one fact; whether an ambient
+    /// message is answered is [`MentionPolicy`]'s call, in one place.
+    #[serde(default)]
+    pub ambient: bool,
+}
+
+/// The per-IM "must I be @-mentioned in a group?" switch
+/// (`require_mention` in the credentials), and the ONE rule that applies it —
+/// so Telegram, Lark and Slack cannot drift apart. Providers report
+/// [`ChannelMessage::ambient`]; this decides what an ambient message does.
+///
+/// Off (the default): every message from an allowed sender is answered. On:
+/// an ambient message is answered only when it continues a conversation the
+/// gateway already holds — a platform thread with a current session (Slack's
+/// thread-per-session). A flat chat has no such thread, so there it takes an
+/// @-mention every time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MentionPolicy {
+    /// `require_mention` from the IM's credentials block.
+    pub require_mention: bool,
+}
+
+impl MentionPolicy {
+    /// Provider-side early drop, BEFORE any attachment download or other
+    /// per-message work: an ambient message outside a thread can never
+    /// continue a held conversation, so under this policy it is dropped for
+    /// certain. (An ambient message inside a thread may — that needs the
+    /// gateway; see [`Self::admits`].)
+    pub fn drops_early(self, ambient: bool, in_thread: bool) -> bool {
+        self.require_mention && ambient && !in_thread
+    }
+
+    /// The final verdict, with the gateway's answer to "does this thread
+    /// already have a current session here" (`thread_held`).
+    pub fn admits(self, ambient: bool, thread_held: bool) -> bool {
+        !(self.require_mention && ambient) || thread_held
+    }
 }
 
 /// v0.8.20 F2 — a per-tenant IM bot's channel name is `"<platform>@<tenant_id>"`
@@ -622,6 +662,13 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// This channel's [`MentionPolicy`] (from its credentials'
+    /// `require_mention`); the daemon's inbound consumer applies it to every
+    /// [`ChannelMessage::ambient`] message. **Default**: answer everything.
+    fn mention_policy(&self) -> MentionPolicy {
+        MentionPolicy::default()
+    }
+
     /// Whether this channel renders [`SendMessage::options`] as tappable
     /// buttons whose click comes back as a [`ChannelMessage::selection`]
     /// (Telegram inline keyboard, Slack Block Kit). The daemon reports it to
@@ -762,6 +809,36 @@ pub fn next_project_upload_path(
 mod tests {
     use super::*;
     use crate::transport::providers::mock::MockChannel;
+
+    /// The one rule behind every IM's `require_mention` switch.
+    #[test]
+    fn mention_policy_truth_table() {
+        let off = MentionPolicy::default();
+        let on = MentionPolicy {
+            require_mention: true,
+        };
+        // Off (the default) answers everything, ambient or not.
+        for (ambient, in_thread, held) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            assert!(!off.drops_early(ambient, in_thread));
+            assert!(off.admits(ambient, held));
+        }
+        // On: an addressed message (DM, @-mention, command, click) always passes…
+        assert!(!on.drops_early(false, false));
+        assert!(!on.drops_early(false, true));
+        assert!(on.admits(false, false));
+        // …ambient chatter outside a thread is dropped for certain…
+        assert!(on.drops_early(true, false));
+        // …an ambient reply inside a thread is the gateway's call: it passes
+        // only when that thread already holds a session.
+        assert!(!on.drops_early(true, true));
+        assert!(!on.admits(true, false));
+        assert!(on.admits(true, true));
+    }
 
     /// v0.8.20 F2 — the platform prefix is what platform-keyed logic (ACL,
     /// menus) uses; the `@`-suffixed full name is the per-bot routing key.

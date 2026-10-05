@@ -6117,6 +6117,7 @@ mod chat_send_file_tests {
             Some(ccteam_core::tenants::TenantTelegram {
                 bot_token: "123:test".into(),
                 allowed_chat_ids: Vec::new(),
+                require_mention: false,
             }),
         );
         tenants.save(&paths.users_dir()).unwrap();
@@ -8113,6 +8114,7 @@ mod session_tool_tests {
                 telegram: Some(crate::credentials::TelegramCreds {
                     bot_token: "123:test".into(),
                     allowed_chat_ids: vec!["admin-chat".into()],
+                    require_mention: false,
                 }),
                 ..Default::default()
             },

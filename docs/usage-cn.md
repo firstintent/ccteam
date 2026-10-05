@@ -196,6 +196,8 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - **飞书 / Lark**:填 App ID / App Secret / 区域(飞书国内 / Lark 国际)/ 允许的用户。
 - **Slack**:三步卡片——一键链接创建 App(manifest 已填好)、填 bot token 和 app-level token、私信 bot 后点一下自己的成员 ID 完成授权。详见 [接入](#接入)。
 
+每个 IM 的卡片上还有一个 **群聊/频道里需要 @ 机器人才回复** 开关,见 [群聊与频道](#群聊与频道)。
+
 秘密只显示掩码(`…末四位`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅在启动时加载),页面会提示 `restart required` —— 照 [运维](#运维) 重启即可。详细的 bot 创建步骤见 [二、Telegram / 飞书 / Slack](#接入)。
 
 ### 多用户
@@ -280,11 +282,22 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 2. **填两个 token**:*Bot token* = **OAuth & Permissions → Bot User OAuth Token**(`xoxb-…`);*App-level token* = **Basic Information → App-Level Tokens → Generate**,scope 选 `connections:write`(`xapp-…`)。保存时会先用 Slack 校验两者,通过即连接,不用重启。
 3. **允许自己**:私信 bot(或在频道里 @ 它),你的成员 ID(`U…`)会出现在卡片上,点一下即允许。没人被允许前 bot **谁也不回**(fail closed)。允许名单同时是 **owner 名册**:被允许的成员按本机 owner 服务。
 
-之后把 bot 邀进频道(`/invite @ccteam`)或直接私信它。它会回答允许名单里的人在它所在频道里的每条消息,所以最好用一个专用频道(或私信)。
+之后把 bot 邀进频道(`/invite @ccteam`)或直接私信它。默认它会回答允许名单里的人在它所在频道里的每条消息,所以最好用一个专用频道(或私信)——或者打开下面的 **需要 @** 开关,只在被点名时才回([见下](#群聊与频道))。
 
-- **一个工作区里有多台 ccteam**:每个独立的 ccteam 各建一个 App(`cct2`、`cct3`……)——Socket Mode 会把一个 App 的事件分散到它的所有连接上,两个 daemon 不能共用一个 App。每个 App 有自己的斜杠命令。Slack 免费版一个工作区最多 10 个 App。以卫星方式接入同一个 ccteam 的机器不需要单独的 App:那个 ccteam 的 App 已经能管到它们的项目。
+- **一个工作区里有多台 ccteam**:每个独立的 ccteam 各建一个 App(`cct2`、`cct3`……)——Socket Mode 会把一个 App 的事件分散到它的所有连接上,两个 daemon 不能共用一个 App。每个 App 有自己的斜杠命令。两个 App 在同一个频道里时,对两边都在允许名单里的成员,它们会各回每一条消息:分开频道,或给两边都打开 **需要 @** 开关。Slack 免费版一个工作区最多 10 个 App。以卫星方式接入同一个 ccteam 的机器不需要单独的 App:那个 ccteam 的 App 已经能管到它们的项目。
 
 > **手写凭证文件后必须重启 daemon 才生效**(Web Settings 配的同理)。飞书/Lark、Telegram 与 Slack 对等:文本、富文本、图片/文件收发都支持。
+
+### 群聊与频道
+
+bot 在群聊/频道里是每条都回、还是只在被 @ 时才回,是同一个开关——每个 IM 上都一样,名为 **群聊/频道里需要 @ 机器人才回复**。它在 **Settings → 接入** 里该 IM 的卡片上(每个用户自己的 bot 卡片在 **我的 IM bot** 下),或在凭证文件里该 IM 的块里写 `"require_mention": true`。网页上改动即时生效,不用重启。
+
+- **关(默认)**:bot 会回答允许名单里的人在它所在群聊/频道里发的每一条消息。
+- **开**:在群聊/频道里只回复 @ 了它的消息。私聊始终回复,斜杠命令和按钮点击也始终回复。Slack 上,bot 已有会话的线程里后续消息可以不 @(一个线程 = 一个会话);Telegram 和飞书没有这种线程,所以每条都要 @。Slack 频道顶层打的 `!命令` 也只是一条普通消息,同样要 @(`@ccteam !new codex`)——或者直接用 App 的斜杠命令(`/ccteam new codex`)。
+
+怎样算 @ 了 bot —— **Telegram**:`@botname`、`/命令@botname`,或回复它发的消息(bot 自己的 @ 会在 agent 看到文本前被去掉,所以 `@botname /new codex` 执行的是 `/new codex`)。**飞书/Lark**:群里的任何 @(默认情况下飞书只把 @ 了该应用的群消息投递给它,除非应用有「接收群聊所有消息」权限)。**Slack**:`@ccteam`。
+
+被开关跳过的消息在下载任何东西之前就被丢弃,不会到达任何 agent。两个 ccteam bot 共用一个频道时,也靠它避免互相抢答:两边都打开即可。
 
 ### Slack:一个会话 = 一个线程
 

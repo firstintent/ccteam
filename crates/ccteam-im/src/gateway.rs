@@ -22201,6 +22201,7 @@ mod tests {
                 telegram: Some(crate::credentials::TelegramCreds {
                     bot_token: "123:test".into(),
                     allowed_chat_ids,
+                    require_mention: false,
                 }),
                 ..Default::default()
             },
@@ -27649,6 +27650,7 @@ mod tests {
             Some(ccteam_core::tenants::TenantTelegram {
                 bot_token: "456:alice".into(),
                 allowed_chat_ids: Vec::new(),
+                require_mention: false,
             }),
         );
         tenants.save(&paths.users_dir()).unwrap();

@@ -14,15 +14,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use anyhow::Context as _;
 
 use crate::latency::now_unix_ms;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OptionWeight, OutboundFile,
-    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, MentionPolicy, MessageOption, OptionWeight,
+    OutboundFile, OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -51,9 +51,22 @@ pub struct TelegramChannel {
     open_when_unset: bool,
     /// Shared setup probe + one-shot binding notice for rejected senders.
     rejected_senders: RejectedSenderNotifier,
+    /// Whether a group message must @-mention the bot to be answered.
+    mention_policy: MentionPolicy,
+    /// `getMe`, fetched on the first group message (a private chat needs no
+    /// identity) and kept once it succeeds.
+    bot: OnceCell<BotIdentity>,
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
     name: String,
+}
+
+/// The bot's own identity from `getMe`: its id (a reply to one of its
+/// messages, a `text_mention`) and username (an `@bot` mention, `/cmd@bot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BotIdentity {
+    id: i64,
+    username: String,
 }
 
 impl TelegramChannel {
@@ -66,6 +79,8 @@ impl TelegramChannel {
             allowed_chat_ids,
             open_when_unset: true,
             rejected_senders: RejectedSenderNotifier::default(),
+            mention_policy: MentionPolicy::default(),
+            bot: OnceCell::new(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(POLL_TIMEOUT_SECS + 10))
                 .build()
@@ -81,6 +96,39 @@ impl TelegramChannel {
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
         self
+    }
+
+    /// Answer a group message only when it @-mentions the bot (or replies to
+    /// it) — the credentials' `require_mention`. Private chats, commands'
+    /// buttons and clicks are unaffected.
+    pub fn with_require_mention(mut self, require_mention: bool) -> Self {
+        self.mention_policy = MentionPolicy { require_mention };
+        self
+    }
+
+    /// The bot's own identity (`getMe`), cached after the first success. A
+    /// failure is logged and retried by the next group message.
+    async fn bot_identity(&self) -> Option<&BotIdentity> {
+        self.bot
+            .get_or_try_init(|| async {
+                let resp: GetMeResp = self
+                    .http
+                    .get(self.api_url("getMe"))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                match resp.result {
+                    Some(me) if resp.ok => Ok(BotIdentity {
+                        id: me.id,
+                        username: me.username.unwrap_or_default(),
+                    }),
+                    _ => anyhow::bail!("getMe ok=false"),
+                }
+            })
+            .await
+            .map_err(|err| tracing::warn!(error = %err, "telegram getMe failed"))
+            .ok()
     }
 
     /// Treat an EMPTY allowlist as "answer nobody" instead of "answer
@@ -242,6 +290,7 @@ impl TelegramChannel {
             thread_ts: None,
             attachments: Vec::new(),
             selection: Some(ChoiceReply { data }),
+            ambient: false,
         };
         let _ = tx.send(payload).await;
     }
@@ -388,11 +437,50 @@ struct TgMessage {
     document: Option<TgDocument>,
     #[serde(default)]
     caption: Option<String>,
+    /// Markup spans of `text` (an `@bot` mention, a `/cmd@bot` command).
+    #[serde(default)]
+    entities: Vec<TgEntity>,
+    /// Markup spans of `caption` (a media message's text).
+    #[serde(default)]
+    caption_entities: Vec<TgEntity>,
+    /// The message this one replies to; replying to the bot addresses it.
+    #[serde(default)]
+    reply_to_message: Option<Box<TgReplied>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TgChat {
     id: i64,
+    /// `private` | `group` | `supergroup` | `channel`; absent ⇒ not a group.
+    #[serde(default, rename = "type")]
+    kind: String,
+}
+
+/// The only part of a replied-to message the gateway cares about: who sent it.
+#[derive(Debug, Deserialize)]
+struct TgReplied {
+    #[serde(default)]
+    from: Option<TgUser>,
+}
+
+/// One markup span; `offset`/`length` count UTF-16 code units.
+#[derive(Debug, Deserialize)]
+struct TgEntity {
+    #[serde(rename = "type")]
+    kind: String,
+    offset: usize,
+    length: usize,
+    /// Set on a `text_mention` (a mention of a user with no username).
+    #[serde(default)]
+    user: Option<TgUser>,
+}
+
+/// `getMe` response.
+#[derive(Debug, Deserialize)]
+struct GetMeResp {
+    ok: bool,
+    #[serde(default)]
+    result: Option<TgUser>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +522,92 @@ struct PendingDownload {
     file_name: String,
     mime: Option<String>,
     size: Option<u64>,
+}
+
+/// The text a message carries and the markup spans that index into it (a media
+/// message's text is its caption).
+fn text_and_entities(m: &TgMessage) -> (&str, &[TgEntity]) {
+    match m.text.as_deref() {
+        Some(text) => (text, &m.entities),
+        None => (m.caption.as_deref().unwrap_or(""), &m.caption_entities),
+    }
+}
+
+/// `text[offset..offset+len]` where offset/len count UTF-16 code units (the
+/// unit Telegram's entities use); `None` when the span is out of range.
+fn utf16_span(text: &str, offset: usize, len: usize) -> Option<String> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    String::from_utf16(units.get(offset..offset.checked_add(len)?)?).ok()
+}
+
+/// Whether `m` is a group / supergroup message (not a private chat).
+fn is_group(m: &TgMessage) -> bool {
+    matches!(m.chat.kind.as_str(), "group" | "supergroup")
+}
+
+/// Whether `username` (an `@handle` without its `@`) is the bot's — Telegram
+/// usernames are case-insensitive.
+fn names_bot(username: Option<&str>, bot: &BotIdentity) -> bool {
+    username.is_some_and(|who| !who.is_empty() && who.eq_ignore_ascii_case(&bot.username))
+}
+
+/// Whether a group message addresses the bot: it @-mentions it (`@bot`, or a
+/// `text_mention` of its id), is a command aimed at it (`/cmd@bot`), or
+/// replies to one of its messages.
+fn addresses_bot(m: &TgMessage, bot: &BotIdentity) -> bool {
+    let replies_to_bot = m
+        .reply_to_message
+        .as_ref()
+        .and_then(|r| r.from.as_ref())
+        .is_some_and(|u| u.id == bot.id);
+    if replies_to_bot {
+        return true;
+    }
+    let (text, entities) = text_and_entities(m);
+    entities.iter().any(|e| match e.kind.as_str() {
+        "text_mention" => e.user.as_ref().is_some_and(|u| u.id == bot.id),
+        "mention" => utf16_span(text, e.offset, e.length)
+            .is_some_and(|s| names_bot(s.strip_prefix('@'), bot)),
+        "bot_command" => utf16_span(text, e.offset, e.length)
+            .is_some_and(|s| names_bot(s.rsplit_once('@').map(|(_, who)| who), bot)),
+        _ => false,
+    })
+}
+
+/// The group message's text with the bot's own handle removed — `@bot hi` →
+/// `hi`, `/status@bot` → `/status` — so addressing the bot never stops a
+/// command from being a command (Slack strips `<@BOT>` the same way).
+fn without_bot_handle(m: &TgMessage, bot: &BotIdentity) -> String {
+    let (text, entities) = text_and_entities(m);
+    let handle_units = 1 + bot.username.encode_utf16().count();
+    let mut cuts: Vec<(usize, usize)> = entities
+        .iter()
+        .filter_map(|e| {
+            let span = utf16_span(text, e.offset, e.length)?;
+            match e.kind.as_str() {
+                "mention" if names_bot(span.strip_prefix('@'), bot) => {
+                    Some((e.offset, e.offset + e.length))
+                }
+                "bot_command" if names_bot(span.rsplit_once('@').map(|(_, who)| who), bot) => {
+                    Some((e.offset + e.length - handle_units, e.offset + e.length))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if cuts.is_empty() {
+        return text.to_string();
+    }
+    cuts.sort_unstable();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut kept = Vec::with_capacity(units.len());
+    let mut at = 0;
+    for (start, end) in cuts {
+        kept.extend_from_slice(&units[at..start.max(at)]);
+        at = end.max(at);
+    }
+    kept.extend_from_slice(&units[at..]);
+    String::from_utf16_lossy(&kept).trim().to_string()
 }
 
 /// Pure: choose the single attachment to download for a message —
@@ -610,6 +784,22 @@ impl Channel for TelegramChannel {
                         self.reject_chat(&chat_id, m.message_id, m.date).await;
                         continue;
                     }
+                    // A group message that does not address the bot is
+                    // "ambient"; a private chat never is. Telegram has no
+                    // threads, so under `require_mention` it is dropped here,
+                    // before any attachment download. (Identity unknown ⇒
+                    // cannot tell a mention, so it counts as ambient.)
+                    let group = is_group(&m);
+                    let bot = if group {
+                        self.bot_identity().await
+                    } else {
+                        None
+                    };
+                    let ambient = group && !bot.is_some_and(|b| addresses_bot(&m, b));
+                    if self.mention_policy.drops_early(ambient, false) {
+                        tracing::debug!(chat_id = %chat_id, "telegram: ambient group message dropped (require_mention)");
+                        continue;
+                    }
                     let sender = m
                         .from
                         .as_ref()
@@ -625,11 +815,14 @@ impl Channel for TelegramChannel {
                     let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
                     let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
                     // V0.8.4 P2a — caption is the text for media messages.
-                    let content = m
-                        .text
-                        .clone()
-                        .or_else(|| m.caption.clone())
-                        .unwrap_or_default();
+                    let content = match bot {
+                        Some(bot) if group => without_bot_handle(&m, bot),
+                        _ => m
+                            .text
+                            .clone()
+                            .or_else(|| m.caption.clone())
+                            .unwrap_or_default(),
+                    };
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
                     if let Some(pending) = pick_attachment(&m) {
@@ -685,6 +878,7 @@ impl Channel for TelegramChannel {
                         thread_ts: None,
                         attachments,
                         selection: None,
+                        ambient,
                     };
                     if tx.send(payload).await.is_err() {
                         return Ok(());
@@ -708,6 +902,10 @@ impl Channel for TelegramChannel {
 
     fn native_buttons(&self) -> bool {
         true
+    }
+
+    fn mention_policy(&self) -> MentionPolicy {
+        self.mention_policy
     }
 
     async fn edit_message(
@@ -1056,6 +1254,168 @@ mod tests {
         assert_eq!(
             pick_attachment(&img_doc).unwrap().kind,
             AttachmentKind::Image
+        );
+    }
+
+    fn tg(msg: serde_json::Value) -> TgMessage {
+        let mut base = serde_json::json!({"message_id": 1, "date": 0});
+        base.as_object_mut()
+            .unwrap()
+            .extend(msg.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn me() -> BotIdentity {
+        BotIdentity {
+            id: 777,
+            username: "CctBot".into(),
+        }
+    }
+
+    /// A private chat is never a group; group and supergroup are; a message
+    /// whose chat type is absent counts as not-a-group (answer, don't gate).
+    #[test]
+    fn only_group_and_supergroup_are_groups() {
+        for (kind, group) in [
+            ("private", false),
+            ("group", true),
+            ("supergroup", true),
+            ("channel", false),
+        ] {
+            let m = tg(serde_json::json!({"chat": {"id": 5, "type": kind}, "text": "hi"}));
+            assert_eq!(is_group(&m), group, "{kind}");
+        }
+        assert!(!is_group(&tg(serde_json::json!({"chat": {"id": 5}}))));
+    }
+
+    /// What addresses the bot in a group: an @-mention (any case — usernames
+    /// are case-insensitive), a `text_mention` of its id, `/cmd@bot`, a reply
+    /// to one of its messages. Another bot's handle and a plain `/cmd` do not.
+    #[test]
+    fn a_group_message_addresses_the_bot_by_mention_command_or_reply() {
+        let group = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({"chat": {"id": -9, "type": "supergroup"}});
+            m.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tg(m)
+        };
+        let mention = group(serde_json::json!({
+            "text": "@cctbot what is the status",
+            "entities": [{"type": "mention", "offset": 0, "length": 7}],
+        }));
+        assert!(addresses_bot(&mention, &me()), "case-insensitive @mention");
+
+        let other_bot = group(serde_json::json!({
+            "text": "@OtherBot hello",
+            "entities": [{"type": "mention", "offset": 0, "length": 9}],
+        }));
+        assert!(!addresses_bot(&other_bot, &me()));
+
+        let text_mention = group(serde_json::json!({
+            "text": "hey you",
+            "entities": [{"type": "text_mention", "offset": 4, "length": 3,
+                          "user": {"id": 777}}],
+        }));
+        assert!(addresses_bot(&text_mention, &me()));
+
+        let command = group(serde_json::json!({
+            "text": "/status@CctBot",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 14}],
+        }));
+        assert!(addresses_bot(&command, &me()));
+        let bare_command = group(serde_json::json!({
+            "text": "/status",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 7}],
+        }));
+        assert!(
+            !addresses_bot(&bare_command, &me()),
+            "a bare /cmd goes to every bot in the group"
+        );
+
+        let reply = group(serde_json::json!({
+            "text": "thanks",
+            "reply_to_message": {"from": {"id": 777}},
+        }));
+        assert!(addresses_bot(&reply, &me()));
+        let reply_to_human = group(serde_json::json!({
+            "text": "thanks",
+            "reply_to_message": {"from": {"id": 1}},
+        }));
+        assert!(!addresses_bot(&reply_to_human, &me()));
+
+        // A media message carries its @-mention in the caption entities.
+        let caption = group(serde_json::json!({
+            "caption": "@CctBot see this",
+            "caption_entities": [{"type": "mention", "offset": 0, "length": 7}],
+            "photo": [{"file_id": "p", "file_size": 1}],
+        }));
+        assert!(addresses_bot(&caption, &me()));
+        assert!(!addresses_bot(
+            &group(serde_json::json!({"text": "hi"})),
+            &me()
+        ));
+    }
+
+    /// Entity offsets count UTF-16 units: an emoji before the mention shifts
+    /// it by two, and a malformed span never panics.
+    #[test]
+    fn entity_offsets_are_utf16_units() {
+        let m = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "🙂 @CctBot hi",
+            "entities": [{"type": "mention", "offset": 3, "length": 7}],
+        }));
+        assert!(addresses_bot(&m, &me()));
+        assert_eq!(without_bot_handle(&m, &me()), "🙂  hi");
+        let bad = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "hi",
+            "entities": [{"type": "mention", "offset": 40, "length": 7}],
+        }));
+        assert!(!addresses_bot(&bad, &me()));
+        assert_eq!(without_bot_handle(&bad, &me()), "hi");
+    }
+
+    /// Addressing the bot must never stop a command from being a command:
+    /// the bot's own handle is removed, anyone else's stays.
+    #[test]
+    fn the_bots_own_handle_is_stripped_so_commands_still_parse() {
+        let mention = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "@CctBot /new codex",
+            "entities": [{"type": "mention", "offset": 0, "length": 7},
+                         {"type": "bot_command", "offset": 8, "length": 4}],
+        }));
+        assert_eq!(without_bot_handle(&mention, &me()), "/new codex");
+        let suffix = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "/status@cctbot now",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 14}],
+        }));
+        assert_eq!(without_bot_handle(&suffix, &me()), "/status now");
+        let other = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "@alice @CctBot ping",
+            "entities": [{"type": "mention", "offset": 0, "length": 6},
+                         {"type": "mention", "offset": 7, "length": 7}],
+        }));
+        assert_eq!(without_bot_handle(&other, &me()), "@alice  ping");
+    }
+
+    /// The builder switch reaches the trait, and the default answers all.
+    #[test]
+    fn require_mention_reaches_the_mention_policy() {
+        assert!(
+            !TelegramChannel::new("t".into(), vec![])
+                .mention_policy()
+                .require_mention
+        );
+        assert!(
+            TelegramChannel::new("t".into(), vec![])
+                .with_require_mention(true)
+                .mention_policy()
+                .require_mention
         );
     }
 

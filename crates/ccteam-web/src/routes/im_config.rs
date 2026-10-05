@@ -168,6 +168,9 @@ pub struct TelegramStatus {
     pub bot_token_last4: String,
     /// How many `chat_id`s are bound (the allowlist length).
     pub chat_id_count: usize,
+    /// Whether a group chat / channel message must @-mention the bot to be
+    /// answered (`false` = every message from an allowed sender is).
+    pub require_mention: bool,
 }
 
 /// Masked Lark/Feishu status. Note the absence of any `app_secret` field.
@@ -182,6 +185,9 @@ pub struct LarkStatus {
     pub use_feishu: bool,
     /// How many `open_id`s are allowlisted.
     pub allowed_user_id_count: usize,
+    /// Whether a group chat / channel message must @-mention the bot to be
+    /// answered (`false` = every message from an allowed sender is).
+    pub require_mention: bool,
 }
 
 /// Masked Slack status. Note the absence of any `bot_token` / `app_token`
@@ -197,6 +203,9 @@ pub struct SlackStatus {
     pub app_token_last4: String,
     /// The Slack user ids allowed to drive the bot (empty = nobody).
     pub allowed_user_ids: Vec<String>,
+    /// Whether a group chat / channel message must @-mention the bot to be
+    /// answered (`false` = every message from an allowed sender is).
+    pub require_mention: bool,
 }
 
 /// `GET /config/im` response — masked, secret-free.
@@ -344,30 +353,89 @@ pub(crate) async fn handle_get_im_config(
         Ok(c) => c,
         Err(e) => return json_500(e),
     };
-    let telegram = creds.telegram.map(|t| TelegramStatus {
-        configured: true,
-        bot_token_last4: mask_last4(&t.bot_token),
-        chat_id_count: t.allowed_chat_ids.len(),
-    });
-    let lark = creds.lark.map(|l| LarkStatus {
-        configured: true,
-        app_id_last4: mask_last4(&l.app_id),
-        use_feishu: l.use_feishu,
-        allowed_user_id_count: l.allowed_user_ids.len(),
-    });
-    let slack = creds.slack.map(|s| SlackStatus {
-        configured: true,
-        bot_token_last4: mask_last4(&s.bot_token),
-        app_token_last4: mask_last4(&s.app_token),
-        allowed_user_ids: s.allowed_user_ids,
-    });
     Json(ImConfigStatus {
+        telegram: creds
+            .telegram
+            .map(|t| telegram_status(&t.bot_token, t.allowed_chat_ids.len(), t.require_mention)),
+        lark: creds.lark.map(|l| {
+            lark_status(
+                &l.app_id,
+                l.use_feishu,
+                l.allowed_user_ids.len(),
+                l.require_mention,
+            )
+        }),
+        slack: creds.slack.map(|s| {
+            slack_status(
+                &s.bot_token,
+                &s.app_token,
+                s.allowed_user_ids,
+                s.require_mention,
+            )
+        }),
+        transport_warning: TRANSPORT_WARNING.to_string(),
+    })
+    .into_response()
+}
+
+/// The masked per-IM status builders — shared by the owner's global read here
+/// and a tenant's own read ([`super::users`]), so both surfaces report the same
+/// shape from the one place that knows what is secret.
+pub(crate) fn telegram_status(
+    bot_token: &str,
+    chat_id_count: usize,
+    require_mention: bool,
+) -> TelegramStatus {
+    TelegramStatus {
+        configured: true,
+        bot_token_last4: mask_last4(bot_token),
+        chat_id_count,
+        require_mention,
+    }
+}
+
+pub(crate) fn lark_status(
+    app_id: &str,
+    use_feishu: bool,
+    allowed_user_id_count: usize,
+    require_mention: bool,
+) -> LarkStatus {
+    LarkStatus {
+        configured: true,
+        app_id_last4: mask_last4(app_id),
+        use_feishu,
+        allowed_user_id_count,
+        require_mention,
+    }
+}
+
+pub(crate) fn slack_status(
+    bot_token: &str,
+    app_token: &str,
+    allowed_user_ids: Vec<String>,
+    require_mention: bool,
+) -> SlackStatus {
+    SlackStatus {
+        configured: true,
+        bot_token_last4: mask_last4(bot_token),
+        app_token_last4: mask_last4(app_token),
+        allowed_user_ids,
+        require_mention,
+    }
+}
+
+/// Wrap the three per-IM statuses into the `GET /config/im` / `GET /me/im` body.
+pub(crate) fn im_status(
+    telegram: Option<TelegramStatus>,
+    lark: Option<LarkStatus>,
+    slack: Option<SlackStatus>,
+) -> ImConfigStatus {
+    ImConfigStatus {
         telegram,
         lark,
         slack,
         transport_warning: TRANSPORT_WARNING.to_string(),
-    })
-    .into_response()
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -414,14 +482,15 @@ pub(crate) async fn handle_put_telegram(
         Ok(c) => c,
         Err(e) => return json_500(e),
     };
-    let existing_chat_ids = creds
-        .telegram
-        .take()
-        .map(|t| t.allowed_chat_ids)
-        .unwrap_or_default();
+    let existing = creds.telegram.take();
     creds.telegram = Some(TelegramCreds {
         bot_token: token.to_string(),
-        allowed_chat_ids: existing_chat_ids,
+        allowed_chat_ids: existing
+            .as_ref()
+            .map(|t| t.allowed_chat_ids.clone())
+            .unwrap_or_default(),
+        // A token change must not reset the group-reply switch.
+        require_mention: existing.is_some_and(|t| t.require_mention),
     });
     if let Err(e) = save_creds(&app, &creds) {
         return json_500(e);
@@ -652,6 +721,8 @@ pub(crate) async fn handle_put_lark(
         app_secret: app_secret.to_string(),
         allowed_user_ids: form.allowed_user_ids,
         use_feishu: form.use_feishu,
+        // Re-saving the app must not reset the group-reply switch.
+        require_mention: creds.lark.as_ref().is_some_and(|l| l.require_mention),
     });
     if let Err(e) = save_creds(&app, &creds) {
         return json_500(e);
@@ -724,7 +795,10 @@ pub(crate) async fn handle_put_slack(
         Ok(c) => c,
         Err(e) => return json_500(e),
     };
-    creds.slack = Some(result.creds);
+    let mut slack = result.creds;
+    // Re-saving the tokens must not reset the group-reply switch.
+    slack.require_mention = creds.slack.as_ref().is_some_and(|s| s.require_mention);
+    creds.slack = Some(slack);
     if let Err(e) = save_creds(&app, &creds) {
         return json_500(e);
     }
@@ -883,6 +957,89 @@ pub(crate) async fn handle_put_slack_allowed_users(
 }
 
 // --------------------------------------------------------------------------
+// PUT /config/im/{platform}/require-mention — the group-reply switch
+// --------------------------------------------------------------------------
+
+/// The IMs that carry the `require_mention` switch — ONE list for the owner's
+/// and the tenants' endpoints, so a new IM is one entry and a typo is one
+/// `400`, never a silent no-op.
+pub(crate) const REQUIRE_MENTION_PLATFORMS: [&str; 3] = ["telegram", "lark", "slack"];
+
+/// `PUT /config/im/{platform}/require-mention` body (and the tenant twin).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RequireMentionForm {
+    /// `true` = in a group chat / channel the bot answers only messages that
+    /// @-mention it (DMs always; on Slack also a thread it already holds a
+    /// session in). `false` (the default) = it answers every message from an
+    /// allowed sender.
+    pub require_mention: bool,
+}
+
+/// The unknown-platform `400` shared by both require-mention endpoints.
+pub(crate) fn unknown_platform_400(platform: &str) -> Response {
+    json_400(format!(
+        "unknown IM platform `{platform}` (expected one of: {})",
+        REQUIRE_MENTION_PLATFORMS.join(", ")
+    ))
+}
+
+/// `PUT /api/v1/config/im/{platform}/require-mention` — flip the group-reply
+/// switch of one configured IM bot. Takes the flag alone: the tokens are
+/// write-only, so toggling a reply rule must not mean re-entering them.
+#[utoipa::path(
+    put,
+    path = "/api/v1/config/im/{platform}/require-mention",
+    tag = "config",
+    params(("platform" = String, Path, description = "telegram | lark | slack")),
+    request_body(content = RequireMentionForm, description = "The desired switch value"),
+    responses(
+        (status = 200, description = "Saved; `{ok, platform, require_mention, reloaded, restart_required, note}`", body = serde_json::Value),
+        (status = 400, description = "Unknown platform / that IM is not configured yet"),
+        (status = 403, description = "Not an admin"),
+        (status = 500, description = "Credentials file read/write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_require_mention(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    axum::extract::Path(platform): axum::extract::Path<String>,
+    Json(form): Json<RequireMentionForm>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let mut creds = match load_creds(&app) {
+        Ok(c) => c,
+        Err(e) => return json_500(e),
+    };
+    let slot = match platform.as_str() {
+        "telegram" => creds.telegram.as_mut().map(|c| &mut c.require_mention),
+        "lark" => creds.lark.as_mut().map(|c| &mut c.require_mention),
+        "slack" => creds.slack.as_mut().map(|c| &mut c.require_mention),
+        _ => return unknown_platform_400(&platform),
+    };
+    let Some(slot) = slot else {
+        return json_400(format!(
+            "no {platform} bot configured; save its credentials first"
+        ));
+    };
+    *slot = form.require_mention;
+    if let Err(e) = save_creds(&app, &creds) {
+        return json_500(e);
+    }
+    let reloaded = nudge_im_reload(&app).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "platform": platform,
+        "require_mention": form.require_mention,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+        "note": reload_note(reloaded),
+    }))
+    .into_response()
+}
+
+// --------------------------------------------------------------------------
 // Test-only seam: drive the async poll against a mock base
 // --------------------------------------------------------------------------
 
@@ -927,6 +1084,7 @@ mod tests {
             configured: true,
             bot_token_last4: "…wxyz".into(),
             chat_id_count: 1,
+            require_mention: false,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert!(v.get("bot_token").is_none(), "no bot_token key");
@@ -940,10 +1098,12 @@ mod tests {
             bot_token_last4: "…abcd".into(),
             app_token_last4: "…wxyz".into(),
             allowed_user_ids: vec!["U1".into()],
+            require_mention: true,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert!(v.get("bot_token").is_none(), "no bot_token key");
         assert!(v.get("app_token").is_none(), "no app_token key");
         assert_eq!(v["allowed_user_ids"], serde_json::json!(["U1"]));
+        assert_eq!(v["require_mention"], true);
     }
 }
