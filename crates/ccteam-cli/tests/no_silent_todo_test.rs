@@ -10,8 +10,9 @@
 //! the `chat-handle` and `listbots-cache` anchors (the AgentSpec /
 //! BotRegistration / build_handle_map schema landed) and the
 //! dynamic-workflow rebuild of `ccteam-flow` deleted
-//! `human-approval-adapter` with the old orchestrator, so the count is
-//! now three.
+//! `human-approval-adapter` with the old orchestrator, and Slack over
+//! Socket Mode (#19) closed the last three (`im-providers`,
+//! `slack-inbound`, `slack-socket-mode`), so none survive.
 //! Sister-finding sites owned by F173 / F169 / F170 cover the
 //! remaining markers — see `docs/dev-coupling-audit.md` for the index.
 //!
@@ -114,14 +115,14 @@ fn no_silent_todo_in_production_src() {
     );
 }
 
-/// Cross-check that the surviving `TODO(V0.7-<anchor>)` tag set
-/// matches expectations — guards against accidental tag removal or
-/// duplication. F168 originally delivered six anchors; V0.6.8 retired
-/// `chat-handle` and `listbots-cache`, and the dynamic-workflow rebuild
-/// of `ccteam-flow` deleted `human-approval-adapter` along with the old
-/// decision-engine orchestrator, so the count is now three.
+/// Every `TODO(V0.7-<anchor>)` F168 deferred is closed: V0.6.8 retired
+/// `chat-handle` and `listbots-cache`, the dynamic-workflow rebuild of
+/// `ccteam-flow` deleted `human-approval-adapter`, and Slack over Socket
+/// Mode (#19) delivered `im-providers`, `slack-inbound` and
+/// `slack-socket-mode`. V0.7 is long past, so a new anchor naming it would
+/// be a stale promise — defer to a version still ahead instead.
 #[test]
-fn f168_v07_deferred_tag_count_is_three() {
+fn f168_v07_deferred_anchors_are_all_closed() {
     let workspace_root = workspace_root();
     let mut hits: Vec<String> = Vec::new();
     for root in SCAN_ROOTS {
@@ -143,13 +144,10 @@ fn f168_v07_deferred_tag_count_is_three() {
             }
         });
     }
-    assert_eq!(
-        hits.len(),
-        3,
-        "exactly 3 V0.7-deferred TODO anchors survive (F168 minus \
-         chat-handle and listbots-cache, closed in V0.6.8, minus \
-         human-approval-adapter, deleted with the old ccteam-flow \
-         orchestrator); found {}:\n{}",
+    assert!(
+        hits.is_empty(),
+        "no V0.7-deferred TODO anchor may survive (all six F168 anchors are \
+         closed); found {}:\n{}",
         hits.len(),
         hits.join("\n")
     );

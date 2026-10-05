@@ -388,8 +388,12 @@ fn patch_config(profile_dir: &Path) -> serde_yaml::Mapping {
 #[serial(dsh_env)]
 fn default_bin_is_dsh_absent_override() {
     let _guard = EnvGuard::capture();
+    // An empty home: the fallback also finds a copy the user's own `npx dsh`
+    // cached under `~/.npm/_npx`, so the host's cache must not decide this.
+    let home = tempfile::tempdir().unwrap();
     unsafe {
         std::env::remove_var(DSH_BIN_ENV);
+        std::env::set_var("HOME", home.path());
     }
     assert_eq!(dsh_bin(), "dsh");
 }
