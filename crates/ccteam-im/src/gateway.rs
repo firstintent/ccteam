@@ -3455,22 +3455,44 @@ fn button_action_command(action: &str) -> Option<String> {
         "model" => "/model",
         "interrupt" => "/interrupt",
         _ => {
-            let spec = action.strip_prefix("new:")?;
-            let (vendor, model) = match spec.split_once(':') {
-                Some((vendor, model)) => (vendor, Some(model)),
-                None => (spec, None),
-            };
-            parse_vendor(vendor).ok()?;
-            return Some(match model {
-                Some(model) if !model.is_empty() && !model.contains(char::is_whitespace) => {
-                    format!("/new {vendor} model={model}")
+            // `new-effort:<effort>:<vendor>[:<model>]` — the effort leads
+            // because it never contains a `:` while a model id may.
+            let (effort, spec) = match action.strip_prefix("new-effort:") {
+                Some(rest) => {
+                    let (effort, spec) = rest.split_once(':')?;
+                    (Some(effort), spec)
                 }
-                Some(_) => return None,
-                None => format!("/new {vendor}"),
-            });
+                None => (None, action.strip_prefix("new:")?),
+            };
+            let (vendor, model) = split_vendor_model(spec);
+            parse_vendor(vendor).ok()?;
+            let word = |w: &str| !w.is_empty() && !w.contains(char::is_whitespace);
+            let mut command = format!("/new {vendor}");
+            if let Some(model) = model {
+                if !word(model) {
+                    return None;
+                }
+                command.push_str(&format!(" model={model}"));
+            }
+            if let Some(effort) = effort {
+                if !word(effort) {
+                    return None;
+                }
+                command.push_str(&format!(" effort={effort}"));
+            }
+            return Some(command);
         }
     };
     Some(command.to_string())
+}
+
+/// `<vendor>[:<model>]` — the model id is everything after the first `:` (an id
+/// may itself contain one, a vendor never does).
+fn split_vendor_model(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once(':') {
+        Some((vendor, model)) => (vendor, Some(model)),
+        None => (spec, None),
+    }
 }
 
 /// One `act:` button.
@@ -5100,6 +5122,11 @@ impl Gateway {
                 self.emit_model_picker(&chat, vendor);
                 return Ok(Vec::new());
             }
+            if let Some(spec) = action.strip_prefix("effort:") {
+                let (vendor, model) = split_vendor_model(spec);
+                self.emit_effort_picker(&chat, vendor, model);
+                return Ok(Vec::new());
+            }
             let Some(command) = button_action_command(action) else {
                 return Ok(vec![format!("unknown action: {action}")]);
             };
@@ -6298,8 +6325,22 @@ impl Gateway {
         if parse_vendor(vendor).is_err() {
             return;
         }
+        // A model with an effort axis goes on to pick it (`effort:`); one
+        // without presets at once (`new:`) — never a menu that does nothing.
+        let step = |model: Option<&str>| {
+            let spec = match model {
+                Some(model) => format!("{vendor}:{model}"),
+                None => vendor.to_string(),
+            };
+            let verb = if self.effort_ladder(vendor, model).is_empty() {
+                "new"
+            } else {
+                "effort"
+            };
+            format!("{verb}:{spec}")
+        };
         let mut options = vec![action_option(
-            &format!("new:{vendor}"),
+            &step(None),
             &format!("{vendor} · 默认模型"),
             OptionWeight::Normal,
         )];
@@ -6312,7 +6353,7 @@ impl Gateway {
                         .clone()
                         .unwrap_or_else(|| model.id.clone());
                     options.push(action_option(
-                        &format!("new:{vendor}:{}", model.id),
+                        &step(Some(&model.id)),
                         &label,
                         OptionWeight::Normal,
                     ));
@@ -6322,6 +6363,64 @@ impl Gateway {
         // Telegram caps callback data at 64 bytes; a pathological id drops out.
         options.retain(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX);
         self.emit_list_options(chat, format!("🧠 {vendor} 的模型:"), options);
+    }
+
+    /// Reasoning-effort levels to offer for `vendor`'s `model` (`None` = its
+    /// default): the model's own declared set when it has one, else the
+    /// vendor's ladder — the web composer's rule (`effortRowsFor`), so both
+    /// doors offer the same levels. Advisory like the model list: the vendor
+    /// owns the verdict on whatever is picked. Tokens that cannot ride a
+    /// button (`:` or whitespace) are left out. Empty = no effort axis.
+    fn effort_ladder(&self, vendor: &str, model: Option<&str>) -> Vec<String> {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return Vec::new();
+        };
+        let own = model.and_then(|id| {
+            ccteam_core::model_catalog::load_model_catalog_in(&paths.root)
+                .0
+                .get(vendor)?
+                .models
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.efforts.clone())
+                .filter(|efforts| !efforts.is_empty())
+        });
+        let mut ladder = own.unwrap_or_else(|| {
+            ccteam_core::model_catalog::supported_efforts_in(&paths.root, vendor)
+        });
+        ladder.retain(|e| !e.contains(':') && !e.contains(char::is_whitespace));
+        ladder
+    }
+
+    /// The step after a model pick: how hard it should think. Default first
+    /// (wires nothing, exactly like picking no effort), then the ladder; a tap
+    /// presets the next session with both.
+    fn emit_effort_picker(&self, chat: &ChatKey, vendor: &str, model: Option<&str>) {
+        if parse_vendor(vendor).is_err() {
+            return;
+        }
+        let spec = match model {
+            Some(model) => format!("{vendor}:{model}"),
+            None => vendor.to_string(),
+        };
+        let mut options = vec![action_option(
+            &format!("new:{spec}"),
+            "默认 effort",
+            OptionWeight::Normal,
+        )];
+        for effort in self.effort_ladder(vendor, model) {
+            options.push(action_option(
+                &format!("new-effort:{effort}:{spec}"),
+                &effort,
+                OptionWeight::Normal,
+            ));
+        }
+        options.retain(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX);
+        self.emit_list_options(
+            chat,
+            format!("🧠 {vendor} · {} 的 effort:", model.unwrap_or("默认模型")),
+            options,
+        );
     }
 
     /// Deliver a command's `reply` with its next step. Where the channel
@@ -30282,6 +30381,140 @@ mod tests {
             vec!["act:preset", "act:projects"],
             "change it again by tapping"
         );
+    }
+
+    /// After a model, the menu asks for its reasoning effort: the model's own
+    /// declared levels when it has them, else the vendor's ladder (the web
+    /// composer's rule). A harness without an effort axis is not asked, and
+    /// "default" wires nothing. Every tap lands in the same preset a typed
+    /// `/new <vendor> model= effort=` makes — model ids with a `:` included.
+    #[tokio::test]
+    async fn the_channel_menu_asks_for_effort_after_the_model() {
+        use ccteam_core::model_catalog::{record_vendor_models_in, CatalogModel};
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let paths = CcteamPaths {
+            root: proj.path().join("home"),
+            projects_root: proj.path().join("projects"),
+        };
+        let model = |id: &str, efforts: &[&str]| CatalogModel {
+            id: id.to_string(),
+            display_name: None,
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+        };
+        record_vendor_models_in(
+            &paths.root,
+            "codex",
+            "test",
+            vec![
+                model("gpt-6", &["low", "high"]),
+                model("mini", &["minimal"]),
+                model("plain", &[]),
+                model("ollama:llama3", &["low"]),
+            ],
+        )
+        .unwrap();
+        record_vendor_models_in(&paths.root, "opencode", "test", vec![model("oc-1", &[])]).unwrap();
+        gateway.enable_project_creation(paths);
+        gateway.bind_channel_threads("slack", true);
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        let data = |ev: &GatewayEvent| -> Vec<String> {
+            ev.options.iter().map(|o| o.data.clone()).collect()
+        };
+
+        // The model list leads on to the effort step — except where there is
+        // no effort axis, which presets at once.
+        tap_at_channel(&mut gateway, "act:preset:codex").await;
+        let models = recv_answer(&mut events).await;
+        assert_eq!(
+            data(&models),
+            vec![
+                "act:effort:codex",
+                "act:effort:codex:gpt-6",
+                "act:effort:codex:mini",
+                "act:effort:codex:plain",
+                "act:effort:codex:ollama:llama3",
+            ]
+        );
+        tap_at_channel(&mut gateway, "act:preset:opencode").await;
+        let models = recv_answer(&mut events).await;
+        assert_eq!(
+            data(&models),
+            vec!["act:new:opencode", "act:new:opencode:oc-1"],
+            "no effort axis, no extra question"
+        );
+
+        // A model's own levels win; "default effort" comes first and wires none.
+        tap_at_channel(&mut gateway, "act:effort:codex:gpt-6").await;
+        let efforts = recv_answer(&mut events).await;
+        assert!(efforts.content.contains("gpt-6"), "{}", efforts.content);
+        assert_eq!(
+            data(&efforts),
+            vec![
+                "act:new:codex:gpt-6",
+                "act:new-effort:low:codex:gpt-6",
+                "act:new-effort:high:codex:gpt-6",
+            ]
+        );
+        // A model that declares none falls back to the vendor's ladder (the
+        // union of what its models declared); the default model does too.
+        for pick in ["act:effort:codex:plain", "act:effort:codex"] {
+            tap_at_channel(&mut gateway, pick).await;
+            let efforts = recv_answer(&mut events).await;
+            let levels: Vec<String> = data(&efforts)
+                .iter()
+                .skip(1)
+                .map(|d| d.split(':').nth(2).unwrap().to_string())
+                .collect();
+            assert_eq!(levels, vec!["low", "high", "minimal"], "{pick}");
+        }
+
+        // The tap presets exactly what typing it would — then the first
+        // message spawns with both.
+        tap_at_channel(&mut gateway, "act:new-effort:high:codex:gpt-6").await;
+        let preset = recv_answer(&mut events).await;
+        assert!(
+            preset.content.contains("下一个会话:codex · gpt-6 · high"),
+            "{}",
+            preset.content
+        );
+        gateway
+            .handle_message("slack", "C1", "U1", Some("5.5"), "5.5", "hi", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_tunings.lock().await.clone(),
+            vec![(Some("gpt-6".to_string()), Some("high".to_string()))]
+        );
+
+        // The spawn announced itself; drop that so the next Answer is ours.
+        while events.try_recv().is_ok() {}
+
+        // A model id containing `:` survives the round trip; "default effort"
+        // presets the model alone.
+        tap_at_channel(&mut gateway, "act:new-effort:low:codex:ollama:llama3").await;
+        let preset = recv_answer(&mut events).await;
+        assert!(
+            preset
+                .content
+                .contains("下一个会话:codex · ollama:llama3 · low"),
+            "{}",
+            preset.content
+        );
+        tap_at_channel(&mut gateway, "act:new:codex:gpt-6").await;
+        let preset = recv_answer(&mut events).await;
+        assert!(
+            preset.content.contains("下一个会话:codex · gpt-6 · 项目"),
+            "no effort facet: {}",
+            preset.content
+        );
+
+        // A malformed effort button is refused, not guessed at.
+        assert_eq!(button_action_command("new-effort:high"), None);
+        assert_eq!(button_action_command("new-effort::codex"), None);
+        assert_eq!(button_action_command("new-effort:hi gh:codex"), None);
     }
 
     /// A thread whose first plain message spawns its session opens with a
