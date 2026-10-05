@@ -75,11 +75,16 @@ export function classifyDestination(dest: string): DestVerdict {
   return { kind: 'writable' }
 }
 
-/** `<…>/target/{debug,release}` is a build output, not an install location. */
+/** The cargo profiles a source checkout builds into — the engine's
+ *  `ccteam_core::install_channel::CARGO_BUILD_PROFILES` (`local-release` is the
+ *  thin-LTO profile `make install` builds). */
+const CARGO_BUILD_PROFILES = ['debug', 'release', 'local-release']
+
+/** `<…>/target/<profile>` is a build output, not an install location. */
 function isCargoBuildTree(dir: string): boolean {
   const parts = dir.split(sep)
   const last = parts.at(-1)
-  return (last === 'debug' || last === 'release') && parts.at(-2) === 'target'
+  return last !== undefined && CARGO_BUILD_PROFILES.includes(last) && parts.at(-2) === 'target'
 }
 
 function isWritableDir(dir: string): boolean {

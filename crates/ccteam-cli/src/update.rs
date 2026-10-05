@@ -697,13 +697,13 @@ fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(&m))
 }
 
-/// `<…>/target/{debug,release}` is a build output, not an install
-/// location: `cargo clean` there would take the daemon's binary with it.
+/// `<…>/target/<profile>` is a build output, not an install location:
+/// `cargo clean` there would take the daemon's binary with it.
 fn is_cargo_build_tree(dir: &Path) -> bool {
-    matches!(
-        dir.file_name().and_then(|n| n.to_str()),
-        Some("debug") | Some("release")
-    ) && dir.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("target"))
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| ccteam_core::install_channel::CARGO_BUILD_PROFILES.contains(&n))
+        && dir.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("target"))
 }
 
 fn is_writable_dir(dir: &Path) -> bool {
@@ -1273,6 +1273,7 @@ mod tests {
                     | Some("/home/u/.local/bin/ccteam")
                     | Some("/ro/ccteam")
                     | Some("/src/target/debug/ccteam")
+                    | Some("/src/target/local-release/ccteam")
             )
         };
         let writable = |d: &Path| d != Path::new("/ro");
@@ -1304,12 +1305,15 @@ mod tests {
             ladder(None, Some("/nope:/opt/first:/home/u/.local/bin")),
             Path::new("/opt/first")
         );
-        // Rung 2 skips a cargo build tree (`cargo clean` would delete it)…
-        assert_eq!(
-            ladder(None, Some("/src/target/debug:/home/u/.local/bin")),
-            Path::new("/home/u/.local/bin"),
-            "a build tree is not an install location"
-        );
+        // Rung 2 skips a cargo build tree (`cargo clean` would delete it),
+        // whichever profile built it — `make install` builds `local-release`…
+        for tree in ["/src/target/debug", "/src/target/local-release"] {
+            assert_eq!(
+                ladder(None, Some(&format!("{tree}:/home/u/.local/bin"))),
+                Path::new("/home/u/.local/bin"),
+                "a build tree is not an install location: {tree}"
+            );
+        }
         // …and a directory it cannot write.
         assert_eq!(
             ladder(None, Some("/ro")),
@@ -1344,7 +1348,10 @@ mod tests {
             ("1: explicit override", "CCTEAM_INSTALL_DIR"),
             ("2: PATH lookup", "command -v ccteam"),
             ("2: symlink resolution", "canonical_bin"),
-            ("2: build-tree exclusion", "*/target/release|*/target/debug"),
+            (
+                "2: build-tree exclusion",
+                "*/target/release|*/target/local-release|*/target/debug",
+            ),
             ("2: writability", "-w \"$_dir\""),
             ("3: default", "$HOME/.local/bin"),
         ] {
