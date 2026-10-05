@@ -901,6 +901,18 @@ pub struct Gateway {
     /// daemon reported them ([`Self::bind_channel_buttons`]). Empty until the
     /// daemon binds its channel set — every chat then gets plain-text pickers.
     button_channels: BTreeSet<String>,
+    /// Live channel names whose provider gives every session its own thread
+    /// ([`crate::transport::Channel::session_threads`]), as the daemon
+    /// reported them ([`Self::bind_channel_threads`]). In such a channel a
+    /// command typed at the channel level presets the NEXT session instead of
+    /// starting one, so a session's thread always opens with the person's
+    /// first real message ([`Self::preset_next_session`]).
+    thread_channels: BTreeSet<String>,
+    /// The preset for a conversation's next session (`/new …` or `/use <sid>`
+    /// typed at the channel level of a threaded channel), keyed by the
+    /// conversation; consumed by the next top-level message, whose thread the
+    /// session then lives in.
+    next_session_presets: BTreeMap<ChatKey, String>,
     /// conversation → its current project ([`FocusScope::Conversation`]: every
     /// thread of a conversation works in the same project).
     current_project: FocusRoutes,
@@ -3407,6 +3419,8 @@ enum NextStep {
     SessionControls,
     /// `/help`: the main menu, so nothing has to be typed.
     Menu,
+    /// The next session was just preset: change its model or project.
+    Preset,
 }
 
 impl NextStep {
@@ -3414,7 +3428,7 @@ impl NextStep {
         match self {
             Self::Session => Some(NEXT_HINT_STATUS),
             Self::Sessions => Some(NEXT_HINT_SESSIONS),
-            Self::SessionControls | Self::Menu => None,
+            Self::SessionControls | Self::Menu | Self::Preset => None,
         }
     }
 }
@@ -3441,9 +3455,19 @@ fn button_action_command(action: &str) -> Option<String> {
         "model" => "/model",
         "interrupt" => "/interrupt",
         _ => {
-            let vendor = action.strip_prefix("new:")?;
+            let spec = action.strip_prefix("new:")?;
+            let (vendor, model) = match spec.split_once(':') {
+                Some((vendor, model)) => (vendor, Some(model)),
+                None => (spec, None),
+            };
             parse_vendor(vendor).ok()?;
-            return Some(format!("/new {vendor}"));
+            return Some(match model {
+                Some(model) if !model.is_empty() && !model.contains(char::is_whitespace) => {
+                    format!("/new {vendor} model={model}")
+                }
+                Some(_) => return None,
+                None => format!("/new {vendor}"),
+            });
         }
     };
     Some(command.to_string())
@@ -3535,6 +3559,8 @@ impl Gateway {
             projects,
             operator_chats: BTreeMap::new(),
             button_channels: BTreeSet::new(),
+            thread_channels: BTreeSet::new(),
+            next_session_presets: BTreeMap::new(),
             current_project: FocusRoutes::new(FocusScope::Conversation),
             current_session: FocusRoutes::new(FocusScope::Thread),
             sessions: BTreeMap::new(),
@@ -5066,6 +5092,14 @@ impl Gateway {
         // An `act:` button stands for a command the user could have typed
         // (`button_action_command`): run it exactly as typed, in this chat.
         if let Some(action) = selection.and_then(|reply| reply.data.strip_prefix("act:")) {
+            if action == "preset" {
+                self.emit_harness_picker(&chat);
+                return Ok(Vec::new());
+            }
+            if let Some(vendor) = action.strip_prefix("preset:") {
+                self.emit_model_picker(&chat, vendor);
+                return Ok(Vec::new());
+            }
             let Some(command) = button_action_command(action) else {
                 return Ok(vec![format!("unknown action: {action}")]);
             };
@@ -5119,6 +5153,9 @@ impl Gateway {
                 "/inbox scheduled messages do not support files or skills"
             ));
         }
+        if let Some(reply) = self.preset_next_session(&chat, text)? {
+            return Ok(self.reply_with_next_step(&chat, reply, Some(NextStep::Preset)));
+        }
         if let Some(reply) = self.handle_command(&chat, text).await? {
             // Owner req — teach the next step (`command_next_step`): buttons
             // where the channel renders them, else a footer line. IM only — the
@@ -5163,6 +5200,18 @@ impl Gateway {
             handles.dedup();
             return Ok(vec![format_ambiguous_dm_reply(&handles)]);
         }
+        // A new thread's first message carries out the preset its channel
+        // holds (`/new …` / `/use <sid>` typed at the channel level), so the
+        // session's thread opens with this message rather than a command.
+        let mut preset_replies = Vec::new();
+        if chat.thread.is_some() && !self.current_session.contains(&chat) {
+            if let Some(preset) = self.next_session_presets.remove(&chat.focus_key()) {
+                if let Some(receipt) = self.handle_command(&chat, &preset).await? {
+                    preset_replies =
+                        self.reply_with_next_step(&chat, receipt, Some(NextStep::Session));
+                }
+            }
+        }
         self.ensure_current_session(&chat).await?;
         // v0.8.10 — codex `/clear` = recycle + recreate at the gateway, so its
         // user-facing EFFECT matches Claude Code's in-thread `/clear` (a brand-new
@@ -5184,7 +5233,8 @@ impl Gateway {
             }
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
-        let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
+        let mut replies = preset_replies;
+        replies.extend(self.submit_to_current(&chat, message_id, turn).await?);
         if chat.channel != "web"
             && !self.channel_supports_buttons(&chat.channel)
             && text.split_whitespace().next() == Some("/model")
@@ -5291,9 +5341,10 @@ impl Gateway {
             && !Self::is_gateway_command(text)
             && crate::router::parse_first_mention(text).is_none();
         let candidate = if candidate_shape {
-            !crate::latency::gateway_lock(&gateway, "im.turn.candidate")
-                .await
-                .has_current_session(channel, chat_id, user_id, thread)
+            let g = crate::latency::gateway_lock(&gateway, "im.turn.candidate").await;
+            // A preset session is started inline by `handle_message`.
+            !g.has_current_session(channel, chat_id, user_id, thread)
+                && !g.next_session_presets.contains_key(&chat.focus_key())
         } else {
             false
         };
@@ -5868,6 +5919,9 @@ impl Gateway {
             return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Sessions)));
         }
         if let Some(sid) = nav.strip_prefix("use:") {
+            if let Some(reply) = self.preset_next_session(chat, &format!("/use {sid}"))? {
+                return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Preset)));
+            }
             let reply = self.use_session(chat, sid).await?;
             return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Session)));
         }
@@ -5884,6 +5938,23 @@ impl Gateway {
         } else {
             self.button_channels.remove(name);
         }
+    }
+
+    /// Record whether the live channel `name` gives every session its own
+    /// thread — the provider's [`crate::transport::Channel::session_threads`],
+    /// reported by the daemon like [`Self::bind_channel_buttons`].
+    pub fn bind_channel_threads(&mut self, name: &str, threads: bool) {
+        if threads {
+            self.thread_channels.insert(name.to_string());
+        } else {
+            self.thread_channels.remove(name);
+        }
+    }
+
+    /// A chat at the CHANNEL level of a channel that threads sessions — where
+    /// a session never lives, so commands there preset the next one.
+    fn at_threaded_channel_level(&self, chat: &ChatKey) -> bool {
+        chat.thread.is_none() && self.thread_channels.contains(&chat.channel)
     }
 
     /// Whether a chat's channel renders message `options` as tappable
@@ -6139,6 +6210,120 @@ impl Gateway {
         options
     }
 
+    /// At the channel level of a channel that threads sessions, `/new …` and
+    /// `/use <sid>` do not open a session in the command's place: they PRESET
+    /// the conversation's next one, which the next top-level message starts
+    /// (or continues) in its own thread — so the thread opens with that
+    /// message, the session's natural title, and the preset stays visible in
+    /// the channel above it. Validated now, so a typo answers at once.
+    /// `None` = not a preset (any other chat or command).
+    fn preset_next_session(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
+        if !self.at_threaded_channel_level(chat) {
+            return Ok(None);
+        }
+        let mut parts = text.split_whitespace();
+        let summary = match parts.next() {
+            Some("/new") => {
+                let args: Vec<&str> = parts.collect();
+                let parsed = parse_new_command_args(&args)?;
+                let project = self.require_current_project(chat)?;
+                let mut summary = format!("⚙️ 下一个会话:{}", vendor_str(parsed.vendor));
+                for facet in [
+                    Some(parsed.role.as_str()).filter(|r| !r.is_empty()),
+                    parsed.tuning.model.as_deref(),
+                    parsed.tuning.effort.as_deref(),
+                    parsed.tuning.mode.as_deref(),
+                    (parsed.permission_mode == PermissionMode::Hitl).then_some("hitl"),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    summary.push_str(&format!(" · {facet}"));
+                }
+                format!("{summary} · 项目 {project}\n在频道里发第一句话即开始,它就是这个会话线程的开头。")
+            }
+            Some("/use") => {
+                let Some(sid) = parts.next().filter(|_| parts.next().is_none()) else {
+                    return Err(anyhow!("用法: /use <sid>"));
+                };
+                if !self.chat_can_access_sid(chat, sid) {
+                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                }
+                let title = self
+                    .sessions
+                    .get(sid)
+                    .and_then(|s| self.session_title(s))
+                    .or_else(|| {
+                        self.find_meta_for_sid(sid)
+                            .ok()
+                            .and_then(|(_, _, m)| m.title)
+                    });
+                let title = title.map(|t| format!(" ({})", truncate_cols(&t, 40)));
+                format!(
+                    "⚙️ 下一条消息继续 {sid}{}\n在频道里发一句话,即把它带进这条新线程。",
+                    title.unwrap_or_default()
+                )
+            }
+            _ => return Ok(None),
+        };
+        self.next_session_presets
+            .insert(chat.focus_key(), text.trim().to_string());
+        Ok(Some(summary))
+    }
+
+    /// The harnesses a next session can be preset to: those this box has
+    /// seen report models (the advisory catalog), Claude always first.
+    fn emit_harness_picker(&self, chat: &ChatKey) {
+        let mut vendors: Vec<String> = vec!["claude".to_string()];
+        if let Some(paths) = self.project_paths.as_ref() {
+            for vendor in ccteam_core::model_catalog::load_model_catalog_in(&paths.root)
+                .0
+                .keys()
+            {
+                if !vendors.contains(vendor) && parse_vendor(vendor).is_ok() {
+                    vendors.push(vendor.clone());
+                }
+            }
+        }
+        let options = vendors
+            .iter()
+            .map(|v| action_option(&format!("preset:{v}"), v, OptionWeight::Normal))
+            .collect();
+        self.emit_list_options(chat, "🧠 下一个会话用哪个 harness?".to_string(), options);
+    }
+
+    /// The models `vendor` last reported (the advisory catalog), plus its
+    /// default; a pick presets the next session to it.
+    fn emit_model_picker(&self, chat: &ChatKey, vendor: &str) {
+        if parse_vendor(vendor).is_err() {
+            return;
+        }
+        let mut options = vec![action_option(
+            &format!("new:{vendor}"),
+            &format!("{vendor} · 默认模型"),
+            OptionWeight::Normal,
+        )];
+        if let Some(paths) = self.project_paths.as_ref() {
+            let catalog = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
+            if let Some(found) = catalog.0.get(vendor) {
+                for model in &found.models {
+                    let label = model
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| model.id.clone());
+                    options.push(action_option(
+                        &format!("new:{vendor}:{}", model.id),
+                        &label,
+                        OptionWeight::Normal,
+                    ));
+                }
+            }
+        }
+        // Telegram caps callback data at 64 bytes; a pathological id drops out.
+        options.retain(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX);
+        self.emit_list_options(chat, format!("🧠 {vendor} 的模型:"), options);
+    }
+
     /// Deliver a command's `reply` with its next step. Where the channel
     /// renders buttons the step is a row of buttons under the reply, sent
     /// through the event sink (so no inline reply comes back); elsewhere it is
@@ -6193,6 +6378,18 @@ impl Gateway {
                 }
             }
             NextStep::Sessions => lists(Primary),
+            NextStep::Preset => vec![
+                action_option("preset", "🧠 模型", Primary),
+                action_option("projects", "📁 项目", Primary),
+            ],
+            // At a threaded channel's level a session is chosen BEFORE its
+            // first message: pick the project and the next session's model.
+            NextStep::Menu if self.at_threaded_channel_level(chat) => vec![
+                action_option("projects", "📁 项目", Primary),
+                action_option("preset", "🧠 模型", Primary),
+                action_option("sessions", "🧵 会话", Normal),
+                action_option("status", "📊 状态", Normal),
+            ],
             NextStep::Menu => vec![
                 action_option("projects", "📁 项目", Primary),
                 action_option("sessions", "🧵 会话", Primary),
@@ -11565,7 +11762,7 @@ impl Gateway {
         // this one. The thread keeps its session only if that session is in
         // `project`; otherwise it is freed, so its next message starts a
         // session there — what a new thread does anyway.
-        if chat.thread.is_some() {
+        if chat.thread.is_some() || self.at_threaded_channel_level(chat) {
             let kept = self.current_session.get(chat).filter(|sid| {
                 self.sessions
                     .get(sid)
@@ -29892,6 +30089,197 @@ mod tests {
             .await
             .unwrap();
         assert!(plain[0].contains("→ /status"), "{plain:?}");
+    }
+
+    /// A message typed at the CHANNEL level of conversation `C1` (no thread).
+    async fn say_at_channel(gw: &mut Gateway, text: &str) -> Vec<String> {
+        gw.handle_message("slack", "C1", "U1", None, "c", text, &[], None)
+            .await
+            .unwrap()
+    }
+
+    /// A button tapped on a channel-level (top-level) message of `C1`.
+    async fn tap_at_channel(gw: &mut Gateway, data: &str) -> Vec<String> {
+        let reply = ChoiceReply { data: data.into() };
+        gw.handle_message("slack", "C1", "U1", None, "m", "", &[], Some(&reply))
+            .await
+            .unwrap()
+    }
+
+    /// At the channel level of a channel that threads sessions, `/new` does
+    /// not start a session in the command's place: it PRESETS the next one
+    /// (the reply says so, visibly), and the next top-level message starts it
+    /// in its own thread — that message is the thread's opening line. `/use`
+    /// presets continuing a session the same way; `/cd` adopts nothing there.
+    #[tokio::test]
+    async fn channel_level_commands_preset_the_next_session() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.bind_channel_threads("slack", true);
+        let reply = say_at_channel(&mut gateway, "/new codex model=gpt-6 effort=high").await;
+        assert!(
+            reply[0].contains("下一个会话:codex · gpt-6 · high · 项目 alpha"),
+            "{reply:?}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "presetting spawns nothing"
+        );
+        let bad = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                None,
+                "c",
+                "/new codex modle=x",
+                &[],
+                None,
+            )
+            .await;
+        assert!(bad.is_err(), "a typo answers at once");
+
+        // The next top-level message starts the preset session in ITS thread.
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("5.5"),
+                "5.5",
+                "fix the login bug",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let thread = ChatKey::new("slack", "C1", "U1").with_thread(Some("5.5"));
+        let sid = gateway
+            .current_session
+            .get(&thread)
+            .expect("bound to the thread");
+        assert_eq!(gateway.sessions[&sid].vendor, AgentVendor::Codex);
+        assert_eq!(
+            fake.spawn_tunings.lock().await.clone(),
+            vec![(Some("gpt-6".to_string()), Some("high".to_string()))]
+        );
+        let last = fake.submissions.lock().await.last().cloned().unwrap();
+        assert!(
+            last.1.contains("fix the login bug"),
+            "the message is the first turn"
+        );
+
+        // A preset is used once: the next new thread gets the default again.
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("6.6"),
+                "6.6",
+                "another task",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let second = ChatKey::new("slack", "C1", "U1").with_thread(Some("6.6"));
+        let second_sid = gateway.current_session.get(&second).unwrap();
+        assert_eq!(gateway.sessions[&second_sid].vendor, AgentVendor::Claude);
+
+        // `/use` presets continuing a session: the next message moves it.
+        let reply = say_at_channel(&mut gateway, "/use s1").await;
+        assert!(reply[0].contains("下一条消息继续 s1"), "{reply:?}");
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("7.7"),
+                "7.7",
+                "carry on",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let third = ChatKey::new("slack", "C1", "U1").with_thread(Some("7.7"));
+        assert_eq!(gateway.current_session.get(&third), Some("s1".to_string()));
+        assert_eq!(gateway.current_session.get(&thread), None, "s1 moved here");
+
+        // `/cd` at the channel level switches the project, adopting nothing.
+        let reply = say_at_channel(&mut gateway, "/cd alpha").await;
+        assert!(
+            reply[0].contains("next message starts a session there"),
+            "{reply:?}"
+        );
+        assert_eq!(
+            gateway
+                .current_session
+                .get(&ChatKey::new("slack", "C1", "U1")),
+            None
+        );
+
+        // A single-stream chat is unchanged: `/new` starts a session at once.
+        let starts = fake.starts.load(Ordering::SeqCst);
+        gateway
+            .handle_text("telegram", "42", "bob", "/new codex")
+            .await
+            .unwrap();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), starts + 1);
+    }
+
+    /// The channel menu offers the next session's harness + model as taps:
+    /// 🧠 → a harness → its models (catalog) → a preset, without typing.
+    #[tokio::test]
+    async fn the_channel_menu_presets_a_model_by_tapping() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.bind_channel_threads("slack", true);
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_message("slack", "C1", "U1", None, "m", "/help", &[], None)
+            .await
+            .unwrap();
+        let menu = recv_answer(&mut events).await;
+        let menu: Vec<&str> = menu.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            menu,
+            vec!["act:projects", "act:preset", "act:sessions", "act:status"]
+        );
+
+        tap_at_channel(&mut gateway, "act:preset").await;
+        let harnesses = recv_answer(&mut events).await;
+        assert!(harnesses
+            .options
+            .iter()
+            .any(|o| o.data == "act:preset:claude"));
+
+        tap_at_channel(&mut gateway, "act:preset:codex").await;
+        let models = recv_answer(&mut events).await;
+        assert_eq!(
+            models.options[0].data, "act:new:codex",
+            "default model first"
+        );
+
+        tap_at_channel(&mut gateway, "act:new:codex:gpt-6").await;
+        let preset = recv_answer(&mut events).await;
+        assert!(
+            preset.content.contains("下一个会话:codex · gpt-6"),
+            "{}",
+            preset.content
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+        let again: Vec<&str> = preset.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            again,
+            vec!["act:preset", "act:projects"],
+            "change it again by tapping"
+        );
     }
 
     /// A thread whose first plain message spawns its session opens with a

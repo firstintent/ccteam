@@ -465,8 +465,8 @@ where
     bind_operator_rosters(&mut *gateway.lock().await, &creds);
     // Which channels render buttons is the provider's fact; hand it over so
     // the gateway's pickers never branch on a platform name.
-    let button_caps = channel_button_caps(&shared_channels.read().unwrap());
-    bind_channel_buttons(&mut *gateway.lock().await, &button_caps);
+    let caps = channel_caps(&shared_channels.read().unwrap());
+    bind_channel_caps(&mut *gateway.lock().await, &caps);
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
     // our own (standalone `ccteam-im run`).
@@ -778,19 +778,34 @@ fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
     }
 }
 
-/// Each channel's [`Channel::native_buttons`], read out of `channels` so no
-/// lock is held while the gateway is updated.
-fn channel_button_caps(channels: &ChannelMap) -> Vec<(String, bool)> {
+/// What a channel's provider says about its presentation — read out of
+/// `channels` so no lock is held while the gateway is updated.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ChannelCaps {
+    name: String,
+    /// [`Channel::native_buttons`].
+    buttons: bool,
+    /// [`Channel::session_threads`].
+    threads: bool,
+}
+
+fn channel_caps(channels: &ChannelMap) -> Vec<ChannelCaps> {
     channels
         .iter()
-        .map(|(name, ch)| (name.clone(), ch.native_buttons()))
+        .map(|(name, ch)| ChannelCaps {
+            name: name.clone(),
+            buttons: ch.native_buttons(),
+            threads: ch.session_threads(),
+        })
         .collect()
 }
 
-/// Report channel button capabilities to the gateway (startup + IM reload).
-fn bind_channel_buttons(gateway: &mut Gateway, caps: &[(String, bool)]) {
-    for (name, native) in caps {
-        gateway.bind_channel_buttons(name, *native);
+/// Report channel capabilities to the gateway (startup + IM reload), so the
+/// gateway never names a platform.
+fn bind_channel_caps(gateway: &mut Gateway, caps: &[ChannelCaps]) {
+    for cap in caps {
+        gateway.bind_channel_buttons(&cap.name, cap.buttons);
+        gateway.bind_channel_threads(&cap.name, cap.threads);
     }
 }
 
@@ -843,7 +858,7 @@ async fn reload_im_channels(
         }
     }
     // A rebuilt channel's button capability goes to the gateway with it.
-    bind_channel_buttons(&mut *gateway.lock().await, &channel_button_caps(&rebuilt));
+    bind_channel_caps(&mut *gateway.lock().await, &channel_caps(&rebuilt));
     // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
     // and (re)publish its command menu.
     for (name, ch) in rebuilt.iter() {
@@ -2295,11 +2310,10 @@ mod tests {
         assert!(ch.max_message_len().is_some());
     }
 
-    /// The daemon hands every live channel's button capability to the
-    /// gateway: a provider that renders buttons is bound, one that does not
-    /// (the mock) is not.
+    /// The daemon hands every live channel's capabilities — buttons, a thread
+    /// per session — to the gateway, as the provider itself reports them.
     #[test]
-    fn channel_button_caps_come_from_the_providers() {
+    fn channel_caps_come_from_the_providers() {
         let mut map: ChannelMap = HashMap::new();
         let creds = Credentials {
             slack: Some(crate::credentials::SlackCreds {
@@ -2317,12 +2331,14 @@ mod tests {
             "mock".into(),
             Arc::new(crate::transport::providers::mock::MockChannel::new()),
         );
-        let mut caps = channel_button_caps(&map);
+        let mut caps = channel_caps(&map);
         caps.sort();
-        assert_eq!(
-            caps,
-            vec![("mock".to_string(), false), ("slack".to_string(), true)]
-        );
+        let cap = |name: &str, on: bool| ChannelCaps {
+            name: name.into(),
+            buttons: on,
+            threads: on,
+        };
+        assert_eq!(caps, vec![cap("mock", false), cap("slack", true)]);
     }
     use tempfile::TempDir;
 
