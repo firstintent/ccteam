@@ -1377,6 +1377,31 @@ mod tests {
         assert_eq!(without_bot_handle(&bad, &me()), "hi");
     }
 
+    /// A command aimed at ANOTHER bot, or a span shorter than this bot's
+    /// handle, is not ours: it must neither count as addressing us nor be cut
+    /// (the cut arithmetic would underflow on a span shorter than the handle).
+    #[test]
+    fn a_command_for_another_bot_is_left_alone() {
+        let long_bot = BotIdentity {
+            id: 777,
+            username: "longbot".into(),
+        };
+        let m = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "/x@b hi",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 4}],
+        }));
+        assert!(!addresses_bot(&m, &long_bot));
+        assert_eq!(without_bot_handle(&m, &long_bot), "/x@b hi");
+        let other = tg(serde_json::json!({
+            "chat": {"id": -9, "type": "group"},
+            "text": "/status@otherbot",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 16}],
+        }));
+        assert!(!addresses_bot(&other, &me()));
+        assert_eq!(without_bot_handle(&other, &me()), "/status@otherbot");
+    }
+
     /// Addressing the bot must never stop a command from being a command:
     /// the bot's own handle is removed, anyone else's stays.
     #[test]

@@ -1531,8 +1531,10 @@ fn spawn_inbound_consumer(
                 } else if let Some(key) = thread_key {
                     // Only the in-flight-spawn window needs this memory (the
                     // gateway's own focus covers a settled thread), so a
-                    // bounded set that resets when full never loses a held
-                    // thread.
+                    // bounded set that resets when full cannot lose a held
+                    // thread; at worst it forgets a claim whose session is
+                    // still spawning, and only if thousands of other threads
+                    // were addressed within that same few-second window.
                     if addressed_threads.len() >= ADDRESSED_THREADS_CAP {
                         addressed_threads.clear();
                     }
