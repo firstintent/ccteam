@@ -54,8 +54,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use crate::onboarding::{client_for_api_base, SLACK_API_BASE};
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OptionWeight, OutboundFile,
-    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, MentionPolicy, MessageOption, OptionWeight,
+    OutboundFile, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// Per-message ceiling in **UTF-16 code units**. Slack caps the cumulative
@@ -229,10 +229,20 @@ struct DecodedMessage {
     channel: String,
     channel_type: String,
     ts: String,
-    /// Resolved thread: the event's `thread_ts`, else its own `ts`.
-    thread_ts: String,
+    /// Resolved thread: the event's `thread_ts`; for a top-level message its
+    /// own `ts` (it opens a thread) — except a top-level COMMAND, which acts
+    /// at the channel level (`None`) so a session's thread opens with a real
+    /// message rather than the command that preset it.
+    thread_ts: Option<String>,
     text: String,
     mentions_bot: bool,
+    /// The event is a reply inside an existing thread (it carried a parent
+    /// `thread_ts`) — as opposed to a top-level message, which only opens
+    /// one. Only a reply can continue a conversation the gateway holds.
+    in_thread: bool,
+    /// A channel / private-channel / group-DM message that does not @-mention
+    /// the bot ([`ChannelMessage::ambient`]).
+    ambient: bool,
     files: Vec<PendingFile>,
 }
 
@@ -245,9 +255,10 @@ impl DecodedMessage {
             reply_target: self.channel,
             content: self.text,
             channel: channel_name.to_string(),
-            thread_ts: Some(self.thread_ts),
+            thread_ts: self.thread_ts,
             attachments: Vec::new(),
             selection: None,
+            ambient: self.ambient,
         }
     }
 }
@@ -285,7 +296,7 @@ fn decode_message_event(event: &Value, bot: &BotIdentity) -> Option<DecodedMessa
     }
     let channel = str_at(event, "/channel")?;
     let ts = str_at(event, "/ts")?;
-    let thread_ts = str_at(event, "/thread_ts").unwrap_or(ts);
+    let parent = str_at(event, "/thread_ts");
 
     let raw = event.get("text").and_then(Value::as_str).unwrap_or("");
     let (stripped, mentions_bot) = strip_bot_mention(raw, &bot.user_id);
@@ -294,6 +305,11 @@ fn decode_message_event(event: &Value, bot: &BotIdentity) -> Option<DecodedMessa
     // ` /status` — typed with a leading space to get past Slack's own slash
     // interception — reach the gateway as the `/status` command.
     let text = command_from_sigil(unescape_entities(&stripped).trim().to_string());
+    let thread_ts = match parent {
+        Some(parent) => Some(parent.to_string()),
+        None if text.starts_with('/') => None,
+        None => Some(ts.to_string()),
+    };
 
     let files: Vec<PendingFile> = event
         .get("files")
@@ -308,9 +324,11 @@ fn decode_message_event(event: &Value, bot: &BotIdentity) -> Option<DecodedMessa
         channel: channel.to_string(),
         channel_type: channel_type.to_string(),
         ts: ts.to_string(),
-        thread_ts: thread_ts.to_string(),
+        thread_ts,
         text,
         mentions_bot,
+        in_thread: parent.is_some(),
+        ambient: channel_type != "im" && !mentions_bot,
         files,
     })
 }
@@ -371,13 +389,6 @@ fn unescape_entities(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
-}
-
-/// Escape user text for Slack's `text` field.
-fn escape_entities(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// A `slash_commands` envelope payload.
@@ -498,25 +509,16 @@ fn rewrite_line_sigils(line: &str, names: &[String], out: &mut String) {
     }
 }
 
-/// Text of the top-level anchor message a slash command threads under —
-/// it echoes the command so the thread reads as "who asked for what".
-fn anchor_text(command: &str, text: &str, user_id: &str) -> String {
-    let text = unescape_entities(text).trim().to_string();
-    let invocation = if text.is_empty() {
-        command.to_string()
-    } else {
-        format!("{command} {text}")
-    };
-    format!("`{}` · <@{user_id}>", escape_entities(&invocation))
-}
-
 /// A `block_actions` click on one of our option buttons.
 #[derive(Debug, Clone, PartialEq)]
 struct ButtonClick {
     user_id: String,
     channel_id: String,
     message_ts: String,
-    thread_ts: String,
+    /// The clicked message's thread; `None` for a button on a top-level
+    /// message (a channel-level menu or list), which acts at the channel
+    /// level like the command that posted it.
+    thread_ts: Option<String>,
     value: String,
     trigger_id: String,
 }
@@ -535,12 +537,12 @@ fn decode_block_actions(payload: &Value) -> Option<ButtonClick> {
         str_at(payload, "/container/message_ts").or_else(|| str_at(payload, "/message/ts"))?;
     let thread_ts = str_at(payload, "/container/thread_ts")
         .or_else(|| str_at(payload, "/message/thread_ts"))
-        .unwrap_or(message_ts);
+        .map(str::to_string);
     Some(ButtonClick {
         user_id: user_id.to_string(),
         channel_id: channel_id.to_string(),
         message_ts: message_ts.to_string(),
-        thread_ts: thread_ts.to_string(),
+        thread_ts,
         value: value.to_string(),
         trigger_id: str_at(payload, "/trigger_id").unwrap_or("").to_string(),
     })
@@ -761,6 +763,8 @@ pub struct SlackChannel {
     bot_token: String,
     app_token: String,
     allowed_users: Vec<String>,
+    /// Whether a channel message must @-mention the bot to be answered.
+    mention_policy: MentionPolicy,
     api_base: String,
     http: reqwest::Client,
     /// `auth.test` result, fetched once per listener (re-fetched only if a
@@ -777,6 +781,10 @@ pub struct SlackChannel {
     /// ccteam's own command names (no `/`), as the daemon registers them —
     /// what [`rewrite_command_sigils`] turns into `!name` on the way out.
     command_names: RwLock<Vec<String>>,
+    /// The latest slash command's `response_url` per channel: if the bot is
+    /// not a member there, its channel-level reply cannot be posted, and this
+    /// is the one way left to tell the person (an ephemeral notice).
+    slash_response_urls: Mutex<std::collections::HashMap<String, String>>,
     name: String,
 }
 
@@ -789,6 +797,7 @@ impl SlackChannel {
             bot_token,
             app_token,
             allowed_users: allowed_user_ids,
+            mention_policy: MentionPolicy::default(),
             api_base: SLACK_API_BASE.to_string(),
             http: Self::http_for(SLACK_API_BASE),
             bot: RwLock::new(None),
@@ -797,6 +806,7 @@ impl SlackChannel {
             probe_path: None,
             rejected_senders: RejectedSenderNotifier::default(),
             command_names: RwLock::new(Vec::new()),
+            slash_response_urls: Mutex::new(std::collections::HashMap::new()),
             name: "slack".to_string(),
         }
     }
@@ -825,6 +835,14 @@ impl SlackChannel {
     /// Override the channel-map key (a per-tenant bot's `"slack@<tenant>"`).
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Answer a channel message only when it @-mentions the bot (or continues
+    /// a thread the gateway already holds a session in) — the credentials'
+    /// `require_mention`. DMs, slash commands and button clicks are unaffected.
+    pub fn with_require_mention(mut self, require_mention: bool) -> Self {
+        self.mention_policy = MentionPolicy { require_mention };
         self
     }
 
@@ -955,16 +973,6 @@ impl SlackChannel {
             }
             Err(err) => return Err(err),
         };
-        Ok(str_at(&v, "/ts").map(str::to_string))
-    }
-
-    /// Post plain `text` (Slack's own `mrkdwn`, where `<@U…>` renders as a
-    /// mention) — used for the slash-command anchor.
-    async fn post_plain(&self, channel: &str, text: &str) -> anyhow::Result<Option<String>> {
-        let body = post_body(channel, None, text, &[], false);
-        let v = self
-            .call_bot("chat.postMessage", ApiBody::Json(&body))
-            .await?;
         Ok(str_at(&v, "/ts").map(str::to_string))
     }
 
@@ -1217,6 +1225,16 @@ impl SlackChannel {
             .await;
             return None;
         }
+        // Ambient chatter that cannot continue a held thread is dropped here,
+        // before its files are downloaded; a reply inside a thread is left to
+        // the daemon, which knows whether the gateway holds that thread.
+        if self
+            .mention_policy
+            .drops_early(decoded.ambient, decoded.in_thread)
+        {
+            tracing::debug!(ts = %decoded.ts, "slack: ambient channel message dropped (require_mention)");
+            return None;
+        }
         let files = decoded.files.clone();
         let mut message = decoded.into_channel_message(&self.name);
         for file in &files {
@@ -1274,36 +1292,29 @@ impl SlackChannel {
             .await;
             return None;
         }
-        let anchor = anchor_text(&command.command, &command.text, &command.user_id);
-        let anchor_ts = match self.post_plain(&command.channel_id, &anchor).await {
-            Ok(Some(ts)) => ts,
-            Ok(None) => {
-                let err = anyhow::anyhow!("chat.postMessage returned no ts");
-                self.respond_ephemeral(&command.response_url, &anchor_failure_notice(&err))
-                    .await;
-                return None;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    channel = %command.channel_id,
-                    error = %err,
-                    "slack: slash-command anchor post failed"
-                );
-                self.respond_ephemeral(&command.response_url, &anchor_failure_notice(&err))
-                    .await;
-                return None;
-            }
+        // The command answers at the channel level (no thread): its reply — a
+        // preset, a list, a confirmation — is a channel message everyone sees,
+        // and a session's thread is left to open with a real message.
+        self.slash_response_urls
+            .lock()
+            .await
+            .insert(command.channel_id.clone(), command.response_url.clone());
+        let id = if command.trigger_id.is_empty() {
+            format!("slash-{}", now_secs())
+        } else {
+            command.trigger_id.clone()
         };
         Some(ChannelMessage {
-            timestamp: ts_secs(&anchor_ts),
-            id: anchor_ts.clone(),
+            timestamp: now_secs(),
+            id,
             sender: command.user_id,
             reply_target: command.channel_id,
             content: slash_content(&command.text),
             channel: self.name.clone(),
-            thread_ts: Some(anchor_ts),
+            thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
     }
 
@@ -1334,9 +1345,10 @@ impl SlackChannel {
             content: String::new(),
             channel: self.name.clone(),
             timestamp: now_secs(),
-            thread_ts: Some(click.thread_ts),
+            thread_ts: click.thread_ts,
             attachments: Vec::new(),
             selection: Some(ChoiceReply { data: click.value }),
+            ambient: false,
         })
     }
 
@@ -1514,13 +1526,33 @@ impl Channel for SlackChannel {
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
         }
-        self.post_message(
-            &message.recipient,
-            message.thread_ts.as_deref(),
-            &message.content,
-            &message.options,
-        )
-        .await
+        let posted = self
+            .post_message(
+                &message.recipient,
+                message.thread_ts.as_deref(),
+                &message.content,
+                &message.options,
+            )
+            .await;
+        if let Err(err) = &posted {
+            // A slash command in a channel the bot is not in: its reply has
+            // nowhere to go but the command's own ephemeral response.
+            if matches!(
+                api_error_code(err),
+                Some("not_in_channel" | "channel_not_found")
+            ) {
+                let url = self
+                    .slash_response_urls
+                    .lock()
+                    .await
+                    .remove(&message.recipient);
+                if let Some(url) = url {
+                    self.respond_ephemeral(&url, &anchor_failure_notice(err))
+                        .await;
+                }
+            }
+        }
+        posted
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -1544,6 +1576,10 @@ impl Channel for SlackChannel {
 
     fn session_threads(&self) -> bool {
         true
+    }
+
+    fn mention_policy(&self) -> MentionPolicy {
+        self.mention_policy
     }
 
     /// Slack has no command menu to fill; it keeps the names so replies can

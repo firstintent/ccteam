@@ -49,6 +49,12 @@ pub struct TelegramCreds {
     /// any chat the bot has been added to (NOT recommended for prod).
     #[serde(default)]
     pub allowed_chat_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat / channel
+    /// (DMs are always answered). `false` (default) = answer every message
+    /// from an allowed sender. Symmetric on every IM; the rule itself lives in
+    /// [`crate::transport::MentionPolicy`].
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 /// Slack app credentials.
@@ -66,6 +72,12 @@ pub struct SlackCreds {
     /// (deny all), `"*"` = open — the same fail-closed semantics as Lark.
     #[serde(default)]
     pub allowed_user_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat / channel
+    /// (DMs are always answered). `false` (default) = answer every message
+    /// from an allowed sender. Symmetric on every IM; the rule itself lives in
+    /// [`crate::transport::MentionPolicy`].
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 /// Discord bot credentials.
@@ -104,6 +116,12 @@ pub struct LarkCreds {
     /// `china` feature intent).
     #[serde(default = "default_use_feishu")]
     pub use_feishu: bool,
+    /// Answer only messages that @-mention the bot in a group chat / channel
+    /// (DMs are always answered). `false` (default) = answer every message
+    /// from an allowed sender. Symmetric on every IM; the rule itself lives in
+    /// [`crate::transport::MentionPolicy`].
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 fn default_use_feishu() -> bool {
@@ -211,6 +229,7 @@ mod tests {
             telegram: Some(TelegramCreds {
                 bot_token: "TEST:abc".into(),
                 allowed_chat_ids: vec!["12345".into()],
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -229,6 +248,7 @@ mod tests {
                 app_secret: "secret456".into(),
                 allowed_user_ids: vec!["ou_alice".into(), "ou_bob".into()],
                 use_feishu: false,
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -246,6 +266,7 @@ mod tests {
                 bot_token: "xoxb-1-abc".into(),
                 app_token: "xapp-1-def".into(),
                 allowed_user_ids: vec!["U0ALICE".into(), "U0BOB".into()],
+                require_mention: false,
             }),
             ..Default::default()
         };
@@ -287,6 +308,7 @@ mod tests {
             telegram: Some(TelegramCreds {
                 bot_token: "x".into(),
                 allowed_chat_ids: vec![],
+                require_mention: false,
             }),
             ..Default::default()
         };

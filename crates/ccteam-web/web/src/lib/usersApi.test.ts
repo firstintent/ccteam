@@ -11,6 +11,10 @@ import {
   listUsers,
   putMyIm,
   putMyLarkAllowedUsers,
+  getMySlackUserIdCandidates,
+  putMySlackAllowedUsers,
+  getMyIm,
+  putMyRequireMention,
 } from "./usersApi";
 
 const realFetch = globalThis.fetch;
@@ -196,5 +200,85 @@ describe("per-user Telegram binding (the fail-closed bot's way in)", () => {
     await expect(putMyTelegramAllowedChats(["1"])).rejects.toThrow(
       "HTTP 400: no Telegram bot configured",
     );
+  });
+});
+
+describe("per-user Slack binding (symmetric with Telegram / Lark)", () => {
+  it("getMySlackUserIdCandidates GETs the caller's own discovery endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { candidates: [] }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await getMySlackUserIdCandidates(1500);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/me/im/slack/user-id-candidates?since=1500");
+    globalThis.fetch = realFetch;
+  });
+
+  it("putMySlackAllowedUsers PUTs only the member ids", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(200, { ok: true, allowed_user_id_count: 1 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await putMySlackAllowedUsers(["U0ALICE"]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/me/im/slack/allowed-users");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ allowed_user_ids: ["U0ALICE"] });
+    globalThis.fetch = realFetch;
+  });
+});
+
+describe("per-user require-@-mention (symmetric with the admin's /config/im)", () => {
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("getMyIm GETs the caller's own masked status in the admin's shape", async () => {
+    const mine = {
+      telegram: {
+        configured: true,
+        bot_token_last4: "…wxyz",
+        chat_id_count: 1,
+        allowed_chat_ids: ["42"],
+        require_mention: true,
+      },
+      lark: null,
+      slack: null,
+      transport_warning: "",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, mine));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const got = await getMyIm();
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/me/im", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual(mine);
+    // Secret-free, like the admin's read (red line).
+    expect(got.telegram).not.toHaveProperty("bot_token");
+  });
+
+  it("putMyRequireMention PUTs {require_mention} to the caller's own platform route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        ok: true,
+        platform: "telegram",
+        require_mention: false,
+        reloaded: true,
+        note: "applied",
+      }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const got = await putMyRequireMention("telegram", false);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/me/im/telegram/require-mention");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ require_mention: false });
+    expect(got.require_mention).toBe(false);
+  });
+
+  it("putMyRequireMention surfaces the 400 reason when that bot isn't configured", async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(400, { error: "no Lark bot configured" })) as unknown as typeof fetch;
+    await expect(putMyRequireMention("lark", true)).rejects.toThrow("no Lark bot configured");
   });
 });

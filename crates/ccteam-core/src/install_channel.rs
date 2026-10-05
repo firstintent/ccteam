@@ -168,10 +168,18 @@ fn env_set(env_lookup: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
     env_lookup(key).is_some_and(|v| !v.trim().is_empty())
 }
 
+/// The cargo profiles a source checkout builds into, `target/<profile>`:
+/// the default two plus `local-release`, the thin-LTO profile `make install`
+/// builds (root `Cargo.toml`). Such a directory is a build output, never an
+/// install location. One list for every Rust reader; install.sh's
+/// `resolve_install_dir` carries the shell copy, held in step by
+/// `update::tests::install_sh_ladder_rungs_match_the_rust_copy`.
+pub const CARGO_BUILD_PROFILES: &[&str] = &["debug", "release", "local-release"];
+
 /// Classify by executable location:
 /// - under `~/.local/bin` → [`InstallChannel::Standalone`] (install.sh drop);
-/// - under `~/.cargo/bin` or a `target/{debug,release}` build tree →
-///   [`InstallChannel::Source`];
+/// - under `~/.cargo/bin` or a `target/<profile>` build tree
+///   ([`CARGO_BUILD_PROFILES`]) → [`InstallChannel::Source`];
 /// - anything else → `None` (caller falls through to `Other`).
 fn channel_from_exe_path(exe: &Path) -> Option<InstallChannel> {
     let parent = exe.parent()?;
@@ -181,7 +189,7 @@ fn channel_from_exe_path(exe: &Path) -> Option<InstallChannel> {
     if parent.ends_with(".cargo/bin") {
         return Some(InstallChannel::Source);
     }
-    // Cargo build tree: `<…>/target/{debug,release}[/deps]/ccteam`.
+    // Cargo build tree: `<…>/target/<profile>[/deps]/ccteam`.
     let mut dirs: Vec<&str> = exe
         .components()
         .filter_map(|c| match c {
@@ -193,7 +201,7 @@ fn channel_from_exe_path(exe: &Path) -> Option<InstallChannel> {
     if let Some(pos) = dirs.iter().position(|c| *c == "target") {
         if dirs
             .get(pos + 1)
-            .is_some_and(|c| *c == "debug" || *c == "release")
+            .is_some_and(|c| CARGO_BUILD_PROFILES.contains(c))
         {
             return Some(InstallChannel::Source);
         }
@@ -305,6 +313,11 @@ mod tests {
             ),
             (
                 "/home/u/src/ccteam/target/release/ccteam",
+                InstallChannel::Source,
+            ),
+            // `make install` builds the thin-LTO `local-release` profile.
+            (
+                "/home/u/src/ccteam/target/local-release/ccteam",
                 InstallChannel::Source,
             ),
             // Test binaries live under target/debug/deps/…

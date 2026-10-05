@@ -77,7 +77,7 @@ resolve_install_dir() {
         # A build-tree binary is not an install location — `cargo clean` or a
         # redirected CARGO_TARGET_DIR would take the daemon's binary with it.
         case "$_dir" in
-            */target/release|*/target/debug) _dir="" ;;
+            */target/release|*/target/local-release|*/target/debug) _dir="" ;;
         esac
         if [ -n "$_dir" ] && [ -w "$_dir" ]; then
             printf '%s\n' "$_dir"

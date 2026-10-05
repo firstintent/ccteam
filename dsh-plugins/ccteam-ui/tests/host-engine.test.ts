@@ -234,7 +234,13 @@ describe('installing from the platform package', () => {
   it('walks install.sh’s rungs in order, exactly as the Rust copy does', () => {
     const home = '/home/u'
     const exec = (p: string): boolean =>
-      ['/opt/first/ccteam', '/home/u/.local/bin/ccteam', '/ro/ccteam', '/src/target/debug/ccteam'].includes(p)
+      [
+        '/opt/first/ccteam',
+        '/home/u/.local/bin/ccteam',
+        '/ro/ccteam',
+        '/src/target/debug/ccteam',
+        '/src/target/local-release/ccteam',
+      ].includes(p)
     const writable = (d: string): boolean => d !== '/ro'
     const ladder = (env: string | undefined, path: string | undefined): string =>
       resolveInstallDirWith(env, path, home, exec, writable)
@@ -248,8 +254,11 @@ describe('installing from the platform package', () => {
     // shell would run. Not whatever discovery picked: installing beside a
     // shadowing copy instead of over it is the whole failure.
     expect(ladder(undefined, '/nope:/opt/first:/home/u/.local/bin')).toBe('/opt/first')
-    // Rung 2 skips a cargo build tree (`cargo clean` would delete it)…
-    expect(ladder(undefined, '/src/target/debug:/home/u/.local/bin')).toBe('/home/u/.local/bin')
+    // Rung 2 skips a cargo build tree (`cargo clean` would delete it),
+    // whichever profile built it — `make install` builds `local-release`…
+    for (const tree of ['/src/target/debug', '/src/target/local-release']) {
+      expect(ladder(undefined, `${tree}:/home/u/.local/bin`), tree).toBe('/home/u/.local/bin')
+    }
     // …and a directory it cannot write.
     expect(ladder(undefined, '/ro')).toBe('/home/u/.local/bin')
     // POSIX says an empty PATH entry means the current directory; an installer
@@ -277,7 +286,7 @@ describe('installing from the platform package', () => {
       ['1: explicit override', 'CCTEAM_INSTALL_DIR'],
       ['2: PATH lookup', 'command -v ccteam'],
       ['2: symlink resolution', 'canonical_bin'],
-      ['2: build-tree exclusion', '*/target/release|*/target/debug'],
+      ['2: build-tree exclusion', '*/target/release|*/target/local-release|*/target/debug'],
       ['2: writability', '-w "$_dir"'],
       ['3: default', '$HOME/.local/bin'],
     ] as const) {

@@ -43,7 +43,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, MessageOption, OutboundFile, OutboundFileKind,
+    ChannelMessage, ChoiceReply, MentionPolicy, MessageOption, OutboundFile, OutboundFileKind,
     RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
@@ -220,6 +220,9 @@ struct DecodedMessage {
     /// plain text/`post`. Decoding stays pure (no `&self`/network); the
     /// actual download happens in [`LarkChannel::stage_lark_attachment`].
     pending: Option<LarkPending>,
+    /// A group-chat message that does not @-mention the bot
+    /// ([`ChannelMessage::ambient`]); a p2p message never is.
+    ambient: bool,
 }
 
 /// A Lark message resource (image or file) the WS loop should download.
@@ -241,8 +244,8 @@ struct LarkPending {
 /// applying every content/visibility rule the live WS loop applies *except*
 /// the allowlists and dedup (those need `&self` / shared state and stay at
 /// the call sites). Returns `None` to skip — bot/app sender, missing
-/// open_id, unsupported `message_type`, empty body, or a group message the
-/// bot wasn't @-mentioned in.
+/// open_id, unsupported `message_type`, or empty body. (A group message the
+/// bot wasn't @-mentioned in is decoded too, marked `ambient`.)
 fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
     // Drop the bot's own (and other apps') messages.
     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" {
@@ -289,12 +292,10 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
         return None;
     }
 
-    // Group chat: only respond when explicitly @-mentioned. Applies to
-    // attachments too (a group image with no @-mention is ignored, matching
-    // the text rule).
-    if msg.chat_type == "group" && !should_respond_in_group(&msg.mentions) {
-        return None;
-    }
+    // A group message that does not @-mention the bot is "ambient" — whether
+    // it is answered is the channel's `MentionPolicy` (`require_mention`),
+    // for text and attachments alike.
+    let ambient = msg.chat_type == "group" && !should_respond_in_group(&msg.mentions);
 
     let timestamp = msg
         .create_time
@@ -311,6 +312,7 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
         text,
         timestamp,
         pending,
+        ambient,
     })
 }
 
@@ -438,6 +440,7 @@ impl DecodedMessage {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: self.ambient,
         }
     }
 }
@@ -478,6 +481,8 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Shared setup probe + one-shot binding notice for rejected senders.
     rejected_senders: RejectedSenderNotifier,
+    /// Whether a group message must @-mention the bot to be answered.
+    mention_policy: MentionPolicy,
     name: String,
 }
 
@@ -502,8 +507,24 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             rejected_senders: RejectedSenderNotifier::default(),
+            mention_policy: MentionPolicy::default(),
             name: "lark".to_string(),
         }
+    }
+
+    /// Answer a group message only when it @-mentions the bot — the
+    /// credentials' `require_mention`. p2p chats and card clicks are
+    /// unaffected.
+    pub fn with_require_mention(mut self, require_mention: bool) -> Self {
+        self.mention_policy = MentionPolicy { require_mention };
+        self
+    }
+
+    /// Whether `decoded` is ambient group chatter this bot must not answer.
+    /// Lark has no threads, so an ambient message is dropped for certain —
+    /// before its attachment is downloaded.
+    fn drops_ambient(&self, decoded: &DecodedMessage) -> bool {
+        self.mention_policy.drops_early(decoded.ambient, false)
     }
 
     /// v0.8.20 F2 — override the channel-map key (`"lark@<tenant_id>"`) for a
@@ -793,6 +814,7 @@ impl LarkChannel {
                             thread_ts: None,
                             attachments: Vec::new(),
                             selection: Some(ChoiceReply { data: action.data }),
+                            ambient: false,
                         };
                         if tx.send(cm).await.is_err() { break; }
                         continue;
@@ -814,6 +836,10 @@ impl LarkChannel {
                             &decoded.message_id,
                             decoded.timestamp,
                         ).await;
+                        continue;
+                    }
+                    if self.drops_ambient(&decoded) {
+                        tracing::debug!(message_id = %decoded.message_id, "Lark WS: ambient group message dropped (require_mention)");
                         continue;
                     }
 
@@ -1206,7 +1232,8 @@ impl LarkChannel {
     /// (which needs the shared `ws_seen_ids` mutable state). Returns `None`
     /// for anything the loop would `continue` past: wrong event type, bot
     /// sender, missing/disallowed `open_id`, unsupported `message_type`,
-    /// empty body, or an un-@-mentioned group message.
+    /// empty body, or — under `require_mention` — an un-@-mentioned group
+    /// message.
     ///
     /// This is the tested seam, and it shares [`decode_message_receive`] +
     /// [`DecodedMessage::into_channel_message`] with [`Self::listen_ws`], so
@@ -1228,6 +1255,9 @@ impl LarkChannel {
                 "Lark: ignoring message from unauthorized user: {}",
                 decoded.open_id
             );
+            return None;
+        }
+        if self.drops_ambient(&decoded) {
             return None;
         }
         let mut cm = decoded.into_channel_message();
@@ -1263,6 +1293,10 @@ impl LarkChannel {
 impl Channel for LarkChannel {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn mention_policy(&self) -> MentionPolicy {
+        self.mention_policy
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -1633,7 +1667,10 @@ fn strip_at_placeholders(text: &str) -> String {
     result
 }
 
-/// In group chats, only respond when the bot is explicitly @-mentioned.
+/// Whether a group message addresses the bot. The event lists who it
+/// @-mentions; unless the app holds the receive-all-group-messages
+/// permission Lark only delivers a group message that @-mentions the app, so a
+/// non-empty list is taken to mean it.
 fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
 }

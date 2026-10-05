@@ -242,6 +242,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
     }

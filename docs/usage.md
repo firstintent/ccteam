@@ -200,6 +200,8 @@ Open **Settings** and enter IM credentials:
 - **Lark/Feishu:** enter App ID, App Secret, region (Feishu China / Lark international), and allowed users.
 - **Slack:** a three-step card — create the app from a one-click link (manifest prefilled), paste the bot and app-level tokens, then DM the bot and click your member id to allow it. Details in [Setup](#setup).
 
+Every IM card also has a **Require @-mention in groups/channels** switch — see [Group chats and channels](#group-chats-and-channels).
+
 Secrets are masked (`...last4`) and never returned in plaintext. **Restart the daemon after changing global IM credentials** because they are loaded at startup. The page will show `restart required`. Per-user IM bots are hot-reloaded; see [Multi-User](#multi-user).
 
 Detailed bot setup is in [2. Telegram / Lark / Slack](#setup).
@@ -209,7 +211,7 @@ Detailed bot setup is in [2. Telegram / Lark / Slack](#setup).
 One daemon can serve multiple users on one machine. This is **soft isolation** under one OS account: a UX boundary, not a security boundary.
 
 - Admins can create users in **Settings -> User Management**. Each user receives a one-time personal login link and sees only their own projects and sessions.
-- Each user can configure their own IM bot in **Settings → Access → My IM bot**: one guided card per platform (Telegram / Lark), each a numbered two-step flow — ① save that platform's credential with its own button, ② bind who the bot answers, with sender capture starting by itself right after the save, so the next action is never a guess. Saving one platform never touches the other's credential. Save validates the token and applies immediately without a daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
+- Each user can configure their own IM bot in **Settings → Access → My IM bot**: one guided card per platform (Telegram / Lark / Slack — Slack adds a first step that creates the app from a one-click link), each a numbered flow — ① save that platform's credential with its own button, ② bind who the bot answers, with sender capture starting by itself right after the save, so the next action is never a guess. Saving one platform never touches the other's credential, and a saved bot's card carries its own **Require @-mention** switch. Save validates the token and applies immediately without a daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
 
 ### Status and Cost
 
@@ -288,20 +290,32 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 2. **Paste the two tokens.** *Bot token* = **OAuth & Permissions → Bot User OAuth Token** (`xoxb-…`); *App-level token* = **Basic Information → App-Level Tokens → Generate** with the `connections:write` scope (`xapp-…`). Saving checks both with Slack and connects at once — no restart.
 3. **Allow yourself.** DM the bot (or @-mention it in a channel): your member id (`U…`) shows up on the card, one click allows it. Until someone is allowed the bot answers **no one** (fail closed). The allowlist is also the **owner roster**: an allowed member is served as the box owner.
 
-Then invite the bot to a channel (`/invite @ccteam`) or DM it. It answers every message from allowed members in the channels it is in, so a dedicated channel (or the DM) works best.
+Then invite the bot to a channel (`/invite @ccteam`) or DM it. By default it answers every message from allowed members in the channels it is in, so a dedicated channel (or the DM) works best — or turn on **Require @-mention** ([below](#group-chats-and-channels)) so it answers only when addressed.
 
-- **Several ccteam machines in one workspace:** give each independent ccteam its own app (`cct2`, `cct3`, …) — Socket Mode spreads one app's events across all its connections, so two daemons cannot share an app. Each app gets its own slash command. Slack's free plan allows up to 10 apps per workspace. Machines joined to one ccteam as satellites need no app of their own: that ccteam's app already reaches their projects.
+- **Several ccteam machines in one workspace:** give each independent ccteam its own app (`cct2`, `cct3`, …) — Socket Mode spreads one app's events across all its connections, so two daemons cannot share an app. Each app gets its own slash command. Two apps in one channel both answer every message from a member allowed on both: give them separate channels, or turn on **Require @-mention** for both. Slack's free plan allows up to 10 apps per workspace. Machines joined to one ccteam as satellites need no app of their own: that ccteam's app already reaches their projects.
 
 > Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu, Telegram, and Slack are peers: text, rich text, images, and files are supported.
+
+### Group chats and channels
+
+Whether the bot answers everything in a group or channel, or only when @-mentioned, is one switch — the same on every IM, named **Require @-mention in groups/channels**. Find it on the IM's card in **Settings → Access** (and on each user's own bot card under **My IM bot**), or `"require_mention": true` in that IM's block of the credentials file. The web switch applies live, with no restart.
+
+- **Off (default):** the bot answers every message an allowed sender posts in a group chat or channel it is in.
+- **On:** in a group chat or channel it answers only messages that @-mention it. DMs are always answered, and so are slash commands and button clicks. On Slack, a thread the bot already holds a session in carries on without the @ (one thread = one session); Telegram and Lark have no such thread, so every message there needs the @. A typed `!command` at a Slack channel's top level is an ordinary message too, so it takes the @ (`@ccteam !new codex`) — or use the app's slash command (`/ccteam new codex`).
+
+What counts as @-mentioning the bot — **Telegram:** `@botname`, a `/command@botname`, or a reply to one of its messages (the bot's own handle is stripped before the agent sees the text, so `@botname /new codex` runs `/new codex`). **Lark/Feishu:** an @-mention in the group (any @ counts; by default Lark delivers a group message to the app only when it @-mentions the app, unless the app holds the "receive all group messages" permission). **Slack:** `@ccteam`.
+
+A message the switch skips is dropped before anything is downloaded and never reaches an agent. It is also how two ccteam bots share a channel without answering each other's messages: turn it on for both.
 
 ### Slack: One Thread per Session
 
 - A **top-level message** starts a new thread; the first ordinary message in a thread with no session starts a roleless session in the channel's current project (exactly like a fresh Telegram chat). Post another top-level message and a second session runs beside the first.
 - A **reply in a thread** goes to that thread's session. Everything that session produces — answers, the live progress card, approval buttons, files, the answer it gives after a delegate reports back — lands in its own thread.
 - The **channel** is the chat for ownership and the current project: `/cd` in any thread switches the project for the whole channel (that thread keeps its session only if the session is in the new project; otherwise its next message starts one there), and `/sessions` lists every session the channel owns. A session lives in **one thread at a time**: `/use <sid>` (or `@<handle>`) in a thread moves that session into it, and the thread it left says so (a new message there starts a fresh session). `/new …` in a thread starts a new session in that thread.
-- **Mostly you tap.** A thread whose first message starts a session opens with a header and the session's buttons — **📊 Status · 🧠 Model · ⏹ Interrupt** — and the replies to `new` / `use` / `status` carry the same row. The app's slash command on its own (`/ccteam`) posts a menu: **📁 Projects · 🧵 Sessions · 📊 Status · ＋ Claude · ＋ Codex**. Long lists (projects, sessions, model × effort) come as a dropdown.
-- **Commands start with `!` on Slack.** Slack keeps `/` for itself (it swallows any message starting with one, and an app's slash command cannot run inside a thread at all), so type `!` where Telegram types `/`: `!status`, `!model`, `!compact`, `!interrupt` in a session's thread act on that session; `!projects`, `!cd demo`, `!sessions`, `!new codex` as a top-level message open a thread for the reply — `!new codex` creates the codex session right there, and `!use s12` moves an existing session into it. ccteam's own replies name commands the same way (`→ !status`). The app's slash command (`/ccteam`, or `/cct2` for an app named cct2) also works in the channel.
-- Sessions hired by other agents get no thread of their own; give one a thread with a top-level `!use <sid>` when you want to talk to it.
+- **Choose first, then talk.** At the channel level a command never takes a session's place: the app's slash command on its own (`/ccteam`) posts a menu — **📁 Projects · 🧠 Model · 🧵 Sessions · 📊 Status**. **🧠 Model** walks harness → model (from what each harness last reported) → reasoning effort (that model's own levels, else the harness's; skipped where there is none) and **presets the next session**; the preset is a channel message everyone sees (`⚙️ next session: codex · gpt-6 · project cct`). Your next top-level message then starts that session, and *it* is the thread's opening line — the channel reads as a list of what each session is about. The same works typed: `/ccteam new codex model=gpt-6 effort=high` presets, `/ccteam use s12` presets continuing s12 in the next thread, `/ccteam cd demo` switches the project. Without a preset a message starts a default session.
+- **Inside a thread, tap too.** The thread's first reply carries the session's buttons — **📊 Status · 🧠 Model** (the large ones) · 🧵 Sessions · 📁 Projects · **⏹ Interrupt** (small, and it asks first). Long lists come as one button per row, or a dropdown past 20.
+- **Typed commands start with `!` on Slack**, since Slack keeps `/` for itself (it swallows any message starting with one, and an app's slash command cannot run inside a thread at all): `!status`, `!model`, `!compact`, `!interrupt` in a thread act on that session; at the channel level `!new`, `!use`, `!cd`, `!projects` behave like the `/ccteam` forms. ccteam's own replies name commands the same way (`→ !status`).
+- Sessions hired by other agents get no thread of their own; preset one with `/ccteam use <sid>` (or 🧵 Sessions at the channel level) and your next message brings it into a thread.
 
 ### Gateway Commands
 

@@ -481,6 +481,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
 
@@ -575,6 +576,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -587,6 +589,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
 
@@ -725,6 +728,7 @@ async fn run_two_thread_conversation(threaded: bool) -> (usize, Vec<(String, Opt
             thread_ts: Some(thread.into()),
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
     }
@@ -812,6 +816,119 @@ async fn daemon_scopes_sessions_to_threads_only_on_a_threading_channel() {
     }
 }
 
+/// One `require_mention` daemon run: three messages in one conversation on a
+/// threading channel — chatter in a thread nobody addressed, an @-mention
+/// that opens thread `100.1`, and an un-mentioned follow-up in that same
+/// thread — with the channel's policy on or off. Returns `(spawns, answers)`
+/// where `answers` are the echoed texts.
+async fn run_ambient_conversation(require_mention: bool) -> (usize, Vec<String>) {
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(if require_mention {
+        MockChannel::new()
+            .with_session_threads()
+            .with_require_mention()
+    } else {
+        MockChannel::new().with_session_threads()
+    });
+    for (id, thread, ambient, text) in [
+        ("a-1", "200.2", true, "ambient chatter"),
+        ("a-2", "100.1", false, "hey bot"),
+        ("a-3", "100.1", true, "follow up without a mention"),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "conv-1".into(),
+            content: text.into(),
+            channel: "telegram".into(),
+            timestamp: 0,
+            thread_ts: Some(thread.into()),
+            attachments: Vec::new(),
+            selection: None,
+            ambient,
+        })
+        .await;
+    }
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let spawned: Arc<std::sync::Mutex<Vec<Arc<GatewayAdapter>>>> = Arc::default();
+    let adapter_factory: AdapterFactory = {
+        let spawned = Arc::clone(&spawned);
+        Arc::new(move |_, _| {
+            let adapter = Arc::new(GatewayAdapter::default());
+            spawned.lock().unwrap().push(Arc::clone(&adapter));
+            adapter as Arc<dyn HarnessAdapter + Send + Sync>
+        })
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(1200)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let spawns = spawned
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|adapter| adapter.starts.load(Ordering::SeqCst))
+        .sum();
+    let answers = mock
+        .outbox()
+        .await
+        .into_iter()
+        .filter_map(|m| m.content.strip_prefix("gateway echo: ").map(str::to_string))
+        .collect();
+    (spawns, answers)
+}
+
+/// `require_mention` (every IM's group-reply switch) is applied ONCE, in the
+/// inbound consumer, from the provider's `ambient` fact: off, every message is
+/// answered; on, chatter nobody addressed is dropped, while a thread the bot
+/// was addressed in carries on without a mention — including a follow-up that
+/// arrives while that thread's session is still being spawned.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_answers_ambient_messages_only_in_threads_it_was_addressed_in() {
+    let _g = env_lock();
+
+    let (spawns, answers) = run_ambient_conversation(false).await;
+    assert_eq!(spawns, 2, "off: every thread gets a session");
+    assert_eq!(answers.len(), 3, "off: every message answered: {answers:?}");
+
+    let (spawns, answers) = run_ambient_conversation(true).await;
+    assert_eq!(spawns, 1, "on: only the addressed thread gets a session");
+    assert_eq!(answers.len(), 2, "on: {answers:?}");
+    assert!(
+        answers.iter().any(|a| a.starts_with("hey bot")),
+        "the @-mention is answered: {answers:?}"
+    );
+    assert!(
+        answers
+            .iter()
+            .any(|a| a.starts_with("follow up without a mention")),
+        "an un-mentioned follow-up in the addressed thread is answered: {answers:?}"
+    );
+    assert!(
+        answers.iter().all(|a| !a.starts_with("ambient chatter")),
+        "chatter in an unaddressed thread is dropped: {answers:?}"
+    );
+}
+
 /// V0.8.4 P0 — a gateway reply that overflows the channel's
 /// `max_message_len` is split into ordered durable sub-messages. Built on
 /// `daemon_routes_gateway_inbound_to_submit_turn_and_outbound`, but with a
@@ -842,6 +959,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -854,6 +972,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
 
@@ -1006,6 +1125,7 @@ async fn daemon_split_failure_surfaces_notice() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -1018,6 +1138,7 @@ async fn daemon_split_failure_surfaces_notice() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
 
@@ -1221,6 +1342,7 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(true, false));
@@ -1262,6 +1384,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -1274,6 +1397,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, true));
@@ -1331,6 +1455,7 @@ async fn first_activation_probes_the_tool_face_once_per_session() {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
     }
@@ -1516,6 +1641,7 @@ async fn pump_reattaches_after_the_inbound_stream_ends() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     let adapter = Arc::new(DetachingAdapter::new(true));
@@ -1596,6 +1722,7 @@ async fn detached_stream_closes_the_turn_it_swallowed() {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
     }
@@ -1783,6 +1910,7 @@ async fn watchdog_does_not_interrupt_a_streaming_turn() {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
     }
@@ -1830,6 +1958,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -1842,6 +1971,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     let adapter = Arc::new(FailingGatewayAdapter::new(false, false));
@@ -2947,6 +3077,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
         thread_ts: None,
         attachments: Vec::new(),
         selection: None,
+        ambient: false,
     })
     .await;
     mock.push(ChannelMessage {
@@ -2965,6 +3096,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
             size: Some(1234),
         }],
         selection: None,
+        ambient: false,
     })
     .await;
 

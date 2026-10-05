@@ -187,7 +187,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // v0.8.20 F3 — admin re-reveals a tenant's personal login link.
         .routes(routes!(super::users::handle_user_link))
         // v0.8.20 F2 — per-user IM bot config (self-serve `/me/im` + admin).
-        .routes(routes!(super::users::handle_put_me_im))
+        .routes(routes!(
+            super::users::handle_put_me_im,
+            super::users::handle_get_me_im
+        ))
+        .routes(routes!(super::users::handle_put_me_require_mention))
         .routes(routes!(
             super::users::handle_get_me_lark_open_id_candidates,
             super::users::handle_put_me_lark_allowed_users
@@ -200,6 +204,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(
             super::users::handle_put_me_telegram_allowed_chats
         ))
+        .routes(routes!(
+            super::users::handle_get_me_slack_user_id_candidates
+        ))
+        .routes(routes!(super::users::handle_put_me_slack_allowed_users))
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
@@ -298,6 +306,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::im_config::handle_get_slack_manifest))
         .routes(routes!(super::im_config::handle_get_slack_user_id_candidates))
         .routes(routes!(super::im_config::handle_put_slack_allowed_users))
+        .routes(routes!(super::im_config::handle_put_require_mention))
         // v0.8.9 Phase 2 — ccteam-hub plugin marketplace: global catalog +
         // body preview, plus per-project decorated catalog + install.
         .routes(routes!(super::marketplace::handle_marketplace))

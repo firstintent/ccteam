@@ -79,8 +79,22 @@ async fn tenant_token_keeps_only_user_management_and_global_im_admin_only() {
         "tenant must be 403 on the global Slack config"
     );
     // …and the Slack setup helpers (manifest link, sender capture, allowlist).
+    // The create-app manifest holds no secret: a regular user builds their
+    // OWN Slack app from it, exactly as the owner does.
+    let r = c
+        .get(format!(
+            "http://{addr}/api/v1/config/im/slack/app-manifest?name=mine"
+        ))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "every signed-in user may build a Slack app"
+    );
     for (method, path) in [
-        ("GET", "/api/v1/config/im/slack/app-manifest"),
         ("GET", "/api/v1/config/im/slack/user-id-candidates"),
         ("PUT", "/api/v1/config/im/slack/allowed-users"),
     ] {
@@ -818,6 +832,7 @@ async fn tenant_telegram_binds_its_own_chat_and_starts_unbound() {
         Some(ccteam_core::tenants::TenantTelegram {
             bot_token: "111:AAA".into(),
             allowed_chat_ids: Vec::new(),
+            require_mention: false,
         }),
     );
     reg.save(&paths.users_dir()).unwrap();

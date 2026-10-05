@@ -183,17 +183,20 @@ async fn get_im_config_masks_secrets() {
         telegram: Some(TelegramCreds {
             bot_token: "111222:SUPERSECRETTOKENvalue".into(),
             allowed_chat_ids: vec!["98765".into()],
+            require_mention: false,
         }),
         lark: Some(LarkCreds {
             app_id: "cli_app_xyz".into(),
             app_secret: "larkAPPSECRETvalue".into(),
             allowed_user_ids: vec!["ou_a".into(), "ou_b".into()],
             use_feishu: true,
+            require_mention: false,
         }),
         slack: Some(SlackCreds {
             bot_token: "xoxb-SLACKBOTSECRETvalue".into(),
             app_token: "xapp-SLACKAPPSECRETtail".into(),
             allowed_user_ids: vec!["U0ALICE".into()],
+            require_mention: false,
         }),
         ..Default::default()
     };
@@ -319,6 +322,7 @@ async fn put_telegram_preserves_existing_chat_ids() {
             telegram: Some(TelegramCreds {
                 bot_token: "old".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
             ..Default::default()
         },
@@ -478,6 +482,7 @@ async fn put_slack_valid_tokens_persist_and_preserve_other_platforms() {
             telegram: Some(TelegramCreds {
                 bot_token: "tg".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
             ..Default::default()
         },
@@ -576,6 +581,7 @@ async fn chat_id_capture_writes_into_allowlist() {
             telegram: Some(TelegramCreds {
                 bot_token: "111:TOK".into(),
                 allowed_chat_ids: vec![],
+                require_mention: false,
             }),
             ..Default::default()
         },
@@ -719,6 +725,7 @@ async fn slack_allowed_users_update_keeps_the_tokens() {
                 bot_token: "xoxb-keep".into(),
                 app_token: "xapp-keep".into(),
                 allowed_user_ids: vec![],
+                require_mention: false,
             }),
             ..Default::default()
         },
@@ -788,6 +795,574 @@ async fn slack_user_id_candidates_are_the_global_bots_rejected_senders() {
         vec!["U0NEW"],
         "only the global Slack bot, since the cutoff"
     );
+}
+
+// --------------------------------------------------------------------------
+// A regular user's OWN Slack app — symmetric with their Telegram / Lark bot
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn a_tenant_sets_up_their_own_slack_app() {
+    use ccteam_core::tenants::TenantRegistry;
+    let base = spawn_slack_mock(true, true).await;
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &base);
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    let bob = reg.add("bob");
+    reg.save(&paths.users_dir()).unwrap();
+    let users = paths.users_dir();
+    let probe = paths.im_state_dir().join("rejected-senders.jsonl");
+    let (state, _) = state_with_creds(&tmp, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn_app(state).await;
+    let alice_auth = format!("Bearer ccteam:{}", alice.web_token);
+
+    // ② Tokens, validated against Slack; fail-closed until someone is allowed.
+    let v: Value = client()
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"slack": {"bot_token": "xoxb-a", "app_token": "xapp-a"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["slack"], true, "{v}");
+    assert_eq!(v["slack_unbound"], true, "{v}");
+    let saved = TenantRegistry::load(&users)
+        .by_id(&alice.id)
+        .unwrap()
+        .clone();
+    assert_eq!(saved.slack.as_ref().unwrap().bot_token, "xoxb-a");
+    assert!(saved.lark.is_none() && saved.telegram.is_none());
+
+    // ③ Capture is scoped to HER bot (`slack@<alice>`), then one click allows.
+    std::fs::create_dir_all(probe.parent().unwrap()).unwrap();
+    let row = |channel: String, sender: &str| {
+        serde_json::json!({
+            "channel": channel, "sender_id": sender, "chat_id": "D1",
+            "message_id": "1.1", "timestamp": 2000_u64,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        &probe,
+        [
+            row(format!("slack@{}", alice.id), "U0ALICE"),
+            row(format!("slack@{}", bob.id), "U0BOB"),
+            row("slack".into(), "U0OWNER"),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let candidates: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/me/im/slack/user-id-candidates"
+        ))
+        .header("Authorization", &alice_auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["sender_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["U0ALICE"], "only her own bot's rejected senders");
+    let r = client()
+        .put(format!("http://{addr}/api/v1/me/im/slack/allowed-users"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"allowed_user_ids": ["U0ALICE"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // A later token change keeps the binding (a member id names the person).
+    client()
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"slack": {"bot_token": "xoxb-a2", "app_token": "xapp-a2"}}))
+        .send()
+        .await
+        .unwrap();
+    let saved = TenantRegistry::load(&users)
+        .by_id(&alice.id)
+        .unwrap()
+        .clone();
+    let slack = saved.slack.unwrap();
+    assert_eq!(slack.bot_token, "xoxb-a2");
+    assert_eq!(slack.allowed_user_ids, vec!["U0ALICE"]);
+    assert!(
+        TenantRegistry::load(&users)
+            .by_id(&bob.id)
+            .unwrap()
+            .slack
+            .is_none(),
+        "bob is untouched"
+    );
+
+    std::env::remove_var("CCTEAM_SLACK_API_BASE");
+}
+
+// --------------------------------------------------------------------------
+// `require_mention` — the group-reply switch, the same on every IM
+// --------------------------------------------------------------------------
+
+/// Creds with all three IMs configured and the switch off everywhere.
+fn all_three_ims() -> Credentials {
+    Credentials {
+        telegram: Some(TelegramCreds {
+            bot_token: "111:tg-secret".into(),
+            allowed_chat_ids: vec!["42".into()],
+            require_mention: false,
+        }),
+        lark: Some(LarkCreds {
+            app_id: "cli_x".into(),
+            app_secret: "lark-secret".into(),
+            allowed_user_ids: vec!["ou_a".into()],
+            use_feishu: true,
+            require_mention: false,
+        }),
+        slack: Some(SlackCreds {
+            bot_token: "xoxb-keep".into(),
+            app_token: "xapp-keep".into(),
+            allowed_user_ids: vec!["U0ALICE".into()],
+            require_mention: false,
+        }),
+        ..Default::default()
+    }
+}
+
+fn switch_flags(c: &Credentials) -> [bool; 3] {
+    [
+        c.telegram.as_ref().unwrap().require_mention,
+        c.lark.as_ref().unwrap().require_mention,
+        c.slack.as_ref().unwrap().require_mention,
+    ]
+}
+
+/// The owner flips each IM's switch with one flag — no tokens re-entered, no
+/// other IM touched — and the masked read reports it back, per IM.
+#[tokio::test]
+async fn require_mention_switch_is_symmetric_across_ims_and_keeps_the_tokens() {
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    credentials::save(&creds_path, &all_three_ims()).unwrap();
+    let addr = spawn_app(state).await;
+
+    for (i, platform) in ["telegram", "lark", "slack"].into_iter().enumerate() {
+        let url = format!("http://{addr}/api/v1/config/im/{platform}/require-mention");
+        let r = client()
+            .put(&url)
+            .json(&serde_json::json!({"require_mention": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{platform}");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["platform"], platform);
+        assert_eq!(v["require_mention"], true);
+        assert_eq!(
+            v["restart_required"], true,
+            "standalone web: no live reload"
+        );
+
+        let mut want = [false; 3];
+        for flag in want.iter_mut().take(i + 1) {
+            *flag = true;
+        }
+        let saved = credentials::load(Some(&creds_path)).unwrap();
+        assert_eq!(switch_flags(&saved), want, "after {platform}");
+        assert_eq!(saved.slack.as_ref().unwrap().bot_token, "xoxb-keep");
+        assert_eq!(saved.lark.as_ref().unwrap().app_secret, "lark-secret");
+        assert_eq!(saved.telegram.as_ref().unwrap().bot_token, "111:tg-secret");
+    }
+
+    // The masked read carries it for each IM.
+    let status: Value = client()
+        .get(format!("http://{addr}/api/v1/config/im"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for platform in ["telegram", "lark", "slack"] {
+        assert_eq!(status[platform]["require_mention"], true, "{platform}");
+    }
+
+    // And back off.
+    let r = client()
+        .put(format!(
+            "http://{addr}/api/v1/config/im/slack/require-mention"
+        ))
+        .json(&serde_json::json!({"require_mention": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let saved = credentials::load(Some(&creds_path)).unwrap();
+    assert_eq!(switch_flags(&saved), [true, true, false]);
+}
+
+#[tokio::test]
+async fn require_mention_switch_refuses_unknown_and_unconfigured_ims() {
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let addr = spawn_app(state).await;
+    let put = |platform: &str| {
+        client()
+            .put(format!(
+                "http://{addr}/api/v1/config/im/{platform}/require-mention"
+            ))
+            .json(&serde_json::json!({"require_mention": true}))
+            .send()
+    };
+
+    // Nothing configured yet: every IM says so, nothing is written.
+    for platform in ["telegram", "lark", "slack"] {
+        assert_eq!(put(platform).await.unwrap().status(), 400, "{platform}");
+    }
+    // A typo is a 400, never a silent no-op.
+    let r = put("slakc").await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("telegram, lark, slack"));
+    assert!(
+        !creds_path.exists()
+            || credentials::load(Some(&creds_path))
+                .unwrap()
+                .slack
+                .is_none(),
+        "a refused flip writes nothing"
+    );
+}
+
+/// The switch is the owner's: a tenant is refused, and the endpoint sits
+/// behind the web-token gate like the rest of `/config/im`.
+#[tokio::test]
+async fn require_mention_switch_is_admin_only_behind_the_gate() {
+    use ccteam_core::tenants::TenantRegistry;
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::enabled(TOKEN_HEX.into()));
+    credentials::save(&creds_path, &all_three_ims()).unwrap();
+    let addr = spawn_app(state).await;
+    let url = format!("http://{addr}/api/v1/config/im/slack/require-mention");
+    let body = serde_json::json!({"require_mention": true});
+
+    let r = client().put(&url).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    let r = client()
+        .put(&url)
+        .header(
+            "Authorization",
+            format!("Bearer ccteam:{}", alice.web_token),
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant cannot flip the owner's bot");
+    assert!(
+        !credentials::load(Some(&creds_path))
+            .unwrap()
+            .slack
+            .unwrap()
+            .require_mention
+    );
+    let r = client()
+        .put(&url)
+        .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// Saving the tokens again (a rotated bot token, a re-run setup) is not a
+/// reason to forget how the bot was told to behave in groups.
+#[tokio::test]
+#[serial]
+async fn re_saving_an_ims_credentials_keeps_its_require_mention_switch() {
+    let tg_base = spawn_telegram_mock(true, "ccteam_bot", 1).await;
+    let lark_base = spawn_lark_mock(0).await;
+    let slack_base = spawn_slack_mock(true, true).await;
+    std::env::set_var("CCTEAM_TELEGRAM_API_BASE", &tg_base);
+    std::env::set_var("CCTEAM_LARK_API_BASE", &lark_base);
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &slack_base);
+
+    let tmp = TempDir::new().unwrap();
+    let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
+    let mut creds = all_three_ims();
+    creds.telegram.as_mut().unwrap().require_mention = true;
+    creds.lark.as_mut().unwrap().require_mention = true;
+    creds.slack.as_mut().unwrap().require_mention = true;
+    credentials::save(&creds_path, &creds).unwrap();
+    let addr = spawn_app(state).await;
+
+    for (platform, body) in [
+        ("telegram", serde_json::json!({"bot_token": "222:rotated"})),
+        (
+            "lark",
+            serde_json::json!({"app_id": "cli_y", "app_secret": "s2", "use_feishu": true,
+                               "allowed_user_ids": ["ou_a"]}),
+        ),
+        (
+            "slack",
+            serde_json::json!({"bot_token": "xoxb-new", "app_token": "xapp-new"}),
+        ),
+    ] {
+        let r = client()
+            .put(format!("http://{addr}/api/v1/config/im/{platform}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{platform}: {:?}", r.text().await);
+    }
+    let saved = credentials::load(Some(&creds_path)).unwrap();
+    assert_eq!(saved.telegram.as_ref().unwrap().bot_token, "222:rotated");
+    assert_eq!(saved.lark.as_ref().unwrap().app_id, "cli_y");
+    assert_eq!(saved.slack.as_ref().unwrap().bot_token, "xoxb-new");
+    assert_eq!(
+        switch_flags(&saved),
+        [true, true, true],
+        "a token change must not reset the switch"
+    );
+
+    for var in [
+        "CCTEAM_TELEGRAM_API_BASE",
+        "CCTEAM_LARK_API_BASE",
+        "CCTEAM_SLACK_API_BASE",
+    ] {
+        std::env::remove_var(var);
+    }
+}
+
+/// A regular user reads and flips the switch of their OWN bots, on every IM,
+/// through the same shapes the owner has; nobody else's bot moves, and a
+/// token change keeps it.
+#[tokio::test]
+#[serial]
+async fn a_tenant_reads_and_flips_the_require_mention_switch_of_their_own_bots() {
+    use ccteam_core::tenants::{TenantLark, TenantRegistry, TenantSlack, TenantTelegram};
+    let tg_base = spawn_telegram_mock(true, "alice_bot", 1).await;
+    let slack_base = spawn_slack_mock(true, true).await;
+    std::env::set_var("CCTEAM_TELEGRAM_API_BASE", &tg_base);
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &slack_base);
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let users = paths.users_dir();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    let bob = reg.add("bob");
+    reg.set_telegram(
+        &alice.id,
+        Some(TenantTelegram {
+            bot_token: "111:alice-secret".into(),
+            allowed_chat_ids: vec!["42".into()],
+            require_mention: false,
+        }),
+    );
+    reg.set_lark(
+        &alice.id,
+        Some(TenantLark {
+            app_id: "cli_alice".into(),
+            app_secret: "alice-lark-secret".into(),
+            allowed_user_ids: vec!["ou_1".into(), "ou_2".into()],
+            use_feishu: true,
+            require_mention: false,
+        }),
+    );
+    reg.set_slack(
+        &alice.id,
+        Some(TenantSlack {
+            bot_token: "xoxb-alice".into(),
+            app_token: "xapp-alice".into(),
+            allowed_user_ids: vec!["U0ALICE".into()],
+            require_mention: false,
+        }),
+    );
+    reg.set_slack(
+        &bob.id,
+        Some(TenantSlack {
+            bot_token: "xoxb-bob".into(),
+            app_token: "xapp-bob".into(),
+            allowed_user_ids: vec![],
+            require_mention: false,
+        }),
+    );
+    reg.save(&users).unwrap();
+    let (state, _) = state_with_creds(&tmp, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn_app(state).await;
+    let alice_auth = format!("Bearer ccteam:{}", alice.web_token);
+    let admin_auth = format!("Bearer ccteam:{TOKEN_HEX}");
+
+    // She can read her own bots — masked, same shape as the owner's read.
+    let me: Value = client()
+        .get(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["telegram"]["chat_id_count"], 1, "{me}");
+    assert_eq!(me["lark"]["allowed_user_id_count"], 2, "{me}");
+    // The saved allowlists come back too: the allowlist PUTs replace the whole
+    // list, so the card has to start from what is already bound.
+    assert_eq!(
+        me["telegram"]["allowed_chat_ids"],
+        serde_json::json!(["42"])
+    );
+    assert_eq!(
+        me["lark"]["allowed_user_ids"],
+        serde_json::json!(["ou_1", "ou_2"])
+    );
+    assert_eq!(
+        me["slack"]["allowed_user_ids"],
+        serde_json::json!(["U0ALICE"])
+    );
+    for platform in ["telegram", "lark", "slack"] {
+        assert_eq!(me[platform]["configured"], true);
+        assert_eq!(me[platform]["require_mention"], false, "{platform}");
+    }
+    let body = me.to_string();
+    for secret in [
+        "alice-secret",
+        "alice-lark-secret",
+        "xoxb-alice",
+        "xapp-alice",
+    ] {
+        assert!(!body.contains(secret), "no secret in the read: {secret}");
+    }
+
+    // Flip each of her bots.
+    for platform in ["telegram", "lark", "slack"] {
+        let r = client()
+            .put(format!(
+                "http://{addr}/api/v1/me/im/{platform}/require-mention"
+            ))
+            .header("Authorization", &alice_auth)
+            .json(&serde_json::json!({"require_mention": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{platform}");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["platform"], platform);
+        assert_eq!(v["require_mention"], true);
+    }
+    let reg = TenantRegistry::load(&users);
+    let a = reg.by_id(&alice.id).unwrap();
+    assert!(a.telegram.as_ref().unwrap().require_mention);
+    assert!(a.lark.as_ref().unwrap().require_mention);
+    assert!(a.slack.as_ref().unwrap().require_mention);
+    assert_eq!(a.slack.as_ref().unwrap().bot_token, "xoxb-alice");
+    assert_eq!(
+        a.lark.as_ref().unwrap().allowed_user_ids,
+        vec!["ou_1", "ou_2"]
+    );
+    assert!(
+        !reg.by_id(&bob.id)
+            .unwrap()
+            .slack
+            .as_ref()
+            .unwrap()
+            .require_mention,
+        "bob's bot did not move"
+    );
+
+    // A token change keeps it (Telegram + Slack validate against the mocks).
+    let r = client()
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({
+            "telegram_bot_token": "222:rotated",
+            "lark": {"app_id": "cli_alice2", "app_secret": "s2"},
+            "slack": {"bot_token": "xoxb-a2", "app_token": "xapp-a2"},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{:?}", r.text().await);
+    let reg = TenantRegistry::load(&users);
+    let a = reg.by_id(&alice.id).unwrap();
+    assert_eq!(a.telegram.as_ref().unwrap().bot_token, "222:rotated");
+    assert_eq!(a.lark.as_ref().unwrap().app_id, "cli_alice2");
+    assert_eq!(a.slack.as_ref().unwrap().bot_token, "xoxb-a2");
+    assert!(
+        a.telegram.as_ref().unwrap().require_mention
+            && a.lark.as_ref().unwrap().require_mention
+            && a.slack.as_ref().unwrap().require_mention,
+        "a token change must not reset the switch"
+    );
+
+    // Bob has no Telegram bot: refused, not silently created. A typo too.
+    let bob_auth = format!("Bearer ccteam:{}", bob.web_token);
+    let r = client()
+        .put(format!(
+            "http://{addr}/api/v1/me/im/telegram/require-mention"
+        ))
+        .header("Authorization", &bob_auth)
+        .json(&serde_json::json!({"require_mention": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client()
+        .put(format!(
+            "http://{addr}/api/v1/me/im/discord/require-mention"
+        ))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"require_mention": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // The owner's bot is the global one: the tenant endpoints say so.
+    for method_url in [
+        ("GET", format!("http://{addr}/api/v1/me/im")),
+        (
+            "PUT",
+            format!("http://{addr}/api/v1/me/im/slack/require-mention"),
+        ),
+    ] {
+        let req = match method_url.0 {
+            "GET" => client().get(&method_url.1),
+            _ => client()
+                .put(&method_url.1)
+                .json(&serde_json::json!({"require_mention": true})),
+        };
+        let r = req
+            .header("Authorization", &admin_auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{}", method_url.1);
+    }
+
+    std::env::remove_var("CCTEAM_TELEGRAM_API_BASE");
+    std::env::remove_var("CCTEAM_SLACK_API_BASE");
 }
 
 // --------------------------------------------------------------------------

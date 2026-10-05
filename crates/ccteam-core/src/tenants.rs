@@ -40,6 +40,12 @@ pub struct TenantTelegram {
     /// bound (the global/owner Telegram bot has separate legacy semantics).
     #[serde(default)]
     pub allowed_chat_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 /// v0.8.20 F2 — a tenant's OWN Lark/Feishu app (the per-user IM bot).
@@ -54,6 +60,30 @@ pub struct TenantLark {
     /// `true` → Feishu (CN); `false` → Lark intl. Defaults true (CN-first).
     #[serde(default = "default_true")]
     pub use_feishu: bool,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
+}
+
+/// A tenant's OWN Slack app (the per-user IM bot, symmetric with
+/// [`TenantTelegram`] / [`TenantLark`]): the `xoxb-` bot token, the `xapp-`
+/// app-level token for Socket Mode, and the Slack member ids it answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantSlack {
+    pub bot_token: String,
+    pub app_token: String,
+    /// Slack member ids (`U…`) allowed to drive the bot. Empty = closed.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    /// Answer only messages that @-mention the bot in a group chat (DMs are
+    /// always answered). `false` (default) = answer every message from an
+    /// allowed chat. The same switch on every IM — see
+    /// `ccteam_im::transport::MentionPolicy`.
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 fn default_true() -> bool {
@@ -83,6 +113,9 @@ pub struct Tenant {
     /// v0.8.20 F2 — this tenant's OWN Lark/Feishu app (per-user IM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lark: Option<TenantLark>,
+    /// This tenant's OWN Slack app (per-user IM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<TenantSlack>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -212,6 +245,7 @@ impl TenantRegistry {
             linked_chat: None,
             telegram: None,
             lark: None,
+            slack: None,
             created_at: Utc::now(),
         };
         self.tenants.push(tenant.clone());
@@ -295,6 +329,17 @@ impl TenantRegistry {
         }
     }
 
+    /// Set (or clear with `None`) a tenant's OWN Slack app.
+    pub fn set_slack(&mut self, id: &str, slack: Option<TenantSlack>) -> bool {
+        match self.tenants.iter_mut().find(|t| t.id == id) {
+            Some(t) => {
+                t.slack = slack;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn list(&self) -> &[Tenant] {
         &self.tenants
     }
@@ -313,6 +358,28 @@ impl TenantRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tenant file written before the switch existed has no `require_mention`
+    /// key: every IM reads it as off (answer everything), and an on value
+    /// survives the file round trip.
+    #[test]
+    fn require_mention_defaults_off_and_round_trips() {
+        let legacy = r#"{"id":"u1","handle":"a","web_token":"t","created_at":"2026-01-01T00:00:00Z",
+            "telegram":{"bot_token":"b"},
+            "lark":{"app_id":"a","app_secret":"s"},
+            "slack":{"bot_token":"b","app_token":"x"}}"#;
+        let mut t: Tenant = serde_json::from_str(legacy).unwrap();
+        assert!(!t.telegram.as_ref().unwrap().require_mention);
+        assert!(!t.lark.as_ref().unwrap().require_mention);
+        assert!(!t.slack.as_ref().unwrap().require_mention);
+        t.telegram.as_mut().unwrap().require_mention = true;
+        t.lark.as_mut().unwrap().require_mention = true;
+        t.slack.as_mut().unwrap().require_mention = true;
+        let back: Tenant = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert!(back.telegram.unwrap().require_mention);
+        assert!(back.lark.unwrap().require_mention);
+        assert!(back.slack.unwrap().require_mention);
+    }
 
     #[test]
     fn add_mints_unique_id_and_token() {
@@ -408,6 +475,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "111:AAA".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
         );
         stale.save_one(&dir, &alice.id).unwrap();
@@ -465,6 +533,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "123:abc".into(),
                 allowed_chat_ids: vec!["42".into()],
+                require_mention: false,
             }),
         ));
         assert_eq!(
@@ -487,6 +556,7 @@ mod tests {
                 app_secret: "s".into(),
                 allowed_user_ids: vec![],
                 use_feishu: true,
+                require_mention: false,
             }),
         ));
         assert!(reg.by_id(&a.id).unwrap().lark.is_some());
@@ -507,6 +577,7 @@ mod tests {
             Some(TenantTelegram {
                 bot_token: "t".into(),
                 allowed_chat_ids: vec![],
+                require_mention: false,
             }),
         );
         reg.save(&dir).unwrap();

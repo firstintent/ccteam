@@ -389,7 +389,7 @@ fn thread_reply_and_broadcast_thread_on_the_parent_ts() {
     let mut reply = msg_event(ALLOWED, "C1", "channel", "1700000002.000200", "more");
     reply["thread_ts"] = json!("1700000001.000100");
     let decoded = decode_message_event(&reply, &bot()).unwrap();
-    assert_eq!(decoded.thread_ts, "1700000001.000100");
+    assert_eq!(decoded.thread_ts.as_deref(), Some("1700000001.000100"));
     assert_eq!(
         decoded.into_channel_message("slack").id,
         "1700000002.000200"
@@ -398,8 +398,39 @@ fn thread_reply_and_broadcast_thread_on_the_parent_ts() {
     let mut broadcast = reply.clone();
     broadcast["subtype"] = json!("thread_broadcast");
     assert_eq!(
-        decode_message_event(&broadcast, &bot()).unwrap().thread_ts,
-        "1700000001.000100"
+        decode_message_event(&broadcast, &bot())
+            .unwrap()
+            .thread_ts
+            .as_deref(),
+        Some("1700000001.000100")
+    );
+}
+
+/// A top-level COMMAND acts at the channel level (no thread): it presets or
+/// lists, and the session's thread opens with a real message instead. In a
+/// thread a command still belongs to that thread's session.
+#[test]
+fn a_top_level_command_acts_at_the_channel_level() {
+    let top = |text: &str| {
+        decode_message_event(&msg_event(ALLOWED, "C1", "channel", "6.6", text), &bot())
+            .unwrap()
+            .thread_ts
+    };
+    assert_eq!(top("!new codex"), None);
+    assert_eq!(top(" /projects"), None);
+    assert_eq!(
+        top("fix the login bug"),
+        Some("6.6".to_string()),
+        "a real message opens its thread"
+    );
+    let mut in_thread = msg_event(ALLOWED, "C1", "channel", "7.7", "!model");
+    in_thread["thread_ts"] = json!("6.6");
+    assert_eq!(
+        decode_message_event(&in_thread, &bot())
+            .unwrap()
+            .thread_ts
+            .as_deref(),
+        Some("6.6")
     );
 }
 
@@ -498,38 +529,37 @@ fn files_are_collected_and_unreachable_ones_skipped() {
 }
 
 #[test]
-fn slash_text_maps_to_a_gateway_command_and_anchor_echoes_it() {
+fn slash_text_maps_to_a_gateway_command() {
     assert_eq!(slash_content(""), "/help");
     assert_eq!(slash_content("   "), "/help");
     assert_eq!(slash_content("new codex"), "/new codex");
     assert_eq!(slash_content(" /status "), "/status");
     assert_eq!(slash_content("say a &amp; b"), "/say a & b");
-    assert_eq!(
-        anchor_text("/ccteam", "new codex", "U1"),
-        "`/ccteam new codex` · <@U1>"
-    );
-    assert_eq!(anchor_text("/ccteam", "", "U1"), "`/ccteam` · <@U1>");
-    assert_eq!(
-        anchor_text("/ccteam", "a &lt;b&gt;", "U1"),
-        "`/ccteam a &lt;b&gt;` · <@U1>",
-        "echo stays Slack-escaped"
-    );
 }
 
 #[test]
 fn button_click_threads_on_the_clicked_messages_thread() {
     let in_thread =
         decode_block_actions(&click_payload(ALLOWED, "C1", "3.3", Some("1.1"))).unwrap();
-    assert_eq!(in_thread.thread_ts, "1.1");
+    assert_eq!(in_thread.thread_ts.as_deref(), Some("1.1"));
     assert_eq!(in_thread.message_ts, "3.3");
     assert_eq!(in_thread.value, "tok:1");
 
     let mut via_message = click_payload(ALLOWED, "C1", "3.3", None);
     via_message["message"]["thread_ts"] = json!("2.2");
-    assert_eq!(decode_block_actions(&via_message).unwrap().thread_ts, "2.2");
+    assert_eq!(
+        decode_block_actions(&via_message)
+            .unwrap()
+            .thread_ts
+            .as_deref(),
+        Some("2.2")
+    );
 
     let top_level = decode_block_actions(&click_payload(ALLOWED, "C1", "3.3", None)).unwrap();
-    assert_eq!(top_level.thread_ts, "3.3", "falls back to the message ts");
+    assert_eq!(
+        top_level.thread_ts, None,
+        "a top-level menu/list acts at the channel level"
+    );
 
     let mut not_actions = click_payload(ALLOWED, "C1", "3.3", None);
     not_actions["type"] = json!("view_submission");
@@ -610,7 +640,7 @@ fn a_dropdown_pick_comes_back_like_a_button_click() {
     }]);
     let click = decode_block_actions(&payload).unwrap();
     assert_eq!(click.value, "nav:cd:beta");
-    assert_eq!(click.thread_ts, "1.1");
+    assert_eq!(click.thread_ts.as_deref(), Some("1.1"));
 }
 
 #[test]
@@ -696,12 +726,11 @@ fn retry_after_header_is_parsed_and_capped() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The load-bearing inbound contract over a real (local) socket: every
-/// envelope is ACKed — the slash command's ACK provably lands BEFORE its
-/// anchor post (the mock refuses the post until the ACK arrived) — a
-/// re-delivery is deduped, Ping is answered, and every emitted message
-/// carries `thread_ts`.
+/// envelope is ACKed, a re-delivery is deduped, Ping is answered, and every
+/// message carries its thread — except the slash command, which acts at the
+/// channel level and posts nothing of its own (no anchor).
 #[tokio::test]
-async fn socket_mode_acks_first_dedupes_and_every_message_carries_thread_ts() {
+async fn socket_mode_acks_first_dedupes_and_threads_all_but_channel_commands() {
     let (ws_listener, ws_url) = ws_server().await;
     let slash_acked = Arc::new(tokio::sync::Notify::new());
     let gate = slash_acked.clone();
@@ -824,8 +853,10 @@ async fn socket_mode_acks_first_dedupes_and_every_message_carries_thread_ts() {
     let (acks, _ws) = server.await.unwrap();
     assert_eq!(acks, vec!["e1", "e2", "e3", "e4", "e5"]);
 
-    for m in [&top, &reply, &slash, &click] {
+    for m in [&top, &reply, &click] {
         assert!(m.thread_ts.is_some(), "inbound invariant: {m:?}");
+    }
+    for m in [&top, &reply, &slash, &click] {
         assert_eq!(m.channel, "slack");
         assert_eq!(m.reply_target, "C1");
         assert_eq!(m.sender, ALLOWED);
@@ -836,8 +867,10 @@ async fn socket_mode_acks_first_dedupes_and_every_message_carries_thread_ts() {
     assert_eq!(reply.id, "1700000002.000200");
     assert_eq!(reply.thread_ts.as_deref(), Some("1700000001.000100"));
     assert_eq!(slash.content, "/new codex");
-    assert_eq!(slash.id, "1700000100.000200");
-    assert_eq!(slash.thread_ts.as_deref(), Some("1700000100.000200"));
+    assert_eq!(
+        slash.thread_ts, None,
+        "a slash command acts at the channel level"
+    );
     assert_eq!(
         click.selection,
         Some(ChoiceReply {
@@ -847,12 +880,10 @@ async fn socket_mode_acks_first_dedupes_and_every_message_carries_thread_ts() {
     assert!(click.content.is_empty());
     assert_eq!(click.thread_ts.as_deref(), Some("1700000001.000100"));
 
-    let anchor = api.calls("chat.postMessage");
-    assert_eq!(anchor.len(), 1);
-    let body = anchor[0].json();
-    assert_eq!(body["channel"], "C1");
-    assert_eq!(body["text"], "`/ccteam new codex` · <@UALLOWED>");
-    assert!(body.get("thread_ts").is_none(), "the anchor is top-level");
+    assert!(
+        api.calls("chat.postMessage").is_empty(),
+        "a slash command posts no anchor of its own"
+    );
     assert_eq!(
         api.calls("auth.test")[0].header("authorization"),
         Some("Bearer xoxb-test")
@@ -1068,8 +1099,10 @@ async fn empty_allowlist_admits_no_one() {
     assert!(ch.handle_envelope(&click).await.is_none());
 }
 
+/// A slash command in a channel the bot is not in: its channel-level reply
+/// cannot be posted, so the command's own ephemeral response explains why.
 #[tokio::test]
-async fn slash_command_without_a_postable_anchor_explains_ephemerally_and_drops() {
+async fn a_slash_reply_the_bot_cannot_post_is_explained_ephemerally() {
     let api = MockHttp::start_sync(|req| match req.method() {
         "chat.postMessage" => api_err("channel_not_found"),
         "response" => ok(json!({})),
@@ -1086,7 +1119,17 @@ async fn slash_command_without_a_postable_anchor_explains_ephemerally_and_drops(
             &format!("{}/response", api.base),
         ),
     );
-    assert!(ch.handle_envelope(&slash).await.is_none());
+    let message = ch
+        .handle_envelope(&slash)
+        .await
+        .expect("handled at channel level");
+    assert!(ch
+        .send(&SendMessage::new(
+            "⚙️ 下一个会话:codex",
+            message.reply_target
+        ))
+        .await
+        .is_err());
     let replies = api.calls("response");
     assert_eq!(replies.len(), 1);
     let body = replies[0].json();
@@ -1096,7 +1139,7 @@ async fn slash_command_without_a_postable_anchor_explains_ephemerally_and_drops(
 
 /// Each app declares its own command (`/cct2` for an app named cct2) and
 /// Socket Mode only routes an app its own commands, so whatever command
-/// arrives is this app's: it opens an anchor thread like `/ccteam` does.
+/// arrives is this app's — handled at the channel level like `/ccteam`.
 #[tokio::test]
 async fn an_apps_own_slash_command_works_whatever_it_is_named() {
     let api = MockHttp::start_sync(default_api).await;
@@ -1108,13 +1151,8 @@ async fn an_apps_own_slash_command_works_whatever_it_is_named() {
         .await
         .expect("the app's own command is handled");
     assert_eq!(message.content, "/projects");
-    let posts = api.calls("chat.postMessage");
-    assert_eq!(posts.len(), 1, "one anchor message");
-    assert!(posts[0].json()["text"]
-        .as_str()
-        .unwrap()
-        .contains("/cct2 projects"));
-    assert_eq!(message.thread_ts.as_deref(), Some("1700000999.000100"));
+    assert_eq!(message.thread_ts, None);
+    assert!(api.calls("chat.postMessage").is_empty(), "no anchor");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1589,4 +1627,168 @@ fn button_weight_maps_to_style_and_a_confirm_step() {
     assert!(buttons[2].get("style").is_none());
     assert_eq!(buttons[2]["confirm"]["confirm"]["text"], "确定");
     assert_eq!(buttons[2]["confirm"]["deny"]["text"], "取消");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `require_mention` — channel chatter vs. a message that addresses the bot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// "Ambient" is a channel / private-channel / group-DM message that does not
+/// @-mention the bot; a DM never is. The fact is reported either way — the
+/// policy, not the decoder, decides what to do with it.
+#[test]
+fn channel_messages_are_ambient_until_they_mention_the_bot() {
+    for channel_type in ["channel", "group", "mpim"] {
+        let plain = msg_event(ALLOWED, "C1", channel_type, "1.1", "anyone around?");
+        let d = decode_message_event(&plain, &bot()).unwrap();
+        assert!(d.ambient, "{channel_type}: no mention is ambient");
+        assert!(!d.in_thread, "a top-level message only opens a thread");
+
+        let addressed = msg_event(ALLOWED, "C1", channel_type, "1.2", "<@UBOT> status?");
+        let d = decode_message_event(&addressed, &bot()).unwrap();
+        assert!(!d.ambient, "{channel_type}: an @-mention addresses the bot");
+
+        // Mentioning someone else addresses someone else.
+        let other = msg_event(ALLOWED, "C1", channel_type, "1.3", "<@UOTHER> status?");
+        assert!(decode_message_event(&other, &bot()).unwrap().ambient);
+    }
+    let dm = msg_event(ALLOWED, "D1", "im", "2.1", "hi");
+    assert!(!decode_message_event(&dm, &bot()).unwrap().ambient);
+
+    let mut reply = msg_event(ALLOWED, "C1", "channel", "3.2", "and another thing");
+    reply["thread_ts"] = json!("3.1");
+    let d = decode_message_event(&reply, &bot()).unwrap();
+    assert!(
+        d.ambient && d.in_thread,
+        "a thread reply is still ambient chatter"
+    );
+}
+
+/// Default policy: everything an allowed member says is delivered; the
+/// ambient fact rides along for the daemon.
+#[tokio::test]
+async fn by_default_ambient_channel_messages_are_delivered() {
+    let api = MockHttp::start_sync(default_api).await;
+    let ch = channel(&api.base, &[ALLOWED]);
+    assert!(!ch.mention_policy().require_mention);
+    let msg = ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload("Ev1", msg_event(ALLOWED, "C1", "channel", "1.1", "chatter")),
+        ))
+        .await
+        .expect("answered by default");
+    assert!(msg.ambient);
+}
+
+/// `require_mention`: ambient top-level chatter is dropped before anything is
+/// downloaded; a mention, a DM and a thread reply (the daemon decides whether
+/// that thread is held) get through.
+#[tokio::test]
+async fn require_mention_drops_ambient_chatter_before_downloading_its_files() {
+    let api = MockHttp::start_sync(|req| match req.path.as_str() {
+        "/files/F1/shot.png" => Resp {
+            status: 200,
+            headers: vec![("Content-Type".into(), "image/png".into())],
+            body: b"\x89PNG".to_vec(),
+        },
+        _ => default_api(req),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ch = channel(&api.base, &[ALLOWED])
+        .with_require_mention(true)
+        .with_staging_dir(tmp.path().to_path_buf());
+    assert!(ch.mention_policy().require_mention);
+
+    // Ambient top-level chatter WITH a file: dropped, file never fetched.
+    let mut chatter = msg_event(ALLOWED, "C1", "channel", "1.1", "look at this");
+    chatter["subtype"] = json!("file_share");
+    chatter["files"] = json!([
+        { "id": "F1", "name": "shot.png", "mimetype": "image/png", "size": 4,
+          "url_private_download": format!("{}/files/F1/shot.png", api.base) },
+    ]);
+    assert!(ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev1", chatter)))
+        .await
+        .is_none());
+    assert!(
+        api.requests()
+            .iter()
+            .all(|r| !r.path.starts_with("/files/")),
+        "a dropped message must not cost a download"
+    );
+
+    // Addressed: delivered, file and all.
+    let mut mention = msg_event(ALLOWED, "C1", "channel", "2.1", "<@UBOT> look at this");
+    mention["subtype"] = json!("file_share");
+    mention["files"] = json!([
+        { "id": "F1", "name": "shot.png", "mimetype": "image/png", "size": 4,
+          "url_private_download": format!("{}/files/F1/shot.png", api.base) },
+    ]);
+    let msg = ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev2", mention)))
+        .await
+        .expect("a mention is answered");
+    assert!(!msg.ambient);
+    assert_eq!(msg.attachments.len(), 1);
+
+    // A DM is never ambient.
+    let dm = ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload("Ev3", msg_event(ALLOWED, "D1", "im", "3.1", "hi")),
+        ))
+        .await
+        .expect("a DM is answered");
+    assert!(!dm.ambient);
+
+    // An ambient reply inside a thread goes on to the daemon, which knows
+    // whether the gateway holds that thread.
+    let mut reply = msg_event(ALLOWED, "C1", "channel", "4.2", "and another thing");
+    reply["thread_ts"] = json!("2.1");
+    let msg = ch
+        .handle_envelope(&envelope("events_api", event_payload("Ev4", reply)))
+        .await
+        .expect("a thread reply is left to the daemon");
+    assert!(msg.ambient);
+    assert_eq!(msg.thread_ts.as_deref(), Some("2.1"));
+
+    // Slash commands and button clicks address the app by construction.
+    let click = ch
+        .handle_envelope(&envelope(
+            "interactive",
+            click_payload(ALLOWED, "C1", "5.5", Some("2.1")),
+        ))
+        .await
+        .expect("a click is answered");
+    assert!(!click.ambient);
+}
+
+/// The allowlist still runs first: an ambient message from a stranger leaves
+/// its probe (the web binding flow reads it) even though it is also dropped.
+#[tokio::test]
+async fn require_mention_does_not_hide_strangers_from_the_binding_probe() {
+    let api = MockHttp::start_sync(default_api).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let probe = tmp.path().join("probe.jsonl");
+    let ch = channel(&api.base, &[ALLOWED])
+        .with_require_mention(true)
+        .with_probe_path(probe.clone());
+    assert!(ch
+        .handle_envelope(&envelope(
+            "events_api",
+            event_payload(
+                "Ev1",
+                msg_event("USTRANGER", "C1", "channel", "1.1", "hello")
+            ),
+        ))
+        .await
+        .is_none());
+    assert!(
+        std::fs::read_to_string(&probe)
+            .unwrap_or_default()
+            .contains("USTRANGER"),
+        "the rejected sender is recorded"
+    );
 }

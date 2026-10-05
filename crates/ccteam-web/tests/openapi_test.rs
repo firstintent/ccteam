@@ -86,6 +86,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/users/{id}/link"),
         // v0.8.20 F2 — per-user IM bot config (self-serve + admin).
         ("PUT", "/api/v1/me/im"),
+        // The caller's own bots, masked (same shape as GET /config/im).
+        ("GET", "/api/v1/me/im"),
+        // The group-reply switch, one route for every IM (owner + tenant).
+        ("PUT", "/api/v1/me/im/{platform}/require-mention"),
         ("GET", "/api/v1/me/im/lark/open-id-candidates"),
         ("PUT", "/api/v1/me/im/lark/allowed-users"),
         // Telegram twin — a per-tenant bot is fail-closed, so the tenant needs
@@ -171,6 +175,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/config/im/slack/app-manifest"),
         ("GET", "/api/v1/config/im/slack/user-id-candidates"),
         ("PUT", "/api/v1/config/im/slack/allowed-users"),
+        ("PUT", "/api/v1/config/im/{platform}/require-mention"),
+        ("GET", "/api/v1/me/im/slack/user-id-candidates"),
+        ("PUT", "/api/v1/me/im/slack/allowed-users"),
         // v0.8.9 Phase 2 — ccteam-hub plugin marketplace.
         ("GET", "/api/v1/marketplace"),
         ("GET", "/api/v1/marketplace/{id}/body"),

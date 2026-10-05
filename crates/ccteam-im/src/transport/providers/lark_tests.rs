@@ -402,7 +402,7 @@ fn lark_decode_skips_app_and_bot_senders() {
 }
 
 #[test]
-fn lark_decode_group_requires_at_mention() {
+fn lark_group_message_without_mention_is_ambient_and_answered_by_default() {
     let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true);
     let base = |mentions: serde_json::Value| {
         serde_json::json!({
@@ -421,15 +421,53 @@ fn lark_decode_group_requires_at_mention() {
             }
         })
     };
-    // No @-mention in a group → dropped.
-    assert!(ch
+    // Default policy: a group message with no @-mention is delivered, marked
+    // ambient (the same switch every IM has — Lark no longer hard-codes it).
+    let chatter = ch
         .decode_event_value(&base(serde_json::json!([])))
-        .is_none());
-    // @-mentioned → delivered.
+        .expect("answered by default");
+    assert!(chatter.ambient);
+    // @-mentioned → delivered, and not ambient.
     let msg = ch
         .decode_event_value(&base(serde_json::json!([{"key": "@_user_1"}])))
         .expect("mentioned group message delivered");
     assert_eq!(msg.reply_target, "oc_group");
+    assert!(!msg.ambient);
+}
+
+#[test]
+fn lark_require_mention_drops_ambient_group_messages() {
+    let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true)
+        .with_require_mention(true);
+    assert!(ch.mention_policy().require_mention);
+    let group = |mentions: serde_json::Value| {
+        serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_id": "om_grp",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hi team\"}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "mentions": mentions,
+                    "create_time": "1000"
+                }
+            }
+        })
+    };
+    assert!(ch
+        .decode_event_value(&group(serde_json::json!([])))
+        .is_none());
+    assert!(ch
+        .decode_event_value(&group(serde_json::json!([{"key": "@_user_1"}])))
+        .is_some());
+    // A p2p chat has no group to be ambient in.
+    let mut p2p = group(serde_json::json!([]));
+    p2p["event"]["message"]["chat_type"] = serde_json::json!("p2p");
+    let msg = ch.decode_event_value(&p2p).expect("p2p is always answered");
+    assert!(!msg.ambient);
 }
 
 #[test]
@@ -876,8 +914,9 @@ fn lark_decode_file_yields_pending() {
 }
 
 #[test]
-fn lark_decode_group_image_requires_at_mention() {
-    // The group @-mention gate applies to attachments too.
+fn lark_decode_group_image_is_ambient_without_at_mention() {
+    // Attachments follow the same ambient rule as text; the channel's policy
+    // (not the decoder) decides, and drops it before the download.
     let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true);
     let event = |mentions: serde_json::Value| {
         serde_json::to_vec(&serde_json::json!({
@@ -897,10 +936,22 @@ fn lark_decode_group_image_requires_at_mention() {
         }))
         .unwrap()
     };
-    assert!(ch.decode_event(&event(serde_json::json!([]))).is_none());
-    assert!(ch
+    let ambient = ch
+        .decode_event(&event(serde_json::json!([])))
+        .expect("decoded");
+    assert!(ambient.ambient && ambient.pending.is_some());
+    assert!(!ch.drops_ambient(&ambient));
+    let strict = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true)
+        .with_require_mention(true);
+    assert!(
+        strict.drops_ambient(&ambient),
+        "dropped before the download"
+    );
+    let mentioned = ch
         .decode_event(&event(serde_json::json!([{"key": "@_user_1"}])))
-        .is_some());
+        .expect("decoded");
+    assert!(!mentioned.ambient);
+    assert!(!strict.drops_ambient(&mentioned));
 }
 
 // ── attachments: upload-response + magic-byte helpers (pure) ────────────

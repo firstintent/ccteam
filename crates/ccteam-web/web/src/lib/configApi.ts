@@ -24,6 +24,9 @@
 
 import type { SenderCandidatesResponse } from "./usersApi";
 
+/** The three IMs a per-platform setting is keyed by (the URL segment). */
+export type ImPlatform = "telegram" | "lark" | "slack";
+
 /** Masked Telegram status (`im_config::TelegramStatus`). No token field. */
 export interface TelegramStatus {
   /** Always `true` when present (a block exists on disk). */
@@ -32,6 +35,12 @@ export interface TelegramStatus {
   bot_token_last4: string;
   /** How many `chat_id`s are bound (the allowlist length). */
   chat_id_count: number;
+  /** The bound `chat_id`s (not secrets) — allowlist PUTs replace the whole
+   *  list, so an editor starts from these. */
+  allowed_chat_ids: string[];
+  /** Groups/channels: `true` = only answer messages that @-mention the bot;
+   *  `false` (default) = answer every allowed member. DMs always answer. */
+  require_mention: boolean;
 }
 
 /** Masked Lark/Feishu status (`im_config::LarkStatus`). No app_secret field. */
@@ -44,6 +53,10 @@ export interface LarkStatus {
   use_feishu: boolean;
   /** How many `open_id`s are allowlisted. */
   allowed_user_id_count: number;
+  /** The allowlisted `open_id`s (not secrets). */
+  allowed_user_ids: string[];
+  /** Same @-mention gate as Telegram (`TelegramStatus.require_mention`). */
+  require_mention: boolean;
 }
 
 /** Masked Slack status (`im_config::SlackStatus`). No token fields — only
@@ -57,6 +70,9 @@ export interface SlackStatus {
   app_token_last4: string;
   /** Slack member ids (`U…`) allowed to drive the bot — empty = no one. */
   allowed_user_ids: string[];
+  /** Same @-mention gate as Telegram; a thread the bot already holds a
+   *  session in continues without the @. */
+  require_mention: boolean;
 }
 
 /** `GET /api/v1/config/im` response — masked, secret-free
@@ -296,4 +312,29 @@ export function putSlackAllowedUsers(ids: string[]): Promise<SlackAllowedUsersRe
   return putJson<SlackAllowedUsersResult>("/api/v1/config/im/slack/allowed-users", {
     allowed_user_ids: ids,
   });
+}
+
+/** `PUT /config/im/{platform}/require-mention` success body. */
+export interface RequireMentionResult {
+  ok: boolean;
+  platform: ImPlatform;
+  require_mention: boolean;
+  /** The daemon applied it live; standalone web says `restart_required`
+   *  instead and `note` tells the operator so. */
+  reloaded: boolean;
+  restart_required: boolean;
+  note: string;
+}
+
+/** `PUT /api/v1/config/im/{platform}/require-mention` — flip only the
+ *  @-mention gate for groups/channels; credentials and allowlists stay as
+ *  saved. 400 (with the reason) when that IM isn't configured yet. */
+export function putRequireMention(
+  platform: ImPlatform,
+  require_mention: boolean,
+): Promise<RequireMentionResult> {
+  return putJson<RequireMentionResult>(
+    `/api/v1/config/im/${platform}/require-mention`,
+    { require_mention },
+  );
 }

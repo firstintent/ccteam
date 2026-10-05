@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::transport::{Channel, ChannelMessage, CommandSpec, SendMessage};
+use crate::transport::{Channel, ChannelMessage, CommandSpec, MentionPolicy, SendMessage};
 
 /// One recorded reaction call (v0.8.19): `(op, chat_id, message_id, handle)`
 /// where `op` is `"add"`/`"remove"` and `handle` is what was passed to remove
@@ -57,6 +57,9 @@ pub struct MockChannel {
     /// single-stream shape); a test flips it to drive the threaded routing a
     /// Slack channel gets.
     session_threads: bool,
+    /// Report [`Channel::mention_policy`] with `require_mention` — `false` by
+    /// default (answer everything).
+    require_mention: bool,
 }
 
 impl MockChannel {
@@ -73,7 +76,16 @@ impl MockChannel {
             reaction_handle: None,
             reactions: Arc::default(),
             session_threads: false,
+            require_mention: false,
         }
+    }
+
+    /// Make this channel's [`Channel::mention_policy`] require an @-mention
+    /// in a group (the credentials' `require_mention`), so a test can drive
+    /// the daemon's ambient-message gate. Builder-style; default `false`.
+    pub fn with_require_mention(mut self) -> Self {
+        self.require_mention = true;
+        self
     }
 
     /// Make this channel report [`Channel::session_threads`] `== true` (one
@@ -187,6 +199,12 @@ impl Channel for MockChannel {
         self.session_threads
     }
 
+    fn mention_policy(&self) -> MentionPolicy {
+        MentionPolicy {
+            require_mention: self.require_mention,
+        }
+    }
+
     async fn edit_message(
         &self,
         _recipient: &str,
@@ -257,6 +275,7 @@ mod tests {
             thread_ts: None,
             attachments: Vec::new(),
             selection: None,
+            ambient: false,
         })
         .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);

@@ -16,6 +16,7 @@ import {
   saveSlack,
   getSlackAppManifest,
   getSlackUserIdCandidates,
+  putRequireMention,
   putSlackAllowedUsers,
   saveTelegramToken,
   startTelegramChatId,
@@ -41,18 +42,27 @@ describe("configApi", () => {
 
   it("getImConfig GETs /config/im with same-origin creds and returns masked status", async () => {
     const masked = {
-      telegram: { configured: true, bot_token_last4: "…wxyz", chat_id_count: 1 },
+      telegram: {
+        configured: true,
+        bot_token_last4: "…wxyz",
+        chat_id_count: 1,
+        allowed_chat_ids: ["42"],
+        require_mention: false,
+      },
       lark: {
         configured: true,
         app_id_last4: "…cli9",
         use_feishu: true,
         allowed_user_id_count: 2,
+        allowed_user_ids: ["ou_1", "ou_2"],
+        require_mention: true,
       },
       slack: {
         configured: true,
         bot_token_last4: "…bot1",
         app_token_last4: "…app1",
         allowed_user_ids: ["U0ALICE"],
+        require_mention: false,
       },
       transport_warning: "no TLS",
     };
@@ -73,12 +83,16 @@ describe("configApi", () => {
       "configured",
       "bot_token_last4",
       "chat_id_count",
+      "allowed_chat_ids",
+      "require_mention",
     ]);
     expect(Object.keys(got.lark ?? {})).toEqual([
       "configured",
       "app_id_last4",
       "use_feishu",
       "allowed_user_id_count",
+      "allowed_user_ids",
+      "require_mention",
     ]);
     expect(got.slack).not.toHaveProperty("bot_token");
     expect(got.slack).not.toHaveProperty("app_token");
@@ -87,7 +101,36 @@ describe("configApi", () => {
       "bot_token_last4",
       "app_token_last4",
       "allowed_user_ids",
+      "require_mention",
     ]);
+  });
+
+  it("putRequireMention PUTs {require_mention} to /config/im/{platform}/require-mention", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        ok: true,
+        platform: "lark",
+        require_mention: true,
+        reloaded: true,
+        restart_required: false,
+        note: "applied",
+      }),
+    );
+    const got = await putRequireMention("lark", true);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/config/im/lark/require-mention");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ require_mention: true });
+    expect(got.require_mention).toBe(true);
+    expect(got.note).toBe("applied");
+  });
+
+  it("putRequireMention surfaces the server {error} on 400 (IM not configured)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(400, { error: "Slack is not configured" }),
+    );
+    await expect(putRequireMention("slack", true)).rejects.toThrow("Slack is not configured");
   });
 
   it("getImConfig tolerates null provider blocks", async () => {
