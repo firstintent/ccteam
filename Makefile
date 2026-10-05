@@ -1,7 +1,7 @@
 # ccteam Makefile — thin convenience wrappers around cargo / npm / the CLI.
 #
 #   make gate            # full pre-push gate: fmt + clippy + tests + SPA
-#   make install         # THE install: build release + copy to $(BIN_DIR)/ccteam
+#   make install         # THE install: build optimized (thin LTO) + copy to $(BIN_DIR)/ccteam
 #                        #   + `ccteam daemon restart` (self-managed setsid daemon;
 #                        #   migrates any legacy systemd/launchd unit) + next steps
 #   make start           # run the daemon in the FOREGROUND (dev / one-off)
@@ -34,7 +34,7 @@ BIN_LINK     := $(BIN_DIR)/$(BIN_NAME)
 # every build lands below this checkout. The first arm avoids invoking
 # `cargo metadata` when the caller already supplied the environment variable.
 CARGO_TARGET_DIR_RESOLVED = $(or $(strip $(CARGO_TARGET_DIR)),$(shell cargo metadata --no-deps --format-version 1 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'))
-RELEASE_BIN  = $(abspath $(CARGO_TARGET_DIR_RESOLVED))/release/$(BIN_NAME)
+INSTALL_BIN  = $(abspath $(CARGO_TARGET_DIR_RESOLVED))/local-release/$(BIN_NAME)
 CCTEAM_HOME  ?= $(HOME)/.ccteam
 WEB_DIR      := $(CURDIR)/crates/ccteam-web/web
 WEB_PORT     ?= 7331
@@ -78,7 +78,7 @@ help:
 	@printf '  \033[1mmake gate\033[0m          full pre-push gate (fmt+clippy+test+test-web+web-check)\n'
 	@printf '  make clean         cargo clean + rm SPA dist\n\n'
 	@printf '\033[1mInstall\033[0m\n'
-	@printf '  \033[1mmake install\033[0m       build release + atomic copy + `ccteam daemon restart` (self-managed daemon)\n'
+	@printf '  \033[1mmake install\033[0m       optimized build (thin LTO) + atomic copy + `ccteam daemon restart` (self-managed daemon)\n'
 	@printf '  make uninstall     stop the daemon + remove the executable (state untouched)\n'
 	@printf '  make reinstall     uninstall + install\n\n'
 	@printf '\033[1mRun foreground (daemon = IM gateway + web UI + MCP, one process)\033[0m\n'
@@ -203,7 +203,8 @@ gate: fmt-check clippy test test-web web-check
 
 # --- Install / uninstall -----------------------------------------------------
 #
-# `make install` is THE product install: release build → atomic executable
+# `make install` is THE product install: optimized build (Cargo profile
+# `local-release` = release with thin LTO, see Cargo.toml) → atomic executable
 # copy → `ccteam daemon restart` (self-managed setsid daemon). The installed
 # executable is deliberately independent of Cargo's build tree: shared target
 # cleanup or a redirected CARGO_TARGET_DIR must never break the live daemon.
@@ -218,11 +219,12 @@ gate: fmt-check clippy test test-web web-check
 # schema is owned by `ccteam_core::install_channel::InstallMarker`; unknown
 # fields are ignored, and `tag` is absent here on purpose (no release tag).
 
-install-binary: release
+install-binary: require-node
+	cargo build --profile local-release
 	@set -eu; \
-	_release_bin="$(RELEASE_BIN)"; \
+	_release_bin="$(INSTALL_BIN)"; \
 	if [ ! -x "$$_release_bin" ]; then \
-	    printf '\033[31merror:\033[0m Cargo release binary not found: %s\n' "$$_release_bin" >&2; \
+	    printf '\033[31merror:\033[0m Cargo local-release binary not found: %s\n' "$$_release_bin" >&2; \
 	    exit 1; \
 	fi; \
 	mkdir -p "$(BIN_DIR)"; \
