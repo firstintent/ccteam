@@ -5127,37 +5127,92 @@ impl Gateway {
             // A delegation parent waiting on a task queued here would wait
             // forever: answer it through the normal completion path, as an
             // honest failure. Its task line was withdrawn above.
-            if let Some(dtx) = g.delegation_tx.clone().filter(|_| !withdrawn.is_empty()) {
-                let turn_id = format!(
-                    "{sid}-resume-failed-{}",
-                    chrono::Utc::now().timestamp_millis()
-                );
-                let _ = dtx.send(crate::delegation::DelegationPulse::Signal(
-                    crate::delegation::DelegationSignal {
-                        child_sid: sid.clone(),
-                        turn_id: turn_id.clone(),
-                        // Never observed executing: resolves the requests
-                        // still queued for this sid.
-                        exec_turn_id: None,
-                        tail: format!(
-                            "{sid} could not be resumed after its old process ended: {error}. \
-                             The task was withdrawn and did not run; send it again to retry."
-                        ),
-                        vendor: meta.vendor,
-                        host: meta.host.clone(),
-                        boundary: true,
-                        continuation: ccteam_harness::TurnContinuation::Settled,
-                        vendor_error: true,
-                        interim_notes: 0,
-                        covered_turns: vec![turn_id],
-                        context_pct: None,
-                        turn: meta.turn_count,
-                        error_kind: Some("resume_failed".to_string()),
-                        conclusion: None,
-                    },
-                ));
+            let answer = (
+                withdrawn,
+                meta.vendor,
+                meta.host.clone(),
+                meta.turn_count,
+                error,
+            );
+            drop(g);
+            let (withdrawn, vendor, host, turn, error) = answer;
+            Self::answer_withdrawn_requests(gateway, &d.sid, withdrawn, vendor, host, turn, &error)
+                .await;
+        }
+    }
+
+    /// Answer the parents of delegated tasks that were withdrawn because
+    /// `sid` could not be resumed: a terminal failure each parent receives
+    /// through the ordinary completion path — bound to a turn of its own, so
+    /// the delivery is matched by identity, durable, deduplicated across a
+    /// restart, and submitted to the parent the way any completion is (a live
+    /// parent is steered, a released one gets the pending FIFO and a resume).
+    async fn answer_withdrawn_requests(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        request_ids: Vec<String>,
+        vendor: AgentVendor,
+        host: String,
+        turn: u64,
+        error: &str,
+    ) {
+        if request_ids.is_empty() {
+            return;
+        }
+        let exec_turn_id = format!(
+            "{sid}-resume-failed-{}",
+            chrono::Utc::now().timestamp_millis()
+        );
+        {
+            let claim = Self::claim_delegation_store(gateway, sid).await;
+            let bound = {
+                let mut g = gateway.lock().await;
+                let Some(mirror) = g.delegations.get_mut(sid) else {
+                    return;
+                };
+                let mut bound = 0;
+                for request_id in &request_ids {
+                    if let Some(request) = mirror.store.get_mut(request_id) {
+                        if !request.state.is_terminal() {
+                            request.turn_id = Some(exec_turn_id.clone());
+                            request.state = ccteam_harness::RequestState::Submitted;
+                            bound += 1;
+                        }
+                    }
+                }
+                bound
+            };
+            if bound == 0 {
+                return;
+            }
+            if let Err(error) = Self::persist_delegation_store(gateway, &claim).await {
+                tracing::warn!(session = %sid, %error, "ccteam-im: withdrawn tasks' binding is not durable; a restart re-reads them as outstanding");
             }
         }
+        Self::deliver_delegation_signal_shared(
+            Arc::clone(gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: sid.to_string(),
+                turn_id: exec_turn_id.clone(),
+                exec_turn_id: Some(exec_turn_id.clone()),
+                tail: format!(
+                    "{sid} could not be resumed after its old process ended: {error}. \
+                     The task was withdrawn and did not run; send it again to retry."
+                ),
+                vendor,
+                host,
+                boundary: true,
+                continuation: ccteam_harness::TurnContinuation::Settled,
+                vendor_error: true,
+                interim_notes: 0,
+                covered_turns: vec![exec_turn_id],
+                context_pct: None,
+                turn,
+                error_kind: Some("resume_failed".to_string()),
+                conclusion: None,
+            },
+        )
+        .await;
     }
 
     /// Recover what `sid`'s body said while unobserved (vendor record via the
@@ -18043,6 +18098,21 @@ impl Gateway {
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
     ) -> Result<StopOutcome> {
+        // The whole stop runs on its own task: a caller that goes away
+        // mid-kill (a web client disconnecting drops this future) must not
+        // leave a body ended but its session never stopped — marked
+        // `stopping` forever, with messages queued behind a dead process.
+        let gateway = Arc::clone(gateway);
+        let sid = sid.to_string();
+        tokio::spawn(async move { Self::stop_session_owned(&gateway, &sid).await })
+            .await
+            .unwrap_or_else(|join| Err(anyhow!("stop task failed: {join}")))
+    }
+
+    async fn stop_session_owned(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<StopOutcome> {
         let claim = Self::claim_delegation_store(gateway, sid).await;
         // A detached body is ended HERE, off the gateway lock (the kill can
         // take the whole SIGTERM grace); the stop below then finds it gone.
@@ -23423,6 +23493,126 @@ mod tests {
         assert!(g.body_ends.lock().unwrap().get("s99").is_none());
     }
 
+    /// End to end: a delegated task queued behind a body whose session then
+    /// fails to come back is withdrawn, its PARENT — a real session — receives
+    /// the "withdrawn, did not run, send it again" turn through the ordinary
+    /// completion path, the request is no longer outstanding, and a restart's
+    /// reconcile does not tell the parent a second time (checker item 4).
+    #[tokio::test]
+    async fn a_withdrawn_task_answers_its_parent_once_through_the_completion_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (child, mut body, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let parent = spawn_managed(&mut restarted).await;
+        let request_id = restarted
+            .accept_delegation_request(
+                &DelegationStoreClaim::for_test(&child),
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("build the thing".into()),
+                TurnRouting::Queue,
+                None,
+            )
+            .expect("accepted");
+        crate::pending_turns::enqueue_pending_turn(
+            &project_dir,
+            &child,
+            "build the thing",
+            Some("mcp".into()),
+            false,
+            TurnIntent::from_origin(TurnOrigin::Internal).pending(),
+            Some(request_id.clone()),
+        )
+        .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        fake.fail_starts.store(1, Ordering::SeqCst);
+        Gateway::interrupt_session_shared(&gateway, &child)
+            .await
+            .unwrap();
+        body.wait().unwrap();
+        Gateway::body_watch_tick(&gateway).await;
+
+        let told: Vec<String> = submitted_texts(&fake)
+            .into_iter()
+            .filter(|text| text.contains("withdrawn and did not run"))
+            .collect();
+        assert_eq!(told.len(), 1, "the parent is told once: {told:?}");
+        assert!(told[0].contains(&request_id), "{}", told[0]);
+        {
+            let g = gateway.lock().await;
+            assert!(
+                g.outstanding_request_ids(&child, &parent).is_empty(),
+                "the request is settled"
+            );
+            assert!(g
+                .delegation_request_state(&child, &request_id)
+                .is_some_and(|state| state.is_terminal()));
+        }
+        assert!(!submitted_texts(&fake)
+            .iter()
+            .any(|t| t == "build the thing"));
+
+        // A restart reconciles the store and tells the parent nothing new.
+        let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut again = Gateway::new(fake2.clone(), "alpha", &project_dir);
+        again.enable_persistence(tmp.path()).unwrap();
+        let again = Arc::new(tokio::sync::Mutex::new(again));
+        Gateway::reconcile_delegations(Arc::clone(&again)).await;
+        assert!(
+            !submitted_texts(&fake2)
+                .iter()
+                .any(|text| text.contains("withdrawn")),
+            "no second notification after a restart"
+        );
+        assert!(again
+            .lock()
+            .await
+            .outstanding_request_ids(&child, &parent)
+            .is_empty());
+    }
+
+    /// A REST `/stop` whose client goes away mid-kill still finishes the
+    /// stop: the session ends up stopped, not detached with a `stopping` mark
+    /// nobody will ever lift (checker item a).
+    #[tokio::test]
+    async fn a_dropped_stop_caller_still_stops_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, _fake, restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        let pid = child.id();
+        SLOW_BODY_END_PIDS.lock().unwrap().push(pid);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Gateway::stop_session_shared(&gateway, &sid),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller went away mid-stop");
+        let started = std::time::Instant::now();
+        loop {
+            let _ = child.try_wait();
+            let stopped = read_session_meta(&project_dir, &sid)
+                .unwrap()
+                .stopped_at
+                .is_some();
+            if stopped && !gateway.lock().await.is_session_detached(&sid) {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the stop must finish without its caller"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        SLOW_BODY_END_PIDS.lock().unwrap().retain(|p| *p != pid);
+    }
+
     /// When the session does not come back after its old process ended, the
     /// people promised a resume are told why, the queued turns are kept, and
     /// the next message delivers them FIRST, in order — never ahead of them,
@@ -23438,8 +23628,6 @@ mod tests {
         let paths = progress_paths(tmp.path());
         restarted.enable_project_creation(paths.clone());
         let mut events = restarted.subscribe_events();
-        let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
-        restarted.set_delegation_notifier_tx(dtx);
         restarted.submit_to_sid(&sid, "Q1".into()).await.unwrap();
         // A parent's delegated task, queued behind the same body: withdrawn
         // when the parent is told the resume failed, so it never runs late.
@@ -23480,21 +23668,8 @@ mod tests {
             told,
             "the reply target hears why the session did not come back"
         );
-        let mut parent_told = false;
-        while let Ok(pulse) = drx.try_recv() {
-            if let crate::delegation::DelegationPulse::Signal(signal) = pulse {
-                if signal.child_sid == sid
-                    && signal.error_kind.as_deref() == Some("resume_failed")
-                    && signal.vendor_error
-                {
-                    parent_told = true;
-                }
-            }
-        }
-        assert!(
-            parent_told,
-            "a waiting delegation parent gets an honest failure"
-        );
+        // The parent side is covered end to end by
+        // `a_withdrawn_task_answers_its_parent_once_through_the_completion_path`.
         assert!(ledger_has(&paths, r#""reason":"interrupted""#).await);
 
         let id = gateway
