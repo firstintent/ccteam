@@ -1823,6 +1823,7 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
         // Standalone `ccteam internal web` shares the home but is not the
         // daemon; publishing would point `daemon status` at this process.
         publish_endpoint: false,
+        bound: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
