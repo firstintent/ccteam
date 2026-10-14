@@ -54,6 +54,9 @@ fn isolate_home() -> TempDir {
 #[derive(Debug)]
 struct ScriptedAdapter {
     script: Vec<ThreadEvent>,
+    /// Events the stream yields when the daemon detaches the session at
+    /// shutdown — a busy session still talking while the daemon stops.
+    on_detach: Vec<ThreadEvent>,
     events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
     starts: AtomicUsize,
     submits: AtomicUsize,
@@ -63,6 +66,7 @@ impl ScriptedAdapter {
     fn new(script: Vec<ThreadEvent>) -> Self {
         Self {
             script,
+            on_detach: Vec::new(),
             events: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             starts: AtomicUsize::new(0),
             submits: AtomicUsize::new(0),
@@ -153,6 +157,21 @@ impl HarnessAdapter for ScriptedAdapter {
         Ok(())
     }
 
+    async fn detach_thread(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<ccteam_harness::DetachOutcome, HarnessError> {
+        if !self.on_detach.is_empty() {
+            self.events
+                .lock()
+                .await
+                .extend(self.on_detach.iter().cloned());
+            // Give the pump time to read them before the daemon aborts it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        Ok(ccteam_harness::DetachOutcome::NotApplicable)
+    }
+
     async fn handle_directive(
         &self,
         _h: &ThreadHandle,
@@ -226,6 +245,10 @@ fn is_status(text: &str) -> bool {
 /// Run the daemon over one `/new` + one trigger message with `script` as
 /// the turn's events. Returns the mock channel for outbox/edits asserts.
 async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
+    run_adapter(ScriptedAdapter::new(script)).await
+}
+
+async fn run_adapter(adapter: ScriptedAdapter) -> Arc<MockChannel> {
     let home = isolate_home();
     let projects_root = home.path().join("projects");
     std::fs::create_dir_all(&projects_root).unwrap();
@@ -253,7 +276,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
         mock.clone() as Arc<dyn Channel + Send + Sync>,
     );
 
-    let adapter = Arc::new(ScriptedAdapter::new(script));
+    let adapter = Arc::new(adapter);
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
         Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
@@ -406,4 +429,75 @@ async fn codex_streaming_delta_not_sent_as_answer() {
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
     std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
+}
+
+/// Every log line the process emits from here on (installed once, global:
+/// the daemon's tasks run on runtime worker threads).
+fn captured_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    use std::sync::{Mutex, OnceLock};
+    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    BUF.get_or_init(|| {
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Buf(Arc::clone(&buf));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("ccteam_im=debug"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        buf
+    })
+    .clone()
+}
+
+/// Issue #210 follow-up: a session still emitting events while the daemon
+/// stops meets the already-aborted delivery consumer. That is the stop, not
+/// a delivery outage — a clean stop logs no ERROR for it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_stop_with_a_busy_session_logs_no_delivery_error() {
+    let _g = env_lock();
+    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
+    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
+    let logs = captured_logs();
+
+    let mut adapter = ScriptedAdapter::new(vec![tool_started(
+        "t1",
+        "Bash",
+        serde_json::json!({"command": "sleep 600"}),
+    )]);
+    adapter.on_detach = vec![
+        tool_completed("t1", "Bash"),
+        tool_started("t2", "Read", serde_json::json!({"file_path": "/a"})),
+    ];
+    let _mock = run_adapter(adapter).await;
+
+    let text =
+        String::from_utf8_lossy(&logs.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    let errors: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("ERROR") && line.contains("consumer is gone"))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "a clean stop logged delivery errors: {errors:#?}"
+    );
+    assert!(
+        text.contains("delivery closed for shutdown"),
+        "the busy session's pump must have met the closed sink during the stop:\n{text}"
+    );
 }

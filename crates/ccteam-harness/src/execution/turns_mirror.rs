@@ -183,10 +183,7 @@ pub fn append_turn(project_dir: &Path, sid: &str, record: &TurnRecord) -> Result
     ensure_dir(project_dir, sid)?;
     let path = turns_jsonl_path(project_dir, sid);
     let line = serde_json::to_string(record)? + "\n";
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = crate::execution::fs_atomic::open_jsonl_append(&path)
         .with_context(|| format!("open {}", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("append to {}", path.display()))?;
@@ -314,6 +311,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["t2", "t3"]
         );
+    }
+
+    /// Issue #210: after an ENOSPC-torn tail the next appended turn lands on
+    /// its own line instead of being glued to the fragment (both lost).
+    #[test]
+    fn append_after_a_torn_tail_keeps_the_new_turn() {
+        let tmp = TempDir::new().unwrap();
+        append_turn(tmp.path(), "eve", &mk_turn("t0", "eve", "u", "a")).unwrap();
+        let path = turns_jsonl_path(tmp.path(), "eve");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{{\"turn_id\":\"torn").unwrap();
+        drop(file);
+        append_turn(tmp.path(), "eve", &mk_turn("t1", "eve", "u", "a")).unwrap();
+        append_turn(tmp.path(), "eve", &mk_turn("t2", "eve", "u", "a")).unwrap();
+
+        let ids: Vec<String> = read_all_turns(tmp.path(), "eve")
+            .unwrap()
+            .into_iter()
+            .map(|turn| turn.turn_id)
+            .collect();
+        assert_eq!(ids, vec!["t0", "t1", "t2"]);
     }
 
     #[test]

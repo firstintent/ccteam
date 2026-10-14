@@ -110,6 +110,38 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>>
     Ok(out)
 }
 
+/// Open an append-only JSONL log for appending (creating it when missing),
+/// first terminating a torn last line — the write-side counterpart of
+/// [`read_jsonl`]'s tolerance.
+///
+/// An interrupted append (ENOSPC, crash) leaves a partial line with no
+/// trailing `\n`. Appending straight after it glues the next record onto the
+/// fragment, so the reader loses BOTH; after a disk-full window that meant the
+/// first record written once space came back was lost too (issue #210). One
+/// one-byte read at open fixes it: the fragment stays a lone unparseable line
+/// and every later record lands on its own line.
+///
+/// Callers must write each record with ONE `write_all` of the whole line
+/// (serialize to a buffer first), so a concurrent appender never observes —
+/// and "heals" — another writer's half-written record.
+pub fn open_jsonl_append(path: &Path) -> std::io::Result<File> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(file)
+}
+
 /// A staging file that removes itself unless the rename claimed it.
 struct TmpFile {
     path: std::path::PathBuf,
@@ -226,6 +258,42 @@ mod tests {
 
         // No leftover staging file after a successful write.
         assert_eq!(tmp_files(dir.path()), Vec::<String>::new());
+    }
+
+    /// Issue #210: an append after a torn (ENOSPC-truncated) last line starts
+    /// a fresh line, so the new record survives; a healthy or empty log gets
+    /// no extra blank line.
+    #[test]
+    fn jsonl_append_terminates_a_torn_tail_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+
+        open_jsonl_append(&path)
+            .unwrap()
+            .write_all(b"{\"n\":1}\n")
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"n\":2,\"tru")
+            .unwrap();
+        open_jsonl_append(&path)
+            .unwrap()
+            .write_all(b"{\"n\":3}\n")
+            .unwrap();
+        open_jsonl_append(&path)
+            .unwrap()
+            .write_all(b"{\"n\":4}\n")
+            .unwrap();
+
+        let rows: Vec<serde_json::Value> = read_jsonl(&path).unwrap();
+        let ns: Vec<i64> = rows.iter().map(|r| r["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, vec![1, 3, 4], "only the torn fragment is lost");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"n\":1}\n{\"n\":2,\"tru\n{\"n\":3}\n{\"n\":4}\n"
+        );
     }
 
     /// Two writers of ONE target never share a staging file. Before this,

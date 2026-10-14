@@ -32,7 +32,7 @@
 //! `PendingInteractions`, not from ring contents.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ccteam_im::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use tokio::sync::broadcast;
@@ -93,7 +93,7 @@ impl SessionEventRing {
     /// itself is still the durable side of this record.
     pub(crate) fn record(&self, sid: &str, event: GatewayEvent) -> u64 {
         let seq = {
-            let mut guard = self.rings.lock().unwrap();
+            let mut guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
             let state = guard.entry(sid.to_string()).or_default();
             state.next_seq += 1;
             let seq = state.next_seq;
@@ -115,7 +115,7 @@ impl SessionEventRing {
     /// (the gap outran the ring's capacity), this simply returns everything
     /// left — the closest available approximation of "what you missed".
     pub(crate) fn replay_since(&self, sid: &str, since: u64) -> Vec<RingEntry> {
-        let guard = self.rings.lock().unwrap();
+        let guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
         guard
             .get(sid)
             .map(|s| s.buf.iter().filter(|e| e.seq > since).cloned().collect())
@@ -169,7 +169,7 @@ impl GlobalEventRing {
     /// Returns the assigned seq.
     pub(crate) fn record(&self, event: GatewayEvent) -> u64 {
         let seq = {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             guard.next_seq += 1;
             let seq = guard.next_seq;
             guard.buf.push_back(RingEntry {
@@ -188,7 +188,7 @@ impl GlobalEventRing {
     /// Every buffered entry with `seq > since`, oldest first — the same
     /// best-effort catch-up contract as [`SessionEventRing::replay_since`].
     pub(crate) fn replay_since(&self, since: u64) -> Vec<RingEntry> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         guard
             .buf
             .iter()
@@ -206,21 +206,30 @@ pub(crate) fn spawn_global_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<GlobalEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving the ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "global ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            ring.record(ev);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    ring.record(ev);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 /// Spawn the ONE persistent ring-feeder task for this gateway — called once
@@ -237,23 +246,32 @@ pub(crate) fn spawn_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<SessionEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
-                    }
-                    if let Some(sid) = ev.sid.clone() {
-                        ring.record(&sid, ev);
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving every session's replay ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "session ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            if let Some(sid) = ev.sid.clone() {
+                                ring.record(&sid, ev);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 #[cfg(test)]
@@ -275,6 +293,29 @@ mod tests {
             sid: Some(sid.to_string()),
             slug: None,
         }
+    }
+
+    /// One panic while a ring lock is held must not turn every later record
+    /// and replay into a panic too (the feeders run for the daemon's life).
+    #[test]
+    fn rings_keep_working_after_a_panic_poisoned_their_lock() {
+        let session = Arc::new(SessionEventRing::new());
+        let global = Arc::new(GlobalEventRing::new());
+        session.record("s1", ev("a", "s1"));
+        global.record(ev("a", "s1"));
+        let (s, g) = (Arc::clone(&session), Arc::clone(&global));
+        let _ = std::thread::spawn(move || {
+            let _rings = s.rings.lock().unwrap();
+            let _state = g.state.lock().unwrap();
+            panic!("poison both ring locks");
+        })
+        .join();
+        assert!(session.rings.is_poisoned() && global.state.is_poisoned());
+
+        assert_eq!(session.record("s1", ev("b", "s1")), 2);
+        assert_eq!(session.replay_since("s1", 0).len(), 2);
+        assert_eq!(global.record(ev("b", "s1")), 2);
+        assert_eq!(global.replay_since(0).len(), 2);
     }
 
     #[test]

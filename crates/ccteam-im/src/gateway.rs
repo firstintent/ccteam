@@ -959,6 +959,11 @@ pub struct Gateway {
     next_scheduled: u64,
     /// Durable scheduled rows indexed by globally unique short id.
     scheduled_items: BTreeMap<String, ScheduledEntry>,
+    /// Scheduled ids whose fire has begun in this daemon life. An id stays
+    /// here until its row is completed or failed, so a fire that panicked
+    /// between delivery and bookkeeping is never sent again on the next
+    /// pass (at most once per daemon life; a restart re-reads the store).
+    scheduled_firing: HashSet<String>,
     /// Wakes the lightweight next-fire timer after create/cancel/GC.
     scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
@@ -971,6 +976,11 @@ pub struct Gateway {
     /// is wired or on the standalone path. The pump tees through
     /// [`GatewayEventSink`]; the held sender is the source for new receivers.
     events_broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// Set once the daemon begins a clean stop, before it aborts the
+    /// delivery consumer: a pump's last send then meets a closed sink, which
+    /// is expected and logged quietly instead of as a delivery outage.
+    /// Shared with every [`GatewayEventSink`] this gateway hands out.
+    event_delivery_closing: Arc<std::sync::atomic::AtomicBool>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
     /// Outstanding choice prompts (v0.8.5 D3/D4/D6). Its own lock — held
     /// separately from the gateway so a long External await (D6, W2) never
@@ -2279,6 +2289,8 @@ struct GatewayEventSink {
     mpsc: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
     /// Fan-out for per-session SSE subscribers.
     broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// The gateway's [`Gateway::close_event_delivery`] flag.
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GatewayEventSink {
@@ -2290,7 +2302,7 @@ impl GatewayEventSink {
         // Broadcast first (cheap clone); a `SendError` here just means no SSE
         // subscriber is attached, which is normal.
         let _ = self.broadcast.send(event.clone());
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// Send a delivery-only event to the daemon egress without publishing it
@@ -2298,7 +2310,7 @@ impl GatewayEventSink {
     /// original sid-keyed Answer already feeds SSE, while the duplicate is a
     /// phone notification only.
     fn send_delivery_only(&self, event: GatewayEvent) -> bool {
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// v0.10.1 — publish to the SSE fan-out (web console + the inline-wait
@@ -2307,8 +2319,45 @@ impl GatewayEventSink {
     /// pump-liveness signal as [`Self::send`] (the mpsc being closed is still
     /// "the daemon exited"), so a caller's `if !send { break }` is unchanged.
     fn send_broadcast_only(&self, event: GatewayEvent) -> bool {
+        let live = !self.mpsc.is_closed();
+        if !live {
+            self.log_consumer_gone(&event);
+        }
         let _ = self.broadcast.send(event);
-        !self.mpsc.is_closed()
+        live
+    }
+
+    /// The mpsc leg shared by every send shape. A closed mpsc is the pump's
+    /// stop signal, and every pump stops on it, so it is logged HERE (once
+    /// per stopping pump, every send site covered): outside daemon shutdown
+    /// it means no session's reply reaches IM/web/turns any more (issue #210:
+    /// the consumer died during ENOSPC and every pump stopped silently).
+    fn deliver(&self, event: GatewayEvent) -> bool {
+        match self.mpsc.send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::SendError(event)) => {
+                self.log_consumer_gone(&event);
+                false
+            }
+        }
+    }
+
+    fn log_consumer_gone(&self, event: &GatewayEvent) {
+        let sid = event.sid.as_deref().unwrap_or("-");
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!(
+                sid,
+                event_id = %event.id,
+                "ccteam-im: delivery closed for shutdown; stopping this session's event pump"
+            );
+            return;
+        }
+        tracing::error!(
+            sid,
+            event_id = %event.id,
+            channel = %event.channel,
+            "ccteam-im: gateway event consumer is gone; stopping this session's event pump"
+        );
     }
 }
 
@@ -3596,9 +3645,11 @@ impl Gateway {
             next_session: 0,
             next_scheduled: 0,
             scheduled_items: BTreeMap::new(),
+            scheduled_firing: HashSet::new(),
             scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
+            event_delivery_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_pumps: BTreeMap::new(),
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
@@ -3666,11 +3717,20 @@ impl Gateway {
         self.event_sink = Some(GatewayEventSink {
             mpsc: tx,
             broadcast: self.events_broadcast.clone(),
+            closing: Arc::clone(&self.event_delivery_closing),
         });
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// The flag the daemon raises when it begins a clean stop, before it
+    /// aborts the delivery consumer: from then on a closed delivery sink is
+    /// shutdown, not an outage, so pumps that stop on it log at debug. Handed
+    /// out so the daemon can raise it without taking the gateway lock.
+    pub fn event_delivery_closing(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.event_delivery_closing)
     }
 
     /// v0.9.0 W2 (F2) — wire the sender the detached event pumps use to signal a
@@ -4580,15 +4640,26 @@ impl Gateway {
                 std::mem::take(&mut g.post_mortem_pending),
             )
         };
+        // Each body under its own containment: the batch was taken off the
+        // gateway, so one panicking post-mortem must not drop the rest of it.
         for (sid, slug, cwd, body) in post_mortems {
-            Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited").await;
+            crate::supervise::contain_panic(
+                "body watcher",
+                &sid,
+                Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited"),
+            )
+            .await;
         }
         for d in detached {
-            // Off the lock: a pure OS probe.
-            if session_body::body_is_alive(&d.body, &d.sid) {
-                continue;
-            }
-            Self::on_detached_body_exited_shared(gateway, d).await;
+            let sid = d.sid.clone();
+            crate::supervise::contain_panic("body watcher", &sid, async {
+                // Off the lock: a pure OS probe.
+                if session_body::body_is_alive(&d.body, &d.sid) {
+                    return;
+                }
+                Self::on_detached_body_exited_shared(gateway, d).await;
+            })
+            .await;
         }
     }
 
@@ -10104,6 +10175,7 @@ impl Gateway {
             .filter(|entry| {
                 entry.item.status == crate::scheduled::ScheduledStatus::Pending
                     && entry.item.send_at <= now
+                    && !self.scheduled_firing.contains(&entry.item.id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -10116,11 +10188,24 @@ impl Gateway {
                 );
                 continue;
             }
-            let result = self.submit_scheduled_user_turn(&entry.item).await;
+            // In flight BEFORE the submit: whatever happens after this point,
+            // the row is not picked up again by a later pass.
+            self.scheduled_firing.insert(entry.item.id.clone());
+            // One poison row must cost that row, not every later due row (a
+            // panic escaping here would restart the scheduler on the same
+            // sorted batch, forever).
+            let result = crate::supervise::contain_panic(
+                "scheduled scheduler",
+                &entry.item.id,
+                self.submit_scheduled_user_turn(&entry.item),
+            )
+            .await;
             match result {
-                Ok(()) => self.complete_scheduled_fire(&entry),
-                Err(err) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+                Some(Ok(())) => self.complete_scheduled_fire(&entry),
+                Some(Err(err)) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+                None => self.fail_scheduled(&entry.item.id, "panicked while firing".to_string()),
             }
+            self.scheduled_firing.remove(&entry.item.id);
         }
     }
 
@@ -14531,30 +14616,38 @@ impl Gateway {
         }
         let mut released = Vec::new();
         for row in ripe {
-            // Off the lock: the vendor's own answer to "is background work
-            // still running here".
-            if row
-                .adapter
-                .running_tasks(&row.thread)
-                .await
-                .iter()
-                .any(|task| task.outlives_turn())
-            {
-                continue;
-            }
-            match Self::release_session_shared(
-                gateway,
-                &row.sid,
-                row.generation,
-                ReleaseReason::Idle,
-            )
-            .await
-            {
-                Ok(true) => released.push(row.sid.clone()),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+            // Per session: one release that panics must not skip every
+            // session after it on every pass.
+            let freed = crate::supervise::contain_panic("idle-release sweeper", &row.sid, async {
+                // Off the lock: the vendor's own answer to "is background work
+                // still running here".
+                if row
+                    .adapter
+                    .running_tasks(&row.thread)
+                    .await
+                    .iter()
+                    .any(|task| task.outlives_turn())
+                {
+                    return false;
                 }
+                match Self::release_session_shared(
+                    gateway,
+                    &row.sid,
+                    row.generation,
+                    ReleaseReason::Idle,
+                )
+                .await
+                {
+                    Ok(released) => released,
+                    Err(error) => {
+                        tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                        false
+                    }
+                }
+            })
+            .await;
+            if freed == Some(true) {
+                released.push(row.sid.clone());
             }
         }
         released
@@ -16523,73 +16616,102 @@ impl Gateway {
                 .delegation_watch_set,
         );
         while let Some(pulse) = rx.recv().await {
-            match pulse {
-                crate::delegation::DelegationPulse::TurnOpened {
-                    child_sid,
-                    exec_turn_id,
-                    continues_from,
-                } => {
-                    if !watch_set.read().unwrap().contains(&child_sid) {
-                        continue;
-                    }
-                    // A store mutation: claimed like every other one, so it
-                    // cannot interleave with a dispatch's accept/bind pair.
-                    let claim = Self::claim_delegation_store(&gateway, &child_sid).await;
-                    let (moved, changed) = {
-                        let mut guard =
-                            crate::latency::gateway_lock(&gateway, "notifier.executing").await;
-                        // Move the bindings FIRST, so the executing mark that
-                        // follows finds the requests already on this turn. Both
-                        // under one lock hold: a reader must never catch a
-                        // request bound to a turn that has ended while the one
-                        // continuing it is already running.
-                        let moved = match continues_from.as_deref() {
-                            Some(from) => {
-                                // The vendor DID come back for the work: the
-                                // boundary held under `from` was a checkpoint
-                                // after all, not the answer.
-                                if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
-                                    mirror.provisional.remove(from);
-                                }
-                                guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+            let child = match &pulse {
+                crate::delegation::DelegationPulse::TurnOpened { child_sid, .. } => {
+                    child_sid.clone()
+                }
+                crate::delegation::DelegationPulse::Signal(signal) => signal.child_sid.clone(),
+            };
+            // The only notifier: a panic on one pulse must not end parent
+            // notification for every delegation (issue #210 failure class).
+            crate::supervise::contain_panic(
+                "delegation notifier",
+                &format!("child={child}"),
+                Self::handle_delegation_pulse(&gateway, &watch_set, pulse),
+            )
+            .await;
+        }
+    }
+
+    /// One pulse of [`Self::run_delegation_notifier`].
+    async fn handle_delegation_pulse(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        watch_set: &std::sync::RwLock<HashSet<String>>,
+        pulse: crate::delegation::DelegationPulse,
+    ) {
+        match pulse {
+            crate::delegation::DelegationPulse::TurnOpened {
+                child_sid,
+                exec_turn_id,
+                continues_from,
+            } => {
+                if !watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&child_sid)
+                {
+                    return;
+                }
+                // A store mutation: claimed like every other one, so it
+                // cannot interleave with a dispatch's accept/bind pair.
+                let claim = Self::claim_delegation_store(gateway, &child_sid).await;
+                let (moved, changed) = {
+                    let mut guard =
+                        crate::latency::gateway_lock(gateway, "notifier.executing").await;
+                    // Move the bindings FIRST, so the executing mark that
+                    // follows finds the requests already on this turn. Both
+                    // under one lock hold: a reader must never catch a
+                    // request bound to a turn that has ended while the one
+                    // continuing it is already running.
+                    let moved = match continues_from.as_deref() {
+                        Some(from) => {
+                            // The vendor DID come back for the work: the
+                            // boundary held under `from` was a checkpoint
+                            // after all, not the answer.
+                            if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
+                                mirror.provisional.remove(from);
                             }
-                            None => false,
-                        };
-                        (
-                            moved,
-                            moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
-                        )
+                            guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+                        }
+                        None => false,
                     };
-                    if changed {
-                        // The executing flag alone is a display fact the next
-                        // write carries anyway; a REBINDING is not. A move that
-                        // never reaches disk leaves the request pointing at a
-                        // turn that has already ended, and a restart would then
-                        // read that turn's row as this request's answer.
-                        if let Err(error) = Self::persist_delegation_store(&gateway, &claim).await {
-                            if moved {
-                                tracing::warn!(
-                                    child = %child_sid,
-                                    turn = %exec_turn_id,
-                                    %error,
-                                    "ccteam-im: a continuation rebinding could not be made \
-                                     durable; a restart may resolve it off the turn it left"
-                                );
-                            }
+                    (
+                        moved,
+                        moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
+                    )
+                };
+                if changed {
+                    // The executing flag alone is a display fact the next
+                    // write carries anyway; a REBINDING is not. A move that
+                    // never reaches disk leaves the request pointing at a
+                    // turn that has already ended, and a restart would then
+                    // read that turn's row as this request's answer.
+                    if let Err(error) = Self::persist_delegation_store(gateway, &claim).await {
+                        if moved {
+                            tracing::warn!(
+                                child = %child_sid,
+                                turn = %exec_turn_id,
+                                %error,
+                                "ccteam-im: a continuation rebinding could not be made \
+                                 durable; a restart may resolve it off the turn it left"
+                            );
                         }
                     }
                 }
-                crate::delegation::DelegationPulse::Signal(signal) => {
-                    let watched = watch_set.read().unwrap().contains(&signal.child_sid);
-                    // Unwatched fleet chatter and watched mid-turn narration
-                    // create no gateway-lock traffic. The child pump already
-                    // mirrored narration into its ledger; only a vendor turn
-                    // boundary can notify a parent.
-                    if !watched || !signal.boundary {
-                        continue;
-                    }
-                    Self::deliver_delegation_signal_shared(Arc::clone(&gateway), signal).await;
+            }
+            crate::delegation::DelegationPulse::Signal(signal) => {
+                let watched = watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&signal.child_sid);
+                // Unwatched fleet chatter and watched mid-turn narration
+                // create no gateway-lock traffic. The child pump already
+                // mirrored narration into its ledger; only a vendor turn
+                // boundary can notify a parent.
+                if !watched || !signal.boundary {
+                    return;
                 }
+                Self::deliver_delegation_signal_shared(Arc::clone(gateway), signal).await;
             }
         }
     }
@@ -20942,6 +21064,38 @@ mod tests {
     /// process, and — the load-bearing half — the chat that was driving it
     /// KEEPS pointing at it, so the next plain message resumes the SAME sid
     /// instead of silently opening a new session on a fresh context.
+    /// Issue #210 follow-up: one session whose release panics costs that
+    /// session's release, not every session after it on every pass.
+    #[tokio::test]
+    async fn idle_release_tick_releases_the_rest_when_one_row_panics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 60,
+            ..Default::default()
+        });
+        for chat in ["chat-1", "chat-2"] {
+            gateway
+                .handle_text("mock", chat, "alice", "hello")
+                .await
+                .unwrap();
+        }
+        for sid in ["s1", "s2"] {
+            gateway.settle_turn_for_tests(sid);
+            gateway.backdate_residency_for_tests(sid, std::time::Duration::from_secs(120));
+        }
+        let poison = gateway.sessions["s1"].thread.identity.clone();
+        fake.panic_running_tasks_for.lock().unwrap().insert(poison);
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s2"]);
+        assert!(gateway.lock().await.is_session_live("s1"));
+    }
+
     #[tokio::test]
     async fn idle_release_frees_the_process_and_the_next_message_resumes_the_same_sid() {
         let tmp = tempfile::tempdir().unwrap();
@@ -22215,6 +22369,42 @@ mod tests {
         assert_eq!(submitted, vec!["hello after restart".to_string()]);
     }
 
+    /// Issue #210 follow-up: the post-mortem batch is taken off the gateway in
+    /// one go, so one panicking post-mortem must not drop the others.
+    #[tokio::test]
+    async fn body_watch_tick_runs_every_post_mortem_when_one_panics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        let first = spawn_managed(&mut gateway).await;
+        let second = spawn_managed(&mut gateway).await;
+        fake.panic_recover_for.lock().unwrap().insert(first.clone());
+        let body = ccteam_harness::execution::session_body::SessionBody {
+            pid: 1,
+            fingerprint: String::new(),
+            adapter: String::new(),
+            recorded_at: String::new(),
+        };
+        for sid in [&first, &second] {
+            gateway.post_mortem_pending.push((
+                sid.clone(),
+                "alpha".into(),
+                project_dir.clone(),
+                body.clone(),
+            ));
+        }
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::body_watch_tick(&gateway).await;
+        assert_eq!(
+            *fake.recovered_for.lock().unwrap(),
+            vec![first, second],
+            "the post-mortem after the panicking one still ran"
+        );
+    }
+
     /// A body record whose process is already GONE at restore time means the
     /// body finished (or died) while no daemon was watching. The session is
     /// rebuilt at once; the watcher's post-mortem then reports the unanswered
@@ -22530,6 +22720,7 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(Some("s1"))), "mpsc live ⇒ send ok");
         assert_eq!(mrx.recv().await.unwrap().sid.as_deref(), Some("s1"));
@@ -22545,9 +22736,72 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(None)), "no SSE subscriber ⇒ still ok");
         assert!(mrx.recv().await.is_some());
+    }
+
+    /// The log lines `f` emits on this thread, as `LEVEL message` text.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Issue #210: a closed delivery sink outside shutdown is an outage and
+    /// says so at ERROR, for every send shape; once the daemon has raised
+    /// the closing flag the same stop is quiet (no ERROR on a clean stop).
+    #[test]
+    fn closed_sink_logs_error_only_outside_shutdown() {
+        let (mtx, mrx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        drop(mrx);
+        let (btx, _) = tokio::sync::broadcast::channel::<GatewayEvent>(8);
+        let sink = GatewayEventSink {
+            mpsc: mtx,
+            broadcast: btx,
+            closing: Arc::default(),
+        };
+        let send_all = || {
+            assert!(!sink.send(fake_event(Some("s7"))));
+            assert!(!sink.send_delivery_only(fake_event(Some("s7"))));
+            assert!(!sink.send_broadcast_only(fake_event(Some("s7"))));
+        };
+
+        let outage = captured_logs(send_all);
+        assert_eq!(
+            outage.matches("ERROR").count(),
+            3,
+            "every send shape reports the outage: {outage}"
+        );
+        assert!(outage.contains("s7"), "the log names the session: {outage}");
+
+        sink.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let shutdown = captured_logs(send_all);
+        assert!(
+            !shutdown.contains("ERROR"),
+            "clean stop is quiet: {shutdown}"
+        );
+        assert!(shutdown.contains("DEBUG"), "{shutdown}");
     }
 
     /// `subscribe_events` hands out a live receiver off the gateway's held
@@ -23762,6 +24016,12 @@ mod tests {
         /// sweeper never lets go of a session whose vendor is still carrying
         /// work.
         running_tasks: Arc<Mutex<Vec<RunningTask>>>,
+        /// Thread identities whose `running_tasks` probe panics, and sids
+        /// whose `recover_unobserved_turn` panics — one poison row in a
+        /// sweep. `recovered_for` records every recovery asked for.
+        panic_running_tasks_for: Arc<std::sync::Mutex<HashSet<String>>>,
+        panic_recover_for: Arc<std::sync::Mutex<HashSet<String>>>,
+        recovered_for: Arc<std::sync::Mutex<Vec<String>>>,
         /// What `account_usage` reports (`None` = no usage channel, the
         /// trait default). Account-scoped: every session sharing this fake
         /// answers with the same windows, exactly like one vendor account.
@@ -23854,6 +24114,9 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
                 running_tasks: Arc::new(Mutex::new(Vec::new())),
+                panic_running_tasks_for: Arc::default(),
+                panic_recover_for: Arc::default(),
+                recovered_for: Arc::default(),
                 account_usage: Arc::new(Mutex::new(None)),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -23905,6 +24168,11 @@ mod tests {
                 .lock()
                 .await
                 .push((h.identity.clone(), text.clone()));
+            // A submit that panics AFTER the line was delivered — the worst
+            // case for anything that retries on failure.
+            if text.contains("PANIC_AFTER_DELIVERY") {
+                panic!("fake adapter panicked after delivering {text:?}");
+            }
             let turn_id = turn_id.to_string();
             if self.emit_turn_started {
                 self.events.lock().await.push_back((
@@ -24361,8 +24629,27 @@ mod tests {
             Ok(())
         }
 
-        async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
+        async fn running_tasks(&self, h: &ThreadHandle) -> Vec<RunningTask> {
+            if self
+                .panic_running_tasks_for
+                .lock()
+                .unwrap()
+                .contains(&h.identity)
+            {
+                panic!("fake running_tasks panicked for {}", h.identity);
+            }
             self.running_tasks.lock().await.clone()
+        }
+
+        async fn recover_unobserved_turn(
+            &self,
+            ctx: &ccteam_harness::UnobservedTurnCtx,
+        ) -> Option<ccteam_harness::RecoveredTurn> {
+            self.recovered_for.lock().unwrap().push(ctx.sid.clone());
+            if self.panic_recover_for.lock().unwrap().contains(&ctx.sid) {
+                panic!("fake recover panicked for {}", ctx.sid);
+            }
+            None
         }
 
         async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
@@ -39933,6 +40220,69 @@ mod tests {
         assert!(submissions.iter().any(|(_, text)| text == "/model opus"));
         assert!(fake.directives.lock().await.is_empty());
         assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    /// Issue #210 follow-up: a scheduled row whose submit panics after the
+    /// line was delivered fires exactly once (it is failed, not retried), and
+    /// the rows due after it in the same batch still fire.
+    #[tokio::test]
+    async fn scheduled_fire_that_panics_fires_once_and_later_rows_still_fire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let mut sids = Vec::new();
+        for _ in 0..2 {
+            sids.push(
+                gateway
+                    .create_session_api(
+                        "alpha".into(),
+                        "reviewer".into(),
+                        AgentVendor::Claude,
+                        PermissionMode::Skip,
+                    )
+                    .await
+                    .unwrap()
+                    .sid,
+            );
+        }
+        let mut ids = Vec::new();
+        for (sid, text, ago) in [
+            (&sids[0], "PANIC_AFTER_DELIVERY", 20),
+            (&sids[1], "second", 10),
+        ] {
+            let item = gateway
+                .create_scheduled_message(
+                    sid,
+                    text.into(),
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                    "user:web-api".into(),
+                    None,
+                )
+                .unwrap();
+            gateway
+                .scheduled_items
+                .get_mut(&item.id)
+                .unwrap()
+                .item
+                .send_at = chrono::Utc::now() - chrono::Duration::seconds(ago);
+            ids.push(item.id);
+        }
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+
+        let submissions = fake.submissions.lock().await.clone();
+        let sent = |needle: &str| submissions.iter().filter(|(_, t)| t == needle).count();
+        assert_eq!(sent("PANIC_AFTER_DELIVERY"), 1, "fired exactly once");
+        assert_eq!(sent("second"), 1, "the later row still fired");
+        let poison = &gateway.scheduled_items[&ids[0]].item;
+        assert_eq!(poison.status, crate::scheduled::ScheduledStatus::Failed);
+        assert_eq!(poison.fail_reason.as_deref(), Some("panicked while firing"));
+        assert!(
+            !gateway.scheduled_items.contains_key(&ids[1]),
+            "second completed"
+        );
     }
 
     #[tokio::test]

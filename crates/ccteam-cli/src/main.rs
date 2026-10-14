@@ -1965,9 +1965,12 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                                 _ = rx.changed() => break,
                                 maybe = sink.recv() => {
                                     let Some(event) = maybe else { break };
-                                    ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
                                     let dispatch_paths = dispatch_paths.clone();
+                                    // All per-event work runs in the blocking task, so a
+                                    // panic in it costs this event (the `Err(je)` arm), not
+                                    // the only hook-sink loop.
                                     let res = tokio::task::spawn_blocking(move || {
+                                        ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
                                         let stdin: serde_json::Value =
                                             serde_json::from_str(&event.payload_json)
                                                 .unwrap_or(serde_json::Value::Null);
@@ -1985,9 +1988,9 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                                             error = %err,
                                             "W6 hook-sink: dispatch failed; event dropped"
                                         ),
-                                        Err(je) => tracing::warn!(
+                                        Err(je) => tracing::error!(
                                             ?je,
-                                            "W6 hook-sink: dispatch task panicked"
+                                            "W6 hook-sink: dispatch task panicked; event dropped"
                                         ),
                                     }
                                 }

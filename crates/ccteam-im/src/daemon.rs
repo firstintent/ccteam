@@ -465,7 +465,11 @@ where
     bind_operator_rosters(&mut *gateway.lock().await, &creds);
     // Which channels render buttons is the provider's fact; hand it over so
     // the gateway's pickers never branch on a platform name.
-    let caps = channel_caps(&shared_channels.read().unwrap());
+    let caps = channel_caps(
+        &shared_channels
+            .read()
+            .unwrap_or_else(|err| err.into_inner()),
+    );
     bind_channel_caps(&mut *gateway.lock().await, &caps);
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
@@ -488,6 +492,7 @@ where
     // setup); the sender is wired in BEFORE `set_event_sink` so every pump it
     // spawns captures it.
     let (delegation_tx, delegation_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_delivery_closing;
     {
         // Hold the gateway lock only for synchronous setup. Restored-session
         // resume can wait on vendor startup (stream-json `system:init`), and
@@ -505,6 +510,7 @@ where
         log_orphan_chat_sessions(&g).await;
         g.set_delegation_notifier_tx(delegation_tx);
         g.set_event_sink(gateway_event_tx.clone());
+        event_delivery_closing = g.event_delivery_closing();
         g.set_im_reload_trigger(reload_tx);
         // v0.8.22 P0-2 — wire the production HITL resolver onto the
         // stream-json Claude adapter singleton, now that the gateway +
@@ -543,7 +549,10 @@ where
         Gateway::catch_up_scheduled(Arc::clone(&restore_gateway)).await;
         Gateway::reconcile_restored_sessions_shared(Arc::clone(&restore_gateway)).await;
         let _ = restore_complete_tx.send(true);
-        Gateway::run_scheduled_scheduler(restore_gateway).await;
+        crate::supervise::supervise_loop("scheduled scheduler", || {
+            Gateway::run_scheduled_scheduler(Arc::clone(&restore_gateway))
+        })
+        .await;
     });
     // One sid, one body (2026-08-19) — the body watcher: a session whose
     // process outlived the previous daemon is WAITED for (never duplicated,
@@ -551,9 +560,10 @@ where
     // and the session is rebuilt by sid. Runs for the daemon's whole life —
     // a detached body can also be found later, on first touch.
     let body_watch_gateway = Arc::clone(&gateway);
-    let body_watcher = tokio::spawn(async move {
-        Gateway::run_body_watcher(body_watch_gateway).await;
-    });
+    let body_watcher = tokio::spawn(crate::supervise::supervise_loop(
+        "body watcher",
+        move || Gateway::run_body_watcher(Arc::clone(&body_watch_gateway)),
+    ));
     // The idle-release sweeper: the PRIMARY residency policy. A resident
     // session nobody has spoken to for its harness's `sessions.idle_release_secs`
     // window gives up its vendor process — the session itself is untouched and
@@ -561,9 +571,10 @@ where
     // produces no work and calls no model, it only stops holding an OS process
     // past the point where holding it can still save a prompt-cache read.
     let idle_release_gateway = Arc::clone(&gateway);
-    tokio::spawn(async move {
-        Gateway::run_idle_release_sweeper(idle_release_gateway).await;
-    });
+    tokio::spawn(crate::supervise::supervise_loop(
+        "idle-release sweeper",
+        move || Gateway::run_idle_release_sweeper(Arc::clone(&idle_release_gateway)),
+    ));
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every
     // completed watched child turn. Owns its own gateway handle + the pump
@@ -585,10 +596,12 @@ where
         // Clone out the (name, ch) pairs under the read lock, then drop the
         // guard before spawning (never hold a std lock across spawn/await).
         let pairs: Vec<(String, Arc<dyn Channel + Send + Sync>)> = {
-            let g = shared_channels.read().unwrap();
+            let g = shared_channels
+                .read()
+                .unwrap_or_else(|err| err.into_inner());
             g.iter().map(|(n, c)| (n.clone(), c.clone())).collect()
         };
-        let mut reg = listeners.lock().unwrap();
+        let mut reg = listeners.lock().unwrap_or_else(|err| err.into_inner());
         for (name, ch) in pairs {
             let h = spawn_channel_listener(name.clone(), ch, inbound_tx.clone());
             reg.insert(name.clone(), h);
@@ -631,7 +644,10 @@ where
     );
 
     tracing::info!(
-        channels = shared_channels.read().unwrap().len(),
+        channels = shared_channels
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .len(),
         bots = initial.len(),
         "ccteam-im: gateway router started (no supervisor tick)"
     );
@@ -658,27 +674,36 @@ where
                 break Ok(());
             }
             Some(()) = reload_rx.recv() => {
-                reload_im_channels(
-                    &gateway,
-                    &shared_channels,
-                    &listeners,
-                    &inbound_tx_for_reload,
-                    &args,
-                    &last_creds,
-                    &last_tenants,
-                    &menu_specs,
+                // This loop IS the daemon: a reload that panics must cost the
+                // reload, not every listener, consumer and session.
+                crate::supervise::contain_panic(
+                    "IM reload",
+                    "reload",
+                    reload_im_channels(
+                        &gateway,
+                        &shared_channels,
+                        &listeners,
+                        &inbound_tx_for_reload,
+                        &args,
+                        &last_creds,
+                        &last_tenants,
+                        &menu_specs,
+                    ),
                 )
                 .await;
             }
         }
     };
 
+    // From here a pump whose send finds the delivery consumer gone is part
+    // of this stop, not an outage: no ERROR on a clean shutdown.
+    event_delivery_closing.store(true, std::sync::atomic::Ordering::SeqCst);
     // V0.6.1 F132 — abort listener + consumer tasks on shutdown so the
     // daemon doesn't leak background tokio tasks. `JoinHandle::abort`
     // is best-effort but matches the rest of the F130 supervisor's
     // shutdown semantics.
     {
-        let mut reg = listeners.lock().unwrap();
+        let mut reg = listeners.lock().unwrap_or_else(|err| err.into_inner());
         for (_name, h) in reg.drain() {
             h.abort();
         }
@@ -829,8 +854,9 @@ async fn reload_im_channels(
         }
     };
     let new_tenants_raw = tenants_fingerprint(args);
-    let creds_changed = *last_creds.lock().unwrap() != new_creds;
-    let tenants_changed = *last_tenants.lock().unwrap() != new_tenants_raw;
+    let creds_changed = *last_creds.lock().unwrap_or_else(|err| err.into_inner()) != new_creds;
+    let tenants_changed =
+        *last_tenants.lock().unwrap_or_else(|err| err.into_inner()) != new_tenants_raw;
     // No-op when nothing changed (e.g. a pref-only `ccteam config`).
     if !creds_changed && !tenants_changed {
         tracing::debug!("imd: reload — credentials + tenants unchanged, no-op");
@@ -862,11 +888,18 @@ async fn reload_im_channels(
     // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
     // and (re)publish its command menu.
     for (name, ch) in rebuilt.iter() {
-        if let Some(old) = listeners.lock().unwrap().remove(name) {
+        if let Some(old) = listeners
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(name)
+        {
             old.abort();
         }
         let h = spawn_channel_listener(name.clone(), ch.clone(), inbound_tx.clone());
-        listeners.lock().unwrap().insert(name.clone(), h);
+        listeners
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(name.clone(), h);
         if let Err(e) = ch.register_commands(menu_specs).await {
             tracing::warn!(channel = %name, error = %e, "imd: reload register_commands failed");
         }
@@ -876,7 +909,7 @@ async fn reload_im_channels(
     // changed), so the unchanged dimension's listeners are never touched.
     {
         let creds_driven: HashSet<&str> = CHANNEL_BUILDERS.iter().map(|(n, _)| *n).collect();
-        let mut map = shared.write().unwrap();
+        let mut map = shared.write().unwrap_or_else(|err| err.into_inner());
         let vanished: Vec<String> = map
             .keys()
             .filter(|k| {
@@ -891,7 +924,11 @@ async fn reload_im_channels(
             .collect();
         for k in vanished {
             map.remove(&k);
-            if let Some(h) = listeners.lock().unwrap().remove(&k) {
+            if let Some(h) = listeners
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .remove(&k)
+            {
                 h.abort();
             }
         }
@@ -900,10 +937,10 @@ async fn reload_im_channels(
         }
     }
     if creds_changed {
-        *last_creds.lock().unwrap() = new_creds;
+        *last_creds.lock().unwrap_or_else(|err| err.into_inner()) = new_creds;
     }
     if tenants_changed {
-        *last_tenants.lock().unwrap() = new_tenants_raw;
+        *last_tenants.lock().unwrap_or_else(|err| err.into_inner()) = new_tenants_raw;
     }
     tracing::info!(
         creds_changed,
@@ -1466,239 +1503,168 @@ fn spawn_inbound_consumer(
         // claimed — see the `require_mention` gate below.
         let mut addressed_threads: HashSet<(String, String, String)> = HashSet::new();
         while let Some(msg) = rx.recv().await {
-            let cid = msg.id.clone();
-            let route_t0 = std::time::Instant::now();
-            tracing::info!(
-                event = "latency",
-                stage = "imd.route.begin",
-                cid = %cid,
-                channel = %msg.channel,
-                "latency imd.route.begin"
-            );
-            // Clone the channel out under the read lock, then DROP the guard
-            // before any `.await` (never hold a std RwLock guard across await).
-            let channel = {
-                let g = channels.read().unwrap();
-                g.get(&msg.channel).cloned()
-            };
-            let Some(channel) = channel else {
-                tracing::debug!(
-                    channel = %msg.channel,
-                    sender = %msg.sender,
-                    "imd: no Channel for inbound msg.channel; dropping"
-                );
-                continue;
-            };
+            // The only inbound consumer: a panic routing one message must not
+            // end routing for every chat (issue #210, inbound side).
+            let item = format!("message={} channel={}", msg.id, msg.channel);
+            crate::supervise::contain_panic(
+                "inbound consumer",
+                &item,
+                route_inbound_message(
+                    &ccteam_root,
+                    &channels,
+                    &sec,
+                    &gateway,
+                    &restore_complete,
+                    &mut addressed_threads,
+                    msg,
+                ),
+            )
+            .await;
+        }
+        tracing::error!(
+            "ccteam-im: inbound consumer exited; inbound messages are no longer routed"
+        );
+    })
+}
 
-            // The thread reaches the gateway only from a channel whose
-            // contract is "one thread = one session" (Slack). Everyone else
-            // (Telegram, Lark, web) never passes one, whatever the platform
-            // happened to fill in — their routing stays the single stream.
-            let thread = inbound_session_thread(channel.as_ref(), &msg);
+/// Route one inbound message: security gate, then the gateway, then the
+/// replies back to its channel.
+async fn route_inbound_message(
+    ccteam_root: &Path,
+    channels: &RwLock<ChannelMap>,
+    sec: &Mutex<ThreeLayerSec>,
+    gateway: &Arc<Mutex<Gateway>>,
+    restore_complete: &tokio::sync::watch::Receiver<bool>,
+    addressed_threads: &mut HashSet<(String, String, String)>,
+    msg: ChannelMessage,
+) {
+    let cid = msg.id.clone();
+    let route_t0 = std::time::Instant::now();
+    tracing::info!(
+        event = "latency",
+        stage = "imd.route.begin",
+        cid = %cid,
+        channel = %msg.channel,
+        "latency imd.route.begin"
+    );
+    // Clone the channel out under the read lock, then DROP the guard
+    // before any `.await` (never hold a std RwLock guard across await).
+    let channel = {
+        let g = channels.read().unwrap_or_else(|err| err.into_inner());
+        g.get(&msg.channel).cloned()
+    };
+    let Some(channel) = channel else {
+        tracing::debug!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            "imd: no Channel for inbound msg.channel; dropping"
+        );
+        return;
+    };
 
-            // Ambient group/channel chatter under `require_mention` is
-            // answered only when it continues a thread the gateway already
-            // holds a session in. Decided BEFORE the security layer so that
-            // chatter never spends the sender's rate-limit budget.
-            let policy = channel.mention_policy();
-            if policy.require_mention {
-                let thread_key = thread
-                    .as_deref()
-                    .map(|t| (msg.channel.clone(), msg.reply_target.clone(), t.to_string()));
-                if msg.ambient {
-                    // Held = the gateway has a current session in that thread,
-                    // or an addressed message already claimed it (its session
-                    // may still be spawning off this loop, so the gateway
-                    // cannot know yet).
-                    let held = match &thread_key {
-                        Some(key) if addressed_threads.contains(key) => true,
-                        Some((_, _, t)) => gateway.lock().await.has_current_session(
-                            &msg.channel,
-                            &msg.reply_target,
-                            &msg.sender,
-                            Some(t),
-                        ),
-                        None => false,
-                    };
-                    if !policy.admits(msg.ambient, held) {
-                        tracing::debug!(
-                            channel = %msg.channel,
-                            sender = %msg.sender,
-                            "imd: ambient message dropped (require_mention, no held thread)"
-                        );
-                        continue;
-                    }
-                } else if let Some(key) = thread_key {
-                    // Only the in-flight-spawn window needs this memory (the
-                    // gateway's own focus covers a settled thread), so a
-                    // bounded set that resets when full cannot lose a held
-                    // thread; at worst it forgets a claim whose session is
-                    // still spawning, and only if thousands of other threads
-                    // were addressed within that same few-second window.
-                    if addressed_threads.len() >= ADDRESSED_THREADS_CAP {
-                        addressed_threads.clear();
-                    }
-                    addressed_threads.insert(key);
-                }
-            }
+    // The thread reaches the gateway only from a channel whose
+    // contract is "one thread = one session" (Slack). Everyone else
+    // (Telegram, Lark, web) never passes one, whatever the platform
+    // happened to fill in — their routing stays the single stream.
+    let thread = inbound_session_thread(channel.as_ref(), &msg);
 
-            // (v0.8.5 B1 / B1b) A non-text message legitimately carries empty
-            // `content`: a selection callback (inline-button / web-chip click —
-            // its real payload is `msg.selection`, resolved in the gateway) OR
-            // an attachment-only message (a file/photo with no caption — the
-            // staged `msg.attachments` are Read by the agent via the `<channel>`
-            // tag). The security layer's `EmptyAfterSanitize` is expected for
-            // both, not an attack. ACL + rate-limit (which run *before* the
-            // sanitize check in `evaluate`) still gate it; only the empty-text
-            // rejection is waived. Without this, every D3/D6 button AND every
-            // captionless inbound file is silently dropped here (on Telegram
-            // *and* web chat — both feed this consumer).
-            // v0.8.20 F2 — a per-tenant bot's channel is "<platform>@<tenant>";
-            // the ACL is keyed by PLATFORM (fail-closed on unknown), so strip the
-            // tenant suffix before the gate (reply routing still uses the full
-            // channel name elsewhere).
-            let outcome = sec.lock().await.evaluate(
-                crate::transport::platform_of(&msg.channel),
-                &msg.sender,
-                &msg.content,
-            );
-            let has_nontext_payload = msg.selection.is_some() || !msg.attachments.is_empty();
-            let Some(clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload) else {
-                tracing::warn!(
-                    cid = %cid,
-                    outcome = ?outcome,
-                    "ccteam-im: gateway inbound rejected by security layer"
-                );
-                continue;
-            };
-
-            let restore_incomplete = !*restore_complete.borrow();
-            if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
-                // Startup restore deliberately runs outside the gateway lock
-                // so the daemon and web face remain available while vendor
-                // children resume. A listing must not expose a partial prefix
-                // of that batch (s1 applied while s2 is still spawning), so
-                // park ONLY this request on the explicit completion signal.
-                // Its own task keeps the inbound consumer free to serve every
-                // unrelated message during restore.
-                let gateway = Arc::clone(&gateway);
-                let channel = Arc::clone(&channel);
-                let msg = msg.clone();
-                let cid = cid.clone();
-                let mut restore_complete = restore_complete.clone();
-                let ccteam_root = ccteam_root.clone();
-                tokio::spawn(async move {
-                    if restore_complete.changed().await.is_err() {
-                        tracing::warn!(
-                            "ccteam-im: restore task ended before session-list readiness was signalled"
-                        );
-                    }
-                    let replies = gateway
-                        .lock()
-                        .await
-                        .handle_message(
-                            &msg.channel,
-                            &msg.reply_target,
-                            &msg.sender,
-                            thread.as_deref(),
-                            &msg.id,
-                            &clean_payload,
-                            &msg.attachments,
-                            msg.selection.as_ref(),
-                        )
-                        .await;
-                    deliver_gateway_replies(
-                        &ccteam_root,
-                        &cid,
-                        route_t0,
-                        &msg,
-                        channel.as_ref(),
-                        replies,
-                    )
-                    .await;
-                });
-                continue;
-            }
-
-            // v0.8.x (concurrency review §4.1 P1) — LOCKING PROTOCOL. Before
-            // this fix, `gateway.lock().await.handle_message(...).await` held
-            // the gateway's global lock for the ENTIRE call, and this loop
-            // awaited it inline before pulling the next message off `rx` — so
-            // one chat spawning a session (tmux/subprocess spawn, stream-json
-            // `system:init`) queued every other chat's message behind it,
-            // both on the lock AND on this loop never reaching `rx.recv()`
-            // again.
-            //
-            // `inbound_may_spawn` is a cheap, synchronous, always-safe-either-
-            // way hint: a message that can only ever SUBMIT to an
-            // already-live session (no gateway command, no `@mention`, the
-            // chat already has a current session) is still processed INLINE
-            // exactly as before — its own lock section is bounded by the
-            // adapter's submit timeout, never a spawn, so keeping it on this
-            // loop costs nothing. A message that might need the implicit
-            // first-message spawn is instead handed to
-            // `Gateway::handle_message_shared` on its OWN task: that entry
-            // point plans under a short lock, drops the lock for the slow
-            // spawn, then re-locks briefly to apply the result — freeing this
-            // loop to `rx.recv()` the next chat's message immediately rather
-            // than queuing behind the spawn.
-            //
-            // SCOPE: explicit spawning commands (`/new` `/role` `/use`
-            // `/clear` `@mention`-to-a-template) are NOT decomposed in this
-            // pass — `inbound_may_spawn` returns `false` for them, so they
-            // still run inline, holding the gateway lock across their own
-            // spawn exactly as before (a pre-existing, documented tradeoff —
-            // same as `start_session`'s inline compose). Dead-child resume
-            // is three-phase (v0.9 T2); `resume_dead_session_shared` is the
-            // lock-free form when a shared handle is available. A scoped,
-            // incremental step, not a full fix.
-            let may_spawn = {
-                let g = gateway.lock().await;
-                g.inbound_may_spawn(
+    // Ambient group/channel chatter under `require_mention` is
+    // answered only when it continues a thread the gateway already
+    // holds a session in. Decided BEFORE the security layer so that
+    // chatter never spends the sender's rate-limit budget.
+    let policy = channel.mention_policy();
+    if policy.require_mention {
+        let thread_key = thread
+            .as_deref()
+            .map(|t| (msg.channel.clone(), msg.reply_target.clone(), t.to_string()));
+        if msg.ambient {
+            // Held = the gateway has a current session in that thread,
+            // or an addressed message already claimed it (its session
+            // may still be spawning off this loop, so the gateway
+            // cannot know yet).
+            let held = match &thread_key {
+                Some(key) if addressed_threads.contains(key) => true,
+                Some((_, _, t)) => gateway.lock().await.has_current_session(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
-                    thread.as_deref(),
-                    &clean_payload,
-                    msg.selection.is_some(),
-                )
+                    Some(t),
+                ),
+                None => false,
             };
-            // `/stop` joins the same off-loop entry point for a different
-            // reason: it has to take the stopped child's delegation claim, and
-            // a claim is never taken while the gateway lock is held (issue #197
-            // E). `handle_message_shared` is where the lock can be dropped.
-            if may_spawn || Gateway::inbound_needs_shared_entry(&clean_payload) {
-                let gateway = Arc::clone(&gateway);
-                let channel = Arc::clone(&channel);
-                let msg = msg.clone();
-                let cid = cid.clone();
-                let ccteam_root = ccteam_root.clone();
-                tokio::spawn(async move {
-                    let replies = Gateway::handle_message_shared(
-                        gateway,
-                        &msg.channel,
-                        &msg.reply_target,
-                        &msg.sender,
-                        thread.as_deref(),
-                        &msg.id,
-                        &clean_payload,
-                        &msg.attachments,
-                        msg.selection.as_ref(),
-                    )
-                    .await;
-                    deliver_gateway_replies(
-                        &ccteam_root,
-                        &cid,
-                        route_t0,
-                        &msg,
-                        channel.as_ref(),
-                        replies,
-                    )
-                    .await;
-                });
-                continue;
+            if !policy.admits(msg.ambient, held) {
+                tracing::debug!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "imd: ambient message dropped (require_mention, no held thread)"
+                );
+                return;
             }
+        } else if let Some(key) = thread_key {
+            // Only the in-flight-spawn window needs this memory (the
+            // gateway's own focus covers a settled thread), so a
+            // bounded set that resets when full cannot lose a held
+            // thread; at worst it forgets a claim whose session is
+            // still spawning, and only if thousands of other threads
+            // were addressed within that same few-second window.
+            if addressed_threads.len() >= ADDRESSED_THREADS_CAP {
+                addressed_threads.clear();
+            }
+            addressed_threads.insert(key);
+        }
+    }
 
+    // (v0.8.5 B1 / B1b) A non-text message legitimately carries empty
+    // `content`: a selection callback (inline-button / web-chip click —
+    // its real payload is `msg.selection`, resolved in the gateway) OR
+    // an attachment-only message (a file/photo with no caption — the
+    // staged `msg.attachments` are Read by the agent via the `<channel>`
+    // tag). The security layer's `EmptyAfterSanitize` is expected for
+    // both, not an attack. ACL + rate-limit (which run *before* the
+    // sanitize check in `evaluate`) still gate it; only the empty-text
+    // rejection is waived. Without this, every D3/D6 button AND every
+    // captionless inbound file is silently dropped here (on Telegram
+    // *and* web chat — both feed this consumer).
+    // v0.8.20 F2 — a per-tenant bot's channel is "<platform>@<tenant>";
+    // the ACL is keyed by PLATFORM (fail-closed on unknown), so strip the
+    // tenant suffix before the gate (reply routing still uses the full
+    // channel name elsewhere).
+    let outcome = sec.lock().await.evaluate(
+        crate::transport::platform_of(&msg.channel),
+        &msg.sender,
+        &msg.content,
+    );
+    let has_nontext_payload = msg.selection.is_some() || !msg.attachments.is_empty();
+    let Some(clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload) else {
+        tracing::warn!(
+            cid = %cid,
+            outcome = ?outcome,
+            "ccteam-im: gateway inbound rejected by security layer"
+        );
+        return;
+    };
+
+    let restore_incomplete = !*restore_complete.borrow();
+    if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
+        // Startup restore deliberately runs outside the gateway lock
+        // so the daemon and web face remain available while vendor
+        // children resume. A listing must not expose a partial prefix
+        // of that batch (s1 applied while s2 is still spawning), so
+        // park ONLY this request on the explicit completion signal.
+        // Its own task keeps the inbound consumer free to serve every
+        // unrelated message during restore.
+        let gateway = Arc::clone(gateway);
+        let channel = Arc::clone(&channel);
+        let msg = msg.clone();
+        let cid = cid.clone();
+        let mut restore_complete = restore_complete.clone();
+        let ccteam_root = ccteam_root.to_path_buf();
+        tokio::spawn(async move {
+            if restore_complete.changed().await.is_err() {
+                tracing::warn!(
+                    "ccteam-im: restore task ended before session-list readiness was signalled"
+                );
+            }
             let replies = gateway
                 .lock()
                 .await
@@ -1722,9 +1688,104 @@ fn spawn_inbound_consumer(
                 replies,
             )
             .await;
-        }
-        tracing::debug!("imd: inbound consumer exited (all senders closed)");
-    })
+        });
+        return;
+    }
+
+    // v0.8.x (concurrency review §4.1 P1) — LOCKING PROTOCOL. Before
+    // this fix, `gateway.lock().await.handle_message(...).await` held
+    // the gateway's global lock for the ENTIRE call, and this loop
+    // awaited it inline before pulling the next message off `rx` — so
+    // one chat spawning a session (tmux/subprocess spawn, stream-json
+    // `system:init`) queued every other chat's message behind it,
+    // both on the lock AND on this loop never reaching `rx.recv()`
+    // again.
+    //
+    // `inbound_may_spawn` is a cheap, synchronous, always-safe-either-
+    // way hint: a message that can only ever SUBMIT to an
+    // already-live session (no gateway command, no `@mention`, the
+    // chat already has a current session) is still processed INLINE
+    // exactly as before — its own lock section is bounded by the
+    // adapter's submit timeout, never a spawn, so keeping it on this
+    // loop costs nothing. A message that might need the implicit
+    // first-message spawn is instead handed to
+    // `Gateway::handle_message_shared` on its OWN task: that entry
+    // point plans under a short lock, drops the lock for the slow
+    // spawn, then re-locks briefly to apply the result — freeing this
+    // loop to `rx.recv()` the next chat's message immediately rather
+    // than queuing behind the spawn.
+    //
+    // SCOPE: explicit spawning commands (`/new` `/role` `/use`
+    // `/clear` `@mention`-to-a-template) are NOT decomposed in this
+    // pass — `inbound_may_spawn` returns `false` for them, so they
+    // still run inline, holding the gateway lock across their own
+    // spawn exactly as before (a pre-existing, documented tradeoff —
+    // same as `start_session`'s inline compose). Dead-child resume
+    // is three-phase (v0.9 T2); `resume_dead_session_shared` is the
+    // lock-free form when a shared handle is available. A scoped,
+    // incremental step, not a full fix.
+    let may_spawn = {
+        let g = gateway.lock().await;
+        g.inbound_may_spawn(
+            &msg.channel,
+            &msg.reply_target,
+            &msg.sender,
+            thread.as_deref(),
+            &clean_payload,
+            msg.selection.is_some(),
+        )
+    };
+    // `/stop` joins the same off-loop entry point for a different
+    // reason: it has to take the stopped child's delegation claim, and
+    // a claim is never taken while the gateway lock is held (issue #197
+    // E). `handle_message_shared` is where the lock can be dropped.
+    if may_spawn || Gateway::inbound_needs_shared_entry(&clean_payload) {
+        let gateway = Arc::clone(gateway);
+        let channel = Arc::clone(&channel);
+        let msg = msg.clone();
+        let cid = cid.clone();
+        let ccteam_root = ccteam_root.to_path_buf();
+        tokio::spawn(async move {
+            let replies = Gateway::handle_message_shared(
+                gateway,
+                &msg.channel,
+                &msg.reply_target,
+                &msg.sender,
+                thread.as_deref(),
+                &msg.id,
+                &clean_payload,
+                &msg.attachments,
+                msg.selection.as_ref(),
+            )
+            .await;
+            deliver_gateway_replies(
+                &ccteam_root,
+                &cid,
+                route_t0,
+                &msg,
+                channel.as_ref(),
+                replies,
+            )
+            .await;
+        });
+        return;
+    }
+
+    let replies = gateway
+        .lock()
+        .await
+        .handle_message(
+            &msg.channel,
+            &msg.reply_target,
+            &msg.sender,
+            thread.as_deref(),
+            &msg.id,
+            &clean_payload,
+            &msg.attachments,
+            msg.selection.as_ref(),
+        )
+        .await;
+    deliver_gateway_replies(ccteam_root, &cid, route_t0, &msg, channel.as_ref(), replies).await;
 }
 
 /// The thread an inbound message hands the gateway: its platform thread when
@@ -1757,7 +1818,16 @@ async fn deliver_gateway_replies(
             for (seq, reply) in replies.into_iter().enumerate() {
                 let out = SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
-                send_gateway_outbound(ccteam_root, cid, seq, &msg.channel, channel, out).await;
+                send_gateway_outbound(
+                    ccteam_root,
+                    cid,
+                    seq,
+                    &msg.channel,
+                    channel,
+                    out,
+                    PLATFORM_CALL_TIMEOUT,
+                )
+                .await;
             }
             tracing::info!(
                 event = "latency",
@@ -1770,7 +1840,16 @@ async fn deliver_gateway_replies(
         Err(err) => {
             let out = SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
                 .in_thread(msg.thread_ts.clone());
-            send_gateway_outbound(ccteam_root, cid, 0, &msg.channel, channel, out).await;
+            send_gateway_outbound(
+                ccteam_root,
+                cid,
+                0,
+                &msg.channel,
+                channel,
+                out,
+                PLATFORM_CALL_TIMEOUT,
+            )
+            .await;
             tracing::warn!(
                 event = "latency",
                 stage = "imd.gateway.err",
@@ -1792,133 +1871,219 @@ struct StatusHandle {
     recipient: String,
 }
 
+/// Upper bound on ONE platform call (send / edit / reaction) the delivery
+/// paths await. Delivery is serial — one consumer for every session — so a
+/// single hung platform request must not freeze replies for everyone (issue
+/// #210). Generous enough for an attachment upload; a timed-out durable send
+/// is recorded `Failed` like any other send error.
+const PLATFORM_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Await one platform call under `limit`; an elapsed timer becomes an
+/// ordinary `Err` so every caller's existing failure handling applies.
+async fn bounded_platform_call<T>(
+    limit: Duration,
+    what: &str,
+    call: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "{what} timed out after {}s",
+            limit.as_secs_f64()
+        )),
+    }
+}
+
+/// The consumer's cross-event delivery state.
+#[derive(Default)]
+struct GatewayEgressState {
+    /// One editable status message per `status_key` (a turn's progress
+    /// epoch). Bounded: entries are inserted on the first progress of a
+    /// turn and removed when the turn finalizes (`done`).
+    status_messages: HashMap<String, StatusHandle>,
+    /// 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
+    /// the value is the provider's reaction handle (`Some(reaction_id)` for
+    /// Lark, `None` for Telegram which clears by message_id alone). An add
+    /// records the handle; the matching remove pops it. Bounded by the
+    /// in-flight turn count (each turn adds one entry, removes it on its
+    /// first event), and any orphan is harmless (a stale handle never
+    /// dereferences). ALL reaction calls are fire-and-forget — a failure is
+    /// logged + swallowed, NEVER propagated, so it can't affect delivery.
+    reaction_handles: HashMap<String, Option<String>>,
+}
+
 fn spawn_gateway_event_consumer(
+    event_outbox_root: PathBuf,
+    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    channels: Arc<RwLock<ChannelMap>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_gateway_event_consumer_with_timeout(
+        event_outbox_root,
+        rx,
+        channels,
+        PLATFORM_CALL_TIMEOUT,
+    )
+}
+
+/// The single receiver behind every session's event pump: when it exits,
+/// every pump stops at its next event (the sink reports closed), so no reply
+/// is delivered anywhere again (issue #210). It therefore survives each
+/// event's failure modes — a panic is caught and logged per event, every
+/// platform call is bounded by `call_timeout` — and only ends when the
+/// daemon drops the senders or aborts it at shutdown.
+fn spawn_gateway_event_consumer_with_timeout(
     event_outbox_root: PathBuf,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     channels: Arc<RwLock<ChannelMap>>,
+    call_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // One editable status message per `status_key` (a turn's progress
-        // epoch). Bounded: entries are inserted on the first progress of a
-        // turn and removed when the turn finalizes (`done`).
-        let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
-        // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
-        // the value is the provider's reaction handle (`Some(reaction_id)` for
-        // Lark, `None` for Telegram which clears by message_id alone). An add
-        // records the handle; the matching remove pops it. Bounded by the
-        // in-flight turn count (each turn adds one entry, removes it on its
-        // first event), and any orphan is harmless (a stale handle never
-        // dereferences). ALL reaction calls are fire-and-forget — a failure is
-        // logged + swallowed, NEVER propagated, so it can't affect delivery.
-        let mut reaction_handles: HashMap<String, Option<String>> = HashMap::new();
+        let mut state = GatewayEgressState::default();
         while let Some(evt) = rx.recv().await {
-            // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
-            // (the team view's global SSE); it has no IM channel representation
-            // and no bound `evt.channel` to resolve, so skip it BEFORE the
-            // channel lookup (avoids a spurious "channel not configured"
-            // warning firing for every delegation transition).
-            if matches!(
-                evt.kind,
-                GatewayEventKind::Delegation { .. }
-                    | GatewayEventKind::SessionLifecycle { .. }
-                    | GatewayEventKind::ScheduledChanged
-            ) {
-                continue;
-            }
-            // Clone the channel out under the read lock, then DROP the guard
-            // before any `.await` (never hold a std RwLock guard across await).
-            let channel = {
-                let g = channels.read().unwrap();
-                g.get(&evt.channel).cloned()
-            };
-            let Some(channel) = channel else {
-                tracing::warn!(
-                    channel = %evt.channel,
-                    event_id = %evt.id,
-                    "ccteam-im: gateway event dropped because channel is not configured"
-                );
-                continue;
-            };
-            match evt.kind {
-                GatewayEventKind::Answer => {
-                    let out = SendMessage::new(evt.content, evt.chat_id)
-                        .in_thread(evt.thread_ts)
-                        .with_attachments(evt.attachments)
-                        .with_options(evt.options);
-                    send_gateway_outbound(
-                        &event_outbox_root,
-                        &evt.id,
-                        0,
-                        &evt.channel,
-                        channel.as_ref(),
-                        out,
-                    )
-                    .await;
-                }
-                GatewayEventKind::Progress { status_key, done } => {
-                    deliver_progress(
-                        channel.as_ref(),
-                        &mut status_messages,
-                        status_key,
-                        done,
-                        &evt.channel,
-                        evt.chat_id,
-                        evt.thread_ts,
-                        evt.content,
-                    )
-                    .await;
-                }
-                // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
-                // status is fully driven by the folded `Progress` event above,
-                // so this is a strict no-op (no send / no edit): IM delivery
-                // stays byte-identical to before the Activity event existed.
-                GatewayEventKind::Activity { .. } => {}
-                // v0.9.0 W4 — unreachable in practice (the early `continue`
-                // above already skips every `Delegation` event before this
-                // match), but the arm must exist for exhaustiveness and stays
-                // correct if that early skip is ever removed.
-                GatewayEventKind::Delegation { .. } => {}
-                GatewayEventKind::SessionLifecycle { .. } => {}
-                GatewayEventKind::ScheduledChanged => {}
-                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
-                // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
-                // Activity arm's discipline: ALL fire-and-forget — log + swallow,
-                // never propagate, so a reaction can't break/delay the turn.
-                GatewayEventKind::Reaction { message_id, on } => {
-                    let key = format!("{}:{}", evt.channel, message_id);
-                    if on {
-                        match channel.add_reaction(&evt.chat_id, &message_id).await {
-                            Ok(handle) => {
-                                reaction_handles.insert(key, handle);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    channel = %evt.channel,
-                                    message_id = %message_id,
-                                    error = %err,
-                                    "ccteam-im: add_reaction failed (ack skipped)"
-                                );
-                            }
-                        }
-                    } else {
-                        let handle = reaction_handles.remove(&key).flatten();
-                        if let Err(err) = channel
-                            .remove_reaction(&evt.chat_id, &message_id, handle.as_deref())
-                            .await
-                        {
-                            tracing::warn!(
-                                channel = %evt.channel,
-                                message_id = %message_id,
-                                error = %err,
-                                "ccteam-im: remove_reaction failed (ack lingers)"
-                            );
-                        }
+            let item = format!(
+                "event={} channel={} sid={}",
+                evt.id,
+                evt.channel,
+                evt.sid.as_deref().unwrap_or("-")
+            );
+            crate::supervise::contain_panic(
+                "gateway event consumer",
+                &item,
+                deliver_gateway_event(&event_outbox_root, &channels, &mut state, evt, call_timeout),
+            )
+            .await;
+        }
+        tracing::error!(
+            "ccteam-im: gateway event consumer exited; session replies are no longer delivered"
+        );
+    })
+}
+
+/// Deliver one gateway event to its channel.
+async fn deliver_gateway_event(
+    event_outbox_root: &Path,
+    channels: &RwLock<ChannelMap>,
+    state: &mut GatewayEgressState,
+    evt: GatewayEvent,
+    call_timeout: Duration,
+) {
+    // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
+    // (the team view's global SSE); it has no IM channel representation
+    // and no bound `evt.channel` to resolve, so skip it BEFORE the
+    // channel lookup (avoids a spurious "channel not configured"
+    // warning firing for every delegation transition).
+    if matches!(
+        evt.kind,
+        GatewayEventKind::Delegation { .. }
+            | GatewayEventKind::SessionLifecycle { .. }
+            | GatewayEventKind::ScheduledChanged
+    ) {
+        return;
+    }
+    // Clone the channel out under the read lock, then DROP the guard
+    // before any `.await` (never hold a std RwLock guard across await).
+    // A writer that panicked mid-reload poisons the lock but leaves a
+    // whole map behind — keep delivering from it.
+    let channel = {
+        let g = channels.read().unwrap_or_else(|err| err.into_inner());
+        g.get(&evt.channel).cloned()
+    };
+    let Some(channel) = channel else {
+        tracing::warn!(
+            channel = %evt.channel,
+            event_id = %evt.id,
+            "ccteam-im: gateway event dropped because channel is not configured"
+        );
+        return;
+    };
+    match evt.kind {
+        GatewayEventKind::Answer => {
+            let out = SendMessage::new(evt.content, evt.chat_id)
+                .in_thread(evt.thread_ts)
+                .with_attachments(evt.attachments)
+                .with_options(evt.options);
+            send_gateway_outbound(
+                event_outbox_root,
+                &evt.id,
+                0,
+                &evt.channel,
+                channel.as_ref(),
+                out,
+                call_timeout,
+            )
+            .await;
+        }
+        GatewayEventKind::Progress { status_key, done } => {
+            deliver_progress(
+                channel.as_ref(),
+                &mut state.status_messages,
+                status_key,
+                done,
+                &evt.channel,
+                evt.chat_id,
+                evt.thread_ts,
+                evt.content,
+                call_timeout,
+            )
+            .await;
+        }
+        // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
+        // status is fully driven by the folded `Progress` event above,
+        // so this is a strict no-op (no send / no edit): IM delivery
+        // stays byte-identical to before the Activity event existed.
+        GatewayEventKind::Activity { .. } => {}
+        // v0.9.0 W4 — unreachable in practice (the early return above
+        // already skips every `Delegation` event before this match), but
+        // the arm must exist for exhaustiveness and stays correct if that
+        // early skip is ever removed.
+        GatewayEventKind::Delegation { .. } => {}
+        GatewayEventKind::SessionLifecycle { .. } => {}
+        GatewayEventKind::ScheduledChanged => {}
+        // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
+        // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
+        // Activity arm's discipline: ALL fire-and-forget — log + swallow,
+        // never propagate, so a reaction can't break/delay the turn.
+        GatewayEventKind::Reaction { message_id, on } => {
+            let key = format!("{}:{}", evt.channel, message_id);
+            if on {
+                match bounded_platform_call(
+                    call_timeout,
+                    "add_reaction",
+                    channel.add_reaction(&evt.chat_id, &message_id),
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        state.reaction_handles.insert(key, handle);
                     }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel = %evt.channel,
+                            message_id = %message_id,
+                            error = %err,
+                            "ccteam-im: add_reaction failed (ack skipped)"
+                        );
+                    }
+                }
+            } else {
+                let handle = state.reaction_handles.remove(&key).flatten();
+                if let Err(err) = bounded_platform_call(
+                    call_timeout,
+                    "remove_reaction",
+                    channel.remove_reaction(&evt.chat_id, &message_id, handle.as_deref()),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        channel = %evt.channel,
+                        message_id = %message_id,
+                        error = %err,
+                        "ccteam-im: remove_reaction failed (ack lingers)"
+                    );
                 }
             }
         }
-        tracing::debug!("imd: gateway event consumer exited");
-    })
+    }
 }
 
 /// Deliver one progress update: send a fresh status message the first
@@ -1935,11 +2100,15 @@ async fn deliver_progress(
     chat_id: String,
     thread_ts: Option<String>,
     content: String,
+    call_timeout: Duration,
 ) {
     if let Some(handle) = status_messages.get(&status_key).cloned() {
-        if let Err(err) = channel
-            .edit_message(&handle.recipient, &handle.message_id, &content)
-            .await
+        if let Err(err) = bounded_platform_call(
+            call_timeout,
+            "progress edit",
+            channel.edit_message(&handle.recipient, &handle.message_id, &content),
+        )
+        .await
         {
             tracing::warn!(
                 channel = %channel_name,
@@ -1955,7 +2124,7 @@ async fn deliver_progress(
     }
     // First progress for this turn — send a new status message (the seed).
     let seed = SendMessage::new(content, chat_id.clone()).in_thread(thread_ts.clone());
-    match channel.send(&seed).await {
+    match bounded_platform_call(call_timeout, "progress seed send", channel.send(&seed)).await {
         Ok(Some(message_id)) if !done => {
             status_messages.insert(
                 status_key,
@@ -2012,6 +2181,7 @@ async fn send_gateway_outbound(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) {
     // Channel-neutral splitting (V0.8.4 P0 / B2): when the channel
     // declares a per-message ceiling and the content overflows it, fan
@@ -2030,8 +2200,16 @@ async fn send_gateway_outbound(
     if parts.len() <= 1 {
         // Unchanged single-message path: id = `{inbound_id}-{seq}`.
         let id = format!("{inbound_id}-{seq}");
-        queue_and_send_durable_part(ccteam_root, id, inbound_id, channel_name, channel, message)
-            .await;
+        queue_and_send_durable_part(
+            ccteam_root,
+            id,
+            inbound_id,
+            channel_name,
+            channel,
+            message,
+            call_timeout,
+        )
+        .await;
         return;
     }
 
@@ -2051,6 +2229,7 @@ async fn send_gateway_outbound(
             channel_name,
             channel,
             part_msg,
+            call_timeout,
         )
         .await;
         if !sent {
@@ -2070,7 +2249,9 @@ async fn send_gateway_outbound(
         };
         let notice =
             SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
-        if let Err(err) = channel.send(&notice).await {
+        if let Err(err) =
+            bounded_platform_call(call_timeout, "split-failure notice", channel.send(&notice)).await
+        {
             tracing::warn!(
                 inbound_id,
                 channel = %channel_name,
@@ -2091,6 +2272,7 @@ async fn queue_and_send_durable_part(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) -> bool {
     append_durable_outbound(
         ccteam_root,
@@ -2105,7 +2287,16 @@ async fn queue_and_send_durable_part(
             error: None,
         },
     );
-    finish_durable_outbound_send(ccteam_root, id, inbound_id, channel_name, channel, message).await
+    finish_durable_outbound_send(
+        ccteam_root,
+        id,
+        inbound_id,
+        channel_name,
+        channel,
+        message,
+        call_timeout,
+    )
+    .await
 }
 
 /// Send a single already-queued durable row and append its terminal
@@ -2117,8 +2308,9 @@ async fn finish_durable_outbound_send(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) -> bool {
-    match channel.send(&message).await {
+    match bounded_platform_call(call_timeout, "send", channel.send(&message)).await {
         Ok(platform_message_id) => {
             append_durable_outbound(
                 ccteam_root,
@@ -2211,6 +2403,7 @@ async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
             &row.channel,
             channel.as_ref(),
             row.message,
+            PLATFORM_CALL_TIMEOUT,
         )
         .await;
     }
@@ -2237,12 +2430,10 @@ fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    serde_json::to_writer(&mut file, row)?;
-    file.write_all(b"\n")?;
+    // One `write_all` per record (see `open_jsonl_append`).
+    let mut line = serde_json::to_vec(row)?;
+    line.push(b'\n');
+    ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?.write_all(&line)?;
     Ok(())
 }
 
@@ -2654,6 +2845,257 @@ mod tests {
             calls[1].3, None,
             "stateless channel clears with a None handle"
         );
+    }
+
+    /// A channel whose `send` panics or never returns for one marked message
+    /// and records every other send in the wrapped `MockChannel`.
+    struct TrapChannel {
+        inner: crate::transport::providers::mock::MockChannel,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TrapChannel {
+        fn name(&self) -> &str {
+            "trap"
+        }
+
+        async fn send(&self, message: &SendMessage) -> Result<Option<String>> {
+            if message.content.contains("PANIC") {
+                panic!("trap channel panicked on send");
+            }
+            if message.content.contains("HANG") {
+                std::future::pending::<()>().await;
+            }
+            self.inner.send(message).await
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn trap_answer(id: &str, content: &str) -> GatewayEvent {
+        GatewayEvent {
+            interim: false,
+            id: id.to_string(),
+            channel: "trap".to_string(),
+            chat_id: "chat-1".to_string(),
+            thread_ts: None,
+            content: content.to_string(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            status: None,
+            sid: Some("s1".to_string()),
+            slug: None,
+        }
+    }
+
+    /// Drive the real consumer over a `TrapChannel` and return what the
+    /// channel recorded once `want` sends landed (or the wait ran out).
+    async fn deliver_through_trap(
+        events: Vec<GatewayEvent>,
+        call_timeout: Duration,
+        want: usize,
+        outbox_root: &Path,
+    ) -> Vec<String> {
+        let mock = crate::transport::providers::mock::MockChannel::new();
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "trap".to_string(),
+            Arc::new(TrapChannel {
+                inner: mock.clone(),
+            }),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer_with_timeout(
+            outbox_root.to_path_buf(),
+            rx,
+            Arc::new(RwLock::new(channels)),
+            call_timeout,
+        );
+        for evt in events {
+            tx.send(evt).unwrap();
+        }
+        let mut sent = Vec::new();
+        for _ in 0..150 {
+            sent = mock.outbox().await.into_iter().map(|m| m.content).collect();
+            if sent.len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !tx.is_closed(),
+            "the gateway event consumer must still be receiving"
+        );
+        consumer.abort();
+        sent
+    }
+
+    /// Issue #210: one event whose delivery panics must not take the single
+    /// delivery consumer down with it — when it did, every session's pump
+    /// stopped at its next event and no reply was ever delivered again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_consumer_survives_a_panicking_delivery() {
+        let outbox_root = TempDir::new().unwrap();
+        let sent = deliver_through_trap(
+            vec![
+                trap_answer("e1", "before"),
+                trap_answer("e2", "PANIC"),
+                trap_answer("e3", "after"),
+            ],
+            PLATFORM_CALL_TIMEOUT,
+            2,
+            outbox_root.path(),
+        )
+        .await;
+        assert_eq!(sent, vec!["before", "after"]);
+    }
+
+    /// Issue #210: a platform call that never returns is bounded, recorded
+    /// `Failed` in the durable ledger, and later events still go out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_consumer_bounds_a_hung_platform_call() {
+        let outbox_root = TempDir::new().unwrap();
+        let sent = deliver_through_trap(
+            vec![trap_answer("e1", "HANG"), trap_answer("e2", "after")],
+            Duration::from_millis(200),
+            1,
+            outbox_root.path(),
+        )
+        .await;
+        assert_eq!(sent, vec!["after"]);
+
+        let ledger = std::fs::read_to_string(durable_outbox_path_in(outbox_root.path())).unwrap();
+        let hung: Vec<DurableOutboundRow> = ledger
+            .lines()
+            .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap())
+            .filter(|row| row.id == "e1-0")
+            .collect();
+        let last = hung.last().expect("hung send is in the ledger");
+        assert_eq!(last.state, DurableOutboundState::Failed);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("timed out"),
+            "{:?}",
+            last.error
+        );
+    }
+
+    /// Issue #210: a durable-outbox row appended after an ENOSPC-torn tail is
+    /// still readable — it is not glued onto the fragment.
+    #[test]
+    fn durable_outbox_append_after_torn_tail_keeps_the_row() {
+        let root = TempDir::new().unwrap();
+        let path = durable_outbox_path_in(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"ts_ms\":1,\"id\":\"torn").unwrap();
+        append_durable_outbound_inner(
+            root.path(),
+            &DurableOutboundRow {
+                ts_ms: 2,
+                id: "o-1".into(),
+                inbound_id: "in-1".into(),
+                channel: "trap".into(),
+                state: DurableOutboundState::Queued,
+                message: SendMessage::new("hi", "chat-1"),
+                platform_message_id: None,
+                error: None,
+            },
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<DurableOutboundRow> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(rows.len(), 1, "{raw}");
+        assert_eq!(rows[0].id, "o-1");
+    }
+
+    /// An inbound channel whose `mention_policy` panics the first time the
+    /// consumer routes a message through it, and counts every call.
+    struct PanicOnceInbound {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PanicOnceInbound {
+        fn name(&self) -> &str {
+            "trap"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+
+        fn mention_policy(&self) -> crate::transport::MentionPolicy {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("trap channel panicked routing a message");
+            }
+            crate::transport::MentionPolicy::default()
+        }
+    }
+
+    /// Issue #210 (inbound side): one message whose routing panics must not
+    /// end the only inbound consumer — the next message is still routed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_consumer_survives_a_panicking_message() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "trap".to_string(),
+            Arc::new(PanicOnceInbound {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let root = TempDir::new().unwrap();
+        let gateway = Arc::new(Mutex::new(Gateway::new(
+            Arc::new(ccteam_harness::execution::CodexExecAdapter::new()),
+            "alpha",
+            root.path(),
+        )));
+        let (_restore_tx, restore_rx) = tokio::sync::watch::channel(true);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let consumer = spawn_inbound_consumer(
+            root.path().to_path_buf(),
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default()))),
+            gateway,
+            restore_rx,
+        );
+        let msg = |id: &str| ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "hi".into(),
+            channel: "trap".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+            ambient: false,
+        };
+        tx.send(msg("m-1")).await.unwrap();
+        tx.send(msg("m-2")).await.unwrap();
+        for _ in 0..150 {
+            if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the message after the panic must still be routed"
+        );
+        assert!(!consumer.is_finished(), "the inbound consumer must survive");
+        consumer.abort();
     }
 
     /// (v0.8.5 S4) End-to-end through the *real* security layer: a button
