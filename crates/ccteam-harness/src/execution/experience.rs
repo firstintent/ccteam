@@ -113,10 +113,7 @@ pub fn append_experience(project_dir: &Path, record: &ExperienceRecord) -> Resul
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let line = serde_json::to_string(record)? + "\n";
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = crate::execution::fs_atomic::open_jsonl_append(&path)
         .with_context(|| format!("open {}", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("append to {}", path.display()))?;

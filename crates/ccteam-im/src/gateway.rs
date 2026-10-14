@@ -2290,7 +2290,7 @@ impl GatewayEventSink {
         // Broadcast first (cheap clone); a `SendError` here just means no SSE
         // subscriber is attached, which is normal.
         let _ = self.broadcast.send(event.clone());
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// Send a delivery-only event to the daemon egress without publishing it
@@ -2298,7 +2298,7 @@ impl GatewayEventSink {
     /// original sid-keyed Answer already feeds SSE, while the duplicate is a
     /// phone notification only.
     fn send_delivery_only(&self, event: GatewayEvent) -> bool {
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// v0.10.1 — publish to the SSE fan-out (web console + the inline-wait
@@ -2307,8 +2307,37 @@ impl GatewayEventSink {
     /// pump-liveness signal as [`Self::send`] (the mpsc being closed is still
     /// "the daemon exited"), so a caller's `if !send { break }` is unchanged.
     fn send_broadcast_only(&self, event: GatewayEvent) -> bool {
+        let live = !self.mpsc.is_closed();
+        if !live {
+            Self::log_consumer_gone(&event);
+        }
         let _ = self.broadcast.send(event);
-        !self.mpsc.is_closed()
+        live
+    }
+
+    /// The mpsc leg shared by every send shape. A closed mpsc is the pump's
+    /// stop signal, and every pump stops on it, so it is logged HERE (once
+    /// per stopping pump, every send site covered): outside daemon shutdown
+    /// it means no session's reply reaches IM/web/turns any more (issue #210:
+    /// the consumer died during ENOSPC and every pump stopped silently).
+    fn deliver(&self, event: GatewayEvent) -> bool {
+        match self.mpsc.send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::SendError(event)) => {
+                Self::log_consumer_gone(&event);
+                false
+            }
+        }
+    }
+
+    fn log_consumer_gone(event: &GatewayEvent) {
+        tracing::error!(
+            sid = event.sid.as_deref().unwrap_or("-"),
+            event_id = %event.id,
+            channel = %event.channel,
+            "ccteam-im: gateway event consumer is gone; stopping this session's event pump \
+             (expected only during daemon shutdown)"
+        );
     }
 }
 

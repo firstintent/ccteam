@@ -7,7 +7,6 @@
 //! (`submit_resolved` / event pump). No alternate turns writer.
 
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -115,13 +114,12 @@ pub fn enqueue_pending_turn(
         intent,
         request_id,
     };
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    // One `write_all` per record (see `open_jsonl_append`).
+    let mut line = serde_json::to_vec(&row)?;
+    line.push(b'\n');
+    let mut f = ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)
         .with_context(|| format!("open pending_turns {}", path.display()))?;
-    serde_json::to_writer(&mut f, &row)?;
-    f.write_all(b"\n")?;
+    f.write_all(&line)?;
     f.sync_all().ok();
     Ok(())
 }

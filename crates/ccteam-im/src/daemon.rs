@@ -1757,7 +1757,16 @@ async fn deliver_gateway_replies(
             for (seq, reply) in replies.into_iter().enumerate() {
                 let out = SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
-                send_gateway_outbound(ccteam_root, cid, seq, &msg.channel, channel, out).await;
+                send_gateway_outbound(
+                    ccteam_root,
+                    cid,
+                    seq,
+                    &msg.channel,
+                    channel,
+                    out,
+                    PLATFORM_CALL_TIMEOUT,
+                )
+                .await;
             }
             tracing::info!(
                 event = "latency",
@@ -1770,7 +1779,16 @@ async fn deliver_gateway_replies(
         Err(err) => {
             let out = SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
                 .in_thread(msg.thread_ts.clone());
-            send_gateway_outbound(ccteam_root, cid, 0, &msg.channel, channel, out).await;
+            send_gateway_outbound(
+                ccteam_root,
+                cid,
+                0,
+                &msg.channel,
+                channel,
+                out,
+                PLATFORM_CALL_TIMEOUT,
+            )
+            .await;
             tracing::warn!(
                 event = "latency",
                 stage = "imd.gateway.err",
@@ -1792,133 +1810,230 @@ struct StatusHandle {
     recipient: String,
 }
 
+/// Upper bound on ONE platform call (send / edit / reaction) the delivery
+/// paths await. Delivery is serial — one consumer for every session — so a
+/// single hung platform request must not freeze replies for everyone (issue
+/// #210). Generous enough for an attachment upload; a timed-out durable send
+/// is recorded `Failed` like any other send error.
+const PLATFORM_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Await one platform call under `limit`; an elapsed timer becomes an
+/// ordinary `Err` so every caller's existing failure handling applies.
+async fn bounded_platform_call<T>(
+    limit: Duration,
+    what: &str,
+    call: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "{what} timed out after {}s",
+            limit.as_secs_f64()
+        )),
+    }
+}
+
+/// The consumer's cross-event delivery state.
+#[derive(Default)]
+struct GatewayEgressState {
+    /// One editable status message per `status_key` (a turn's progress
+    /// epoch). Bounded: entries are inserted on the first progress of a
+    /// turn and removed when the turn finalizes (`done`).
+    status_messages: HashMap<String, StatusHandle>,
+    /// 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
+    /// the value is the provider's reaction handle (`Some(reaction_id)` for
+    /// Lark, `None` for Telegram which clears by message_id alone). An add
+    /// records the handle; the matching remove pops it. Bounded by the
+    /// in-flight turn count (each turn adds one entry, removes it on its
+    /// first event), and any orphan is harmless (a stale handle never
+    /// dereferences). ALL reaction calls are fire-and-forget — a failure is
+    /// logged + swallowed, NEVER propagated, so it can't affect delivery.
+    reaction_handles: HashMap<String, Option<String>>,
+}
+
 fn spawn_gateway_event_consumer(
+    event_outbox_root: PathBuf,
+    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    channels: Arc<RwLock<ChannelMap>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_gateway_event_consumer_with_timeout(
+        event_outbox_root,
+        rx,
+        channels,
+        PLATFORM_CALL_TIMEOUT,
+    )
+}
+
+/// The single receiver behind every session's event pump: when it exits,
+/// every pump stops at its next event (the sink reports closed), so no reply
+/// is delivered anywhere again (issue #210). It therefore survives each
+/// event's failure modes — a panic is caught and logged per event, every
+/// platform call is bounded by `call_timeout` — and only ends when the
+/// daemon drops the senders or aborts it at shutdown.
+fn spawn_gateway_event_consumer_with_timeout(
     event_outbox_root: PathBuf,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     channels: Arc<RwLock<ChannelMap>>,
+    call_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    use futures::FutureExt;
     tokio::spawn(async move {
-        // One editable status message per `status_key` (a turn's progress
-        // epoch). Bounded: entries are inserted on the first progress of a
-        // turn and removed when the turn finalizes (`done`).
-        let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
-        // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
-        // the value is the provider's reaction handle (`Some(reaction_id)` for
-        // Lark, `None` for Telegram which clears by message_id alone). An add
-        // records the handle; the matching remove pops it. Bounded by the
-        // in-flight turn count (each turn adds one entry, removes it on its
-        // first event), and any orphan is harmless (a stale handle never
-        // dereferences). ALL reaction calls are fire-and-forget — a failure is
-        // logged + swallowed, NEVER propagated, so it can't affect delivery.
-        let mut reaction_handles: HashMap<String, Option<String>> = HashMap::new();
+        let mut state = GatewayEgressState::default();
         while let Some(evt) = rx.recv().await {
-            // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
-            // (the team view's global SSE); it has no IM channel representation
-            // and no bound `evt.channel` to resolve, so skip it BEFORE the
-            // channel lookup (avoids a spurious "channel not configured"
-            // warning firing for every delegation transition).
-            if matches!(
-                evt.kind,
-                GatewayEventKind::Delegation { .. }
-                    | GatewayEventKind::SessionLifecycle { .. }
-                    | GatewayEventKind::ScheduledChanged
-            ) {
-                continue;
-            }
-            // Clone the channel out under the read lock, then DROP the guard
-            // before any `.await` (never hold a std RwLock guard across await).
-            let channel = {
-                let g = channels.read().unwrap();
-                g.get(&evt.channel).cloned()
-            };
-            let Some(channel) = channel else {
-                tracing::warn!(
-                    channel = %evt.channel,
-                    event_id = %evt.id,
-                    "ccteam-im: gateway event dropped because channel is not configured"
+            let event_id = evt.id.clone();
+            let channel_name = evt.channel.clone();
+            let sid = evt.sid.clone();
+            let delivery =
+                deliver_gateway_event(&event_outbox_root, &channels, &mut state, evt, call_timeout);
+            if let Err(panic) = std::panic::AssertUnwindSafe(delivery).catch_unwind().await {
+                tracing::error!(
+                    event_id = %event_id,
+                    channel = %channel_name,
+                    sid = sid.as_deref().unwrap_or("-"),
+                    panic = panic_message(panic.as_ref()),
+                    "ccteam-im: gateway event delivery panicked; event dropped, consumer continues"
                 );
-                continue;
-            };
-            match evt.kind {
-                GatewayEventKind::Answer => {
-                    let out = SendMessage::new(evt.content, evt.chat_id)
-                        .in_thread(evt.thread_ts)
-                        .with_attachments(evt.attachments)
-                        .with_options(evt.options);
-                    send_gateway_outbound(
-                        &event_outbox_root,
-                        &evt.id,
-                        0,
-                        &evt.channel,
-                        channel.as_ref(),
-                        out,
-                    )
-                    .await;
-                }
-                GatewayEventKind::Progress { status_key, done } => {
-                    deliver_progress(
-                        channel.as_ref(),
-                        &mut status_messages,
-                        status_key,
-                        done,
-                        &evt.channel,
-                        evt.chat_id,
-                        evt.thread_ts,
-                        evt.content,
-                    )
-                    .await;
-                }
-                // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
-                // status is fully driven by the folded `Progress` event above,
-                // so this is a strict no-op (no send / no edit): IM delivery
-                // stays byte-identical to before the Activity event existed.
-                GatewayEventKind::Activity { .. } => {}
-                // v0.9.0 W4 — unreachable in practice (the early `continue`
-                // above already skips every `Delegation` event before this
-                // match), but the arm must exist for exhaustiveness and stays
-                // correct if that early skip is ever removed.
-                GatewayEventKind::Delegation { .. } => {}
-                GatewayEventKind::SessionLifecycle { .. } => {}
-                GatewayEventKind::ScheduledChanged => {}
-                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
-                // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
-                // Activity arm's discipline: ALL fire-and-forget — log + swallow,
-                // never propagate, so a reaction can't break/delay the turn.
-                GatewayEventKind::Reaction { message_id, on } => {
-                    let key = format!("{}:{}", evt.channel, message_id);
-                    if on {
-                        match channel.add_reaction(&evt.chat_id, &message_id).await {
-                            Ok(handle) => {
-                                reaction_handles.insert(key, handle);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    channel = %evt.channel,
-                                    message_id = %message_id,
-                                    error = %err,
-                                    "ccteam-im: add_reaction failed (ack skipped)"
-                                );
-                            }
-                        }
-                    } else {
-                        let handle = reaction_handles.remove(&key).flatten();
-                        if let Err(err) = channel
-                            .remove_reaction(&evt.chat_id, &message_id, handle.as_deref())
-                            .await
-                        {
-                            tracing::warn!(
-                                channel = %evt.channel,
-                                message_id = %message_id,
-                                error = %err,
-                                "ccteam-im: remove_reaction failed (ack lingers)"
-                            );
-                        }
+            }
+        }
+        tracing::error!(
+            "ccteam-im: gateway event consumer exited; session replies are no longer delivered"
+        );
+    })
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
+/// Deliver one gateway event to its channel.
+async fn deliver_gateway_event(
+    event_outbox_root: &Path,
+    channels: &RwLock<ChannelMap>,
+    state: &mut GatewayEgressState,
+    evt: GatewayEvent,
+    call_timeout: Duration,
+) {
+    // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
+    // (the team view's global SSE); it has no IM channel representation
+    // and no bound `evt.channel` to resolve, so skip it BEFORE the
+    // channel lookup (avoids a spurious "channel not configured"
+    // warning firing for every delegation transition).
+    if matches!(
+        evt.kind,
+        GatewayEventKind::Delegation { .. }
+            | GatewayEventKind::SessionLifecycle { .. }
+            | GatewayEventKind::ScheduledChanged
+    ) {
+        return;
+    }
+    // Clone the channel out under the read lock, then DROP the guard
+    // before any `.await` (never hold a std RwLock guard across await).
+    // A writer that panicked mid-reload poisons the lock but leaves a
+    // whole map behind — keep delivering from it.
+    let channel = {
+        let g = channels.read().unwrap_or_else(|err| err.into_inner());
+        g.get(&evt.channel).cloned()
+    };
+    let Some(channel) = channel else {
+        tracing::warn!(
+            channel = %evt.channel,
+            event_id = %evt.id,
+            "ccteam-im: gateway event dropped because channel is not configured"
+        );
+        return;
+    };
+    match evt.kind {
+        GatewayEventKind::Answer => {
+            let out = SendMessage::new(evt.content, evt.chat_id)
+                .in_thread(evt.thread_ts)
+                .with_attachments(evt.attachments)
+                .with_options(evt.options);
+            send_gateway_outbound(
+                event_outbox_root,
+                &evt.id,
+                0,
+                &evt.channel,
+                channel.as_ref(),
+                out,
+                call_timeout,
+            )
+            .await;
+        }
+        GatewayEventKind::Progress { status_key, done } => {
+            deliver_progress(
+                channel.as_ref(),
+                &mut state.status_messages,
+                status_key,
+                done,
+                &evt.channel,
+                evt.chat_id,
+                evt.thread_ts,
+                evt.content,
+                call_timeout,
+            )
+            .await;
+        }
+        // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
+        // status is fully driven by the folded `Progress` event above,
+        // so this is a strict no-op (no send / no edit): IM delivery
+        // stays byte-identical to before the Activity event existed.
+        GatewayEventKind::Activity { .. } => {}
+        // v0.9.0 W4 — unreachable in practice (the early return above
+        // already skips every `Delegation` event before this match), but
+        // the arm must exist for exhaustiveness and stays correct if that
+        // early skip is ever removed.
+        GatewayEventKind::Delegation { .. } => {}
+        GatewayEventKind::SessionLifecycle { .. } => {}
+        GatewayEventKind::ScheduledChanged => {}
+        // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
+        // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
+        // Activity arm's discipline: ALL fire-and-forget — log + swallow,
+        // never propagate, so a reaction can't break/delay the turn.
+        GatewayEventKind::Reaction { message_id, on } => {
+            let key = format!("{}:{}", evt.channel, message_id);
+            if on {
+                match bounded_platform_call(
+                    call_timeout,
+                    "add_reaction",
+                    channel.add_reaction(&evt.chat_id, &message_id),
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        state.reaction_handles.insert(key, handle);
                     }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel = %evt.channel,
+                            message_id = %message_id,
+                            error = %err,
+                            "ccteam-im: add_reaction failed (ack skipped)"
+                        );
+                    }
+                }
+            } else {
+                let handle = state.reaction_handles.remove(&key).flatten();
+                if let Err(err) = bounded_platform_call(
+                    call_timeout,
+                    "remove_reaction",
+                    channel.remove_reaction(&evt.chat_id, &message_id, handle.as_deref()),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        channel = %evt.channel,
+                        message_id = %message_id,
+                        error = %err,
+                        "ccteam-im: remove_reaction failed (ack lingers)"
+                    );
                 }
             }
         }
-        tracing::debug!("imd: gateway event consumer exited");
-    })
+    }
 }
 
 /// Deliver one progress update: send a fresh status message the first
@@ -1935,11 +2050,15 @@ async fn deliver_progress(
     chat_id: String,
     thread_ts: Option<String>,
     content: String,
+    call_timeout: Duration,
 ) {
     if let Some(handle) = status_messages.get(&status_key).cloned() {
-        if let Err(err) = channel
-            .edit_message(&handle.recipient, &handle.message_id, &content)
-            .await
+        if let Err(err) = bounded_platform_call(
+            call_timeout,
+            "progress edit",
+            channel.edit_message(&handle.recipient, &handle.message_id, &content),
+        )
+        .await
         {
             tracing::warn!(
                 channel = %channel_name,
@@ -1955,7 +2074,7 @@ async fn deliver_progress(
     }
     // First progress for this turn — send a new status message (the seed).
     let seed = SendMessage::new(content, chat_id.clone()).in_thread(thread_ts.clone());
-    match channel.send(&seed).await {
+    match bounded_platform_call(call_timeout, "progress seed send", channel.send(&seed)).await {
         Ok(Some(message_id)) if !done => {
             status_messages.insert(
                 status_key,
@@ -2012,6 +2131,7 @@ async fn send_gateway_outbound(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) {
     // Channel-neutral splitting (V0.8.4 P0 / B2): when the channel
     // declares a per-message ceiling and the content overflows it, fan
@@ -2030,8 +2150,16 @@ async fn send_gateway_outbound(
     if parts.len() <= 1 {
         // Unchanged single-message path: id = `{inbound_id}-{seq}`.
         let id = format!("{inbound_id}-{seq}");
-        queue_and_send_durable_part(ccteam_root, id, inbound_id, channel_name, channel, message)
-            .await;
+        queue_and_send_durable_part(
+            ccteam_root,
+            id,
+            inbound_id,
+            channel_name,
+            channel,
+            message,
+            call_timeout,
+        )
+        .await;
         return;
     }
 
@@ -2051,6 +2179,7 @@ async fn send_gateway_outbound(
             channel_name,
             channel,
             part_msg,
+            call_timeout,
         )
         .await;
         if !sent {
@@ -2070,7 +2199,9 @@ async fn send_gateway_outbound(
         };
         let notice =
             SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
-        if let Err(err) = channel.send(&notice).await {
+        if let Err(err) =
+            bounded_platform_call(call_timeout, "split-failure notice", channel.send(&notice)).await
+        {
             tracing::warn!(
                 inbound_id,
                 channel = %channel_name,
@@ -2091,6 +2222,7 @@ async fn queue_and_send_durable_part(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) -> bool {
     append_durable_outbound(
         ccteam_root,
@@ -2105,7 +2237,16 @@ async fn queue_and_send_durable_part(
             error: None,
         },
     );
-    finish_durable_outbound_send(ccteam_root, id, inbound_id, channel_name, channel, message).await
+    finish_durable_outbound_send(
+        ccteam_root,
+        id,
+        inbound_id,
+        channel_name,
+        channel,
+        message,
+        call_timeout,
+    )
+    .await
 }
 
 /// Send a single already-queued durable row and append its terminal
@@ -2117,8 +2258,9 @@ async fn finish_durable_outbound_send(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
+    call_timeout: Duration,
 ) -> bool {
-    match channel.send(&message).await {
+    match bounded_platform_call(call_timeout, "send", channel.send(&message)).await {
         Ok(platform_message_id) => {
             append_durable_outbound(
                 ccteam_root,
@@ -2211,6 +2353,7 @@ async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
             &row.channel,
             channel.as_ref(),
             row.message,
+            PLATFORM_CALL_TIMEOUT,
         )
         .await;
     }
@@ -2237,12 +2380,10 @@ fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    serde_json::to_writer(&mut file, row)?;
-    file.write_all(b"\n")?;
+    // One `write_all` per record (see `open_jsonl_append`).
+    let mut line = serde_json::to_vec(row)?;
+    line.push(b'\n');
+    ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?.write_all(&line)?;
     Ok(())
 }
 
@@ -2654,6 +2795,172 @@ mod tests {
             calls[1].3, None,
             "stateless channel clears with a None handle"
         );
+    }
+
+    /// A channel whose `send` panics or never returns for one marked message
+    /// and records every other send in the wrapped `MockChannel`.
+    struct TrapChannel {
+        inner: crate::transport::providers::mock::MockChannel,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TrapChannel {
+        fn name(&self) -> &str {
+            "trap"
+        }
+
+        async fn send(&self, message: &SendMessage) -> Result<Option<String>> {
+            if message.content.contains("PANIC") {
+                panic!("trap channel panicked on send");
+            }
+            if message.content.contains("HANG") {
+                std::future::pending::<()>().await;
+            }
+            self.inner.send(message).await
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn trap_answer(id: &str, content: &str) -> GatewayEvent {
+        GatewayEvent {
+            interim: false,
+            id: id.to_string(),
+            channel: "trap".to_string(),
+            chat_id: "chat-1".to_string(),
+            thread_ts: None,
+            content: content.to_string(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            status: None,
+            sid: Some("s1".to_string()),
+            slug: None,
+        }
+    }
+
+    /// Drive the real consumer over a `TrapChannel` and return what the
+    /// channel recorded once `want` sends landed (or the wait ran out).
+    async fn deliver_through_trap(
+        events: Vec<GatewayEvent>,
+        call_timeout: Duration,
+        want: usize,
+        outbox_root: &Path,
+    ) -> Vec<String> {
+        let mock = crate::transport::providers::mock::MockChannel::new();
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "trap".to_string(),
+            Arc::new(TrapChannel {
+                inner: mock.clone(),
+            }),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer_with_timeout(
+            outbox_root.to_path_buf(),
+            rx,
+            Arc::new(RwLock::new(channels)),
+            call_timeout,
+        );
+        for evt in events {
+            tx.send(evt).unwrap();
+        }
+        let mut sent = Vec::new();
+        for _ in 0..150 {
+            sent = mock.outbox().await.into_iter().map(|m| m.content).collect();
+            if sent.len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !tx.is_closed(),
+            "the gateway event consumer must still be receiving"
+        );
+        consumer.abort();
+        sent
+    }
+
+    /// Issue #210: one event whose delivery panics must not take the single
+    /// delivery consumer down with it — when it did, every session's pump
+    /// stopped at its next event and no reply was ever delivered again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_consumer_survives_a_panicking_delivery() {
+        let outbox_root = TempDir::new().unwrap();
+        let sent = deliver_through_trap(
+            vec![
+                trap_answer("e1", "before"),
+                trap_answer("e2", "PANIC"),
+                trap_answer("e3", "after"),
+            ],
+            PLATFORM_CALL_TIMEOUT,
+            2,
+            outbox_root.path(),
+        )
+        .await;
+        assert_eq!(sent, vec!["before", "after"]);
+    }
+
+    /// Issue #210: a platform call that never returns is bounded, recorded
+    /// `Failed` in the durable ledger, and later events still go out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_consumer_bounds_a_hung_platform_call() {
+        let outbox_root = TempDir::new().unwrap();
+        let sent = deliver_through_trap(
+            vec![trap_answer("e1", "HANG"), trap_answer("e2", "after")],
+            Duration::from_millis(200),
+            1,
+            outbox_root.path(),
+        )
+        .await;
+        assert_eq!(sent, vec!["after"]);
+
+        let ledger = std::fs::read_to_string(durable_outbox_path_in(outbox_root.path())).unwrap();
+        let hung: Vec<DurableOutboundRow> = ledger
+            .lines()
+            .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap())
+            .filter(|row| row.id == "e1-0")
+            .collect();
+        let last = hung.last().expect("hung send is in the ledger");
+        assert_eq!(last.state, DurableOutboundState::Failed);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("timed out"),
+            "{:?}",
+            last.error
+        );
+    }
+
+    /// Issue #210: a durable-outbox row appended after an ENOSPC-torn tail is
+    /// still readable — it is not glued onto the fragment.
+    #[test]
+    fn durable_outbox_append_after_torn_tail_keeps_the_row() {
+        let root = TempDir::new().unwrap();
+        let path = durable_outbox_path_in(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"ts_ms\":1,\"id\":\"torn").unwrap();
+        append_durable_outbound_inner(
+            root.path(),
+            &DurableOutboundRow {
+                ts_ms: 2,
+                id: "o-1".into(),
+                inbound_id: "in-1".into(),
+                channel: "trap".into(),
+                state: DurableOutboundState::Queued,
+                message: SendMessage::new("hi", "chat-1"),
+                platform_message_id: None,
+                error: None,
+            },
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<DurableOutboundRow> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(rows.len(), 1, "{raw}");
+        assert_eq!(rows[0].id, "o-1");
     }
 
     /// (v0.8.5 S4) End-to-end through the *real* security layer: a button

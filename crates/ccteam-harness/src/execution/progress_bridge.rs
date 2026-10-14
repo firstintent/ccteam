@@ -769,10 +769,7 @@ fn append_serialized(path: &Path, line: &[u8]) -> Result<bool> {
         recover_progress_checkpoint_locked(path)?;
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut file = crate::execution::fs_atomic::open_jsonl_append(path)
         .with_context(|| format!("open {}", path.display()))?;
     file.write_all(line)
         .with_context(|| format!("write event to {}", path.display()))?;
