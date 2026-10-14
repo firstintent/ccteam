@@ -322,12 +322,10 @@ pub use team_resolver::{
 };
 pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
-    merge_named_mcp_server, probe_project, render_project_settings, render_workflow_agents_block,
-    render_workflow_template, resolve_spawnable_exe, validate_mcp_server_name,
-    write_global_helper_templates, write_project_settings, write_project_settings_in,
-    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
-    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
-    HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
+    merge_named_mcp_server, probe_project, render_workflow_agents_block, render_workflow_template,
+    resolve_spawnable_exe, validate_mcp_server_name, write_global_helper_templates, Language,
+    ProjectKind, ProjectProbe, WorkflowAgentEntry, WorkflowPreset, WorkflowTemplateCtx,
+    WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, HELPER_TEMPLATES,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
@@ -338,10 +336,9 @@ pub use tmux::{
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,
     migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, missing_tools,
-    remove_chat_hooks, remove_cost_accumulate_hooks, rewrite_legacy_hook_commands, user_claude_dir,
-    ChatHookScrubAction, ChatHookScrubReport, CostAccumulateScrubAction, CostAccumulateScrubReport,
-    HookCmdRewriteAction, HookCmdRewriteReport, LegacySkillAction, LegacySkillReport,
-    MigrationReport, MissingTool, ToolSurfaceSnapshot, ToolsRequired, BUILTIN_SUBAGENTS,
+    remove_ccteam_hooks, user_claude_dir, CcteamHookScrubAction, CcteamHookScrubReport,
+    LegacySkillAction, LegacySkillReport, MigrationReport, MissingTool, ToolSurfaceSnapshot,
+    ToolsRequired, BUILTIN_SUBAGENTS,
 };
 pub use transcript_scanner::{resolve_jsonl_path, session_cost_from_jsonl};
 pub use vendor::AgentVendor;

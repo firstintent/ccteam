@@ -442,7 +442,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)+ `.claude/settings.local.json`(ccteam 的 hook,写进本地层,**不碰**你的 `.claude/settings.json`)——**不种任何角色**,`.claude/agents/` 归你。重跑安全。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook 剥掉,其余键和你自己的 hook 原样保留。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
 
 ### `project`(项目生命周期)
 
@@ -456,7 +456,7 @@ ccteam project rm demo --dry-run   # 先预览会停什么、删什么
 ccteam project rm demo --purge     # 注销 + 删 ccteam 在项目里建的痕迹
 ```
 
-`rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里 ccteam 的 hook 段);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
+`rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里残留的 ccteam hook 条目);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
 
 ### `session`(会话)
 

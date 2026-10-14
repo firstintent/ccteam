@@ -9,7 +9,6 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{write_project_settings_in, EnabledPluginsSetting};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -331,10 +330,7 @@ pub fn scaffold_workflow_yaml(target: &Path, force: bool) -> Result<()> {
 
 pub fn bootstrap_project_at_dir(
     // `paths` is the global `~/.ccteam/` root. It feeds the
-    // home-ensure below (`ensure_ccteam_home`) so the `hook.sh`
-    // dispatcher the project settings reference actually exists. (It no
-    // longer feeds the dead helper-template stamp removed in v0.8.6
-    // review-fix #3.)
+    // home-ensure below (`ensure_ccteam_home`).
     paths: &CcteamPaths,
     target_dir: &Path,
     slug: &str,
@@ -344,17 +340,11 @@ pub fn bootstrap_project_at_dir(
     _request: &str,
     team: &str,
 ) -> Result<PathBuf> {
-    // Materialize the global `~/.ccteam/` home (canonical dirs +
-    // `hooks/hook.sh` dispatcher) BEFORE writing the project settings:
-    // `write_project_settings` lays down a `.claude/settings.local.json`
-    // whose SessionStart hook command points at
-    // `<paths.root>/hooks/hook.sh`. Historically only `ccteam init` /
-    // `chat_register` / `doctor --install-hooks` ran `install_hooks`, so
-    // the web `POST /projects` + IM/web chat create path that flows
-    // through here referenced a hook.sh that was never written →
-    // "hook.sh: not found" at first launch. Idempotent (cheap no-op when
-    // the home is already complete).
-    crate::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home before project settings")?;
+    // Materialize the global `~/.ccteam/` home (canonical dirs + the
+    // `hooks/hook.sh` dispatcher) so every create path — `ccteam init`, web
+    // `POST /projects`, IM/web chat create — leaves the same complete home.
+    // Idempotent (cheap no-op when the home is already complete).
+    crate::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home")?;
 
     let project_dir = target_dir.to_path_buf();
     let ccteam_dir = project_dir.join(".ccteam");
@@ -364,20 +354,17 @@ pub fn bootstrap_project_at_dir(
     let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
     state.save(&CcteamPaths::project_state_in(&project_dir))?;
 
-    // V0.4.0 F60: the phase-template-driven `enabledPlugins` resolver
-    // (`compute_enabled_plugins` + `load_phase_templates_for_bootstrap`)
-    // was deleted with the rest of the phase machinery. F66 will
-    // reintroduce the plugin enablement set computed from
-    // `workflow.yaml::agents.<role>.executor`. For now we lay down
-    // managed settings (`.claude/settings.local.json`) with an empty
-    // plugin set so the project bootstraps cleanly; user-authored agent
-    // prompts still resolve their plugin surface via the global
-    // `~/.claude/agents/` layer.
-    let enabled_plugins = EnabledPluginsSetting::default();
-
-    // The root is already in hand — render the hook path from IT, never from
-    // `$CCTEAM_HOME` (which may point at a different home entirely).
-    write_project_settings_in(paths, &project_dir, &enabled_plugins)?;
+    // docs-local issue #212 — ccteam writes NO Claude settings for a project.
+    // The `.claude/settings.local.json` hooks block it used to lay down only
+    // served the retired tmux/rmux terminal protocol (the default stream-json
+    // session is hookless), and creating that file for ccteam alone is
+    // exactly what the owner ruled out. A directory that already carries
+    // ccteam's old hooks (a re-bootstrap over an earlier project) gets them
+    // stripped instead; every other key and any user hook survive.
+    crate::tool_surface::remove_ccteam_hooks(
+        &project_dir.join(".claude").join("settings.local.json"),
+        false,
+    )?;
     // v0.8.6 (review-fix #3): no longer stamp `~/.ccteam/templates/`.
     // `HELPER_TEMPLATES` has been empty since V0.5.0 F101, so the writer
     // only ever created an empty `templates/` dir that is *not* in
@@ -1182,65 +1169,96 @@ mod tests {
         );
     }
 
+    /// docs-local issue #212 — creating a project writes no Claude settings:
+    /// no `.claude/settings.local.json` (the hooks it carried only served the
+    /// retired tmux/rmux protocol), so a fresh project has no `.claude/` at all.
     #[test]
-    fn bootstrap_project_settings_routes_through_hook_sh() {
-        // V0.6.1 F139: fresh managed settings render route hook commands
-        // through `~/.ccteam/hooks/hook.sh` (the daemon-aware wrapper)
-        // instead of cold-spawning `ccteam internal hook ...`.
-        //
-        // v0.8.6: managed settings land in `.claude/settings.local.json`
-        // (NOT the user-committed `settings.json`) so ccteam never
-        // dirties the project's checked-in settings.
+    fn bootstrap_project_writes_no_claude_settings() {
+        ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        // CLI-ENVTEST-1: no `CCTEAM_HOME` pin. `bootstrap_project` was already
-        // handed `paths`, and now renders the hook path from it — so this
-        // asserts the real contract (the hook belongs to the root the caller
-        // passed) instead of to whatever the environment happened to say.
-        let expected_hook = paths.hooks_script();
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
 
-        let settings = paths
-            .project_dir("demo")
-            .join(".claude/settings.local.json");
-        let body = std::fs::read_to_string(&settings).unwrap();
-        let v: Value = serde_json::from_str(&body).unwrap();
-        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
+        let claude_dir = paths.project_dir("demo").join(".claude");
         assert!(
-            cmd.starts_with('/'),
-            "settings.local.json hook command must be an absolute path, got: {cmd}",
+            !claude_dir.join("settings.local.json").exists(),
+            "bootstrap must not create .claude/settings.local.json"
         );
         assert!(
-            cmd.contains(expected_hook.to_str().unwrap()),
-            "settings.local.json hook should invoke {}, got: {cmd}",
-            expected_hook.display(),
-        );
-        assert!(
-            cmd.ends_with(" load-context"),
-            "settings.local.json SessionStart[0] should pass `load-context`, got: {cmd}",
-        );
-        assert!(
-            !cmd.contains("__CCTEAM_HOOK_SH__"),
-            "placeholder should be substituted, got: {cmd}",
-        );
-        assert!(
-            !cmd.contains("__CCTEAM_BIN__"),
-            "retired F89 placeholder should not return, got: {cmd}",
+            !claude_dir.exists(),
+            "bootstrap must not create .claude/ for ccteam's sake"
         );
     }
 
-    /// Root-cause regression: a project created via the web / IM /
-    /// daemon path (which all flow through `bootstrap_project_at_dir`)
-    /// writes a `.claude/settings.local.json` SessionStart hook that
-    /// points at `<paths.root>/hooks/hook.sh` — but that dispatcher was
-    /// never materialized on this path, yielding "hook.sh: not found" at
-    /// first launch. `bootstrap_project_at_dir` now calls
-    /// `ensure_ccteam_home` up front, so hook.sh must land + be exec.
+    /// docs-local issue #212 — re-bootstrapping a directory that still carries
+    /// the hooks an earlier ccteam wrote strips exactly those: user keys, a
+    /// user hook in the same event section and `settings.json` survive.
+    #[test]
+    fn bootstrap_project_at_dir_strips_old_ccteam_hooks() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("old-repo");
+        let claude_dir = project_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let hook_sh = paths.hooks_script();
+        let hook_sh = hook_sh.display();
+        let local = claude_dir.join("settings.local.json");
+        std::fs::write(
+            &local,
+            format!(
+                r#"{{
+                  "model": "opus",
+                  "hooks": {{
+                    "SessionStart": [{{"hooks": [
+                      {{"type": "command", "command": "{hook_sh} load-context", "timeout": 5}},
+                      {{"type": "command", "command": "{hook_sh} progress-append session_start", "async": true}}
+                    ]}}],
+                    "Stop": [
+                      {{"hooks": [{{"type": "command", "command": "{hook_sh} progress-append Stop", "async": true}}]}},
+                      {{"hooks": [{{"type": "command", "command": "/usr/bin/notify-send done"}}]}}
+                    ]
+                  }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        let committed = claude_dir.join("settings.json");
+        let committed_body = format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{hook_sh} progress-append Stop"}}]}}]}}}}"#
+        );
+        std::fs::write(&committed, &committed_body).unwrap();
+
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(re-create)", "dev").unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert_eq!(v["model"], "opus", "user key kept");
+        let hooks = v["hooks"].as_object().unwrap();
+        assert!(
+            !hooks.contains_key("SessionStart"),
+            "ccteam-only event pruned"
+        );
+        assert_eq!(
+            v["hooks"]["Stop"],
+            serde_json::json!([{"hooks": [{"type": "command", "command": "/usr/bin/notify-send done"}]}]),
+            "user hook kept, ccteam hook gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&committed).unwrap(),
+            committed_body,
+            "the user's .claude/settings.json is never touched"
+        );
+    }
+
+    /// Every create path (web / IM / daemon all flow through
+    /// `bootstrap_project_at_dir`) leaves a complete ccteam home:
+    /// `ensure_ccteam_home` runs up front, so hook.sh lands + is exec.
     #[test]
     fn bootstrap_project_at_dir_materializes_hook_sh() {
         ensure_isolation();
@@ -1257,7 +1275,7 @@ mod tests {
         let hook_sh = paths.hooks_script();
         assert!(
             hook_sh.exists(),
-            "bootstrap_project_at_dir must materialize {} (the dispatcher the project settings reference)",
+            "bootstrap_project_at_dir must materialize {}",
             hook_sh.display(),
         );
         let body = std::fs::read_to_string(&hook_sh).unwrap();

@@ -192,15 +192,15 @@ impl CcteamPaths {
     }
 
     /// `~/.ccteam/hooks/` — V0.6.1 F139 directory holding the
-    /// `hook.sh` dispatcher (the single shell wrapper every Claude Code
-    /// hook command in a ccteam project invokes). Materialized by
-    /// `ccteam init` and `ccteam doctor --install-hooks`.
+    /// `hook.sh` dispatcher (the single shell wrapper the terminal-protocol
+    /// chat hooks invoke). Materialized by `ensure_ccteam_home`.
     pub fn hooks_dir(&self) -> PathBuf {
         self.root.join("hooks")
     }
 
     /// `~/.ccteam/hooks/hook.sh` — V0.6.1 F139 dispatcher script the
-    /// project-level `.claude/settings.json` hook commands point at. The
+    /// terminal-protocol chat hooks (`claude_tui::ensure_chat_hooks_installed`)
+    /// point at; project creation installs no hooks (docs-local issue #212). The
     /// script POSTs the Claude Code hook stdin to the long-running
     /// daemon's `/internal/hook/:kind[/:action]` route (fast path) and
     /// falls back to `ccteam internal hook ...` when the daemon is
@@ -376,20 +376,13 @@ pub fn canonical_home_dirs() -> &'static [&'static str] {
 ///    `paths.root` (`std::fs::create_dir_all` — a no-op when present).
 /// 2. [`install_hooks`](crate::hooks_dispatcher::install_hooks)
 ///    materializes `~/.ccteam/hooks/hook.sh`, the dispatcher the
-///    project-level `.claude/settings.local.json` SessionStart hook
-///    commands point at. Re-running returns
+///    terminal-protocol chat hooks point at. Re-running returns
 ///    [`InstallHooksAction::Unchanged`](crate::hooks_dispatcher::InstallHooksAction::Unchanged).
 /// 3. Create `~/.ccteam/routing.md` with neutral starter text when absent.
 ///    Existing user content is never overwritten.
 ///
 /// This is the single home-ensure every create/start path calls so the
-/// home is never half-built. Historically only `ccteam init`, the
-/// `chat_register` MCP tool, and `ccteam doctor --install-hooks` ran
-/// `install_hooks`; the web `POST /projects` + IM/web chat create path
-/// (`projects::bootstrap_project_at_dir`) wrote a project settings file
-/// that *references* `hook.sh` without ever materializing it, yielding a
-/// "hook.sh: not found" at the first SessionStart. Calling this from
-/// every create/start path closes that gap.
+/// home is never half-built.
 pub fn ensure_ccteam_home(paths: &CcteamPaths) -> Result<()> {
     for sub in canonical_home_dirs() {
         let dir = paths.root.join(sub);

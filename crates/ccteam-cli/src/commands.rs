@@ -211,6 +211,13 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         target.join(".claude").join("agents").display(),
         project_report.agents_action,
     ));
+    if let Some(entries) = project_report.hooks_stripped {
+        out.push_str(&format!(
+            "  claude hooks     {} (stripped {entries} retired ccteam hook entr{})\n",
+            target.join(".claude").join("settings.local.json").display(),
+            if entries == 1 { "y" } else { "ies" },
+        ));
+    }
     out.push_str(&format!(
         "  config.yaml      {} (upserted)\n",
         ccteam_core::ccteam_config_path(&paths.root).display(),
@@ -315,6 +322,10 @@ struct ProjectInstallReport {
     state_action: &'static str,
     workflow_action: &'static str,
     agents_action: &'static str,
+    /// Old ccteam hook entries a refresh stripped from
+    /// `.claude/settings.local.json` (docs-local issue #212); `None` when
+    /// there was nothing to strip.
+    hooks_stripped: Option<usize>,
 }
 
 impl ProjectInstallReport {
@@ -363,6 +374,7 @@ fn install_project_at(
     let state_action: &'static str;
     let workflow_action: &'static str;
     let agents_action: &'static str;
+    let mut hooks_stripped = None;
     let final_team: String;
     let owner_final: Option<String>;
 
@@ -424,6 +436,18 @@ fn install_project_at(
         } else {
             "preserved"
         };
+
+        // docs-local issue #212 — re-running `ccteam init` is how an existing
+        // project sheds the Claude Code hooks earlier ccteam versions wrote
+        // (a fresh install gets the same scrub inside `bootstrap_project_at_dir`).
+        let scrub = ccteam_core::remove_ccteam_hooks(
+            &target.join(".claude").join("settings.local.json"),
+            false,
+        )?;
+        use ccteam_core::CcteamHookScrubAction as A;
+        if let A::Removed { entries } | A::RemovedNowEmpty { entries } = scrub.action {
+            hooks_stripped = Some(entries);
+        }
     }
 
     Ok(ProjectInstallReport {
@@ -434,6 +458,7 @@ fn install_project_at(
         state_action,
         workflow_action,
         agents_action,
+        hooks_stripped,
     })
 }
 
@@ -3664,16 +3689,16 @@ fn purge_imd_registry_for_slug(
 /// Helper for `run_remove --purge` — deletes exactly ccteam's own
 /// footprint inside `<project>/` (or, under `--dry-run`, just records
 /// the planned step). A project's on-disk ccteam footprint is `.ccteam/`
-/// (state.json + workflow.yaml) plus ccteam's hook section inside
+/// (state.json + workflow.yaml) plus any ccteam hook entries an earlier
+/// version (or a terminal-protocol session) left inside
 /// `.claude/settings.local.json`. (ccteam seeds NO role, so there is
 /// no ccteam-owned persona to purge.)
 ///
 /// **DELETE** (ccteam-managed only):
 /// - `<project>/.ccteam/` — state.json + workflow.yaml live here (W2).
-/// - ccteam's chat-progress + AskUserQuestion hook entries inside
-///   `<project>/.claude/settings.local.json` (surgically, via
-///   [`ccteam_core::remove_chat_hooks`]). If stripping them leaves the
-///   file an empty object, the now-vestigial file is deleted.
+/// - ccteam's own hook entries inside `<project>/.claude/settings.local.json`
+///   (surgically, via [`ccteam_core::remove_ccteam_hooks`]). If stripping
+///   them leaves the file an empty object, the now-vestigial file is deleted.
 ///
 /// **KEEP (never touched):**
 /// - ALL of `<project>/.claude/agents/*.md` — every role file is a user
@@ -3715,8 +3740,8 @@ fn purge_project_managed_paths(
     // removed surgically so any operator-authored keys/hooks survive.
     // If the strip empties the file, delete the vestigial object.
     let settings_local = project_dir.join(".claude").join("settings.local.json");
-    let scrub = ccteam_core::remove_chat_hooks(&settings_local, dry_run)?;
-    use ccteam_core::ChatHookScrubAction as A;
+    let scrub = ccteam_core::remove_ccteam_hooks(&settings_local, dry_run)?;
+    use ccteam_core::CcteamHookScrubAction as A;
     match scrub.action {
         A::NotFound | A::NoChangeNeeded => {}
         A::WouldRemove { entries } => {
@@ -3734,9 +3759,8 @@ fn purge_project_managed_paths(
             ));
         }
         A::RemovedNowEmpty { entries } => {
-            // The file existed only to carry ccteam's hooks — delete it.
-            std::fs::remove_file(&settings_local)
-                .with_context(|| format!("rm {}", settings_local.display()))?;
+            // The file existed only to carry ccteam's hooks — the scrub
+            // deleted it.
             report.steps.push(format!(
                 "stripped {entries} ccteam hook entr{} and removed now-empty \
                  .claude/settings.local.json ({})",
@@ -4638,13 +4662,10 @@ mod tests {
             !body.contains("mode: agent-team"),
             "default workflow.yaml must NOT declare agent-team mode",
         );
-        // No F94 hooks in the default (managed) settings layer. v0.8.6
-        // W2b — ccteam writes to settings.local.json, not settings.json.
-        let settings_body =
-            std::fs::read_to_string(target.join(".claude").join("settings.local.json")).unwrap();
+        // docs-local issue #212 — init writes no Claude settings at all.
         assert!(
-            !settings_body.contains("TeammateIdle"),
-            "default settings.local.json must NOT include team_* hooks",
+            !target.join(".claude").join("settings.local.json").exists(),
+            "init must NOT create .claude/settings.local.json",
         );
     }
 
@@ -4691,6 +4712,50 @@ mod tests {
             std::fs::read_to_string(target.join(".claude").join("agents").join("cto.md")).unwrap(),
             "USER AGENT\n"
         );
+    }
+
+    /// docs-local issue #212 — re-running `ccteam init` on a project an
+    /// earlier version initialized strips the Claude Code hooks it wrote into
+    /// `.claude/settings.local.json`, keeping every other key; a file left
+    /// holding nothing is removed.
+    #[test]
+    fn run_init_refresh_strips_old_ccteam_hooks() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("old-hooks");
+        let opts = || InitOptions {
+            install_in: Some(target.clone()),
+            ..InitOptions::default()
+        };
+        run_init(&paths, opts()).unwrap();
+        let local = target.join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        let hook_sh = paths.hooks_script();
+        let hook_sh = hook_sh.display();
+        std::fs::write(
+            &local,
+            format!(
+                r#"{{"env":{{"CCTEAM_HOME":"/x"}},"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{hook_sh} progress-append Stop","async":true}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        run_init(&paths, opts()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"env": {"CCTEAM_HOME": "/x"}}));
+
+        // Only ccteam hooks left → the file goes away.
+        std::fs::write(
+            &local,
+            format!(
+                r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{hook_sh} progress-append Stop"}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        run_init(&paths, opts()).unwrap();
+        assert!(!local.exists(), "hooks-only settings.local.json removed");
     }
 
     /// `--force` re-runs overwrite user files. workflow.yaml lives in
