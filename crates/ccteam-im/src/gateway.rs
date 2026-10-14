@@ -2604,7 +2604,9 @@ pub struct DetachedBody {
 #[derive(Debug, Clone)]
 enum BodyEnd {
     /// The kill is running; nothing about this body may be reported yet.
-    InProgress,
+    /// `token` names this kill, so only it writes the outcome; `since` lets a
+    /// hand-over that never comes (its task gone) age into `Failed`.
+    InProgress { token: u64, since: Instant },
     /// The body is gone; what it left running, for the report.
     Ended(Vec<session_body::Orphan>),
     /// The kill failed; the mark must be lifted and the body watched again.
@@ -4518,13 +4520,13 @@ impl Gateway {
         let sid_owned = sid.to_string();
         let notify = Arc::clone(&self.body_watch_notify);
         let ends = Arc::clone(&self.body_ends);
-        Self::set_body_end(&ends, sid, BodyEnd::InProgress);
+        let token = Self::start_body_end(&ends, sid);
         tokio::spawn(async move {
             // A failure is handed over as `Failed`: the next reader lifts the
             // mark, or every later /interrupt would be a no-op and a natural
             // exit would be recorded as interrupted.
             if let Err(error) =
-                Self::end_body_process(body, sid_owned.clone(), "interrupted", ends).await
+                Self::end_body_process(body, sid_owned.clone(), "interrupted", ends, token).await
             {
                 tracing::warn!(session = %sid_owned, %error, "ccteam-im: could not end a detached body on interrupt");
             }
@@ -4538,8 +4540,27 @@ impl Gateway {
         let g = gateway.lock().await;
         g.body_ends
             .lock()
-            .map(|map| matches!(map.get(sid), Some(BodyEnd::InProgress)))
+            .map(|map| matches!(map.get(sid), Some(BodyEnd::InProgress { .. })))
             .unwrap_or(false)
+    }
+
+    /// How long a kill may stay `InProgress` before its hand-over is treated
+    /// as lost (a kill takes at most the SIGTERM grace plus the SIGKILL wait).
+    const BODY_END_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Mark a kill of `sid`'s body as started; returns its token.
+    fn start_body_end(ends: &Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>, sid: &str) -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self::set_body_end(
+            ends,
+            sid,
+            BodyEnd::InProgress {
+                token,
+                since: Instant::now(),
+            },
+        );
+        token
     }
 
     fn set_body_end(
@@ -4560,7 +4581,14 @@ impl Gateway {
             Ok(mut map) => {
                 let failed: Vec<String> = map
                     .iter()
-                    .filter(|(_, end)| matches!(end, BodyEnd::Failed))
+                    .filter(|(_, end)| match end {
+                        BodyEnd::Failed => true,
+                        // A hand-over that never came is a failed end.
+                        BodyEnd::InProgress { since, .. } => {
+                            since.elapsed() >= Self::BODY_END_STALE
+                        }
+                        BodyEnd::Ended(_) => false,
+                    })
                     .map(|(sid, _)| sid.clone())
                     .collect();
                 for sid in &failed {
@@ -4593,16 +4621,22 @@ impl Gateway {
         sid: String,
         why: &'static str,
         ends: Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
+        token: u64,
     ) -> Result<()> {
         let outcome = Self::run_body_end(body, &sid, why).await;
-        Self::set_body_end(
-            &ends,
-            &sid,
-            match &outcome {
-                Ok(left) => BodyEnd::Ended(left.clone()),
-                Err(_) => BodyEnd::Failed,
-            },
-        );
+        // Only this kill's own entry: a stale or superseded kill must not
+        // leave a result for a later incarnation of the sid.
+        if let Ok(mut map) = ends.lock() {
+            if matches!(map.get(&sid), Some(BodyEnd::InProgress { token: t, .. }) if *t == token) {
+                map.insert(
+                    sid.clone(),
+                    match &outcome {
+                        Ok(left) => BodyEnd::Ended(left.clone()),
+                        Err(_) => BodyEnd::Failed,
+                    },
+                );
+            }
+        }
         outcome.map(|_| ())
     }
 
@@ -4619,6 +4653,14 @@ impl Gateway {
             .contains(&pid)
         {
             return Err(anyhow!("test: ending body pid {pid} failed"));
+        }
+        #[cfg(test)]
+        if tests::SLOW_BODY_END_PIDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&pid)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         let sid_for_task = sid.to_string();
         let left = tokio::task::spawn_blocking(move || {
@@ -4649,7 +4691,7 @@ impl Gateway {
         sid: &str,
         why: &'static str,
     ) -> Result<bool> {
-        let (body, ends) = {
+        let (body, ends, token) = {
             let mut g = gateway.lock().await;
             g.settle_body_ends();
             let ends = Arc::clone(&g.body_ends);
@@ -4663,10 +4705,21 @@ impl Gateway {
             }
             detached.ending = Some(why);
             let body = detached.body.clone();
-            Self::set_body_end(&ends, sid, BodyEnd::InProgress);
-            (body, ends)
+            let token = Self::start_body_end(&ends, sid);
+            (body, ends, token)
         };
-        let ended = Self::end_body_process(body, sid.to_string(), why, ends).await;
+        // The kill and its hand-over run on their own task: a caller that
+        // goes away mid-kill (a web client disconnecting drops this future)
+        // must not leave the hand-over unwritten and the sid stuck.
+        let ended = tokio::spawn(Self::end_body_process(
+            body,
+            sid.to_string(),
+            why,
+            ends,
+            token,
+        ))
+        .await
+        .unwrap_or_else(|join| Err(anyhow!("body end task failed: {join}")));
         let mut g = gateway.lock().await;
         if ended.is_err() {
             g.settle_body_ends();
@@ -4888,7 +4941,7 @@ impl Gateway {
             // kill that has not handed over yet is waited for (next tick).
             let end = match g.body_ends.lock() {
                 Ok(mut map) => match map.get(&d.sid) {
-                    Some(BodyEnd::InProgress) => return,
+                    Some(BodyEnd::InProgress { .. }) => return,
                     _ => map.remove(&d.sid),
                 },
                 Err(_) => None,
@@ -4955,9 +5008,16 @@ impl Gateway {
             g.drain_and_dispatch_pending_turns(&d.sid).await;
         } else if let Some(error) = failure {
             // The process is gone but the session did not come back: whoever
-            // was promised it would must hear why. The queued turns stay in
-            // the FIFO and go out, in order, ahead of the next message that
-            // reaches this sid (see `submit_resolved`).
+            // was promised it would must hear why. A human's queued turns stay
+            // in the FIFO and go out, in order, ahead of the next message that
+            // reaches this sid (see `submit_resolved`). A delegated task is
+            // withdrawn instead and its parent told so below: the parent's own
+            // retry is then the only run of it, never a second, late one.
+            let withdrawn = crate::pending_turns::withdraw_delegated_turns(&d.cwd, &d.sid)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(session = %d.sid, %error, "pending_turns: could not withdraw delegated tasks");
+                    Vec::new()
+                });
             let queued = crate::pending_turns::pending_turn_count(&d.cwd, &d.sid);
             let Ok(meta) = ccteam_harness::read_session_meta(&d.cwd, &d.sid) else {
                 return;
@@ -4988,8 +5048,8 @@ impl Gateway {
             });
             // A delegation parent waiting on a task queued here would wait
             // forever: answer it through the normal completion path, as an
-            // honest failure. The task line itself stays queued.
-            if let Some(dtx) = g.delegation_tx.clone() {
+            // honest failure. Its task line was withdrawn above.
+            if let Some(dtx) = g.delegation_tx.clone().filter(|_| !withdrawn.is_empty()) {
                 let turn_id = format!(
                     "{sid}-resume-failed-{}",
                     chrono::Utc::now().timestamp_millis()
@@ -5003,7 +5063,7 @@ impl Gateway {
                         exec_turn_id: None,
                         tail: format!(
                             "{sid} could not be resumed after its old process ended: {error}. \
-                             The task is kept queued and runs when {sid} is next resumed."
+                             The task was withdrawn and did not run; send it again to retry."
                         ),
                         vendor: meta.vendor,
                         host: meta.host.clone(),
@@ -21107,6 +21167,9 @@ mod tests {
     /// signal. Keyed by pid so parallel tests never see each other's.
     pub(super) static FAIL_BODY_END_PIDS: std::sync::Mutex<Vec<u32>> =
         std::sync::Mutex::new(Vec::new());
+    /// Body pids whose end takes 300 ms, so a test can drop its caller mid-kill.
+    pub(super) static SLOW_BODY_END_PIDS: std::sync::Mutex<Vec<u32>> =
+        std::sync::Mutex::new(Vec::new());
 
     use super::*;
     use ccteam_harness::{
@@ -23095,7 +23158,7 @@ mod tests {
         let mut events = restarted.subscribe_events();
         restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
         restarted.detached.get_mut(&sid).unwrap().ending = Some("interrupted");
-        Gateway::set_body_end(&restarted.body_ends, &sid, BodyEnd::InProgress);
+        Gateway::start_body_end(&restarted.body_ends, &sid);
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
         // The kill took the body, but has not handed over.
         body_gone(&mut child);
@@ -23127,6 +23190,75 @@ mod tests {
         assert!(gateway.lock().await.body_ends.lock().unwrap().is_empty());
     }
 
+    /// A caller that goes away mid-kill (a web client disconnecting drops the
+    /// REST future) must not strand the sid: the kill and its hand-over run
+    /// on their own task, the watcher still resumes the session and delivers
+    /// its queue (checker C1). A hand-over that never comes ages out.
+    #[tokio::test]
+    async fn a_dropped_interrupt_caller_does_not_strand_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        let pid = child.id();
+        SLOW_BODY_END_PIDS.lock().unwrap().push(pid);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Gateway::interrupt_session_shared(&gateway, &sid),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller went away mid-kill");
+        let started = std::time::Instant::now();
+        while !gateway.lock().await.is_session_live(&sid) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the session must come back without its caller"
+            );
+            let _ = child.try_wait();
+            Gateway::body_watch_tick(&gateway).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        SLOW_BODY_END_PIDS.lock().unwrap().retain(|p| *p != pid);
+        assert_eq!(submitted_texts(&fake), vec!["hi"]);
+
+        // A hand-over that never comes is settled as a failed end.
+        let mut g = gateway.lock().await;
+        g.detached.insert(
+            "s99".into(),
+            DetachedBody {
+                sid: "s99".into(),
+                slug: "alpha".into(),
+                cwd: project_dir.clone(),
+                body: ccteam_harness::execution::session_body::SessionBody {
+                    pid: 0,
+                    fingerprint: String::new(),
+                    adapter: "fake".into(),
+                    recorded_at: String::new(),
+                },
+                since: chrono::Utc::now(),
+                reason: "daemon_restart",
+                ending: Some("interrupted"),
+            },
+        );
+        Gateway::set_body_end(
+            &g.body_ends,
+            "s99",
+            BodyEnd::InProgress {
+                token: 0,
+                since: Instant::now()
+                    .checked_sub(Gateway::BODY_END_STALE)
+                    .expect("a monotonic clock older than 30s"),
+            },
+        );
+        g.settle_body_ends();
+        assert_eq!(g.detached.get("s99").unwrap().ending, None);
+        assert!(g.body_ends.lock().unwrap().get("s99").is_none());
+    }
+
     /// When the session does not come back after its old process ended, the
     /// people promised a resume are told why, the queued turns are kept, and
     /// the next message delivers them FIRST, in order — never ahead of them,
@@ -23145,6 +23277,18 @@ mod tests {
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         restarted.set_delegation_notifier_tx(dtx);
         restarted.submit_to_sid(&sid, "Q1".into()).await.unwrap();
+        // A parent's delegated task, queued behind the same body: withdrawn
+        // when the parent is told the resume failed, so it never runs late.
+        crate::pending_turns::enqueue_pending_turn(
+            &project_dir,
+            &sid,
+            "TASK",
+            Some("mcp".into()),
+            false,
+            TurnIntent::from_origin(TurnOrigin::Internal).pending(),
+            Some("req-7".into()),
+        )
+        .unwrap();
         restarted.submit_to_sid(&sid, "Q2".into()).await.unwrap();
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
 
@@ -23158,7 +23302,7 @@ mod tests {
         assert_eq!(
             crate::pending_turns::pending_turn_count(&project_dir, &sid),
             2,
-            "the queue is kept"
+            "the human lines are kept; the delegated task is withdrawn"
         );
         let mut told = false;
         while let Ok(event) = events.try_recv() {

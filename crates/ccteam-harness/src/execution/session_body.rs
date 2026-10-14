@@ -195,6 +195,10 @@ pub fn body_is_alive(body: &SessionBody, sid: &str) -> bool {
 /// `Ok(true)` if the body is gone afterwards.
 pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool> {
     if !body_is_alive(body, sid) {
+        // The body is gone — another end (an `/interrupt`) may have killed
+        // just it — but its group may not be: a stop still ends what the
+        // body started.
+        sweep_group_left_by(body.pid, sid)?;
         return Ok(true);
     }
     let group = leads_own_group(body.pid);
@@ -219,6 +223,39 @@ pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool>
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(!body_is_alive(body, sid))
+}
+
+/// SIGKILL the process group a dead body led, when a member is still
+/// running AND names this sid in its environment (the body's children
+/// inherit `CCTEAM_CHAT_SID`). A group id cannot be reused while a member
+/// lives; the environment check keeps a group that merely shares the number
+/// — the body's pid recycled as another group's leader — untouched.
+fn sweep_group_left_by(pgid: u32, sid: &str) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Ok(());
+    };
+    let ours = entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let in_group = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                    .and_then(|g| g.parse::<u32>().ok())
+            })
+            == Some(pgid);
+        in_group && environ_names_sid(pid, sid) == Some(true)
+    });
+    if ours {
+        signal_group(pgid, libc::SIGKILL)?;
+    }
+    Ok(())
 }
 
 /// Signal the body, as a group when it leads one.
@@ -341,28 +378,52 @@ fn cmdline_argv(pid: u32) -> Vec<String> {
 pub fn redact_cmdline(argv: &[String], home: Option<&str>) -> String {
     use std::sync::OnceLock;
     // (pattern, match on the ASCII-lowercased text?). Each pattern names the
-    // secret part `v`; only that is replaced. ASCII lowercasing keeps byte
+    // secret part `v` (or `v2`/`v3` for the quoted alternatives); only that
+    // is replaced. ASCII lowercasing keeps byte
     // offsets, so a match on the lowercased copy maps onto the original.
     static RULES: OnceLock<Vec<(regex::Regex, bool)>> = OnceLock::new();
     let rules = RULES.get_or_init(|| {
-        const SENSITIVE: &str =
-            "[a-z0-9_.-]*(?:token|secret|password|passwd|key|auth|credential)[a-z0-9_.-]*";
+        // Key names that mark their value secret; `pwd` only as a whole word.
+        const SENSITIVE: &str = "(?:[a-z0-9_.-]*(?:token|secret|password|passwd|pass|key|auth|credential)[a-z0-9_.-]*|pwd)";
+        // A value: single-quoted, double-quoted, or bare.
+        const VALUE: &str = r#"(?:'(?P<v>[^']*)'|"(?P<v2>[^"]*)"|(?P<v3>[^ \t'"]+))"#;
         [
-            (r#"bearer[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
-            (r#"://(?P<v>[^/ \t:@]+:[^/ \t@]+)@"#.to_string(), false),
+            // An HTTP auth scheme's credentials.
+            (r#"(?:bearer|basic)[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
+            // URL userinfo, the user possibly empty (`redis://:pw@h`).
+            (r#"://(?P<v>[^/ \t@]*:[^/ \t@]+)@"#.to_string(), false),
+            // KEY=value, --key=value.
+            (format!(r#"(?:^|[^a-z0-9_.-])-{{0,2}}{SENSITIVE}={VALUE}"#), true),
+            // --key value.
             (
-                format!(r#"(?:^|[^a-z0-9_.-])-{{0,2}}{SENSITIVE}=(?P<v>[^ \t'"]+)"#),
+                format!(
+                    r#"(?:^|[ \t])--?{SENSITIVE}[ \t]+(?:'(?P<v>[^']*)'|"(?P<v2>[^"]*)"|(?P<v3>[^ \t'"-][^ \t'"]*))"#
+                ),
                 true,
             ),
+            // A header or a JSON member: `X-Api-Key: v`, `{"token":"v"}`.
             (
-                format!(r#"(?:^|[ \t])--?{SENSITIVE}[ \t]+(?P<v>[^ \t'"-][^ \t'"]*)"#),
+                r#"(?:^|[^a-z0-9_-])[a-z0-9_-]*(?:token|secret|key|auth|password|pass)[a-z0-9_-]*"?[ \t]*:[ \t]*"?(?:(?:bearer|basic)[ \t]+)?(?P<v>[^ \t'",}]+)"#
+                    .to_string(),
                 true,
             ),
+            // `curl -u user:pass`.
+            (r#"(?:^|[ \t])-u[ \t]+[^ \t:'"/]+:(?P<v>[^ \t'"/][^ \t'"]*)"#.to_string(), false),
+            // mysql / mariadb tools: `-pSECRET`.
+            (
+                r#"(?:mysql|mariadb|mysqldump|mysqladmin)(?:[ \t][^\n]*?)?[ \t]-p(?P<v>[^ \t'"]+)"#
+                    .to_string(),
+                true,
+            ),
+            // `sshpass -p SECRET`.
+            (r#"sshpass[ \t]+-p[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
+            // Values with a known token prefix.
             (
                 r"(?:^|[^A-Za-z0-9_])(?P<v>(?:sk-|ghp_|gho_|github_pat_|xox[abposr]-|AKIA)[A-Za-z0-9_-]+)"
                     .to_string(),
                 false,
             ),
+            // Anything long enough to be a key.
             (r"(?P<v>[A-Za-z0-9+/=_-]{32,})".to_string(), false),
         ]
         .into_iter()
@@ -383,7 +444,13 @@ pub fn redact_cmdline(argv: &[String], home: Option<&str>) -> String {
         let mut out = String::with_capacity(cmd.len());
         let mut last = 0;
         for caps in rule.captures_iter(&haystack) {
-            let Some(v) = caps.name("v") else { continue };
+            let Some(v) = caps
+                .name("v")
+                .or_else(|| caps.name("v2"))
+                .or_else(|| caps.name("v3"))
+            else {
+                continue;
+            };
             out.push_str(&cmd[last..v.start()]);
             out.push_str("***");
             last = v.end();
@@ -888,6 +955,43 @@ mod tests {
                 "sh ~/bin/x ***",
             ),
             (&["echo", "a`b", "c\u{7}d"], "echo a'b c d"),
+            (
+                &["psql", "--password='hunter2'", "db"],
+                "psql --password='***' db",
+            ),
+            (
+                &["TOKEN=\"abc123\"", "npm", "start"],
+                "TOKEN=\"***\" npm start",
+            ),
+            (&["tool", "--token", "\"abc\""], "tool --token \"***\""),
+            (
+                &["curl", "-H", "'X-Api-Key: abc123'"],
+                "curl -H 'X-Api-Key: ***'",
+            ),
+            (
+                &["curl", "-H", "'Authorization: Basic dXNlcjpwYXNz'"],
+                "curl -H 'Authorization: Basic ***'",
+            ),
+            (
+                &["echo", "{\"token\":\"abc123\"}"],
+                "echo {\"token\":\"***\"}",
+            ),
+            (&["curl", "-u", "admin:s3cret", "h"], "curl -u admin:*** h"),
+            (&["mysql", "-u", "root", "-phunter2"], "mysql -u root -p***"),
+            (
+                &["sshpass", "-p", "hunter2", "ssh", "h"],
+                "sshpass -p *** ssh h",
+            ),
+            (&["env", "DB_PASS=hunter2", "x"], "env DB_PASS=*** x"),
+            (&["tool", "--pass", "x"], "tool --pass ***"),
+            (
+                &["redis-cli", "-u", "redis://:pw@h"],
+                "redis-cli -u redis://***@h",
+            ),
+            (
+                &["app", "--port", "3000", "PWD=/x"],
+                "app --port 3000 PWD=***",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(redact_cmdline(&argv(input), home), *want, "{input:?}");
@@ -908,5 +1012,54 @@ mod tests {
         assert!(!shown.contains("/home/alice"));
         let long = argv(&["x".repeat(200).as_str()]);
         assert!(redact_cmdline(&long, None).chars().count() <= ORPHAN_CMD_MAX + 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_after_the_body_already_died_still_ends_its_group() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 63 & echo $! > {}; wait", pidfile.display()))
+            .env(BODY_SID_ENV, "s16")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s16", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s16").unwrap();
+        // An /interrupt's SIGKILL got the body first.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(kill_body(&body, "s16").unwrap().is_some());
+        reaper.join().unwrap().unwrap();
+        assert!(process_exists(bg));
+        // The stop that took over still ends what the body started.
+        assert!(terminate(&body, "s16", Duration::from_millis(200)).unwrap());
+        let started = Instant::now();
+        while process_exists(bg)
+            && !process_is_zombie(bg)
+            && started.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_exists(bg) || process_is_zombie(bg),
+            "the group was swept"
+        );
     }
 }
