@@ -17,9 +17,22 @@ use std::time::Duration;
 
 use futures::FutureExt;
 
-/// Pause before a panicked loop is restarted, so a loop that panics on every
-/// pass cannot spin.
-const RESTART_BACKOFF: Duration = Duration::from_secs(1);
+/// How a panicked loop is restarted: after `initial`, doubling for each
+/// panic in a row up to `max`, so a loop that panics on every pass neither
+/// spins nor floods the log (#210 began with a full log disk). A run that
+/// lasted `healthy` before panicking starts the doubling over.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    initial: Duration,
+    max: Duration,
+    healthy: Duration,
+}
+
+const RESTART_BACKOFF: Backoff = Backoff {
+    initial: Duration::from_secs(1),
+    max: Duration::from_secs(60),
+    healthy: Duration::from_secs(300),
+};
 
 /// Run one item of `task`'s work; a panic is logged at error (with `item`
 /// naming what was being processed) and swallowed. `None` = it panicked.
@@ -49,18 +62,23 @@ where
     supervise_loop_with_backoff(task, RESTART_BACKOFF, make).await;
 }
 
-async fn supervise_loop_with_backoff<F, Fut>(task: &'static str, backoff: Duration, mut make: F)
+async fn supervise_loop_with_backoff<F, Fut>(task: &'static str, policy: Backoff, mut make: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()>,
 {
+    let mut backoff = policy.initial;
     loop {
+        let started = tokio::time::Instant::now();
         match std::panic::AssertUnwindSafe(make()).catch_unwind().await {
             Ok(()) => {
                 tracing::error!(task, "ccteam-im: a long-lived task exited");
                 return;
             }
             Err(panic) => {
+                if started.elapsed() >= policy.healthy {
+                    backoff = policy.initial;
+                }
                 tracing::error!(
                     task,
                     panic = panic_message(panic.as_ref()),
@@ -68,6 +86,7 @@ where
                     "ccteam-im: a long-lived task panicked; restarting it"
                 );
                 tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(policy.max);
             }
         }
     }
@@ -96,13 +115,19 @@ mod tests {
         assert_eq!(panicked, None);
     }
 
+    const FAST: Backoff = Backoff {
+        initial: Duration::from_millis(1),
+        max: Duration::from_millis(1),
+        healthy: Duration::from_secs(300),
+    };
+
     /// A loop that panics is run again (here: twice), and the supervisor
     /// returns once the loop itself returns.
     #[tokio::test]
     async fn supervise_loop_restarts_a_panicked_loop() {
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&runs);
-        supervise_loop_with_backoff("t", Duration::from_millis(1), move || {
+        supervise_loop_with_backoff("t", FAST, move || {
             let counted = Arc::clone(&counted);
             async move {
                 if counted.fetch_add(1, Ordering::SeqCst) < 2 {
@@ -112,6 +137,43 @@ mod tests {
         })
         .await;
         assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// The pauses between restarts of the production policy: doubling from
+    /// 1s, capped at 60s, and back to 1s after a run that stayed up for the
+    /// healthy window. Paused clock: the sleeps cost no wall time.
+    #[tokio::test(start_paused = true)]
+    async fn restart_backoff_doubles_to_a_cap_and_resets_after_a_healthy_run() {
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&starts);
+        let healthy = RESTART_BACKOFF.healthy;
+        supervise_loop_with_backoff("t", RESTART_BACKOFF, move || {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let run = {
+                    let mut starts = recorded.lock().unwrap();
+                    starts.push(tokio::time::Instant::now());
+                    starts.len()
+                };
+                match run {
+                    // Run 9 stays up for the healthy window, then panics.
+                    9 => {
+                        tokio::time::sleep(healthy).await;
+                        panic!("late")
+                    }
+                    11 => {}
+                    _ => panic!("pass {run}"),
+                }
+            }
+        })
+        .await;
+        let starts = starts.lock().unwrap();
+        let gaps: Vec<u64> = starts
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_secs())
+            .collect();
+        let up = healthy.as_secs();
+        assert_eq!(gaps, vec![1, 2, 4, 8, 16, 32, 60, 60, up + 1, 2]);
     }
 
     #[test]
