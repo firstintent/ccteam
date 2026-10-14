@@ -28,11 +28,15 @@
 //! - Same-uid soft identity, like every other rung: a same-uid process can
 //!   forge a `body.json`. What this prevents is a *misattribution by ccteam
 //!   itself* (two bodies for one sid), not an attack.
-//! - [`terminate`] exists for EXPLICIT user stops (`/stop`, `agent_stop`,
-//!   project stop). [`kill_body`] ends the PROCESS of a detached body whose
-//!   session is wanted again (`/interrupt`, or a queued turn behind a body
-//!   that is idle or stalled) and leaves the session — sid, ledger, focus —
-//!   alone (AGENTS.md §三 "kill 的是进程，不是会话").
+//! - [`terminate`] ends a body's PROCESS GROUP (the body and every
+//!   background process it started — bodies are spawned as group leaders):
+//!   on an EXPLICIT user stop (`/stop`, `agent_stop`, project stop), a user
+//!   `/interrupt`, or when a turn queued behind a detached body that is idle
+//!   or stalled has to reach the session. Ending the process is never ending
+//!   the session — sid, ledger and focus stay (AGENTS.md §三 "kill 的是进程,
+//!   不是会话"). A body that is not its own group leader (spawned by an
+//!   older build, inside the daemon's group) gets only its own pid signalled:
+//!   ccteam never signals a group it did not create.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -178,26 +182,31 @@ pub fn body_is_alive(body: &SessionBody, sid: &str) -> bool {
     }
 }
 
-/// Terminate a body that a user EXPLICITLY asked to stop: SIGTERM, wait up to
-/// `grace`, then SIGKILL. Each signal re-verifies the fingerprint first so a
-/// pid recycled mid-call is never touched. Returns `Ok(true)` if the process
-/// is gone afterwards.
+/// End a body and the background processes it started: SIGTERM, wait up to
+/// `grace` for the body to go, then SIGKILL. Each signal re-verifies the
+/// fingerprint first so a pid recycled mid-call is never touched, and goes to
+/// the body's process group when the body leads its own group (see the
+/// module doc) — `claude` answers SIGTERM by ending its background tasks
+/// itself, and the group SIGKILL sweeps whatever ignored that, so no orphaned
+/// dev server is left holding a port the resumed session needs. Returns
+/// `Ok(true)` if the body is gone afterwards.
 pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool> {
     if !body_is_alive(body, sid) {
         return Ok(true);
     }
-    signal(body.pid, libc::SIGTERM)?;
+    let group = leads_own_group(body.pid);
+    signal_body(body.pid, group, libc::SIGTERM)?;
     let started = Instant::now();
-    while started.elapsed() < grace {
-        if !body_is_alive(body, sid) {
-            return Ok(true);
-        }
+    while started.elapsed() < grace && body_is_alive(body, sid) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    if !body_is_alive(body, sid) {
-        return Ok(true);
+    if body_is_alive(body, sid) {
+        signal_body(body.pid, group, libc::SIGKILL)?;
+    } else if group {
+        // The leader is gone; sweep group members that outlived it. The
+        // group id cannot be reused while any member is alive.
+        signal_group(body.pid, libc::SIGKILL)?;
     }
-    signal(body.pid, libc::SIGKILL)?;
     // SIGKILL is not instantaneous; give the kernel a moment to reap.
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
@@ -209,27 +218,55 @@ pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool>
     Ok(!body_is_alive(body, sid))
 }
 
-/// End a detached body's process and NOTHING else: one SIGKILL to the
-/// verified pid, then wait for it to go. Unlike [`terminate`], this gives
-/// the vendor no chance to clean up — on purpose. `claude` answers SIGTERM by
-/// killing every background task it started (measured, 2.1.296), and those
-/// are the user's work: a dev server, a stack, a job scheduled to run later.
-/// A SIGKILL leaves them running, reparented to init; ccteam signals only the
-/// one process it recorded. Callers use it only once the body has stopped
-/// writing, so no transcript line is cut. `Ok(true)` when the body is gone.
-pub fn kill_body(body: &SessionBody, sid: &str) -> Result<bool> {
-    if !body_is_alive(body, sid) {
-        return Ok(true);
+/// Signal the body, as a group when it leads one.
+fn signal_body(pid: u32, group: bool, sig: libc::c_int) -> Result<()> {
+    if group {
+        signal_group(pid, sig)
+    } else {
+        signal(pid, sig)
     }
-    signal(body.pid, libc::SIGKILL)?;
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
-        if !body_is_alive(body, sid) {
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(50));
+}
+
+/// True iff `pid` is the leader of its own process group (pgid == pid).
+#[cfg(unix)]
+fn leads_own_group(pid: u32) -> bool {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getpgid(2) reads a process attribute; no memory is touched.
+    let pgid = unsafe { libc::getpgid(raw) };
+    pgid == raw
+}
+
+#[cfg(not(unix))]
+fn leads_own_group(_pid: u32) -> bool {
+    false
+}
+
+/// kill(2) to the process group `pgid` (ESRCH — the group is gone — is
+/// success).
+#[cfg(unix)]
+fn signal_group(pgid: u32, sig: libc::c_int) -> Result<()> {
+    let raw = libc::pid_t::try_from(pgid).context("pgid out of range")?;
+    if raw <= 1 {
+        anyhow::bail!("refusing to signal process group {raw}");
     }
-    Ok(!body_is_alive(body, sid))
+    // SAFETY: kill(2) on a group this module verified it leads; the return
+    // value reports failure, no memory is touched.
+    let rc = unsafe { libc::kill(-raw, sig) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err).with_context(|| format!("signal {sig} to body process group {pgid}"))
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pgid: u32, _sig: i32) -> Result<()> {
+    anyhow::bail!("session bodies are only managed on Unix")
 }
 
 #[cfg(unix)]
@@ -476,13 +513,20 @@ mod tests {
     }
 
     #[test]
-    fn kill_body_ends_the_body_and_leaves_its_background_children() {
+    fn terminate_ends_a_group_leader_body_with_its_background_children() {
+        use std::os::unix::process::CommandExt;
         let tmp = tempfile::tempdir().unwrap();
         let pidfile = tmp.path().join("bg.pid");
+        // A body that leads its own group and started a background process
+        // that ignores SIGTERM (an orphan-to-be dev server).
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(format!("sleep 60 & echo $! > {}; wait", pidfile.display()))
+            .arg(format!(
+                "sh -c 'trap \"\" TERM; sleep 60' & echo $! > {}; wait",
+                pidfile.display()
+            ))
             .env(BODY_SID_ENV, "s13")
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -503,9 +547,30 @@ mod tests {
         let body = read(tmp.path(), "s13").unwrap();
         // The test process is the body's parent: reap it while waiting.
         let reaper = std::thread::spawn(move || child.wait());
-        assert!(kill_body(&body, "s13").unwrap());
+        assert!(terminate(&body, "s13", Duration::from_millis(500)).unwrap());
         reaper.join().unwrap().unwrap();
-        assert!(process_exists(bg), "the background child keeps running");
-        signal(bg, libc::SIGKILL).unwrap();
+        let started = Instant::now();
+        while process_exists(bg) && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_exists(bg),
+            "the background child died with its group"
+        );
+    }
+
+    #[test]
+    fn terminate_never_signals_a_group_the_body_does_not_lead() {
+        // A body inside ANOTHER group (the test runner's, standing in for an
+        // older daemon's): only the body's own pid may be signalled.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = spawn_sleep("s14");
+        record(tmp.path(), "s14", Some(child.id()), "test").unwrap();
+        assert!(!leads_own_group(child.id()));
+        let body = read(tmp.path(), "s14").unwrap();
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(terminate(&body, "s14", Duration::from_secs(3)).unwrap());
+        reaper.join().unwrap().unwrap();
+        // Still here: the runner's group was not signalled.
     }
 }

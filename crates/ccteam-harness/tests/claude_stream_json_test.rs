@@ -2372,6 +2372,22 @@ async fn body_record_follows_spawn_close_and_detach() {
         .unwrap();
     let body = session_body::read(tmp.path(), "s41").expect("body.json written at spawn");
     assert_eq!(body.adapter, "claude-stream-json");
+    // The body leads its own process group, so ending it can end the
+    // background processes it starts (and a signal to the daemon's group
+    // never reaches it).
+    if cfg!(target_os = "linux") {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", body.pid)).unwrap();
+        let pgrp: u32 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(pgrp, body.pid, "the body is its own process group leader");
+    }
     assert!(matches!(
         session_body::probe(tmp.path(), "s41"),
         BodyProbe::Alive(_)

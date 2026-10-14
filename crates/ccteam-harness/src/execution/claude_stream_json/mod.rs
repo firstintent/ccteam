@@ -2121,7 +2121,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     );
                     HarnessError::SpawnFailed(format!(
                         "claude --resume {uuid} failed: {err}. The conversation is intact on \
-                         disk; send the message again to retry the resume"
+                         disk; the next resume retries it"
                     ))
                 })?
         };

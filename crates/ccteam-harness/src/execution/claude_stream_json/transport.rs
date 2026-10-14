@@ -115,6 +115,13 @@ impl StreamJsonTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // The body leads its own process group, so ending it (a user stop, or
+        // a detached body a queued turn is waiting on) can end the background
+        // processes it started too — `session_body::terminate` signals the
+        // group. Never the daemon's group: a body that outlives the daemon
+        // must not be reachable by a signal aimed at the daemon either.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {program} (stream-json)"))?;
