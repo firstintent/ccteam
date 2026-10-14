@@ -884,6 +884,9 @@ pub struct Gateway {
     post_mortem_pending: Vec<(String, String, PathBuf, SessionBody)>,
     /// Wakes the body watcher early (a new detached sid, a post-mortem).
     body_watch_notify: Arc<tokio::sync::Notify>,
+    /// What each ended detached body left running (see
+    /// [`session_body::kill_body`]), keyed by sid, until the watcher reports it.
+    body_end_orphans: Arc<std::sync::Mutex<HashMap<String, Vec<session_body::Orphan>>>>,
     projects: BTreeMap<String, PathBuf>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
@@ -2590,7 +2593,7 @@ pub struct DetachedBody {
     pub reason: &'static str,
     /// Set while ccteam is ending this body's process, and why: `stopping`
     /// (a user stop — the watcher leaves it to the stop), `interrupted` (a
-    /// user `/interrupt`) or `auto_recovered` (a queued turn was waiting on a
+    /// user `/interrupt`) or `ended_idle` / `ended_stalled` (a queued turn was waiting on a
     /// body gone idle or stalled). The watcher records the exit under it.
     pub ending: Option<&'static str>,
 }
@@ -3583,6 +3586,7 @@ impl Gateway {
             detached: BTreeMap::new(),
             post_mortem_pending: Vec::new(),
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
+            body_end_orphans: Arc::new(std::sync::Mutex::new(HashMap::new())),
             projects,
             operator_chats: BTreeMap::new(),
             button_channels: BTreeSet::new(),
@@ -4480,10 +4484,9 @@ impl Gateway {
     /// now being ended); `Ok(false)` when `sid` was not detached.
     ///
     /// The `&mut` door (IM commands, buttons) cannot drop the gateway lock, so
-    /// the kill — up to `TERMINATE_GRACE` plus the SIGKILL wait — runs on its
-    /// own task and wakes the watcher when done; nothing waits on it under the
-    /// lock. The REST door, which owes a truthful answer, awaits it off the
-    /// lock instead ([`Self::end_detached_body_shared`]).
+    /// the kill runs on its own task and wakes the watcher when done; nothing
+    /// waits on it under the lock. The REST door awaits it off the lock
+    /// instead ([`Self::end_detached_body_shared`]).
     pub(crate) fn end_detached_body(&mut self, sid: &str) -> bool {
         let Some(detached) = self.detached.get_mut(sid) else {
             return false;
@@ -4495,14 +4498,12 @@ impl Gateway {
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
         let notify = Arc::clone(&self.body_watch_notify);
+        let orphans = Arc::clone(&self.body_end_orphans);
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking({
-                let sid = sid_owned.clone();
-                move || session_body::terminate(&body, &sid, Self::TERMINATE_GRACE)
-            })
-            .await;
-            if !matches!(outcome, Ok(Ok(true))) {
-                tracing::warn!(session = %sid_owned, ?outcome, "ccteam-im: could not end a detached body on interrupt");
+            let outcome =
+                Self::end_body_process(body, sid_owned.clone(), "interrupted", orphans).await;
+            if let Err(error) = outcome {
+                tracing::warn!(session = %sid_owned, %error, "ccteam-im: could not end a detached body on interrupt");
             }
             notify.notify_one();
         });
@@ -4511,48 +4512,74 @@ impl Gateway {
     }
 
     /// How long a body is given to exit on SIGTERM before its group is
-    /// SIGKILLed.
+    /// SIGKILLed (an explicit stop).
     const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// End one detached body off the lock: a stop ends its whole group
+    /// ([`session_body::terminate`]); anything that keeps the session ends
+    /// only the process and parks what it left running in `orphans` for the
+    /// watcher's report ([`session_body::kill_body`]).
+    async fn end_body_process(
+        body: SessionBody,
+        sid: String,
+        why: &'static str,
+        orphans: Arc<std::sync::Mutex<HashMap<String, Vec<session_body::Orphan>>>>,
+    ) -> Result<()> {
+        let pid = body.pid;
+        let sid_for_task = sid.clone();
+        let left = tokio::task::spawn_blocking(move || {
+            if why == "stopping" {
+                session_body::terminate(&body, &sid_for_task, Self::TERMINATE_GRACE)
+                    .map(|gone| gone.then(Vec::new))
+            } else {
+                session_body::kill_body(&body, &sid_for_task)
+            }
+        })
+        .await
+        .context("join body end")??;
+        let Some(left) = left else {
+            return Err(anyhow!(
+                "{sid}'s process (pid {pid}) is still alive after SIGKILL"
+            ));
+        };
+        if !left.is_empty() {
+            if let Ok(mut map) = orphans.lock() {
+                map.insert(sid, left);
+            }
+        }
+        Ok(())
+    }
 
     /// End a detached body's process OFF the gateway lock, marking the entry
     /// with `why` first (see [`DetachedBody::ending`]). `Ok(false)` when `sid`
-    /// is not detached; `Err` when the process outlived SIGTERM and SIGKILL
-    /// (the mark is cleared and the body stays watched).
+    /// is not detached; `Err` when the process outlived the kill (the mark is
+    /// cleared and the body stays watched).
     pub(crate) async fn end_detached_body_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         why: &'static str,
     ) -> Result<bool> {
-        let body = {
+        let (body, orphans) = {
             let mut g = gateway.lock().await;
+            let orphans = Arc::clone(&g.body_end_orphans);
             let Some(detached) = g.detached.get_mut(sid) else {
                 return Ok(false);
             };
             detached.ending = Some(why);
-            detached.body.clone()
+            (detached.body.clone(), orphans)
         };
-        let sid_owned = sid.to_string();
-        let ended = tokio::task::spawn_blocking(move || {
-            session_body::terminate(&body, &sid_owned, Self::TERMINATE_GRACE)
-        })
-        .await
-        .context("join body terminate");
+        let ended = Self::end_body_process(body, sid.to_string(), why, orphans).await;
         let mut g = gateway.lock().await;
         match ended {
-            Ok(Ok(true)) => {
+            Ok(()) => {
                 g.body_watch_notify.notify_one();
                 Ok(true)
             }
-            other => {
+            Err(error) => {
                 if let Some(detached) = g.detached.get_mut(sid) {
                     detached.ending = None;
                 }
-                Err(match other {
-                    Ok(Ok(_)) => {
-                        anyhow!("{sid}'s process is still alive after SIGTERM and SIGKILL")
-                    }
-                    Ok(Err(error)) | Err(error) => error,
-                })
+                Err(error)
             }
         }
     }
@@ -4603,10 +4630,10 @@ impl Gateway {
         let receipt = format!(
             "⏳ {sid}'s process from before ccteam restarted is still running (body pid {}, \
              unobserved since {}): a turn it was finishing, or background tasks it started. Your \
-             message is queued (#{queued}). Once that process has gone quiet ccteam ends it, \
-             with the background processes it started, and resumes {sid} on the same context \
-             with your message. `/interrupt {sid}` does that now; `/stop {sid}` ends the \
-             session.",
+             message is queued (#{queued}). Once that process has gone quiet ccteam ends it \
+             and resumes {sid} on the same context with your message; background processes \
+             it started keep running and are listed then. `/interrupt {sid}` does that now; \
+             `/stop {sid}` ends the session and its background processes.",
             detached.body.pid, since
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
@@ -4645,7 +4672,8 @@ impl Gateway {
             )
         };
         for (sid, slug, cwd, body) in post_mortems {
-            Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited").await;
+            Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited", &[])
+                .await;
         }
         for d in detached {
             // A stop owns its body's end.
@@ -4660,7 +4688,7 @@ impl Gateway {
                     continue;
                 };
                 tracing::info!(session = %d.sid, pid = d.body.pid, bound, "ccteam-im: ending a detached body a queued turn is waiting on; resuming by sid");
-                match Self::end_detached_body_shared(gateway, &d.sid, "auto_recovered").await {
+                match Self::end_detached_body_shared(gateway, &d.sid, bound).await {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
@@ -4702,10 +4730,10 @@ impl Gateway {
     /// Policy (docs-local issue #211): only a turn queued for the sid ends the
     /// wait — a body nobody is waiting on is left alone (its background work,
     /// say a job scheduled for later, runs to its end). Then:
-    /// - `idle`: the vendor record says the last turn ended and it has been
+    /// - `ended_idle`: the vendor record says the last turn ended and it has been
     ///   silent for [`Self::DETACHED_IDLE_QUIET`]. The process is alive only for
     ///   background tasks; it can never take the queued turn itself.
-    /// - `stalled`: a turn is still open but the record has been silent for
+    /// - `ended_stalled`: a turn is still open but the record has been silent for
     ///   [`Self::DETACHED_STALL`] (or, with no readable record, the body has
     ///   been detached that long).
     ///
@@ -4737,12 +4765,12 @@ impl Gateway {
             .await;
         let quiet_for = match activity {
             Some(a) if a.turn_ended && a.quiet_for >= Self::DETACHED_IDLE_QUIET => {
-                return Some("idle")
+                return Some("ended_idle")
             }
             Some(a) => a.quiet_for,
             None => (chrono::Utc::now() - d.since).to_std().unwrap_or_default(),
         };
-        (quiet_for >= Self::DETACHED_STALL).then_some("stalled")
+        (quiet_for >= Self::DETACHED_STALL).then_some("ended_stalled")
     }
 
     /// A detached body exited on its own: forget it, recover + report what it
@@ -4761,7 +4789,55 @@ impl Gateway {
             session_body::clear(&d.cwd, &d.sid);
         }
         tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
-        Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, reason).await;
+        let orphans = {
+            let g = gateway.lock().await;
+            let taken = g
+                .body_end_orphans
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&d.sid))
+                .unwrap_or_default();
+            taken
+        };
+        Self::recover_and_report_shared(
+            gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, reason, &orphans,
+        )
+        .await;
+        if !orphans.is_empty() {
+            // The user's work outlived the process ccteam ended: say where
+            // it is, so a port it holds is not a mystery to anyone.
+            let g = gateway.lock().await;
+            if let Ok(meta) = ccteam_harness::read_session_meta(&d.cwd, &d.sid) {
+                let reply_to = g.owner_reply_target_for_meta(&d.slug, &meta);
+                let list = orphans
+                    .iter()
+                    .map(|o| format!("pid {} `{}`", o.pid, o.cmd))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sid = &d.sid;
+                g.emit_user_signal(GatewayEvent {
+                    interim: false,
+                    id: format!(
+                        "gateway-orphans-{sid}-{}",
+                        chrono::Utc::now().timestamp_millis()
+                    ),
+                    channel: reply_to.channel.clone(),
+                    chat_id: reply_to.chat_id.clone(),
+                    thread_ts: reply_to.thread.clone(),
+                    content: format!(
+                        "ℹ️ {sid}'s old process was ended; what it started is still running, \
+                         unattended: {list}. ccteam does not stop these — the resumed {sid} \
+                         does not know about them."
+                    ),
+                    kind: GatewayEventKind::Answer,
+                    attachments: Vec::new(),
+                    options: Vec::new(),
+                    status: None,
+                    sid: Some(sid.clone()),
+                    slug: Some(d.slug.clone()),
+                });
+            }
+        }
         let failure = Self::rebuild_one_shared(gateway, &d.sid).await;
         let mut g = gateway.lock().await;
         if g.sessions.contains_key(&d.sid) {
@@ -4819,7 +4895,18 @@ impl Gateway {
         cwd: &Path,
         pid: u32,
         reason: &str,
+        orphans: &[session_body::Orphan],
     ) -> bool {
+        let exited_event = |recovered: bool| {
+            let mut event =
+                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
+                    sid, slug, reason, pid, recovered,
+                );
+            if !orphans.is_empty() {
+                event["orphans"] = serde_json::json!(orphans);
+            }
+            event
+        };
         // IO off the lock: the mirror tells us where observation stopped.
         let turns =
             ccteam_harness::execution::turns_mirror::read_all_turns(cwd, sid).unwrap_or_default();
@@ -4870,12 +4957,7 @@ impl Gateway {
             // Nothing ran unobserved (an idle body) — nothing to report, and
             // the lifecycle row still closes the detached window.
             let g = gateway.lock().await;
-            g.append_progress_event(
-                slug,
-                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
-                    sid, slug, reason, pid, false,
-                ),
-            );
+            g.append_progress_event(slug, exited_event(false));
             return false;
         }
         let now = chrono::Utc::now();
@@ -4910,7 +4992,7 @@ impl Gateway {
             ),
             None => {
                 let note = match reason {
-                    "interrupted" | "auto_recovered" => format!(
+                    "interrupted" | "ended_idle" | "ended_stalled" => format!(
                         "⚠️ {sid}'s process from before ccteam restarted was ended ({}) before \
                          its answer could be recovered. The session's own context is intact — \
                          it resumes now; ask it what it did.",
@@ -4984,16 +5066,7 @@ impl Gateway {
             if let Err(error) = g.persist_session_meta(cwd, &meta) {
                 tracing::warn!(session = %sid, %error, "ccteam-im: failed to persist meta after recovery");
             }
-            g.append_progress_event(
-                slug,
-                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
-                    sid,
-                    slug,
-                    reason,
-                    pid,
-                    recovered.is_some(),
-                ),
-            );
+            g.append_progress_event(slug, exited_event(recovered.is_some()));
             g.emit_user_signal(GatewayEvent {
                 interim: false,
                 id: format!("gateway-recovered-{turn_id}"),
@@ -5883,7 +5956,7 @@ impl Gateway {
                 self.interrupt_session(&sid).await?;
                 if detached {
                     return Ok(Some(format!(
-                        "正在结束 {sid} 重启前遗留的进程(连同它启动的后台进程);{sid} 随后按原上下文恢复,排队的消息接着送达"
+                        "正在结束 {sid} 重启前遗留的进程(它启动的后台进程继续运行,结束后会列出);{sid} 随后按原上下文恢复,排队的消息接着送达"
                     )));
                 }
                 Ok(Some(format!(
@@ -18788,7 +18861,7 @@ fn undelivered_after_resume_failure(sid: &str, err: anyhow::Error) -> anyhow::Er
 fn unobserved_end_phrase(reason: &str) -> &'static str {
     match reason {
         "interrupted" => "was working while ccteam restarted, until /interrupt ended that process",
-        "auto_recovered" => {
+        "ended_idle" | "ended_stalled" => {
             "was working while ccteam restarted, until a waiting message ended that process"
         }
         _ => "finished this turn while ccteam was restarting",
@@ -22632,10 +22705,10 @@ mod tests {
     }
 
     /// The automatic path records itself honestly: the ledger says the
-    /// process was ended for a waiting turn (`auto_recovered`), not that it
+    /// process was ended for a waiting turn (`ended_idle`), not that it
     /// exited on its own.
     #[tokio::test]
-    async fn an_auto_recovered_body_is_recorded_as_such() {
+    async fn an_auto_ended_body_is_recorded_as_such() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -22650,8 +22723,8 @@ mod tests {
         Gateway::body_watch_tick(&gateway).await;
         child.wait().unwrap();
         assert!(
-            ledger_has(&paths, r#""reason":"auto_recovered""#).await,
-            "the exit is recorded under auto_recovered"
+            ledger_has(&paths, r#""reason":"ended_idle""#).await,
+            "the exit is recorded under ended_idle"
         );
         let ledger = std::fs::read_to_string(paths.progress_jsonl("alpha")).unwrap();
         assert!(
@@ -22661,6 +22734,83 @@ mod tests {
             "not recorded as a natural exit: {ledger}"
         );
         assert!(gateway.lock().await.is_session_live(&sid));
+    }
+
+    /// Ending a body for a waiting turn never signals what it started: the
+    /// background child keeps running, and the user and the ledger are told
+    /// exactly which processes were left running unattended (checker A).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_ended_body_reports_the_background_processes_it_left_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut planted, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        // Swap the planted body for one that started a background process.
+        body_gone(&mut planted);
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 62 & echo $! > {}; wait", pidfile.display()))
+            .env(ccteam_harness::execution::session_body::BODY_SID_ENV, &sid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        ccteam_harness::execution::session_body::record(
+            &project_dir,
+            &sid,
+            Some(child.id()),
+            "test",
+        )
+        .unwrap();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        restarted.detached.get_mut(&sid).unwrap().body =
+            ccteam_harness::execution::session_body::read(&project_dir, &sid).unwrap();
+        let paths = progress_paths(tmp.path());
+        restarted.enable_project_creation(paths.clone());
+        let mut events = restarted.subscribe_events();
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, true, 60);
+        Gateway::body_watch_tick(&gateway).await;
+        child.wait().unwrap();
+
+        assert!(
+            ccteam_harness::execution::session_body::process_exists(bg),
+            "the background process is never signalled"
+        );
+        let mut told = false;
+        while let Ok(event) = events.try_recv() {
+            if event.content.contains("still running, unattended")
+                && event.content.contains(&format!("pid {bg} `sleep 62`"))
+            {
+                told = true;
+            }
+        }
+        assert!(told, "the reply target is told what is still running");
+        assert!(
+            ledger_has(
+                &paths,
+                &format!(r#""orphans":[{{"cmd":"sleep 62","pid":{bg}}}]"#)
+            )
+            .await
+        );
+        assert!(gateway.lock().await.is_session_live(&sid));
+        unsafe {
+            libc::kill(bg as i32, libc::SIGKILL);
+        }
     }
 
     /// When the session does not come back after its old process ended, the

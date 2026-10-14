@@ -29,14 +29,17 @@
 //!   forge a `body.json`. What this prevents is a *misattribution by ccteam
 //!   itself* (two bodies for one sid), not an attack.
 //! - [`terminate`] ends a body's PROCESS GROUP (the body and every
-//!   background process it started — bodies are spawned as group leaders):
-//!   on an EXPLICIT user stop (`/stop`, `agent_stop`, project stop), a user
-//!   `/interrupt`, or when a turn queued behind a detached body that is idle
-//!   or stalled has to reach the session. Ending the process is never ending
-//!   the session — sid, ledger and focus stay (AGENTS.md §三 "kill 的是进程,
-//!   不是会话"). A body that is not its own group leader (spawned by an
-//!   older build, inside the daemon's group) gets only its own pid signalled:
-//!   ccteam never signals a group it did not create.
+//!   background process it started — bodies are spawned as group leaders)
+//!   on an EXPLICIT user stop (`/stop`, `agent_stop`, project stop): the
+//!   session is over, and so is its work. A body that is not its own group
+//!   leader (spawned by an older build, inside the daemon's group) gets only
+//!   its own pid signalled: ccteam never signals a group it did not create.
+//! - [`kill_body`] ends ONLY the body's process, keeping the session (a user
+//!   `/interrupt`, or a turn queued behind a detached body that is idle or
+//!   stalled): AGENTS.md §三 "kill 的是进程,不是会话". The processes it
+//!   started are the user's work and are never signalled; the ones still
+//!   running afterwards are reported ([`Orphan`]) so nobody has to guess what
+//!   holds a port.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -245,6 +248,110 @@ fn leads_own_group(_pid: u32) -> bool {
 
 /// kill(2) to the process group `pgid` (ESRCH — the group is gone — is
 /// success).
+/// A process a body started that is still running after the body was ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Orphan {
+    pub pid: u32,
+    /// Its command line, shortened for a receipt.
+    pub cmd: String,
+}
+
+/// Longest command line an [`Orphan`] carries.
+const ORPHAN_CMD_MAX: usize = 80;
+
+/// Every live descendant of `pid`, each with its start fingerprint (Linux:
+/// a `/proc` walk by parent pid; empty where there is no `/proc`).
+fn descendants(pid: u32) -> Vec<(u32, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut parent_of: Vec<(u32, u32)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(child) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
+            continue;
+        };
+        let ppid = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(ppid) = ppid {
+            parent_of.push((child, ppid));
+        }
+    }
+    let mut out = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        for &(child, ppid) in &parent_of {
+            if ppid == parent && !out.iter().any(|(p, _)| *p == child) {
+                if let Ok(fingerprint) = process_fingerprint(child) {
+                    out.push((child, fingerprint));
+                    frontier.push(child);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn short_cmdline(pid: u32) -> String {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let cmd = raw
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmd.chars().count() > ORPHAN_CMD_MAX {
+        let cut: String = cmd.chars().take(ORPHAN_CMD_MAX).collect();
+        format!("{cut}…")
+    } else {
+        cmd
+    }
+}
+
+/// End a detached body's PROCESS and nothing else: one SIGKILL to the
+/// verified pid. `claude` answers SIGTERM by killing every background task it
+/// started (measured, 2.1.296), and those are the user's work — a dev server,
+/// a stack, a job scheduled for later — so no SIGTERM, no group signal. The
+/// descendants are listed (fingerprinted) BEFORE the kill, and the ones still
+/// running after it come back as [`Orphan`]s: never signalled, only reported.
+/// Callers use it once the body has stopped writing, so no transcript line is
+/// cut. `Ok(None)` when the body survived the SIGKILL.
+pub fn kill_body(body: &SessionBody, sid: &str) -> Result<Option<Vec<Orphan>>> {
+    if !body_is_alive(body, sid) {
+        return Ok(Some(Vec::new()));
+    }
+    let children = descendants(body.pid);
+    signal(body.pid, libc::SIGKILL)?;
+    let started = Instant::now();
+    while body_is_alive(body, sid) {
+        if started.elapsed() > Duration::from_secs(2) {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(Some(
+        children
+            .into_iter()
+            .filter(|(pid, fingerprint)| {
+                !process_is_zombie(*pid)
+                    && process_fingerprint(*pid).is_ok_and(|now| &now == fingerprint)
+            })
+            .map(|(pid, _)| Orphan {
+                pid,
+                cmd: short_cmdline(pid),
+            })
+            .collect(),
+    ))
+}
+
 #[cfg(unix)]
 fn signal_group(pgid: u32, sig: libc::c_int) -> Result<()> {
     let raw = libc::pid_t::try_from(pgid).context("pgid out of range")?;
@@ -572,5 +679,49 @@ mod tests {
         assert!(terminate(&body, "s14", Duration::from_secs(3)).unwrap());
         reaper.join().unwrap().unwrap();
         // Still here: the runner's group was not signalled.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_body_ends_only_the_body_and_reports_its_surviving_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 61 & echo $! > {}; wait", pidfile.display()))
+            .env(BODY_SID_ENV, "s15")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s15", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s15").unwrap();
+        let reaper = std::thread::spawn(move || child.wait());
+        let orphans = kill_body(&body, "s15").unwrap().expect("body gone");
+        reaper.join().unwrap().unwrap();
+        assert!(
+            process_exists(bg),
+            "the background child is never signalled"
+        );
+        assert_eq!(
+            orphans,
+            vec![Orphan {
+                pid: bg,
+                cmd: "sleep 61".to_string()
+            }]
+        );
+        signal(bg, libc::SIGKILL).unwrap();
     }
 }
