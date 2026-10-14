@@ -562,13 +562,24 @@ pub(crate) async fn handle_delete_project(
     //    alone is the meaningful effect there.
     let mut stopped: Vec<String> = Vec::new();
     if let Some(gw) = app.gateway.as_ref() {
-        let mut guard = gw.lock().await;
-        let sids: Vec<String> = guard
+        let sids: Vec<String> = gw
+            .lock()
+            .await
             .session_views()
             .into_iter()
             .filter(|v| v.project == slug)
             .map(|v| v.sid)
             .collect();
+        // A body left over from a restart is ended off the gateway lock (the
+        // kill can take the whole SIGTERM grace); the stop below finds it gone.
+        for sid in &sids {
+            if let Err(err) =
+                ccteam_im::gateway::Gateway::end_detached_body_shared(gw, sid, "stopping").await
+            {
+                tracing::warn!(%slug, %sid, %err, "ending a detached body during project delete failed; the stop retries it");
+            }
+        }
+        let mut guard = gw.lock().await;
         for sid in sids {
             // The project is being deregistered wholesale, so the stop's
             // own record of what it cut short has nowhere left to be read.
