@@ -37,15 +37,18 @@ impl Sandbox {
         }
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(ccteam_bin())
-            .args(args)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(ccteam_bin());
+        cmd.args(args)
             .env("HOME", &self.home)
             .env("CCTEAM_HOME", &self.ccteam_home)
             .env("CCTEAM_PROJECTS_ROOT", self.home.join("projects"))
-            .env("RUST_LOG", "warn")
-            .output()
-            .expect("run ccteam")
+            .env("RUST_LOG", "warn");
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("run ccteam")
     }
 
     fn json(&self, args: &[&str]) -> serde_json::Value {
@@ -59,6 +62,15 @@ impl Sandbox {
                 String::from_utf8_lossy(&out.stderr)
             )
         })
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // A failing assertion must not leak a daemon into the next test.
+        // Every test here starts one, and stopping a stopped (or never
+        // started) daemon is a harmless `notRunning`.
+        let _ = self.run(&["daemon", "stop", "--json"]);
     }
 }
 
@@ -311,4 +323,51 @@ fn start_is_the_launcher_and_returns_without_leaving_a_foreground_process() {
     );
     let after = sb.json(&["daemon", "status", "--json"]);
     assert_eq!(after["status"], "down", "{after}");
+}
+
+#[test]
+#[cfg(unix)]
+fn started_means_the_advertised_mcp_endpoint_already_accepts() {
+    // issue #214 — readiness is probed on `mcp.sock`, but MCP clients dial
+    // the TCP `/mcp` that `run/mcp-url` advertises. The web listener binds
+    // after pre-bind work (a `/proc` sweep), so the daemon once reported
+    // "started" while that port still refused. The hook stretches the
+    // pre-bind window so the race is lost every time unless the daemon
+    // holds its readiness socket until the web listener is bound.
+    let sb = Sandbox::new();
+    // A real port, not `:0`: the connect below must not first ask the
+    // daemon where it listens (that answer would itself wait for the bind).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("reserve a port")
+        .port();
+    let bind = format!("127.0.0.1:{port}");
+    let out = sb
+        .command(&[
+            "start",
+            "--json",
+            "--web-bind",
+            &bind,
+            "--dsh-web-bind",
+            "off",
+            "--no-imd",
+            "--no-clipboard",
+        ])
+        .env("CCTEAM_TEST_WEB_PREBIND_DELAY_MS", "1500")
+        .output()
+        .expect("run ccteam start");
+    let started: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap_or_else(|err| {
+            panic!(
+                "start printed no JSON ({err}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    assert_eq!(started["status"], "started", "{started}");
+
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .expect("the advertised /mcp accepts the moment start reports started");
+    let recorded = std::fs::read_to_string(sb.ccteam_home.join("run/mcp-url"))
+        .expect("daemon publishes run/mcp-url");
+    assert_eq!(recorded.trim(), format!("http://{bind}/mcp"), "{recorded}");
 }

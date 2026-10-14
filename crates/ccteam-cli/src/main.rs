@@ -1825,7 +1825,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 }
             };
             opts.bound = web_bound.clone();
-            let web_exited = web_bound.clone();
+            let web_exited = NotifyOnDrop(web_bound.clone());
             let mut rx = shutdown_rx.clone();
             let web_bridge = web_chat_bridge
                 .as_ref()
@@ -1856,7 +1856,17 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             let web_host_hub = host_hub.clone();
             let web_dsh_runtime = std::sync::Arc::clone(&dsh_runtime);
             Some(tokio::spawn(async move {
-                let served = ccteam_web::serve_with_state_factory_and_shutdown(
+                // Whatever ends this task — return, error, panic or abort — a
+                // web that never bound must not hold mcp.sock closed forever:
+                // the daemon stays up without it, as before.
+                let _web_exited = web_exited;
+                // Hidden test hook: stretch the pre-bind window so the
+                // "started ⇒ /mcp accepts" contract is tested deterministically
+                // rather than only on a host whose `/proc` sweep is slow.
+                if let Some(delay) = env_ms(WEB_PREBIND_DELAY_ENV) {
+                    tokio::time::sleep(delay).await;
+                }
+                ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
                     move |paths, auth| {
                         let mut state = ccteam_web::AppState::with_auth(paths, auth);
@@ -1875,13 +1885,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         let _ = rx.changed().await;
                     },
                 )
-                .await;
-                // A web that failed before binding must not hold the socket
-                // closed forever: the daemon stays up without it, as before.
-                if let Some(bound) = web_exited {
-                    bound.notify_one();
-                }
-                served
+                .await
             }))
         };
 
@@ -2335,6 +2339,29 @@ fn read_hostname() -> Option<String> {
 #[cfg(not(unix))]
 fn read_hostname() -> Option<String> {
     None
+}
+
+/// Hidden test hook (integration tests only): delay before the daemon's web
+/// listener binds, in milliseconds.
+const WEB_PREBIND_DELAY_ENV: &str = "CCTEAM_TEST_WEB_PREBIND_DELAY_MS";
+
+fn env_ms(key: &str) -> Option<Duration> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// Fires its gate when dropped, so every exit path of the task that owns it
+/// (unwinding included) releases whoever waits on the gate.
+struct NotifyOnDrop(Option<std::sync::Arc<tokio::sync::Notify>>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.notify_one();
+        }
+    }
 }
 
 fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
