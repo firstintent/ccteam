@@ -461,7 +461,7 @@ ccteam status                  # Daemon heartbeat, projects, sessions, web link,
 ccteam doctor                  # Install/dependency checks; --verify-mcp checks MCP surface.
 ```
 
-`ccteam init` only writes ccteam-owned files: project `.ccteam/` (it seeds no roles — `.claude/agents/` stays yours, and it writes no Claude settings: no `.claude/settings.local.json`, no hooks). It does **not** touch your `.claude/settings.json`. Re-running is safe, and on a project an older ccteam initialized it strips the Claude Code hooks that version wrote into `.claude/settings.local.json`, leaving every other key and your own hooks in place. Preferences live in `~/.ccteam/preferences.toml`; currently `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
+`ccteam init` only writes ccteam-owned files: project `.ccteam/` (it seeds no roles — `.claude/agents/` stays yours, and it writes no Claude settings: no `.claude/settings.local.json`, no hooks). It does **not** touch your `.claude/settings.json`. Re-running is safe, and on a project an older ccteam initialized it strips the Claude Code hooks (and the Telegram plugin pin) that version wrote into `.claude/settings.local.json`, leaving every other key and your own hooks in place; a file that is not valid JSON is left untouched and noted. Preferences live in `~/.ccteam/preferences.toml`; currently `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
 
 ### `project` (Project Lifecycle)
 

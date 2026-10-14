@@ -211,11 +211,10 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         target.join(".claude").join("agents").display(),
         project_report.agents_action,
     ));
-    if let Some(entries) = project_report.hooks_stripped {
+    if let Some(note) = &project_report.hooks_note {
         out.push_str(&format!(
-            "  claude hooks     {} (stripped {entries} retired ccteam hook entr{})\n",
+            "  claude settings  {} ({note})\n",
             target.join(".claude").join("settings.local.json").display(),
-            if entries == 1 { "y" } else { "ies" },
         ));
     }
     out.push_str(&format!(
@@ -322,10 +321,10 @@ struct ProjectInstallReport {
     state_action: &'static str,
     workflow_action: &'static str,
     agents_action: &'static str,
-    /// Old ccteam hook entries a refresh stripped from
+    /// What happened to old ccteam hook entries in
     /// `.claude/settings.local.json` (docs-local issue #212); `None` when
-    /// there was nothing to strip.
-    hooks_stripped: Option<usize>,
+    /// there was nothing to report.
+    hooks_note: Option<String>,
 }
 
 impl ProjectInstallReport {
@@ -374,7 +373,6 @@ fn install_project_at(
     let state_action: &'static str;
     let workflow_action: &'static str;
     let agents_action: &'static str;
-    let mut hooks_stripped = None;
     let final_team: String;
     let owner_final: Option<String>;
 
@@ -436,19 +434,20 @@ fn install_project_at(
         } else {
             "preserved"
         };
-
-        // docs-local issue #212 — re-running `ccteam init` is how an existing
-        // project sheds the Claude Code hooks earlier ccteam versions wrote
-        // (a fresh install gets the same scrub inside `bootstrap_project_at_dir`).
-        let scrub = ccteam_core::remove_ccteam_hooks(
-            &target.join(".claude").join("settings.local.json"),
-            false,
-        )?;
-        use ccteam_core::CcteamHookScrubAction as A;
-        if let A::Removed { entries } | A::RemovedNowEmpty { entries } = scrub.action {
-            hooks_stripped = Some(entries);
-        }
     }
+
+    // docs-local issue #212 — re-running `ccteam init` is how an existing
+    // project sheds the Claude Code hooks earlier ccteam versions wrote (a
+    // fresh install already ran the same scrub inside
+    // `bootstrap_project_at_dir`, so here it only reports). Best-effort: a
+    // user file that is not valid JSON is left alone and noted, never fatal.
+    let hooks_note = match ccteam_core::remove_ccteam_hooks(
+        &target.join(".claude").join("settings.local.json"),
+        false,
+    ) {
+        Ok(report) => scrub_note(&report),
+        Err(err) => Some(format!("left untouched: {err:#}")),
+    };
 
     Ok(ProjectInstallReport {
         slug: slug.to_string(),
@@ -458,8 +457,21 @@ fn install_project_at(
         state_action,
         workflow_action,
         agents_action,
-        hooks_stripped,
+        hooks_note,
     })
+}
+
+/// One receipt note for an init-time [`ccteam_core::remove_ccteam_hooks`] run.
+fn scrub_note(report: &ccteam_core::CcteamHookScrubReport) -> Option<String> {
+    use ccteam_core::CcteamHookScrubAction as A;
+    match &report.action {
+        A::Removed { entries } | A::RemovedNowEmpty { entries } => Some(format!(
+            "stripped {entries} retired ccteam entr{}",
+            if *entries == 1 { "y" } else { "ies" }
+        )),
+        A::Unparseable { error } => Some(format!("left untouched: not valid JSON — {error}")),
+        A::NotFound | A::NoChangeNeeded | A::WouldRemove { .. } => None,
+    }
 }
 
 /// Normalize a raw `--owner` value (`ccteam init --owner`) into the
@@ -3744,6 +3756,14 @@ fn purge_project_managed_paths(
     use ccteam_core::CcteamHookScrubAction as A;
     match scrub.action {
         A::NotFound | A::NoChangeNeeded => {}
+        // Purge is explicit cleanup: refuse rather than silently skip a file
+        // it could not inspect.
+        A::Unparseable { error } => {
+            anyhow::bail!(
+                "cannot purge ccteam entries from {}: not valid JSON ({error}); fix or delete it",
+                settings_local.display()
+            );
+        }
         A::WouldRemove { entries } => {
             report.steps.push(format!(
                 "would strip {entries} ccteam hook entr{} from .claude/settings.local.json ({})",
@@ -4756,6 +4776,30 @@ mod tests {
         .unwrap();
         run_init(&paths, opts()).unwrap();
         assert!(!local.exists(), "hooks-only settings.local.json removed");
+    }
+
+    /// docs-local issue #212 — an empty or invalid settings.local.json never
+    /// fails `ccteam init` (fresh or re-run); the file is left as it was and
+    /// the project is fully initialized.
+    #[test]
+    fn run_init_tolerates_unparseable_settings_local() {
+        ensure_isolation();
+        for (name, body) in [("empty", ""), ("comma", "{\"model\": \"opus\",}")] {
+            let tmp = TempDir::new().unwrap();
+            let paths = fresh_paths(&tmp);
+            let target = tmp.path().join(name);
+            let local = target.join(".claude").join("settings.local.json");
+            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            std::fs::write(&local, body).unwrap();
+            let opts = || InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            };
+            run_init(&paths, opts()).unwrap_or_else(|e| panic!("{name}: fresh init: {e:#}"));
+            assert!(target.join(".ccteam").join("workflow.yaml").exists());
+            run_init(&paths, opts()).unwrap_or_else(|e| panic!("{name}: re-init: {e:#}"));
+            assert_eq!(std::fs::read_to_string(&local).unwrap(), body, "{name}");
+        }
     }
 
     /// `--force` re-runs overwrite user files. workflow.yaml lives in

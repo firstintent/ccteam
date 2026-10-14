@@ -442,7 +442,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook 剥掉,其余键和你自己的 hook 原样保留。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook(及 Telegram 插件钉)剥掉,其余键和你自己的 hook 原样保留;文件不是合法 JSON 时原样不动、仅在回执里注明。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
 
 ### `project`(项目生命周期)
 

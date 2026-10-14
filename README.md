@@ -232,7 +232,7 @@ Every spawn surface takes `model` and `effort` for every vendor and forwards bot
 ccteam adds a team to your repo without taking it over:
 
 - **Roleless by default** — the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism; ccteam never rewrites project knowledge.
-- **Small footprint** — exactly `.ccteam/` (state), `.claude/agents/` (personas you install), and in `.claude/settings.local.json` only the keys you ask for (a hub plugin you enable, an `/effort` you pin) — never your `settings.json`, and no hooks.
+- **Small footprint** — exactly `.ccteam/` (state), `.claude/agents/` (personas you install), and in `.claude/settings.local.json` only the keys you ask for (a hub plugin you enable, an `/effort` you pin) — never your `settings.json`, and no hooks (unless you pick the frozen terminal protocol, which installs its own).
 - **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. A session you are not talking to releases its harness process after an idle window (default one hour, matching the prompt-cache TTL) and comes straight back on your next message, on the same id and the same conversation — so a fleet of thirty sessions costs thirty transcripts, not thirty resident processes. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
 
 ## Extras
@@ -267,7 +267,7 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 rm -rf ~/.ccteam        # state, secrets, hub cache — keep it if you may return
 ```
 
-Per project, delete `.ccteam/` — or, before uninstalling, run `ccteam project rm --purge <slug>`, which also strips any hook entries an older ccteam left in `.claude/settings.local.json`.
+Per project, delete `.ccteam/` — or, before uninstalling, run `ccteam project rm --purge <slug>`, which also strips any hook entries or plugin pin an older ccteam left in `.claude/settings.local.json`.
 
 ## Support
 

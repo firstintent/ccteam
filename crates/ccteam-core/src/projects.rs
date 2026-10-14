@@ -361,10 +361,26 @@ pub fn bootstrap_project_at_dir(
     // exactly what the owner ruled out. A directory that already carries
     // ccteam's old hooks (a re-bootstrap over an earlier project) gets them
     // stripped instead; every other key and any user hook survive.
-    crate::tool_surface::remove_ccteam_hooks(
-        &project_dir.join(".claude").join("settings.local.json"),
-        false,
-    )?;
+    // Best-effort: a user file that is unreadable or not valid JSON (empty,
+    // trailing comma) is left untouched and never fails project creation.
+    let settings_local = project_dir.join(".claude").join("settings.local.json");
+    match crate::tool_surface::remove_ccteam_hooks(&settings_local, false) {
+        Ok(report) => {
+            if let crate::tool_surface::CcteamHookScrubAction::Unparseable { error } = report.action
+            {
+                tracing::warn!(
+                    path = %settings_local.display(),
+                    %error,
+                    "left .claude/settings.local.json untouched: not valid JSON",
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
+            path = %settings_local.display(),
+            error = %err,
+            "could not strip old ccteam hooks from .claude/settings.local.json",
+        ),
+    }
     // v0.8.6 (review-fix #3): no longer stamp `~/.ccteam/templates/`.
     // `HELPER_TEMPLATES` has been empty since V0.5.0 F101, so the writer
     // only ever created an empty `templates/` dir that is *not* in
@@ -1254,6 +1270,29 @@ mod tests {
             committed_body,
             "the user's .claude/settings.json is never touched"
         );
+    }
+
+    /// docs-local issue #212 — an empty or invalid user settings.local.json
+    /// never fails project creation and is left exactly as it was.
+    #[test]
+    fn bootstrap_project_at_dir_tolerates_unparseable_settings_local() {
+        ensure_isolation();
+        for (name, body) in [("empty", ""), ("comma", "{\"model\": \"opus\",}")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = CcteamPaths {
+                root: tmp.path().join("home"),
+                projects_root: tmp.path().join("projects"),
+            };
+            let project_dir = tmp.path().join("workspace").join(name);
+            let local = project_dir.join(".claude").join("settings.local.json");
+            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            std::fs::write(&local, body).unwrap();
+
+            bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev")
+                .unwrap_or_else(|e| panic!("{name}: bootstrap must not fail: {e:#}"));
+            assert!(CcteamPaths::project_state_in(&project_dir).exists());
+            assert_eq!(std::fs::read_to_string(&local).unwrap(), body, "{name}");
+        }
     }
 
     /// Every create path (web / IM / daemon all flow through

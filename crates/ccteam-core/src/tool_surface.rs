@@ -502,6 +502,11 @@ pub enum CcteamHookScrubAction {
     /// No ccteam hook entries found. Idempotent re-run after a successful
     /// scrub hits this branch.
     NoChangeNeeded,
+    /// The file exists but could not be read or is not valid JSON (an empty
+    /// file, a trailing comma …). It is left exactly as it is; the caller
+    /// decides whether that is fatal (`project rm --purge`) or a note
+    /// (project create / `ccteam init`, which must never fail on a user file).
+    Unparseable { error: String },
     /// `dry_run = true` — would have removed N hook command entries.
     WouldRemove { entries: usize },
     /// Removed N hook command entries; the file still holds other keys
@@ -532,7 +537,10 @@ pub struct CcteamHookScrubReport {
 /// clean them.
 ///
 /// **Scope (red line).** Removes ONLY entries whose `command` is a ccteam
-/// hook ([`hook_command_is_ccteam_hook`]); every other key (`permissions`,
+/// hook ([`hook_command_is_ccteam_hook`]), plus the Telegram plugin pin an
+/// earlier ccteam wrote here (`enabledPlugins` entry exactly
+/// [`TELEGRAM_PLUGIN_PIN`]` = false`; any other value is the user's and
+/// stays — the pin now rides claude's `--settings` flag layer); every other key (`permissions`,
 /// `env`, `enabledPlugins`, `effortLevel`, …) and any operator-authored hook
 /// survives untouched. Empty inner hook lists + top-level event arrays are
 /// pruned so the file shape stays clean, and if the whole object collapses
@@ -547,12 +555,36 @@ pub fn remove_ccteam_hooks(settings_path: &Path, dry_run: bool) -> Result<Ccteam
         });
     }
 
-    let body = std::fs::read_to_string(settings_path)
-        .with_context(|| format!("read {}", settings_path.display()))?;
-    let mut v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", settings_path.display()))?;
+    let parsed = std::fs::read_to_string(settings_path)
+        .map_err(|e| e.to_string())
+        .and_then(|body| {
+            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
+        });
+    let mut v = match parsed {
+        Ok(v) => v,
+        Err(error) => {
+            return Ok(CcteamHookScrubReport {
+                target: settings_path.to_path_buf(),
+                action: CcteamHookScrubAction::Unparseable { error },
+            })
+        }
+    };
 
     let mut removed = 0usize;
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(plugins) = obj
+            .get_mut("enabledPlugins")
+            .and_then(|p| p.as_object_mut())
+        {
+            if plugins.get(TELEGRAM_PLUGIN_PIN) == Some(&serde_json::Value::Bool(false)) {
+                plugins.remove(TELEGRAM_PLUGIN_PIN);
+                removed += 1;
+                if plugins.is_empty() {
+                    obj.remove("enabledPlugins");
+                }
+            }
+        }
+    }
     if let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_event, list) in hooks.iter_mut() {
             let Some(arr) = list.as_array_mut() else {
@@ -628,6 +660,11 @@ pub fn remove_ccteam_hooks(settings_path: &Path, dry_run: bool) -> Result<Ccteam
         action: CcteamHookScrubAction::Removed { entries: removed },
     })
 }
+
+/// The plugin id ccteam pins off for its Claude sessions (mirror of
+/// `ccteam_harness::execution::claude_tui::TELEGRAM_PLUGIN_ID`; core sits below
+/// harness and cannot name it).
+const TELEGRAM_PLUGIN_PIN: &str = "telegram@claude-plugins-official";
 
 /// Hook kinds ccteam's `hooks/hook.sh` dispatcher has ever been invoked with
 /// from a Claude Code settings file (`ccteam_hooks::dispatch`). A `hook.sh`
@@ -1317,5 +1354,61 @@ mod tests {
         assert!(!is("/usr/bin/jq .progress[]"));
         assert!(!is("/h/hook.sh"));
         assert!(!is("git hook run pre-commit"));
+    }
+
+    /// docs-local issue #212 — an empty / invalid file is reported, never an
+    /// error, and left byte-for-byte as it was.
+    #[test]
+    fn remove_ccteam_hooks_reports_unparseable_and_leaves_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        for body in ["", "{\"model\": \"opus\",}"] {
+            std::fs::write(&path, body).unwrap();
+            let report = remove_ccteam_hooks(&path, false).unwrap();
+            assert!(
+                matches!(report.action, CcteamHookScrubAction::Unparseable { .. }),
+                "{body:?}: {:?}",
+                report.action
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
+    }
+
+    /// The Telegram pin ccteam wrote (`false`) is scrubbed — pruning an
+    /// emptied `enabledPlugins` — while a user's own value survives.
+    #[test]
+    fn remove_ccteam_hooks_strips_ccteam_telegram_pin_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"opus","enabledPlugins":{"telegram@claude-plugins-official":false}}"#,
+        )
+        .unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::Removed { entries: 1 });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"model": "opus"}));
+
+        // Pin-only file collapses and is removed.
+        std::fs::write(
+            &path,
+            r#"{"enabledPlugins":{"telegram@claude-plugins-official":false}}"#,
+        )
+        .unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(
+            report.action,
+            CcteamHookScrubAction::RemovedNowEmpty { entries: 1 }
+        );
+        assert!(!path.exists());
+
+        // A user's own `true` (and other plugins) is not ccteam's.
+        let user = r#"{"enabledPlugins":{"telegram@claude-plugins-official":true,"x@y":false}}"#;
+        std::fs::write(&path, user).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::NoChangeNeeded);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
     }
 }
