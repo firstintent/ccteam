@@ -2445,8 +2445,7 @@ async fn pre_agent_policy_gate(
             children: facts.children,
             delegated: facts.delegated,
             cost_24h_usd: facts.projection.as_ref().and_then(|projection| {
-                (!facts.slug.is_empty())
-                    .then(|| projection.project_snapshot(&facts.slug).cost.cost_24h_usd)
+                (!facts.slug.is_empty()).then(|| projection.cost_summary(&facts.slug).cost_24h_usd)
             }),
         },
     }
@@ -4785,10 +4784,8 @@ async fn read_wait_for_turn_boundary(
 
 /// The turn_id of the newest row in a session's durable mirror.
 fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<String> {
-    ccteam_harness::execution::turns_mirror::read_all_turns(&resolved.project_dir, &resolved.sid)
-        .ok()?
-        .pop()
-        .map(|turn| turn.turn_id)
+    ccteam_harness::execution::turns_mirror::digest(&resolved.project_dir, &resolved.sid)?
+        .last_turn_id
 }
 
 /// Wait (briefly, bounded) for the notifier to record which of `waiting_on`

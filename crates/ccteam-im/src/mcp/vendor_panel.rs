@@ -685,8 +685,7 @@ pub(crate) fn gather_status_panel(paths: &CcteamPaths, slug: Option<&str>) -> St
     let cost_24h_usd = slug
         .map(|slug| {
             crate::progress_projection::ProgressProjection::new(paths.clone())
-                .project_snapshot(slug)
-                .cost
+                .cost_summary(slug)
                 .cost_24h_usd
         })
         .unwrap_or(0.0);
@@ -720,8 +719,7 @@ fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<Pan
     let project_dir = entry.as_ref().map(|e| e.path.clone());
     let budgets = project_dir.as_deref().and_then(budgets_for_project);
     let spend_24h = crate::progress_projection::ProgressProjection::new(paths.clone())
-        .project_snapshot(slug)
-        .cost
+        .cost_summary(slug)
         .cost_24h_by_vendor;
 
     if host == LOCAL_HOST {
@@ -761,8 +759,7 @@ fn build_local_panel(
                 .as_deref()
                 .and_then(budgets_for_project);
             let spend = crate::progress_projection::ProgressProjection::new(paths.clone())
-                .project_snapshot(slug)
-                .cost
+                .cost_summary(slug)
                 .cost_24h_by_vendor;
             (budgets, spend)
         }

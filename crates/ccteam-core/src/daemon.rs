@@ -96,6 +96,28 @@ pub const STOP_KILL_WAIT: Duration = Duration::from_secs(5);
 /// How much of the daemon log tail to surface on a failed start.
 pub const DAEMON_LOG_TAIL_BYTES: u64 = 4096;
 
+/// A daemon log past this size is moved to `daemon.log.1` (replacing the
+/// previous one) before the next daemon starts appending. The detached
+/// daemon's stdout/stderr ARE the log file, so it cannot be cut while that
+/// daemon runs; each start is the safe point, and two generations bound the
+/// disk it can take to ~2x this plus one daemon lifetime (issue #213: 20 MB
+/// and growing with no rotation at all).
+pub const DAEMON_LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Move an oversized daemon log aside (see [`DAEMON_LOG_ROTATE_BYTES`]).
+/// Best-effort: a failed rename just keeps appending to the old file.
+fn rotate_daemon_log(log_path: &Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(log_path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let mut rotated = log_path.as_os_str().to_owned();
+    rotated.push(".1");
+    let _ = std::fs::rename(log_path, PathBuf::from(rotated));
+}
+
 /// Resolve the pid-record path for a given ccteam root.
 pub fn pidfile_path(paths: &CcteamPaths) -> PathBuf {
     paths.root.join("state").join(PIDFILE_NAME)
@@ -762,6 +784,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
     if let Some(parent) = spec.log_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    rotate_daemon_log(&spec.log_path, DAEMON_LOG_ROTATE_BYTES);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1127,6 +1150,27 @@ fn connect_mcp_socket(_path: &Path, _timeout: Duration) -> std::result::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #213: an oversized log is moved to `.1` (replacing the old one)
+    /// before a start appends to it; a small one is left alone.
+    #[test]
+    fn an_oversized_daemon_log_is_rotated_before_a_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join(DAEMON_LOG_NAME);
+        let rotated = tmp.path().join("daemon.log.1");
+        std::fs::write(&rotated, "older").unwrap();
+        std::fs::write(&log, "small").unwrap();
+        rotate_daemon_log(&log, 10);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "small");
+        std::fs::write(&log, "a log past its bound").unwrap();
+        rotate_daemon_log(&log, 10);
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "a log past its bound"
+        );
+        rotate_daemon_log(&log, 10); // nothing to rotate: no-op
+    }
 
     fn paths(tmp: &tempfile::TempDir) -> CcteamPaths {
         CcteamPaths {

@@ -41,6 +41,13 @@ use tokio::sync::broadcast;
 /// without growing unbounded memory for a long-lived chatty session.
 pub(crate) const RING_CAPACITY: usize = 64;
 
+/// Sessions whose backlog is kept. A daemon outlives thousands of sessions,
+/// and every one that ever emitted an event used to keep its 64 frames
+/// (answers, progress, attachments) for the life of the process (issue #213).
+/// Past this, the backlog of the session that recorded least recently is
+/// dropped — its `next_seq` is kept, so seqs still never restart.
+const MAX_BUFFERED_SESSIONS: usize = 128;
+
 /// Fan-out channel capacity for the ring's live tap. Generous relative to
 /// how often ANY one session emits events, so an idle-ish per-connection
 /// SSE consumer is very unlikely to `Lagged` (the existing
@@ -59,21 +66,32 @@ pub(crate) struct RingEntry {
 struct RingState {
     next_seq: u64,
     buf: VecDeque<RingEntry>,
+    /// [`SessionEventRing`]'s record clock at this ring's last record.
+    last_record: u64,
 }
 
 /// Shared per-sid replay ring + live tap. Cheap to clone via `Arc`; the
 /// internal bookkeeping mutex is a plain `std::sync::Mutex` since every
 /// operation is O(capacity) and never holds across an `.await`.
 pub(crate) struct SessionEventRing {
-    rings: Mutex<HashMap<String, RingState>>,
+    rings: Mutex<Rings>,
     tap: broadcast::Sender<RingEntry>,
+}
+
+#[derive(Default)]
+struct Rings {
+    by_sid: HashMap<String, RingState>,
+    /// Monotonic record counter — the LRU clock for [`MAX_BUFFERED_SESSIONS`].
+    clock: u64,
+    /// How many `by_sid` entries hold a non-empty `buf`.
+    buffered: usize,
 }
 
 impl SessionEventRing {
     pub(crate) fn new() -> Self {
         let (tap, _rx) = broadcast::channel(TAP_CAPACITY);
         Self {
-            rings: Mutex::new(HashMap::new()),
+            rings: Mutex::new(Rings::default()),
             tap,
         }
     }
@@ -94,15 +112,34 @@ impl SessionEventRing {
     pub(crate) fn record(&self, sid: &str, event: GatewayEvent) -> u64 {
         let seq = {
             let mut guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
-            let state = guard.entry(sid.to_string()).or_default();
+            let rings = &mut *guard;
+            rings.clock += 1;
+            let state = rings.by_sid.entry(sid.to_string()).or_default();
             state.next_seq += 1;
+            state.last_record = rings.clock;
             let seq = state.next_seq;
+            let newly_buffered = state.buf.is_empty();
             state.buf.push_back(RingEntry {
                 seq,
                 event: event.clone(),
             });
             while state.buf.len() > RING_CAPACITY {
                 state.buf.pop_front();
+            }
+            if newly_buffered {
+                rings.buffered += 1;
+                if rings.buffered > MAX_BUFFERED_SESSIONS {
+                    if let Some(oldest) = rings
+                        .by_sid
+                        .values_mut()
+                        .filter(|state| !state.buf.is_empty())
+                        .min_by_key(|state| state.last_record)
+                    {
+                        // Frees the frames; `next_seq` stays (8 bytes/sid).
+                        oldest.buf = VecDeque::new();
+                        rings.buffered -= 1;
+                    }
+                }
             }
             seq
         };
@@ -117,6 +154,7 @@ impl SessionEventRing {
     pub(crate) fn replay_since(&self, sid: &str, since: u64) -> Vec<RingEntry> {
         let guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
         guard
+            .by_sid
             .get(sid)
             .map(|s| s.buf.iter().filter(|e| e.seq > since).cloned().collect())
             .unwrap_or_default()
@@ -359,6 +397,26 @@ mod tests {
         assert_eq!(replayed.len(), RING_CAPACITY, "capped at RING_CAPACITY");
         // The oldest surviving entry is #10 (0..10 evicted).
         assert_eq!(replayed[0].event.id, "e10");
+    }
+
+    /// Issue #213: only the most recently active sessions keep a backlog,
+    /// and a session whose backlog was dropped keeps counting seqs from where
+    /// it was (a reconnect's `Last-Event-ID` is never confused by a restart).
+    #[test]
+    fn only_recent_sessions_keep_a_backlog_and_seqs_never_restart() {
+        let ring = SessionEventRing::new();
+        ring.record("s0", ev("first", "s0"));
+        for i in 1..=MAX_BUFFERED_SESSIONS {
+            let sid = format!("s{i}");
+            ring.record(&sid, ev("x", &sid));
+        }
+        assert!(
+            ring.replay_since("s0", 0).is_empty(),
+            "least recent dropped"
+        );
+        assert_eq!(ring.replay_since("s1", 0).len(), 1);
+        assert_eq!(ring.rings.lock().unwrap().buffered, MAX_BUFFERED_SESSIONS);
+        assert_eq!(ring.record("s0", ev("second", "s0")), 2);
     }
 
     #[test]

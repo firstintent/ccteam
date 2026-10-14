@@ -12,7 +12,7 @@
 //! - without `--json` → human prose on stdout.
 //! - deterministic failures exit 1 after emitting the JSON/human error.
 
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -777,34 +777,58 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
     let mut offset = file.metadata().map(|m| m.len()).unwrap_or(0);
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        let len = match std::fs::metadata(&path) {
-            Ok(m) => m.len(),
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
             Err(_) => continue,
         };
-        if len < offset {
-            // Truncated/rotated externally — restart from the top.
+        let len = meta.len();
+        if !same_file(&file, &meta) {
+            // A daemon start rotated the log (`daemon.log` → `daemon.log.1`)
+            // and the new daemon writes a fresh file at the path. Drain what
+            // the old daemon wrote since the last poll, then follow the path,
+            // not the inode we opened — or every line after the restart is
+            // missed (and the old file is replayed from its top).
+            print_appended(&mut file, offset)?;
+            file =
+                std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            offset = 0;
+        } else if len < offset {
+            // Truncated in place — restart from the top.
             offset = 0;
         }
         if len > offset {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = Vec::new();
-            let reader = std::io::BufReader::new(&mut file);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => buf.push(l),
-                    Err(_) => break,
-                }
-            }
-            for l in &buf {
-                println!("{l}");
-            }
-            offset = len;
+            offset = print_appended(&mut file, offset)?;
         }
     }
 }
 
-/// Last `n` lines of a file, reading only a bounded tail window (the
-/// daemon log is unrotated and can grow large).
+/// Print everything in `file` past `offset`; returns the new end offset.
+fn print_appended(file: &mut std::fs::File, offset: u64) -> Result<u64> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        println!("{line}");
+    }
+    Ok(offset + bytes.len() as u64)
+}
+
+/// Does the open `file` still name the file whose metadata is `at_path`?
+#[cfg(unix)]
+fn same_file(file: &std::fs::File, at_path: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata()
+        .map(|open| open.dev() == at_path.dev() && open.ino() == at_path.ino())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn same_file(_file: &std::fs::File, _at_path: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Last `n` lines of a file, reading only a bounded tail window (a log grows
+/// up to the rotation bound plus one daemon lifetime).
 fn tail_lines(path: &std::path::Path, n: usize) -> Result<Vec<String>> {
     const WINDOW: u64 = 1024 * 1024;
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;

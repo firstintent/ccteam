@@ -2149,6 +2149,14 @@ async fn deliver_progress(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableOutboundRow {
     ts_ms: u64,
+    /// When this id was FIRST queued — carried on every later row of the id
+    /// so the replay age bound survives compaction.
+    #[serde(default)]
+    first_queued_ms: u64,
+    /// Send attempts STARTED for this id (a `Queued` row is written ahead of
+    /// each one, so an attempt the daemon died inside still counts).
+    #[serde(default)]
+    attempts: u32,
     id: String,
     inbound_id: String,
     channel: String,
@@ -2164,7 +2172,27 @@ enum DurableOutboundState {
     Queued,
     Sent,
     Failed,
+    /// Terminal without delivery: replay gave up on it (attempt or age
+    /// bound, or its send panicked). Never replayed; compaction drops it.
+    GaveUp,
 }
+
+impl DurableOutboundState {
+    /// Nothing is owed for an id whose latest row is in this state.
+    fn is_settled(self) -> bool {
+        matches!(self, Self::Sent | Self::GaveUp)
+    }
+}
+
+/// Send attempts an id gets in total (the live one plus replays). A `Failed`
+/// send may still have landed — a 120 s timeout says nothing about whether
+/// the platform accepted the message — so every replay of it risks a
+/// duplicate; unbounded, each daemon start re-sent every failure ever.
+const DURABLE_OUTBOX_MAX_ATTEMPTS: u32 = 2;
+
+/// A reply older than this is not worth sending late (the conversation has
+/// moved on); replay gives up on it.
+const DURABLE_OUTBOX_MAX_REPLAY_AGE: Duration = Duration::from_secs(24 * 3600);
 
 /// The at-least-once outbound ledger, under the daemon's own ccteam root
 /// (`daemon_ccteam_root`) — threaded from `run_daemon_with_shutdown` rather
@@ -2274,96 +2302,105 @@ async fn queue_and_send_durable_part(
     message: SendMessage,
     call_timeout: Duration,
 ) -> bool {
-    append_durable_outbound(
-        ccteam_root,
-        DurableOutboundRow {
-            ts_ms: now_unix_ms_u64(),
-            id: id.clone(),
-            inbound_id: inbound_id.to_string(),
-            channel: channel_name.to_string(),
-            state: DurableOutboundState::Queued,
-            message: message.clone(),
-            platform_message_id: None,
-            error: None,
-        },
-    );
-    finish_durable_outbound_send(
-        ccteam_root,
+    let now = now_unix_ms_u64();
+    let queued = DurableOutboundRow {
+        ts_ms: now,
+        first_queued_ms: now,
+        attempts: 1,
         id,
-        inbound_id,
-        channel_name,
-        channel,
+        inbound_id: inbound_id.to_string(),
+        channel: channel_name.to_string(),
+        state: DurableOutboundState::Queued,
         message,
-        call_timeout,
-    )
-    .await
+        platform_message_id: None,
+        error: None,
+    };
+    append_durable_outbound(ccteam_root, queued.clone());
+    finish_durable_outbound_send(ccteam_root, queued, channel, call_timeout).await
 }
 
 /// Send a single already-queued durable row and append its terminal
 /// (`Sent`/`Failed`) ledger entry. Returns `true` on success.
 async fn finish_durable_outbound_send(
     ccteam_root: &Path,
-    id: String,
-    inbound_id: &str,
-    channel_name: &str,
+    queued: DurableOutboundRow,
     channel: &(dyn Channel + Send + Sync),
-    message: SendMessage,
     call_timeout: Duration,
 ) -> bool {
-    match bounded_platform_call(call_timeout, "send", channel.send(&message)).await {
-        Ok(platform_message_id) => {
-            append_durable_outbound(
-                ccteam_root,
-                DurableOutboundRow {
-                    ts_ms: now_unix_ms_u64(),
-                    id,
-                    inbound_id: inbound_id.to_string(),
-                    channel: channel_name.to_string(),
-                    state: DurableOutboundState::Sent,
-                    message,
-                    platform_message_id,
-                    error: None,
-                },
-            );
-            true
-        }
+    let result = bounded_platform_call(call_timeout, "send", channel.send(&queued.message)).await;
+    let sent = result.is_ok();
+    let terminal = match result {
+        Ok(platform_message_id) => DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            state: DurableOutboundState::Sent,
+            platform_message_id,
+            error: None,
+            ..queued
+        },
         Err(err) => {
-            append_durable_outbound(
-                ccteam_root,
-                DurableOutboundRow {
-                    ts_ms: now_unix_ms_u64(),
-                    id,
-                    inbound_id: inbound_id.to_string(),
-                    channel: channel_name.to_string(),
-                    state: DurableOutboundState::Failed,
-                    message,
-                    platform_message_id: None,
-                    error: Some(err.to_string()),
-                },
-            );
             tracing::warn!(
-                inbound_id,
-                channel = %channel_name,
+                inbound_id = %queued.inbound_id,
+                channel = %queued.channel,
                 error = %err,
                 "ccteam-im: gateway outbound send failed"
             );
-            false
+            DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                state: DurableOutboundState::Failed,
+                platform_message_id: None,
+                error: Some(err.to_string()),
+                ..queued
+            }
         }
-    }
+    };
+    append_durable_outbound(ccteam_root, terminal);
+    sent
 }
 
-async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
-    let path = durable_outbox_path_in(ccteam_root);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return;
+/// Past this size the ledger is compacted on the next append. Every reply
+/// costs a Queued + Sent pair (the full message twice), so an uncompacted
+/// ledger grows with every reply the daemon ever sent (issue #213: 80 MB
+/// after two months, all of it terminal) and the startup replay scans all of
+/// it. Compaction keeps it bounded by what is still owed.
+const DURABLE_OUTBOX_COMPACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Serializes every ledger append and compaction in this process — a
+/// compaction rewrites the file, so an append must not land between its read
+/// and its rename.
+fn durable_outbox_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// The rows still owed a delivery: the LATEST row of every id whose latest
+/// state is not settled (`Sent`/`GaveUp`), in the order the ids were first
+/// queued. Streams the
+/// file line by line rather than holding it whole.
+fn read_owed_durable_outbound(path: &Path) -> Vec<DurableOutboundRow> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
     };
+    let mut order: Vec<String> = Vec::new();
     let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
-    for (line_idx, line) in raw.lines().enumerate() {
+    for (line_idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let Ok(line) = line else {
+            // Not UTF-8 or unreadable: same as a malformed row.
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<DurableOutboundRow>(line) {
+        match serde_json::from_str::<DurableOutboundRow>(&line) {
+            Ok(row) if row.state.is_settled() => {
+                latest.remove(&row.id);
+            }
             Ok(row) => {
+                if !latest.contains_key(&row.id) {
+                    order.push(row.id.clone());
+                }
                 latest.insert(row.id.clone(), row);
             }
             Err(err) => {
@@ -2376,36 +2413,143 @@ async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
             }
         }
     }
-    for row in latest
-        .into_values()
-        .filter(|row| row.state != DurableOutboundState::Sent)
-    {
-        let Some(channel) = channels.get(&row.channel) else {
-            append_durable_outbound(
-                ccteam_root,
-                DurableOutboundRow {
-                    ts_ms: now_unix_ms_u64(),
-                    id: row.id,
-                    inbound_id: row.inbound_id,
-                    channel: row.channel,
-                    state: DurableOutboundState::Failed,
-                    message: row.message,
-                    platform_message_id: None,
-                    error: Some("replay failed: channel is not configured".to_string()),
-                },
-            );
-            continue;
-        };
-        finish_durable_outbound_send(
+    order
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
+        .collect()
+}
+
+/// Rewrite the ledger to just the rows still owed (see
+/// [`read_owed_durable_outbound`]). Caller holds [`durable_outbox_lock`].
+/// A settled row carries nothing replay could use, so dropping it keeps the
+/// at-least-once contract intact: every Queued/Failed id survives with its
+/// latest row. Atomic (temp + rename), so a crash mid-compaction leaves the
+/// old ledger.
+fn compact_durable_outbox_locked(path: &Path) -> Result<Vec<DurableOutboundRow>> {
+    let owed = read_owed_durable_outbound(path);
+    if !path.exists() {
+        return Ok(owed);
+    }
+    let mut bytes = Vec::new();
+    for row in &owed {
+        serde_json::to_writer(&mut bytes, row)?;
+        bytes.push(b'\n');
+    }
+    ccteam_harness::execution::fs_atomic::atomic_write_durable(path, &bytes)?;
+    last_compacted_len(path, Some(bytes.len() as u64));
+    Ok(owed)
+}
+
+/// The ledger size the last compaction of `path` left (`record` updates it).
+/// Caller holds [`durable_outbox_lock`].
+fn last_compacted_len(path: &Path, record: Option<u64>) -> u64 {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    match record {
+        Some(len) => {
+            last.insert(path.to_path_buf(), len);
+            len
+        }
+        None => last.get(path).copied().unwrap_or(0),
+    }
+}
+
+async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
+    let path = durable_outbox_path_in(ccteam_root);
+    let owed = {
+        let _guard = durable_outbox_lock();
+        match compact_durable_outbox_locked(&path) {
+            Ok(owed) => owed,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "ccteam-im: durable outbox compaction failed; replaying uncompacted");
+                read_owed_durable_outbound(&path)
+            }
+        }
+    };
+    for row in owed {
+        replay_durable_row(ccteam_root, channels, row, PLATFORM_CALL_TIMEOUT).await;
+    }
+}
+
+/// Replay one owed row: give up on it past the attempt / age bound, else
+/// write the attempt ahead and send it. A send that panics (a row whose
+/// content deterministically trips a provider bug) is caught here and marked
+/// `GaveUp` — uncaught, it would abort the replay and panic again on every
+/// daemon start, holding every later row hostage.
+async fn replay_durable_row(
+    ccteam_root: &Path,
+    channels: &ChannelMap,
+    row: DurableOutboundRow,
+    call_timeout: Duration,
+) {
+    use futures::FutureExt;
+    let first_queued_ms = if row.first_queued_ms == 0 {
+        row.ts_ms
+    } else {
+        row.first_queued_ms
+    };
+    let age = Duration::from_millis(now_unix_ms_u64().saturating_sub(first_queued_ms));
+    let give_up = if row.attempts >= DURABLE_OUTBOX_MAX_ATTEMPTS {
+        Some(format!("gave up after {} send attempts", row.attempts))
+    } else if age > DURABLE_OUTBOX_MAX_REPLAY_AGE {
+        Some(format!("gave up: queued {}h ago", age.as_secs() / 3600))
+    } else {
+        None
+    };
+    if let Some(reason) = give_up {
+        tracing::warn!(id = %row.id, channel = %row.channel, %reason, "ccteam-im: durable outbound row not replayed");
+        append_durable_outbound(ccteam_root, settled_row(row, reason));
+        return;
+    }
+    let Some(channel) = channels.get(&row.channel) else {
+        // Nothing was sent, so no attempt is spent: the row stays owed (as
+        // Queued or Failed, whichever it was) until the channel comes back or
+        // the age bound gives up on it. Only the reason is refreshed.
+        append_durable_outbound(
             ccteam_root,
-            row.id,
-            &row.inbound_id,
-            &row.channel,
-            channel.as_ref(),
-            row.message,
-            PLATFORM_CALL_TIMEOUT,
-        )
-        .await;
+            DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                first_queued_ms,
+                error: Some("replay failed: channel is not configured".to_string()),
+                ..row
+            },
+        );
+        return;
+    };
+    let queued = DurableOutboundRow {
+        ts_ms: now_unix_ms_u64(),
+        first_queued_ms,
+        attempts: row.attempts + 1,
+        state: DurableOutboundState::Queued,
+        platform_message_id: None,
+        error: None,
+        ..row
+    };
+    append_durable_outbound(ccteam_root, queued.clone());
+    let send =
+        finish_durable_outbound_send(ccteam_root, queued.clone(), channel.as_ref(), call_timeout);
+    if let Err(panic) = std::panic::AssertUnwindSafe(send).catch_unwind().await {
+        let reason = format!(
+            "replay send panicked: {}",
+            crate::supervise::panic_message(panic.as_ref())
+        );
+        tracing::error!(id = %queued.id, channel = %queued.channel, %reason, "ccteam-im: durable outbound replay panicked; row given up, replay continues");
+        append_durable_outbound(ccteam_root, settled_row(queued, reason));
+    }
+}
+
+/// `row` marked [`DurableOutboundState::GaveUp`] with `reason`.
+fn settled_row(row: DurableOutboundRow, reason: String) -> DurableOutboundRow {
+    DurableOutboundRow {
+        ts_ms: now_unix_ms_u64(),
+        state: DurableOutboundState::GaveUp,
+        platform_message_id: None,
+        error: Some(reason),
+        ..row
     }
 }
 
@@ -2421,11 +2565,15 @@ fn append_durable_outbound(ccteam_root: &Path, row: DurableOutboundRow) {
 }
 
 fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -> Result<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    append_durable_outbound_with_limit(ccteam_root, row, DURABLE_OUTBOX_COMPACT_BYTES)
+}
+
+fn append_durable_outbound_with_limit(
+    ccteam_root: &Path,
+    row: &DurableOutboundRow,
+    compact_bytes: u64,
+) -> Result<()> {
+    let _guard = durable_outbox_lock();
     let path = durable_outbox_path_in(ccteam_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2433,7 +2581,22 @@ fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -
     // One `write_all` per record (see `open_jsonl_append`).
     let mut line = serde_json::to_vec(row)?;
     line.push(b'\n');
-    ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?.write_all(&line)?;
+    let mut file = ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?;
+    file.write_all(&line)?;
+    // Only a terminal row can shrink the ledger; checking there keeps the
+    // compaction off the Queued → send hot path. The bound has headroom over
+    // what the last compaction kept: when the OWED rows alone are past
+    // `compact_bytes`, a fixed bound would rewrite (and fsync) all of them on
+    // every later failure.
+    let bound = compact_bytes.max(2 * last_compacted_len(&path, None));
+    if row.state != DurableOutboundState::Queued && file.metadata()?.len() > bound {
+        drop(file);
+        if let Err(err) = compact_durable_outbox_locked(&path) {
+            // The row is already appended; a failed compaction only defers
+            // the shrink to the next terminal append.
+            tracing::warn!(path = %path.display(), error = %err, "ccteam-im: durable outbox compaction failed");
+        }
+    }
     Ok(())
 }
 
@@ -2866,6 +3029,9 @@ mod tests {
             if message.content.contains("HANG") {
                 std::future::pending::<()>().await;
             }
+            if message.content.contains("FAIL") {
+                anyhow::bail!("trap channel refused the send");
+            }
             self.inner.send(message).await
         }
 
@@ -2994,6 +3160,8 @@ mod tests {
             root.path(),
             &DurableOutboundRow {
                 ts_ms: 2,
+                first_queued_ms: 2,
+                attempts: 1,
                 id: "o-1".into(),
                 inbound_id: "in-1".into(),
                 channel: "trap".into(),
@@ -3096,6 +3264,210 @@ mod tests {
         );
         assert!(!consumer.is_finished(), "the inbound consumer must survive");
         consumer.abort();
+    }
+
+    fn owed_row(id: &str, state: DurableOutboundState, attempts: u32) -> DurableOutboundRow {
+        let now = now_unix_ms_u64();
+        DurableOutboundRow {
+            ts_ms: now,
+            first_queued_ms: now,
+            attempts,
+            id: id.into(),
+            inbound_id: "in".into(),
+            channel: "trap".into(),
+            state,
+            message: SendMessage::new(format!("body of {id} {}", "z".repeat(200)), "chat-1"),
+            platform_message_id: None,
+            error: None,
+        }
+    }
+
+    /// Issue #213: a replay to a channel that is not configured sends nothing,
+    /// so it spends no attempt — the row is still delivered once the channel
+    /// is back, however many starts went by without it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_to_a_missing_channel_spends_no_attempt() {
+        let root = TempDir::new().unwrap();
+        append_durable_outbound_inner(
+            root.path(),
+            &owed_row("waiting", DurableOutboundState::Queued, 1),
+        )
+        .unwrap();
+        let none: ChannelMap = HashMap::new();
+        for _ in 0..3 {
+            replay_durable_outbox(root.path(), &none).await;
+        }
+        let path = durable_outbox_path_in(root.path());
+        let owed = read_owed_durable_outbound(&path);
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].attempts, 1, "no send happened, no attempt spent");
+
+        let mock = crate::transport::providers::mock::MockChannel::new();
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "trap".to_string(),
+            Arc::new(TrapChannel {
+                inner: mock.clone(),
+            }),
+        );
+        replay_durable_outbox(root.path(), &channels).await;
+        assert_eq!(mock.outbox().await.len(), 1);
+        assert!(read_owed_durable_outbound(&path).is_empty());
+    }
+
+    /// Issue #213: when the owed rows alone exceed the compaction bound, a
+    /// compaction that keeps them raises the next trigger to twice what it
+    /// kept — not a full rewrite (with fsync) on every later terminal append.
+    #[test]
+    fn compaction_bound_has_headroom_over_what_is_owed() {
+        let root = TempDir::new().unwrap();
+        let limit = 4096;
+        let append = |r: DurableOutboundRow| {
+            append_durable_outbound_with_limit(root.path(), &r, limit).unwrap();
+        };
+        // Owed Failed rows well past the bound: the crossing append compacts,
+        // keeping all of them.
+        for i in 0..12 {
+            append(owed_row(
+                &format!("owed-{i}"),
+                DurableOutboundState::Failed,
+                1,
+            ));
+        }
+        let path = durable_outbox_path_in(root.path());
+        let kept = std::fs::metadata(&path).unwrap().len();
+        assert!(kept > limit, "owed rows alone exceed the bound: {kept}");
+        // A delivered row now: a fixed bound would compact it straight out.
+        append(owed_row("done", DurableOutboundState::Queued, 1));
+        append(owed_row("done", DurableOutboundState::Sent, 1));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"id\":\"done\""),
+            "no rewrite until the ledger doubles what was kept"
+        );
+        assert_eq!(read_owed_durable_outbound(&path).len(), 12);
+    }
+
+    /// Issue #213: a startup replay sends each owed row at most up to the
+    /// attempt bound and never past the age bound; a row whose send panics is
+    /// given up instead of aborting the replay (and re-panicking at every
+    /// start); and after one replay nothing settled is ever sent again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_gives_up_on_poison_exhausted_and_stale_rows() {
+        let root = TempDir::new().unwrap();
+        let now = now_unix_ms_u64();
+        let row = |id: &str, state, attempts, first_queued_ms, content: &str| DurableOutboundRow {
+            ts_ms: first_queued_ms,
+            first_queued_ms,
+            attempts,
+            id: id.into(),
+            inbound_id: "in".into(),
+            channel: "trap".into(),
+            state,
+            message: SendMessage::new(content, "chat-1"),
+            platform_message_id: None,
+            error: None,
+        };
+        use DurableOutboundState::{Failed, Queued, Sent};
+        let two_days_ago = now - 48 * 3600 * 1000;
+        for r in [
+            row("poison", Queued, 1, now, "PANIC"),
+            row("owed", Queued, 1, now, "owed"),
+            row("retry", Failed, 1, now, "retry"),
+            row("flaky", Failed, 1, now, "FAIL flaky"),
+            row(
+                "exhausted",
+                Failed,
+                DURABLE_OUTBOX_MAX_ATTEMPTS,
+                now,
+                "exhausted",
+            ),
+            row("stale", Queued, 1, two_days_ago, "stale"),
+            row("done", Sent, 1, now, "done"),
+        ] {
+            append_durable_outbound_inner(root.path(), &r).unwrap();
+        }
+        let mock = crate::transport::providers::mock::MockChannel::new();
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "trap".to_string(),
+            Arc::new(TrapChannel {
+                inner: mock.clone(),
+            }),
+        );
+        let sent = || async {
+            mock.outbox()
+                .await
+                .into_iter()
+                .map(|m| m.content)
+                .collect::<Vec<_>>()
+        };
+
+        replay_durable_outbox(root.path(), &channels).await;
+        assert_eq!(sent().await, vec!["owed", "retry"], "queue order, bounded");
+        let path = durable_outbox_path_in(root.path());
+        let owed: Vec<(String, u32)> = read_owed_durable_outbound(&path)
+            .into_iter()
+            .map(|r| (r.id, r.attempts))
+            .collect();
+        assert_eq!(
+            owed,
+            vec![("flaky".to_string(), 2)],
+            "only the retry that failed again"
+        );
+
+        // Next start: `flaky` is out of attempts → given up, not re-sent; the
+        // ledger compacts to nothing.
+        replay_durable_outbox(root.path(), &channels).await;
+        replay_durable_outbox(root.path(), &channels).await;
+        assert_eq!(sent().await, vec!["owed", "retry"], "nothing sent twice");
+        assert!(read_owed_durable_outbound(&path).is_empty());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    /// Issue #213: delivered rows are compacted out once the ledger passes its
+    /// size bound, while every id still owed (Queued or Failed) keeps its
+    /// latest row — the at-least-once replay set is unchanged.
+    #[test]
+    fn durable_outbox_compaction_keeps_exactly_the_owed_rows() {
+        let root = TempDir::new().unwrap();
+        let row = |id: &str, state| DurableOutboundRow {
+            ts_ms: 1,
+            first_queued_ms: 1,
+            attempts: 1,
+            id: id.into(),
+            inbound_id: "in".into(),
+            channel: "trap".into(),
+            state,
+            message: SendMessage::new(format!("body of {id}"), "chat-1"),
+            platform_message_id: None,
+            error: None,
+        };
+        let append = |r: DurableOutboundRow| {
+            append_durable_outbound_with_limit(root.path(), &r, 4096).unwrap();
+        };
+        append(row("owed-queued", DurableOutboundState::Queued));
+        append(row("owed-failed", DurableOutboundState::Queued));
+        append(row("owed-failed", DurableOutboundState::Failed));
+        for i in 0..200 {
+            let id = format!("done-{i}");
+            append(row(&id, DurableOutboundState::Queued));
+            append(row(&id, DurableOutboundState::Sent));
+        }
+        let path = durable_outbox_path_in(root.path());
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len <= 4096 + 1024, "ledger stays bounded, got {len} bytes");
+
+        let owed = read_owed_durable_outbound(&path);
+        let ids: Vec<(&str, DurableOutboundState)> =
+            owed.iter().map(|r| (r.id.as_str(), r.state)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("owed-queued", DurableOutboundState::Queued),
+                ("owed-failed", DurableOutboundState::Failed),
+            ]
+        );
     }
 
     /// (v0.8.5 S4) End-to-end through the *real* security layer: a button
