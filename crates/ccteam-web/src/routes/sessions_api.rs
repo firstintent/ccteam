@@ -1741,6 +1741,8 @@ pub(crate) async fn handle_session_stop(
 /// follow-up. The spine's [`Gateway::interrupt_session`] reaches the adapter
 /// OUT-OF-BAND (stream-json `interrupt` control_request / TUI ESC / codex
 /// `turn/interrupt`), so the interrupt is NOT queued behind the running turn.
+/// On a `detached` sid (a process left over from before a daemon restart) it
+/// ends that process and the same sid resumes with its queued turns.
 /// 200 `{interrupted:true}`. 404 for an unknown sid. 503 with no gateway. Same
 /// auth + project ACL (`gate_sid`) as the stop route.
 #[utoipa::path(

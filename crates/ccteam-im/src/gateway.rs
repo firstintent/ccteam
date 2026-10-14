@@ -4469,6 +4469,44 @@ impl Gateway {
         Ok(true)
     }
 
+    /// An EXPLICIT user `/interrupt` of a detached body: end the PROCESS, keep
+    /// the SESSION. Returns `Ok(true)` when `sid` was detached and its body is
+    /// now gone; `Ok(false)` when `sid` was not detached.
+    ///
+    /// Waiting is the only automatic exit from DETACHED, and it is unbounded:
+    /// a body that lost its stdin is never driveable again, yet `claude` stays
+    /// alive after stdin EOF for as long as any background task it started is
+    /// running (and self-continues when that task ends) — a dev server or a
+    /// watcher keeps it alive for good, and every message to the sid queues
+    /// behind it forever. `/stop` was the only way out, and it ends the
+    /// session (stopped, focus routes dropped), so the chat's next message
+    /// minted a new sid. This is the way out that keeps the sid: only the
+    /// process is signalled; the record, the queue, the focus routes and the
+    /// DETACHED entry stay, and the watcher takes the same path as a body
+    /// that exited on its own — recover what it said, rebuild by sid
+    /// (`--resume`, same context), drain the queued turns.
+    pub(crate) async fn end_detached_body(&mut self, sid: &str) -> Result<bool> {
+        let Some(detached) = self.detached.get(sid).cloned() else {
+            return Ok(false);
+        };
+        let body = detached.body.clone();
+        let sid_owned = sid.to_string();
+        let ended = tokio::task::spawn_blocking(move || {
+            session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
+        })
+        .await
+        .context("join body terminate")??;
+        if !ended {
+            return Err(anyhow!(
+                "{sid}'s body (pid {}) is still alive after SIGTERM and SIGKILL",
+                detached.body.pid
+            ));
+        }
+        tracing::info!(session = %sid, pid = detached.body.pid, "ccteam-im: detached body ended by user interrupt; resuming by sid");
+        self.body_watch_notify.notify_one();
+        Ok(true)
+    }
+
     /// Queue a turn behind a detached body (the session is not driveable
     /// until its body exits): the text goes into the session's file-backed
     /// FIFO, which the watcher drains the moment the rebuilt session is live.
@@ -4500,9 +4538,11 @@ impl Gateway {
         let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
         let since = detached.since.to_rfc3339();
         let receipt = format!(
-            "⏳ {sid} is still finishing a turn that started before ccteam restarted \
-             (body pid {}, unobserved since {}). Your message is queued (#{queued}) and will be \
-             delivered as soon as that turn ends; `/stop` ends it now.",
+            "⏳ {sid}'s process from before ccteam restarted is still running (body pid {}, \
+             unobserved since {}): a turn it was finishing, or background tasks it started. Your \
+             message is queued (#{queued}) and is delivered when that process exits. \
+             `/interrupt {sid}` ends the process now and resumes {sid} on the same context \
+             (its background tasks end with it); `/stop {sid}` ends the session.",
             detached.body.pid, since
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
@@ -5629,15 +5669,20 @@ impl Gateway {
                 };
                 // Own-only ACL — identical to /stop (a chat can interrupt only
                 // its own / the shared web-pool session).
-                let accessible = self
-                    .sessions
-                    .get(&sid)
-                    .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or(false);
+                let detached = self.is_session_detached(&sid);
+                let accessible = match self.sessions.get(&sid) {
+                    Some(s) => self.chat_can_access(chat, s),
+                    None => detached && self.chat_can_access_sid(chat, &sid),
+                };
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
                 self.interrupt_session(&sid).await?;
+                if detached {
+                    return Ok(Some(format!(
+                        "已结束 {sid} 重启前遗留的进程(连同它启动的后台任务);{sid} 正按原上下文恢复,排队的消息随后送达"
+                    )));
+                }
                 Ok(Some(format!(
                     "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
                 )))
@@ -17948,7 +17993,15 @@ impl Gateway {
     /// applies `chat_can_access` first) and the web `POST
     /// /sessions/{sid}/interrupt` route (which applies the project ACL via
     /// `gate_sid` first). Unknown sid → `Err` so the web edge can 404.
+    ///
+    /// A DETACHED sid (its body outlived the previous daemon) has no control
+    /// channel left to interrupt through, so the interrupt ends that body
+    /// instead and the session comes back by sid — see
+    /// [`Self::end_detached_body`].
     pub async fn interrupt_session(&mut self, sid: &str) -> Result<()> {
+        if self.end_detached_body(sid).await? {
+            return Ok(());
+        }
         let session = self
             .sessions
             .get(sid)
@@ -22084,6 +22137,82 @@ mod tests {
             .unwrap();
         assert!(!id.starts_with("queued-behind-body:"), "got {id}");
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A body that never exits on its own (real `claude` after stdin EOF stays
+    /// alive while a background task it started runs) must not hold its sid
+    /// hostage: `/interrupt` ends that PROCESS and the SAME sid comes back on
+    /// its context — not stopped, the chat's focus kept, the turns queued
+    /// behind the body delivered (docs-local issue #211).
+    #[tokio::test]
+    async fn interrupt_ends_a_detached_body_and_resumes_the_same_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+            gateway.current_session.set(&chat, sid.clone());
+            gateway.persist_routing().unwrap();
+        }
+        let mut child = plant_body(&project_dir, &sid);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid));
+        let replies = restarted
+            .submit_to_current(&chat, "", "hello after restart".into())
+            .await
+            .unwrap();
+        assert!(
+            replies
+                .iter()
+                .any(|r| r.contains(&format!("/interrupt {sid}"))),
+            "the receipt names the way out that keeps the session: {replies:?}"
+        );
+
+        let replies = restarted
+            .handle_text("web", "web-api", "web-api", "/interrupt")
+            .await
+            .unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("已结束")),
+            "the bare /interrupt reached the detached focus: {replies:?}"
+        );
+        let status = child.wait().expect("the ended body is waitable");
+        assert!(status.code().is_none(), "signalled: {status:?}");
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        Gateway::body_watch_tick(&gateway).await;
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid), "the same sid is live again");
+        assert!(!g.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1, "exactly one body");
+        assert_eq!(g.current_session.get(&chat), Some(sid.clone()));
+        assert!(
+            read_session_meta(&project_dir, &sid)
+                .unwrap()
+                .stopped_at
+                .is_none(),
+            "an interrupt is not a stop"
+        );
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+        let submitted: Vec<String> = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(submitted, vec!["hello after restart".to_string()]);
     }
 
     /// A body record whose process is already GONE at restore time means the
