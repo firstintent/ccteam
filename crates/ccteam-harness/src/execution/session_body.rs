@@ -415,6 +415,22 @@ pub fn redact_cmdline(argv: &[String], home: Option<&str>) -> String {
                     .to_string(),
                 true,
             ),
+            // A cookie header carries a session: the whole value.
+            (
+                r#"(?:^|[^a-z0-9_-])(?:set-)?cookie[ \t]*:[ \t]*(?P<v>[^'"\n]+)"#.to_string(),
+                true,
+            ),
+            // `docker login … -p SECRET`.
+            (
+                r#"docker[ \t]+login(?:[ \t][^|;&\n]*?)?[ \t]-p[ \t]+(?P<v>[^ \t'"]+)"#.to_string(),
+                true,
+            ),
+            // `echo SECRET | docker login --password-stdin` and the like.
+            (
+                r#"(?:echo|printf)[ \t]+(?:-n[ \t]+)?(?:'(?P<v>[^']*)'|"(?P<v2>[^"]*)"|(?P<v3>[^ \t'"|]+))[ \t]*\|[^|\n]*--password-stdin"#
+                    .to_string(),
+                true,
+            ),
             // `sshpass -p SECRET`.
             (r#"sshpass[ \t]+-p[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
             // Values with a known token prefix.
@@ -991,6 +1007,42 @@ mod tests {
             (
                 &["app", "--port", "3000", "PWD=/x"],
                 "app --port 3000 PWD=***",
+            ),
+            (
+                &["curl", "-H", "'Cookie: session=abc; theme=dark'"],
+                "curl -H 'Cookie: ***'",
+            ),
+            (
+                &["curl", "-H", "'Set-Cookie: id=xyz'"],
+                "curl -H 'Set-Cookie: ***'",
+            ),
+            (
+                &["docker", "login", "-u", "bob", "-p", "s3cret", "ghcr.io"],
+                "docker login -u bob -p *** ghcr.io",
+            ),
+            (
+                &[
+                    "echo",
+                    "s3cret",
+                    "|",
+                    "docker",
+                    "login",
+                    "--password-stdin",
+                    "-u",
+                    "bob",
+                ],
+                "echo *** | docker login --password-stdin -u bob",
+            ),
+            (
+                &[
+                    "printf",
+                    "'s3cret'",
+                    "|",
+                    "docker",
+                    "login",
+                    "--password-stdin",
+                ],
+                "printf '***' | docker login --password-stdin",
             ),
         ];
         for (input, want) in cases {
