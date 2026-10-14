@@ -28,9 +28,18 @@
 //! - Same-uid soft identity, like every other rung: a same-uid process can
 //!   forge a `body.json`. What this prevents is a *misattribution by ccteam
 //!   itself* (two bodies for one sid), not an attack.
-//! - [`terminate`] exists for EXPLICIT user stops (`/stop`, `agent_stop`,
-//!   project stop). The daemon never calls it on its own initiative — a
-//!   detached body is waited for, not killed (AGENTS.md §三 "永不主动 kill").
+//! - [`terminate`] ends a body's PROCESS GROUP (the body and every
+//!   background process it started — bodies are spawned as group leaders)
+//!   on an EXPLICIT user stop (`/stop`, `agent_stop`, project stop): the
+//!   session is over, and so is its work. A body that is not its own group
+//!   leader (spawned by an older build, inside the daemon's group) gets only
+//!   its own pid signalled: ccteam never signals a group it did not create.
+//! - [`kill_body`] ends ONLY the body's process, keeping the session (a user
+//!   `/interrupt`, or a turn queued behind a detached body that is idle or
+//!   stalled): AGENTS.md §三 "kill 的是进程,不是会话". The processes it
+//!   started are the user's work and are never signalled; the ones still
+//!   running afterwards are reported ([`Orphan`]) so nobody has to guess what
+//!   holds a port.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -176,26 +185,35 @@ pub fn body_is_alive(body: &SessionBody, sid: &str) -> bool {
     }
 }
 
-/// Terminate a body that a user EXPLICITLY asked to stop: SIGTERM, wait up to
-/// `grace`, then SIGKILL. Each signal re-verifies the fingerprint first so a
-/// pid recycled mid-call is never touched. Returns `Ok(true)` if the process
-/// is gone afterwards.
+/// End a body and the background processes it started: SIGTERM, wait up to
+/// `grace` for the body to go, then SIGKILL. Each signal re-verifies the
+/// fingerprint first so a pid recycled mid-call is never touched, and goes to
+/// the body's process group when the body leads its own group (see the
+/// module doc) — `claude` answers SIGTERM by ending its background tasks
+/// itself, and the group SIGKILL sweeps whatever ignored that, so no orphaned
+/// dev server is left holding a port the resumed session needs. Returns
+/// `Ok(true)` if the body is gone afterwards.
 pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool> {
     if !body_is_alive(body, sid) {
+        // The body is gone — another end (an `/interrupt`) may have killed
+        // just it — but its group may not be: a stop still ends what the
+        // body started.
+        sweep_group_left_by(body.pid, sid)?;
         return Ok(true);
     }
-    signal(body.pid, libc::SIGTERM)?;
+    let group = leads_own_group(body.pid);
+    signal_body(body.pid, group, libc::SIGTERM)?;
     let started = Instant::now();
-    while started.elapsed() < grace {
-        if !body_is_alive(body, sid) {
-            return Ok(true);
-        }
+    while started.elapsed() < grace && body_is_alive(body, sid) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    if !body_is_alive(body, sid) {
-        return Ok(true);
+    if body_is_alive(body, sid) {
+        signal_body(body.pid, group, libc::SIGKILL)?;
+    } else if group {
+        // The leader is gone; sweep group members that outlived it. The
+        // group id cannot be reused while any member is alive.
+        signal_group(body.pid, libc::SIGKILL)?;
     }
-    signal(body.pid, libc::SIGKILL)?;
     // SIGKILL is not instantaneous; give the kernel a moment to reap.
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
@@ -205,6 +223,346 @@ pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool>
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(!body_is_alive(body, sid))
+}
+
+/// SIGKILL the process group a dead body led, when a member is still
+/// running AND names this sid in its environment (the body's children
+/// inherit `CCTEAM_CHAT_SID`). A group id cannot be reused while a member
+/// lives; the environment check keeps a group that merely shares the number
+/// — the body's pid recycled as another group's leader — untouched.
+fn sweep_group_left_by(pgid: u32, sid: &str) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Ok(());
+    };
+    let ours = entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let in_group = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                    .and_then(|g| g.parse::<u32>().ok())
+            })
+            == Some(pgid);
+        in_group && environ_names_sid(pid, sid) == Some(true)
+    });
+    if ours {
+        signal_group(pgid, libc::SIGKILL)?;
+    }
+    Ok(())
+}
+
+/// Signal the body, as a group when it leads one.
+fn signal_body(pid: u32, group: bool, sig: libc::c_int) -> Result<()> {
+    if group {
+        signal_group(pid, sig)
+    } else {
+        signal(pid, sig)
+    }
+}
+
+/// True iff `pid` is the leader of its own process group (pgid == pid).
+#[cfg(unix)]
+fn leads_own_group(pid: u32) -> bool {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getpgid(2) reads a process attribute; no memory is touched.
+    let pgid = unsafe { libc::getpgid(raw) };
+    pgid == raw
+}
+
+#[cfg(not(unix))]
+fn leads_own_group(_pid: u32) -> bool {
+    false
+}
+
+/// A process a body started that is still running after the body was ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Orphan {
+    pub pid: u32,
+    /// Its command line, redacted and shortened for a receipt
+    /// ([`redact_cmdline`]).
+    pub cmd: String,
+    /// Its OS start-time fingerprint, so a report made later never names a
+    /// process that merely reuses the pid.
+    pub fingerprint: String,
+}
+
+impl Orphan {
+    /// Is this exact process (pid + start time) still running?
+    pub fn still_running(&self) -> bool {
+        !process_is_zombie(self.pid)
+            && process_fingerprint(self.pid).is_ok_and(|now| now == self.fingerprint)
+    }
+}
+
+/// Longest command line an [`Orphan`] carries.
+const ORPHAN_CMD_MAX: usize = 80;
+
+/// Every live descendant of `pid` with its start fingerprint, both taken
+/// from ONE read of `/proc/<n>/stat` (Linux; empty where there is no
+/// `/proc`).
+fn descendants(pid: u32) -> Vec<(u32, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    // (pid, ppid, starttime)
+    let mut table: Vec<(u32, u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(child) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // After `)`: state(0) ppid(1) … starttime(19).
+        let (Some(ppid), Some(start)) = (
+            fields.get(1).and_then(|p| p.parse::<u32>().ok()),
+            fields.get(19),
+        ) else {
+            continue;
+        };
+        table.push((child, ppid, (*start).to_string()));
+    }
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        for (child, ppid, start) in &table {
+            if *ppid == parent && !out.iter().any(|(p, _)| p == child) {
+                out.push((*child, start.clone()));
+                frontier.push(*child);
+            }
+        }
+    }
+    out
+}
+
+fn cmdline_argv(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+/// A command line fit for an IM receipt and a ledger: what the user would
+/// recognise, never a secret or the home path.
+///
+/// - claude's Bash tool wraps every command as `bash -c 'source
+///   ~/.claude/shell-snapshots/… && eval '<cmd>' …'`; the eval payload is
+///   what was run, so that is shown instead of the wrapper.
+/// - Redacted to `***`: `key=value` and `--key value` when the key names a
+///   token, secret, password, passwd, key, auth or credential; `Bearer <x>`;
+///   the `user:pass@` of a URL; values with a known token prefix (`sk-`,
+///   `ghp_`, `gho_`, `github_pat_`, `xox?-`, `AKIA`); any run of 32 or more
+///   base64/hex characters.
+/// - Control characters and backticks are replaced (it is shown inside a
+///   Markdown code span), the home directory reads as `~`, and the result is
+///   cut at [`ORPHAN_CMD_MAX`] characters.
+pub fn redact_cmdline(argv: &[String], home: Option<&str>) -> String {
+    use std::sync::OnceLock;
+    // (pattern, match on the ASCII-lowercased text?). Each pattern names the
+    // secret part `v` (or `v2`/`v3` for the quoted alternatives); only that
+    // is replaced. ASCII lowercasing keeps byte
+    // offsets, so a match on the lowercased copy maps onto the original.
+    static RULES: OnceLock<Vec<(regex::Regex, bool)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        // Key names that mark their value secret; `pwd` only as a whole word.
+        const SENSITIVE: &str = "(?:[a-z0-9_.-]*(?:token|secret|password|passwd|pass|key|auth|credential)[a-z0-9_.-]*|pwd)";
+        // A value: single-quoted, double-quoted, or bare.
+        const VALUE: &str = r#"(?:'(?P<v>[^']*)'|"(?P<v2>[^"]*)"|(?P<v3>[^ \t'"]+))"#;
+        [
+            // An HTTP auth scheme's credentials.
+            (r#"(?:bearer|basic)[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
+            // URL userinfo, the user possibly empty (`redis://:pw@h`).
+            (r#"://(?P<v>[^/ \t@]*:[^/ \t@]+)@"#.to_string(), false),
+            // KEY=value, --key=value.
+            (format!(r#"(?:^|[^a-z0-9_.-])-{{0,2}}{SENSITIVE}={VALUE}"#), true),
+            // --key value.
+            (
+                format!(
+                    r#"(?:^|[ \t])--?{SENSITIVE}[ \t]+(?:'(?P<v>[^']*)'|"(?P<v2>[^"]*)"|(?P<v3>[^ \t'"-][^ \t'"]*))"#
+                ),
+                true,
+            ),
+            // A header or a JSON member: `X-Api-Key: v`, `{"token":"v"}`.
+            (
+                r#"(?:^|[^a-z0-9_-])[a-z0-9_-]*(?:token|secret|key|auth|password|pass)[a-z0-9_-]*"?[ \t]*:[ \t]*"?(?:(?:bearer|basic)[ \t]+)?(?P<v>[^ \t'",}]+)"#
+                    .to_string(),
+                true,
+            ),
+            // `curl -u user:pass`.
+            (r#"(?:^|[ \t])-u[ \t]+[^ \t:'"/]+:(?P<v>[^ \t'"/][^ \t'"]*)"#.to_string(), false),
+            // mysql / mariadb tools: `-pSECRET`.
+            (
+                r#"(?:mysql|mariadb|mysqldump|mysqladmin)(?:[ \t][^\n]*?)?[ \t]-p(?P<v>[^ \t'"]+)"#
+                    .to_string(),
+                true,
+            ),
+            // `sshpass -p SECRET`.
+            (r#"sshpass[ \t]+-p[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
+            // Values with a known token prefix.
+            (
+                r"(?:^|[^A-Za-z0-9_])(?P<v>(?:sk-|ghp_|gho_|github_pat_|xox[abposr]-|AKIA)[A-Za-z0-9_-]+)"
+                    .to_string(),
+                false,
+            ),
+            // Anything long enough to be a key.
+            (r"(?P<v>[A-Za-z0-9+/=_-]{32,})".to_string(), false),
+        ]
+        .into_iter()
+        .map(|(pattern, lower)| (regex::Regex::new(&pattern).expect("redaction rule"), lower))
+        .collect()
+    });
+    let joined = argv.join(" ");
+    let mut cmd = claude_bash_payload(argv).unwrap_or(joined);
+    if let Some(home) = home.filter(|h| h.len() > 1) {
+        cmd = cmd.replace(home, "~");
+    }
+    for (rule, lower) in rules {
+        let haystack = if *lower {
+            cmd.to_ascii_lowercase()
+        } else {
+            cmd.clone()
+        };
+        let mut out = String::with_capacity(cmd.len());
+        let mut last = 0;
+        for caps in rule.captures_iter(&haystack) {
+            let Some(v) = caps
+                .name("v")
+                .or_else(|| caps.name("v2"))
+                .or_else(|| caps.name("v3"))
+            else {
+                continue;
+            };
+            out.push_str(&cmd[last..v.start()]);
+            out.push_str("***");
+            last = v.end();
+        }
+        out.push_str(&cmd[last..]);
+        cmd = out;
+    }
+    let cmd: String = cmd
+        .chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let cmd = cmd.trim().to_string();
+    if cmd.chars().count() > ORPHAN_CMD_MAX {
+        let cut: String = cmd.chars().take(ORPHAN_CMD_MAX).collect();
+        format!("{cut}…")
+    } else {
+        cmd
+    }
+}
+
+/// The command claude's Bash tool actually ran, out of its
+/// `bash -c '… shell-snapshots … eval '<cmd>' …'` wrapper.
+fn claude_bash_payload(argv: &[String]) -> Option<String> {
+    let [shell, flag, script, ..] = argv else {
+        return None;
+    };
+    if !shell.ends_with("bash") || flag != "-c" || !script.contains("shell-snapshots") {
+        return None;
+    }
+    let start = script.find("eval '")? + "eval '".len();
+    let rest = &script[start..];
+    // The payload is single-quoted, with each inner quote spelled '"'"'.
+    let unescaped = rest.replace("'\"'\"'", "\u{0}");
+    let end = unescaped.find('\'')?;
+    Some(unescaped[..end].replace('\u{0}', "'"))
+}
+
+/// End a detached body's PROCESS and nothing else: one SIGKILL to the
+/// verified pid. `claude` answers SIGTERM by killing every background task it
+/// started (measured, 2.1.296), and those are the user's work — a dev server,
+/// a stack, a job scheduled for later — so no SIGTERM, no group signal. The
+/// descendants are listed (fingerprinted) BEFORE the kill, and the ones still
+/// running after it come back as [`Orphan`]s: never signalled, only reported.
+///
+/// A body killed mid-write can leave its transcript's last line torn — the
+/// case for `/interrupt` and for a body ended as stalled; claude resumes past
+/// a torn line (measured). `Ok(None)` when the body survived the SIGKILL.
+pub fn kill_body(body: &SessionBody, sid: &str) -> Result<Option<Vec<Orphan>>> {
+    if !body_is_alive(body, sid) {
+        return Ok(Some(Vec::new()));
+    }
+    let children = descendants(body.pid);
+    let home = dirs::home_dir().map(|h| h.display().to_string());
+    let cmds: Vec<String> = children
+        .iter()
+        .map(|(pid, _)| redact_cmdline(&cmdline_argv(*pid), home.as_deref()))
+        .collect();
+    // The /proc walk took time: re-verify the incarnation right before the
+    // signal, so a pid recycled meanwhile is never touched.
+    if !body_is_alive(body, sid) {
+        return Ok(Some(Vec::new()));
+    }
+    signal(body.pid, libc::SIGKILL)?;
+    let started = Instant::now();
+    while body_is_alive(body, sid) {
+        if started.elapsed() > Duration::from_secs(2) {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(Some(
+        children
+            .into_iter()
+            .zip(cmds)
+            .map(|((pid, fingerprint), cmd)| Orphan {
+                pid,
+                cmd,
+                fingerprint,
+            })
+            .filter(Orphan::still_running)
+            .collect(),
+    ))
+}
+
+/// kill(2) to the process group `pgid` (ESRCH — the group is gone — is
+/// success).
+#[cfg(unix)]
+fn signal_group(pgid: u32, sig: libc::c_int) -> Result<()> {
+    let raw = libc::pid_t::try_from(pgid).context("pgid out of range")?;
+    if raw <= 1 {
+        anyhow::bail!("refusing to signal process group {raw}");
+    }
+    // SAFETY: kill(2) on a group this module verified it leads; the return
+    // value reports failure, no memory is touched.
+    let rc = unsafe { libc::kill(-raw, sig) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err).with_context(|| format!("signal {sig} to body process group {pgid}"))
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pgid: u32, _sig: i32) -> Result<()> {
+    anyhow::bail!("session bodies are only managed on Unix")
 }
 
 #[cfg(unix)]
@@ -448,5 +806,260 @@ mod tests {
         assert_eq!(probe(tmp.path(), "s12"), BodyProbe::Absent);
         record(tmp.path(), "", Some(std::process::id()), "test").unwrap();
         assert!(!body_path(tmp.path(), "").exists());
+    }
+
+    #[test]
+    fn terminate_ends_a_group_leader_body_with_its_background_children() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        // A body that leads its own group and started a background process
+        // that ignores SIGTERM (an orphan-to-be dev server).
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'trap \"\" TERM; sleep 60' & echo $! > {}; wait",
+                pidfile.display()
+            ))
+            .env(BODY_SID_ENV, "s13")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s13", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s13").unwrap();
+        // The test process is the body's parent: reap it while waiting.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(terminate(&body, "s13", Duration::from_millis(500)).unwrap());
+        reaper.join().unwrap().unwrap();
+        let started = Instant::now();
+        while process_exists(bg) && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_exists(bg),
+            "the background child died with its group"
+        );
+    }
+
+    #[test]
+    fn terminate_never_signals_a_group_the_body_does_not_lead() {
+        // A body inside ANOTHER group (the test runner's, standing in for an
+        // older daemon's): only the body's own pid may be signalled.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = spawn_sleep("s14");
+        record(tmp.path(), "s14", Some(child.id()), "test").unwrap();
+        assert!(!leads_own_group(child.id()));
+        let body = read(tmp.path(), "s14").unwrap();
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(terminate(&body, "s14", Duration::from_secs(3)).unwrap());
+        reaper.join().unwrap().unwrap();
+        // Still here: the runner's group was not signalled.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_body_ends_only_the_body_and_reports_its_surviving_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 61 & echo $! > {}; wait", pidfile.display()))
+            .env(BODY_SID_ENV, "s15")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s15", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s15").unwrap();
+        let reaper = std::thread::spawn(move || child.wait());
+        let orphans = kill_body(&body, "s15").unwrap().expect("body gone");
+        reaper.join().unwrap().unwrap();
+        assert!(
+            process_exists(bg),
+            "the background child is never signalled"
+        );
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0].pid, bg);
+        assert_eq!(orphans[0].cmd, "sleep 61");
+        assert!(orphans[0].still_running());
+        signal(bg, libc::SIGKILL).unwrap();
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn redact_cmdline_hides_secrets_and_the_home_path() {
+        let home = Some("/home/alice");
+        let cases: &[(&[&str], &str)] = &[
+            (&["npm", "run", "dev"], "npm run dev"),
+            (
+                &["deploy", "--api-key", "abc123", "--port", "80"],
+                "deploy --api-key *** --port 80",
+            ),
+            (
+                &["env", "GITHUB_TOKEN=abc", "PASSWORD=hunter2", "x"],
+                "env GITHUB_TOKEN=*** PASSWORD=*** x",
+            ),
+            (
+                &["curl", "-H", "Authorization: Bearer eyJabc.def"],
+                "curl -H Authorization: Bearer ***",
+            ),
+            (
+                &["git", "clone", "https://bob:pw@github.com/x"],
+                "git clone https://***@github.com/x",
+            ),
+            (
+                &[
+                    "run",
+                    "sk-proj-abcdef",
+                    "ghp_xyz",
+                    "xoxb-1-2",
+                    "AKIAEXAMPLE",
+                ],
+                "run *** *** *** ***",
+            ),
+            (
+                &[
+                    "sh",
+                    "/home/alice/bin/x",
+                    "0123456789abcdef0123456789abcdef01",
+                ],
+                "sh ~/bin/x ***",
+            ),
+            (&["echo", "a`b", "c\u{7}d"], "echo a'b c d"),
+            (
+                &["psql", "--password='hunter2'", "db"],
+                "psql --password='***' db",
+            ),
+            (
+                &["TOKEN=\"abc123\"", "npm", "start"],
+                "TOKEN=\"***\" npm start",
+            ),
+            (&["tool", "--token", "\"abc\""], "tool --token \"***\""),
+            (
+                &["curl", "-H", "'X-Api-Key: abc123'"],
+                "curl -H 'X-Api-Key: ***'",
+            ),
+            (
+                &["curl", "-H", "'Authorization: Basic dXNlcjpwYXNz'"],
+                "curl -H 'Authorization: Basic ***'",
+            ),
+            (
+                &["echo", "{\"token\":\"abc123\"}"],
+                "echo {\"token\":\"***\"}",
+            ),
+            (&["curl", "-u", "admin:s3cret", "h"], "curl -u admin:*** h"),
+            (&["mysql", "-u", "root", "-phunter2"], "mysql -u root -p***"),
+            (
+                &["sshpass", "-p", "hunter2", "ssh", "h"],
+                "sshpass -p *** ssh h",
+            ),
+            (&["env", "DB_PASS=hunter2", "x"], "env DB_PASS=*** x"),
+            (&["tool", "--pass", "x"], "tool --pass ***"),
+            (
+                &["redis-cli", "-u", "redis://:pw@h"],
+                "redis-cli -u redis://***@h",
+            ),
+            (
+                &["app", "--port", "3000", "PWD=/x"],
+                "app --port 3000 PWD=***",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_cmdline(&argv(input), home), *want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn redact_cmdline_shows_the_command_claude_ran_not_its_wrapper() {
+        let wrapper = argv(&[
+            "/bin/bash",
+            "-c",
+            "source /home/alice/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true \
+             && eval 'PORT=3000 TOKEN=s3cr3t npm run dev -- --name '\"'\"'my app'\"'\"'' < /dev/null \
+             && pwd -P >| /tmp/claude-1-cwd",
+        ]);
+        let shown = redact_cmdline(&wrapper, Some("/home/alice"));
+        assert_eq!(shown, "PORT=3000 TOKEN=*** npm run dev -- --name 'my app'");
+        assert!(!shown.contains("/home/alice"));
+        let long = argv(&["x".repeat(200).as_str()]);
+        assert!(redact_cmdline(&long, None).chars().count() <= ORPHAN_CMD_MAX + 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_after_the_body_already_died_still_ends_its_group() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 63 & echo $! > {}; wait", pidfile.display()))
+            .env(BODY_SID_ENV, "s16")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s16", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s16").unwrap();
+        // An /interrupt's SIGKILL got the body first.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(kill_body(&body, "s16").unwrap().is_some());
+        reaper.join().unwrap().unwrap();
+        assert!(process_exists(bg));
+        // The stop that took over still ends what the body started.
+        assert!(terminate(&body, "s16", Duration::from_millis(200)).unwrap());
+        let started = Instant::now();
+        while process_exists(bg)
+            && !process_is_zombie(bg)
+            && started.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_exists(bg) || process_is_zombie(bg),
+            "the group was swept"
+        );
     }
 }

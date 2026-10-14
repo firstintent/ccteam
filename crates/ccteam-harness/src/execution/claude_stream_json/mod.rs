@@ -54,10 +54,10 @@ use crate::execution::progress_bridge::{
 use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, Directive,
-    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnobservedTurnCtx,
+    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, DetachedActivity,
+    Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting,
+    TurnSubmission, UnobservedTurnCtx,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -1967,7 +1967,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     );
                     HarnessError::SpawnFailed(format!(
                         "claude --resume {uuid} failed: {err}. The conversation is intact on \
-                         disk; send the message again to retry the resume"
+                         disk; the next resume retries it"
                     ))
                 })?
         };
@@ -2544,6 +2544,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         .await
         .ok()
         .flatten()
+    }
+
+    async fn detached_activity(&self, ctx: &UnobservedTurnCtx) -> Option<DetachedActivity> {
+        if ctx.vendor_uuid.is_empty() {
+            return None;
+        }
+        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        tokio::task::spawn_blocking(move || recovery::activity(&path, std::time::SystemTime::now()))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn handle_directive(

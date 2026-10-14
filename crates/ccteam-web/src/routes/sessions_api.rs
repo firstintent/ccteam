@@ -1767,15 +1767,16 @@ pub(crate) async fn handle_session_interrupt(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let mut guard = gw.lock().await;
-        guard.interrupt_session(&sid).await
-    };
-    match result {
+    match ccteam_im::gateway::Gateway::interrupt_session_shared(gw, &sid).await {
         Ok(()) => Json(json!({"interrupted": true})).into_response(),
+        Err(err) if err.to_string().starts_with("unknown session") => unknown_session(&sid),
         Err(err) => {
             tracing::warn!(%sid, %err, "interrupt_session failed");
-            unknown_session(&sid)
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("interrupt of {sid} failed: {err:#}")})),
+            )
+                .into_response()
         }
     }
 }
