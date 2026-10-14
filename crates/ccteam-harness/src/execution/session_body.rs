@@ -246,26 +246,38 @@ fn leads_own_group(_pid: u32) -> bool {
     false
 }
 
-/// kill(2) to the process group `pgid` (ESRCH — the group is gone — is
-/// success).
 /// A process a body started that is still running after the body was ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Orphan {
     pub pid: u32,
-    /// Its command line, shortened for a receipt.
+    /// Its command line, redacted and shortened for a receipt
+    /// ([`redact_cmdline`]).
     pub cmd: String,
+    /// Its OS start-time fingerprint, so a report made later never names a
+    /// process that merely reuses the pid.
+    pub fingerprint: String,
+}
+
+impl Orphan {
+    /// Is this exact process (pid + start time) still running?
+    pub fn still_running(&self) -> bool {
+        !process_is_zombie(self.pid)
+            && process_fingerprint(self.pid).is_ok_and(|now| now == self.fingerprint)
+    }
 }
 
 /// Longest command line an [`Orphan`] carries.
 const ORPHAN_CMD_MAX: usize = 80;
 
-/// Every live descendant of `pid`, each with its start fingerprint (Linux:
-/// a `/proc` walk by parent pid; empty where there is no `/proc`).
+/// Every live descendant of `pid` with its start fingerprint, both taken
+/// from ONE read of `/proc/<n>/stat` (Linux; empty where there is no
+/// `/proc`).
 fn descendants(pid: u32) -> Vec<(u32, String)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    let mut parent_of: Vec<(u32, u32)> = Vec::new();
+    // (pid, ppid, starttime)
+    let mut table: Vec<(u32, u32, String)> = Vec::new();
     for entry in entries.flatten() {
         let Some(child) = entry
             .file_name()
@@ -277,37 +289,117 @@ fn descendants(pid: u32) -> Vec<(u32, String)> {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
             continue;
         };
-        let ppid = stat
-            .rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-            .and_then(|p| p.parse::<u32>().ok());
-        if let Some(ppid) = ppid {
-            parent_of.push((child, ppid));
-        }
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // After `)`: state(0) ppid(1) … starttime(19).
+        let (Some(ppid), Some(start)) = (
+            fields.get(1).and_then(|p| p.parse::<u32>().ok()),
+            fields.get(19),
+        ) else {
+            continue;
+        };
+        table.push((child, ppid, (*start).to_string()));
     }
-    let mut out = Vec::new();
+    let mut out: Vec<(u32, String)> = Vec::new();
     let mut frontier = vec![pid];
     while let Some(parent) = frontier.pop() {
-        for &(child, ppid) in &parent_of {
-            if ppid == parent && !out.iter().any(|(p, _)| *p == child) {
-                if let Ok(fingerprint) = process_fingerprint(child) {
-                    out.push((child, fingerprint));
-                    frontier.push(child);
-                }
+        for (child, ppid, start) in &table {
+            if *ppid == parent && !out.iter().any(|(p, _)| p == child) {
+                out.push((*child, start.clone()));
+                frontier.push(*child);
             }
         }
     }
     out
 }
 
-fn short_cmdline(pid: u32) -> String {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let cmd = raw
+fn cmdline_argv(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
         .split(|b| *b == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect()
+}
+
+/// A command line fit for an IM receipt and a ledger: what the user would
+/// recognise, never a secret or the home path.
+///
+/// - claude's Bash tool wraps every command as `bash -c 'source
+///   ~/.claude/shell-snapshots/… && eval '<cmd>' …'`; the eval payload is
+///   what was run, so that is shown instead of the wrapper.
+/// - Redacted to `***`: `key=value` and `--key value` when the key names a
+///   token, secret, password, passwd, key, auth or credential; `Bearer <x>`;
+///   the `user:pass@` of a URL; values with a known token prefix (`sk-`,
+///   `ghp_`, `gho_`, `github_pat_`, `xox?-`, `AKIA`); any run of 32 or more
+///   base64/hex characters.
+/// - Control characters and backticks are replaced (it is shown inside a
+///   Markdown code span), the home directory reads as `~`, and the result is
+///   cut at [`ORPHAN_CMD_MAX`] characters.
+pub fn redact_cmdline(argv: &[String], home: Option<&str>) -> String {
+    use std::sync::OnceLock;
+    // (pattern, match on the ASCII-lowercased text?). Each pattern names the
+    // secret part `v`; only that is replaced. ASCII lowercasing keeps byte
+    // offsets, so a match on the lowercased copy maps onto the original.
+    static RULES: OnceLock<Vec<(regex::Regex, bool)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        const SENSITIVE: &str =
+            "[a-z0-9_.-]*(?:token|secret|password|passwd|key|auth|credential)[a-z0-9_.-]*";
+        [
+            (r#"bearer[ \t]+(?P<v>[^ \t'"]+)"#.to_string(), true),
+            (r#"://(?P<v>[^/ \t:@]+:[^/ \t@]+)@"#.to_string(), false),
+            (
+                format!(r#"(?:^|[^a-z0-9_.-])-{{0,2}}{SENSITIVE}=(?P<v>[^ \t'"]+)"#),
+                true,
+            ),
+            (
+                format!(r#"(?:^|[ \t])--?{SENSITIVE}[ \t]+(?P<v>[^ \t'"-][^ \t'"]*)"#),
+                true,
+            ),
+            (
+                r"(?:^|[^A-Za-z0-9_])(?P<v>(?:sk-|ghp_|gho_|github_pat_|xox[abposr]-|AKIA)[A-Za-z0-9_-]+)"
+                    .to_string(),
+                false,
+            ),
+            (r"(?P<v>[A-Za-z0-9+/=_-]{32,})".to_string(), false),
+        ]
+        .into_iter()
+        .map(|(pattern, lower)| (regex::Regex::new(&pattern).expect("redaction rule"), lower))
+        .collect()
+    });
+    let joined = argv.join(" ");
+    let mut cmd = claude_bash_payload(argv).unwrap_or(joined);
+    if let Some(home) = home.filter(|h| h.len() > 1) {
+        cmd = cmd.replace(home, "~");
+    }
+    for (rule, lower) in rules {
+        let haystack = if *lower {
+            cmd.to_ascii_lowercase()
+        } else {
+            cmd.clone()
+        };
+        let mut out = String::with_capacity(cmd.len());
+        let mut last = 0;
+        for caps in rule.captures_iter(&haystack) {
+            let Some(v) = caps.name("v") else { continue };
+            out.push_str(&cmd[last..v.start()]);
+            out.push_str("***");
+            last = v.end();
+        }
+        out.push_str(&cmd[last..]);
+        cmd = out;
+    }
+    let cmd: String = cmd
+        .chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let cmd = cmd.trim().to_string();
     if cmd.chars().count() > ORPHAN_CMD_MAX {
         let cut: String = cmd.chars().take(ORPHAN_CMD_MAX).collect();
         format!("{cut}…")
@@ -316,19 +408,48 @@ fn short_cmdline(pid: u32) -> String {
     }
 }
 
+/// The command claude's Bash tool actually ran, out of its
+/// `bash -c '… shell-snapshots … eval '<cmd>' …'` wrapper.
+fn claude_bash_payload(argv: &[String]) -> Option<String> {
+    let [shell, flag, script, ..] = argv else {
+        return None;
+    };
+    if !shell.ends_with("bash") || flag != "-c" || !script.contains("shell-snapshots") {
+        return None;
+    }
+    let start = script.find("eval '")? + "eval '".len();
+    let rest = &script[start..];
+    // The payload is single-quoted, with each inner quote spelled '"'"'.
+    let unescaped = rest.replace("'\"'\"'", "\u{0}");
+    let end = unescaped.find('\'')?;
+    Some(unescaped[..end].replace('\u{0}', "'"))
+}
+
 /// End a detached body's PROCESS and nothing else: one SIGKILL to the
 /// verified pid. `claude` answers SIGTERM by killing every background task it
 /// started (measured, 2.1.296), and those are the user's work — a dev server,
 /// a stack, a job scheduled for later — so no SIGTERM, no group signal. The
 /// descendants are listed (fingerprinted) BEFORE the kill, and the ones still
 /// running after it come back as [`Orphan`]s: never signalled, only reported.
-/// Callers use it once the body has stopped writing, so no transcript line is
-/// cut. `Ok(None)` when the body survived the SIGKILL.
+///
+/// A body killed mid-write can leave its transcript's last line torn — the
+/// case for `/interrupt` and for a body ended as stalled; claude resumes past
+/// a torn line (measured). `Ok(None)` when the body survived the SIGKILL.
 pub fn kill_body(body: &SessionBody, sid: &str) -> Result<Option<Vec<Orphan>>> {
     if !body_is_alive(body, sid) {
         return Ok(Some(Vec::new()));
     }
     let children = descendants(body.pid);
+    let home = dirs::home_dir().map(|h| h.display().to_string());
+    let cmds: Vec<String> = children
+        .iter()
+        .map(|(pid, _)| redact_cmdline(&cmdline_argv(*pid), home.as_deref()))
+        .collect();
+    // The /proc walk took time: re-verify the incarnation right before the
+    // signal, so a pid recycled meanwhile is never touched.
+    if !body_is_alive(body, sid) {
+        return Ok(Some(Vec::new()));
+    }
     signal(body.pid, libc::SIGKILL)?;
     let started = Instant::now();
     while body_is_alive(body, sid) {
@@ -340,18 +461,19 @@ pub fn kill_body(body: &SessionBody, sid: &str) -> Result<Option<Vec<Orphan>>> {
     Ok(Some(
         children
             .into_iter()
-            .filter(|(pid, fingerprint)| {
-                !process_is_zombie(*pid)
-                    && process_fingerprint(*pid).is_ok_and(|now| &now == fingerprint)
-            })
-            .map(|(pid, _)| Orphan {
+            .zip(cmds)
+            .map(|((pid, fingerprint), cmd)| Orphan {
                 pid,
-                cmd: short_cmdline(pid),
+                cmd,
+                fingerprint,
             })
+            .filter(Orphan::still_running)
             .collect(),
     ))
 }
 
+/// kill(2) to the process group `pgid` (ESRCH — the group is gone — is
+/// success).
 #[cfg(unix)]
 fn signal_group(pgid: u32, sig: libc::c_int) -> Result<()> {
     let raw = libc::pid_t::try_from(pgid).context("pgid out of range")?;
@@ -715,13 +837,76 @@ mod tests {
             process_exists(bg),
             "the background child is never signalled"
         );
-        assert_eq!(
-            orphans,
-            vec![Orphan {
-                pid: bg,
-                cmd: "sleep 61".to_string()
-            }]
-        );
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0].pid, bg);
+        assert_eq!(orphans[0].cmd, "sleep 61");
+        assert!(orphans[0].still_running());
         signal(bg, libc::SIGKILL).unwrap();
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn redact_cmdline_hides_secrets_and_the_home_path() {
+        let home = Some("/home/alice");
+        let cases: &[(&[&str], &str)] = &[
+            (&["npm", "run", "dev"], "npm run dev"),
+            (
+                &["deploy", "--api-key", "abc123", "--port", "80"],
+                "deploy --api-key *** --port 80",
+            ),
+            (
+                &["env", "GITHUB_TOKEN=abc", "PASSWORD=hunter2", "x"],
+                "env GITHUB_TOKEN=*** PASSWORD=*** x",
+            ),
+            (
+                &["curl", "-H", "Authorization: Bearer eyJabc.def"],
+                "curl -H Authorization: Bearer ***",
+            ),
+            (
+                &["git", "clone", "https://bob:pw@github.com/x"],
+                "git clone https://***@github.com/x",
+            ),
+            (
+                &[
+                    "run",
+                    "sk-proj-abcdef",
+                    "ghp_xyz",
+                    "xoxb-1-2",
+                    "AKIAEXAMPLE",
+                ],
+                "run *** *** *** ***",
+            ),
+            (
+                &[
+                    "sh",
+                    "/home/alice/bin/x",
+                    "0123456789abcdef0123456789abcdef01",
+                ],
+                "sh ~/bin/x ***",
+            ),
+            (&["echo", "a`b", "c\u{7}d"], "echo a'b c d"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_cmdline(&argv(input), home), *want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn redact_cmdline_shows_the_command_claude_ran_not_its_wrapper() {
+        let wrapper = argv(&[
+            "/bin/bash",
+            "-c",
+            "source /home/alice/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true \
+             && eval 'PORT=3000 TOKEN=s3cr3t npm run dev -- --name '\"'\"'my app'\"'\"'' < /dev/null \
+             && pwd -P >| /tmp/claude-1-cwd",
+        ]);
+        let shown = redact_cmdline(&wrapper, Some("/home/alice"));
+        assert_eq!(shown, "PORT=3000 TOKEN=*** npm run dev -- --name 'my app'");
+        assert!(!shown.contains("/home/alice"));
+        let long = argv(&["x".repeat(200).as_str()]);
+        assert!(redact_cmdline(&long, None).chars().count() <= ORPHAN_CMD_MAX + 1);
     }
 }

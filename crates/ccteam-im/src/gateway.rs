@@ -884,13 +884,11 @@ pub struct Gateway {
     post_mortem_pending: Vec<(String, String, PathBuf, SessionBody)>,
     /// Wakes the body watcher early (a new detached sid, a post-mortem).
     body_watch_notify: Arc<tokio::sync::Notify>,
-    /// What each ended detached body left running (see
-    /// [`session_body::kill_body`]), keyed by sid, until the watcher reports it.
-    body_end_orphans: Arc<std::sync::Mutex<HashMap<String, Vec<session_body::Orphan>>>>,
-    /// Sids whose body end, started by the `&mut` interrupt door on its own
-    /// task, FAILED: their `interrupted` mark must be lifted (see
-    /// [`Self::settle_failed_body_ends`]).
-    body_end_failures: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// The end of each detached body ccteam is carrying out, keyed by sid:
+    /// in progress, done (with what it left running) or failed. A std mutex
+    /// so a kill task without the gateway can hand its result over; the
+    /// watcher waits for that hand-over before it reports or rebuilds.
+    body_ends: Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
     projects: BTreeMap<String, PathBuf>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
@@ -2602,6 +2600,17 @@ pub struct DetachedBody {
     pub ending: Option<&'static str>,
 }
 
+/// Where ccteam's end of one detached body stands (see `Gateway::body_ends`).
+#[derive(Debug, Clone)]
+enum BodyEnd {
+    /// The kill is running; nothing about this body may be reported yet.
+    InProgress,
+    /// The body is gone; what it left running, for the report.
+    Ended(Vec<session_body::Orphan>),
+    /// The kill failed; the mark must be lifted and the body watched again.
+    Failed,
+}
+
 impl DetachedBody {
     fn error(&self) -> GatewayRequestError {
         GatewayRequestError::SessionBodyDetached {
@@ -3590,8 +3599,7 @@ impl Gateway {
             detached: BTreeMap::new(),
             post_mortem_pending: Vec::new(),
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
-            body_end_orphans: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            body_end_failures: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            body_ends: Arc::new(std::sync::Mutex::new(HashMap::new())),
             projects,
             operator_chats: BTreeMap::new(),
             button_channels: BTreeSet::new(),
@@ -4458,6 +4466,11 @@ impl Gateway {
         let Some(detached) = self.detached.remove(sid) else {
             return Ok(false);
         };
+        // What an earlier end of this body left running belongs to the
+        // incarnation the stop ends; never report it for a later one.
+        if let Ok(mut map) = self.body_ends.lock() {
+            map.remove(sid);
+        }
         self.principals.forget(sid);
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
@@ -4493,7 +4506,7 @@ impl Gateway {
     /// waits on it under the lock. The REST door awaits it off the lock
     /// instead ([`Self::end_detached_body_shared`]).
     pub(crate) fn end_detached_body(&mut self, sid: &str) -> bool {
-        self.settle_failed_body_ends();
+        self.settle_body_ends();
         let Some(detached) = self.detached.get_mut(sid) else {
             return false;
         };
@@ -4504,19 +4517,16 @@ impl Gateway {
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
         let notify = Arc::clone(&self.body_watch_notify);
-        let orphans = Arc::clone(&self.body_end_orphans);
-        let failures = Arc::clone(&self.body_end_failures);
+        let ends = Arc::clone(&self.body_ends);
+        Self::set_body_end(&ends, sid, BodyEnd::InProgress);
         tokio::spawn(async move {
-            let outcome =
-                Self::end_body_process(body, sid_owned.clone(), "interrupted", orphans).await;
-            if let Err(error) = outcome {
+            // A failure is handed over as `Failed`: the next reader lifts the
+            // mark, or every later /interrupt would be a no-op and a natural
+            // exit would be recorded as interrupted.
+            if let Err(error) =
+                Self::end_body_process(body, sid_owned.clone(), "interrupted", ends).await
+            {
                 tracing::warn!(session = %sid_owned, %error, "ccteam-im: could not end a detached body on interrupt");
-                // Lift the mark (next lock holder settles it), or every later
-                // /interrupt would be a no-op and a natural exit would be
-                // recorded as interrupted.
-                if let Ok(mut set) = failures.lock() {
-                    set.insert(sid_owned);
-                }
             }
             notify.notify_one();
         });
@@ -4524,17 +4534,45 @@ impl Gateway {
         true
     }
 
-    /// Lift the `interrupted` mark of every body whose end failed on the
-    /// `&mut` door's own task, so the body is watched (and interruptible)
-    /// again. Called by every reader of the mark before it trusts it.
-    fn settle_failed_body_ends(&mut self) {
-        let failed: Vec<String> = match self.body_end_failures.lock() {
-            Ok(mut set) => set.drain().collect(),
+    async fn body_end_in_progress(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) -> bool {
+        let g = gateway.lock().await;
+        g.body_ends
+            .lock()
+            .map(|map| matches!(map.get(sid), Some(BodyEnd::InProgress)))
+            .unwrap_or(false)
+    }
+
+    fn set_body_end(
+        ends: &Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
+        sid: &str,
+        end: BodyEnd,
+    ) {
+        if let Ok(mut map) = ends.lock() {
+            map.insert(sid.to_string(), end);
+        }
+    }
+
+    /// Lift the mark of every body whose end FAILED (handed over by a kill
+    /// task), so it is watched — and interruptible — again. Called by every
+    /// reader of the mark before it trusts it.
+    fn settle_body_ends(&mut self) {
+        let failed: Vec<String> = match self.body_ends.lock() {
+            Ok(mut map) => {
+                let failed: Vec<String> = map
+                    .iter()
+                    .filter(|(_, end)| matches!(end, BodyEnd::Failed))
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                for sid in &failed {
+                    map.remove(sid);
+                }
+                failed
+            }
             Err(_) => return,
         };
         for sid in failed {
             if let Some(detached) = self.detached.get_mut(&sid) {
-                if detached.ending == Some("interrupted") {
+                if detached.ending != Some("stopping") {
                     detached.ending = None;
                 }
             }
@@ -4547,14 +4585,32 @@ impl Gateway {
 
     /// End one detached body off the lock: a stop ends its whole group
     /// ([`session_body::terminate`]); anything that keeps the session ends
-    /// only the process and parks what it left running in `orphans` for the
-    /// watcher's report ([`session_body::kill_body`]).
+    /// only the process ([`session_body::kill_body`]). The caller has set the
+    /// sid's entry in `ends` to `InProgress`; this hands the outcome over in
+    /// the same entry — `Ended` with what it left running, or `Failed`.
     async fn end_body_process(
         body: SessionBody,
         sid: String,
         why: &'static str,
-        orphans: Arc<std::sync::Mutex<HashMap<String, Vec<session_body::Orphan>>>>,
+        ends: Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
     ) -> Result<()> {
+        let outcome = Self::run_body_end(body, &sid, why).await;
+        Self::set_body_end(
+            &ends,
+            &sid,
+            match &outcome {
+                Ok(left) => BodyEnd::Ended(left.clone()),
+                Err(_) => BodyEnd::Failed,
+            },
+        );
+        outcome.map(|_| ())
+    }
+
+    async fn run_body_end(
+        body: SessionBody,
+        sid: &str,
+        why: &'static str,
+    ) -> Result<Vec<session_body::Orphan>> {
         let pid = body.pid;
         #[cfg(test)]
         if tests::FAIL_BODY_END_PIDS
@@ -4564,7 +4620,7 @@ impl Gateway {
         {
             return Err(anyhow!("test: ending body pid {pid} failed"));
         }
-        let sid_for_task = sid.clone();
+        let sid_for_task = sid.to_string();
         let left = tokio::task::spawn_blocking(move || {
             if why == "stopping" {
                 session_body::terminate(&body, &sid_for_task, Self::TERMINATE_GRACE)
@@ -4575,17 +4631,7 @@ impl Gateway {
         })
         .await
         .context("join body end")??;
-        let Some(left) = left else {
-            return Err(anyhow!(
-                "{sid}'s process (pid {pid}) is still alive after SIGKILL"
-            ));
-        };
-        if !left.is_empty() {
-            if let Ok(mut map) = orphans.lock() {
-                map.insert(sid, left);
-            }
-        }
-        Ok(())
+        left.ok_or_else(|| anyhow!("{sid}'s process (pid {pid}) is still alive after SIGKILL"))
     }
 
     /// End a detached body's process OFF the gateway lock, marking the entry
@@ -4603,10 +4649,10 @@ impl Gateway {
         sid: &str,
         why: &'static str,
     ) -> Result<bool> {
-        let (body, orphans) = {
+        let (body, ends) = {
             let mut g = gateway.lock().await;
-            g.settle_failed_body_ends();
-            let orphans = Arc::clone(&g.body_end_orphans);
+            g.settle_body_ends();
+            let ends = Arc::clone(&g.body_ends);
             let Some(detached) = g.detached.get_mut(sid) else {
                 return Ok(false);
             };
@@ -4616,22 +4662,17 @@ impl Gateway {
                 Some(_) => return Ok(false),
             }
             detached.ending = Some(why);
-            (detached.body.clone(), orphans)
+            let body = detached.body.clone();
+            Self::set_body_end(&ends, sid, BodyEnd::InProgress);
+            (body, ends)
         };
-        let ended = Self::end_body_process(body, sid.to_string(), why, orphans).await;
+        let ended = Self::end_body_process(body, sid.to_string(), why, ends).await;
         let mut g = gateway.lock().await;
-        match ended {
-            Ok(()) => {
-                g.body_watch_notify.notify_one();
-                Ok(true)
-            }
-            Err(error) => {
-                if let Some(detached) = g.detached.get_mut(sid) {
-                    detached.ending = None;
-                }
-                Err(error)
-            }
+        if ended.is_err() {
+            g.settle_body_ends();
         }
+        g.body_watch_notify.notify_one();
+        ended.map(|()| true)
     }
 
     /// `/interrupt` for a caller holding the shared handle (the REST route):
@@ -4683,7 +4724,7 @@ impl Gateway {
              message is queued (#{queued}). Once that process has gone quiet ccteam ends it \
              and resumes {sid} on the same context with your message; background processes \
              it started keep running and are listed then. `/interrupt {sid}` does that now; \
-             `/stop {sid}` ends the session and its background processes.",
+             `/stop {sid}` ends the session and that process with its background processes.",
             detached.body.pid, since
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
@@ -4716,7 +4757,7 @@ impl Gateway {
     pub async fn body_watch_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) {
         let (detached, post_mortems) = {
             let mut g = gateway.lock().await;
-            g.settle_failed_body_ends();
+            g.settle_body_ends();
             (
                 g.detached.values().cloned().collect::<Vec<_>>(),
                 std::mem::take(&mut g.post_mortem_pending),
@@ -4729,6 +4770,11 @@ impl Gateway {
         for d in detached {
             // A stop owns its body's end.
             if d.ending == Some("stopping") {
+                continue;
+            }
+            // A kill ccteam is carrying out has not handed over yet: what
+            // it left running must be in the report, so wait for it.
+            if Self::body_end_in_progress(gateway, &d.sid).await {
                 continue;
             }
             // Off the lock: a pure OS probe.
@@ -4831,30 +4877,35 @@ impl Gateway {
         d: DetachedBody,
         reason: &str,
     ) {
-        {
+        let mut orphans = {
             let mut g = gateway.lock().await;
             // A user stop that marked the body after the watcher read its
             // mark owns the end from here.
             if g.detached.get(&d.sid).and_then(|current| current.ending) == Some("stopping") {
                 return;
             }
+            // Take the kill's hand-over in the same breath as the entry; a
+            // kill that has not handed over yet is waited for (next tick).
+            let end = match g.body_ends.lock() {
+                Ok(mut map) => match map.get(&d.sid) {
+                    Some(BodyEnd::InProgress) => return,
+                    _ => map.remove(&d.sid),
+                },
+                Err(_) => None,
+            };
             if g.detached.remove(&d.sid).is_none() {
                 // Stopped by a user between the snapshot and now.
                 return;
             }
             session_body::clear(&d.cwd, &d.sid);
-        }
-        tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
-        let orphans = {
-            let g = gateway.lock().await;
-            let taken = g
-                .body_end_orphans
-                .lock()
-                .ok()
-                .and_then(|mut map| map.remove(&d.sid))
-                .unwrap_or_default();
-            taken
+            match end {
+                Some(BodyEnd::Ended(left)) => left,
+                _ => Vec::new(),
+            }
         };
+        tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
+        // Re-verify by start time: a pid reused since the kill is not ours.
+        orphans.retain(session_body::Orphan::still_running);
         Self::recover_and_report_shared(
             gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, reason, &orphans,
         )
@@ -18330,6 +18381,9 @@ impl Gateway {
         // an on-demand resume) must not install it after the stop: without
         // its reservation, `apply_rebuilt_session` discards the thread.
         self.rebuild_reservations.remove(sid);
+        if let Ok(mut map) = self.body_ends.lock() {
+            map.remove(sid);
+        }
         self.current_session.retain_values(|v| v != sid);
         self.record_explicit_stop(sid);
         if !already_stopped {
@@ -22623,7 +22677,16 @@ mod tests {
         assert!(status.code().is_none(), "signalled: {status:?}");
 
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
-        Gateway::body_watch_tick(&gateway).await;
+        // The watcher waits for the kill task's hand-over before it rebuilds.
+        let started = std::time::Instant::now();
+        while !gateway.lock().await.is_session_live(&sid) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "rebuilt once the kill handed over"
+            );
+            Gateway::body_watch_tick(&gateway).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let g = gateway.lock().await;
         assert!(g.is_session_live(&sid), "the same sid is live again");
         assert!(!g.is_session_detached(&sid));
@@ -22899,13 +22962,8 @@ mod tests {
             }
         }
         assert!(told, "the reply target is told what is still running");
-        assert!(
-            ledger_has(
-                &paths,
-                &format!(r#""orphans":[{{"cmd":"sleep 62","pid":{bg}}}]"#)
-            )
-            .await
-        );
+        assert!(ledger_has(&paths, r#""orphans":[{"cmd":"sleep 62","fingerprint":""#).await);
+        assert!(ledger_has(&paths, &format!(r#""pid":{bg}}}]"#)).await);
         assert!(gateway.lock().await.is_session_live(&sid));
         unsafe {
             libc::kill(bg as i32, libc::SIGKILL);
@@ -22990,7 +23048,10 @@ mod tests {
         // Let the kill task run and fail.
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if !restarted.body_end_failures.lock().unwrap().is_empty() {
+            if matches!(
+                restarted.body_ends.lock().unwrap().get(&sid),
+                Some(BodyEnd::Failed)
+            ) {
                 break;
             }
         }
@@ -23017,6 +23078,53 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert!(status.code().is_none(), "signalled: {status:?}");
+    }
+
+    /// A body can be seen dead while the kill that ended it has not handed
+    /// over yet: the report waits for the hand-over instead of going out
+    /// without the orphans, and an orphan whose pid now belongs to another
+    /// process (start time changed) is never named (checker N1).
+    #[tokio::test]
+    async fn the_report_waits_for_the_kill_and_names_only_its_own_orphans() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let mut events = restarted.subscribe_events();
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        restarted.detached.get_mut(&sid).unwrap().ending = Some("interrupted");
+        Gateway::set_body_end(&restarted.body_ends, &sid, BodyEnd::InProgress);
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        // The kill took the body, but has not handed over.
+        body_gone(&mut child);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid), "deferred");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+
+        // Hand-over: one orphan whose pid is now somebody else (this test
+        // process, with a start time that does not match).
+        let reused = std::process::id();
+        Gateway::set_body_end(
+            &gateway.lock().await.body_ends,
+            &sid,
+            BodyEnd::Ended(vec![ccteam_harness::execution::session_body::Orphan {
+                pid: reused,
+                cmd: "npm run dev".to_string(),
+                fingerprint: "0".to_string(),
+            }]),
+        );
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_live(&sid));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !event.content.contains("still running, unattended"),
+                "a reused pid is not reported: {}",
+                event.content
+            );
+        }
+        assert!(gateway.lock().await.body_ends.lock().unwrap().is_empty());
     }
 
     /// When the session does not come back after its old process ended, the
