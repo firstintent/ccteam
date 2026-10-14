@@ -206,21 +206,30 @@ pub(crate) fn spawn_global_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<GlobalEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving the ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "global ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            ring.record(ev);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    ring.record(ev);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 /// Spawn the ONE persistent ring-feeder task for this gateway — called once
@@ -237,23 +246,32 @@ pub(crate) fn spawn_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<SessionEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
-                    }
-                    if let Some(sid) = ev.sid.clone() {
-                        ring.record(&sid, ev);
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving every session's replay ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "session ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            if let Some(sid) = ev.sid.clone() {
+                                ring.record(&sid, ev);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 #[cfg(test)]

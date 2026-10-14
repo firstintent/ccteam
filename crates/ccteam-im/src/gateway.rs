@@ -971,6 +971,11 @@ pub struct Gateway {
     /// is wired or on the standalone path. The pump tees through
     /// [`GatewayEventSink`]; the held sender is the source for new receivers.
     events_broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// Set once the daemon begins a clean stop, before it aborts the
+    /// delivery consumer: a pump's last send then meets a closed sink, which
+    /// is expected and logged quietly instead of as a delivery outage.
+    /// Shared with every [`GatewayEventSink`] this gateway hands out.
+    event_delivery_closing: Arc<std::sync::atomic::AtomicBool>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
     /// Outstanding choice prompts (v0.8.5 D3/D4/D6). Its own lock — held
     /// separately from the gateway so a long External await (D6, W2) never
@@ -2279,6 +2284,8 @@ struct GatewayEventSink {
     mpsc: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
     /// Fan-out for per-session SSE subscribers.
     broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// The gateway's [`Gateway::close_event_delivery`] flag.
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GatewayEventSink {
@@ -2309,7 +2316,7 @@ impl GatewayEventSink {
     fn send_broadcast_only(&self, event: GatewayEvent) -> bool {
         let live = !self.mpsc.is_closed();
         if !live {
-            Self::log_consumer_gone(&event);
+            self.log_consumer_gone(&event);
         }
         let _ = self.broadcast.send(event);
         live
@@ -2324,19 +2331,27 @@ impl GatewayEventSink {
         match self.mpsc.send(event) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::SendError(event)) => {
-                Self::log_consumer_gone(&event);
+                self.log_consumer_gone(&event);
                 false
             }
         }
     }
 
-    fn log_consumer_gone(event: &GatewayEvent) {
+    fn log_consumer_gone(&self, event: &GatewayEvent) {
+        let sid = event.sid.as_deref().unwrap_or("-");
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!(
+                sid,
+                event_id = %event.id,
+                "ccteam-im: delivery closed for shutdown; stopping this session's event pump"
+            );
+            return;
+        }
         tracing::error!(
-            sid = event.sid.as_deref().unwrap_or("-"),
+            sid,
             event_id = %event.id,
             channel = %event.channel,
-            "ccteam-im: gateway event consumer is gone; stopping this session's event pump \
-             (expected only during daemon shutdown)"
+            "ccteam-im: gateway event consumer is gone; stopping this session's event pump"
         );
     }
 }
@@ -3628,6 +3643,7 @@ impl Gateway {
             scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
+            event_delivery_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_pumps: BTreeMap::new(),
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
@@ -3695,11 +3711,20 @@ impl Gateway {
         self.event_sink = Some(GatewayEventSink {
             mpsc: tx,
             broadcast: self.events_broadcast.clone(),
+            closing: Arc::clone(&self.event_delivery_closing),
         });
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// The flag the daemon raises when it begins a clean stop, before it
+    /// aborts the delivery consumer: from then on a closed delivery sink is
+    /// shutdown, not an outage, so pumps that stop on it log at debug. Handed
+    /// out so the daemon can raise it without taking the gateway lock.
+    pub fn event_delivery_closing(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.event_delivery_closing)
     }
 
     /// v0.9.0 W2 (F2) — wire the sender the detached event pumps use to signal a
@@ -16507,73 +16532,102 @@ impl Gateway {
                 .delegation_watch_set,
         );
         while let Some(pulse) = rx.recv().await {
-            match pulse {
-                crate::delegation::DelegationPulse::TurnOpened {
-                    child_sid,
-                    exec_turn_id,
-                    continues_from,
-                } => {
-                    if !watch_set.read().unwrap().contains(&child_sid) {
-                        continue;
-                    }
-                    // A store mutation: claimed like every other one, so it
-                    // cannot interleave with a dispatch's accept/bind pair.
-                    let claim = Self::claim_delegation_store(&gateway, &child_sid).await;
-                    let (moved, changed) = {
-                        let mut guard =
-                            crate::latency::gateway_lock(&gateway, "notifier.executing").await;
-                        // Move the bindings FIRST, so the executing mark that
-                        // follows finds the requests already on this turn. Both
-                        // under one lock hold: a reader must never catch a
-                        // request bound to a turn that has ended while the one
-                        // continuing it is already running.
-                        let moved = match continues_from.as_deref() {
-                            Some(from) => {
-                                // The vendor DID come back for the work: the
-                                // boundary held under `from` was a checkpoint
-                                // after all, not the answer.
-                                if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
-                                    mirror.provisional.remove(from);
-                                }
-                                guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+            let child = match &pulse {
+                crate::delegation::DelegationPulse::TurnOpened { child_sid, .. } => {
+                    child_sid.clone()
+                }
+                crate::delegation::DelegationPulse::Signal(signal) => signal.child_sid.clone(),
+            };
+            // The only notifier: a panic on one pulse must not end parent
+            // notification for every delegation (issue #210 failure class).
+            crate::supervise::contain_panic(
+                "delegation notifier",
+                &format!("child={child}"),
+                Self::handle_delegation_pulse(&gateway, &watch_set, pulse),
+            )
+            .await;
+        }
+    }
+
+    /// One pulse of [`Self::run_delegation_notifier`].
+    async fn handle_delegation_pulse(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        watch_set: &std::sync::RwLock<HashSet<String>>,
+        pulse: crate::delegation::DelegationPulse,
+    ) {
+        match pulse {
+            crate::delegation::DelegationPulse::TurnOpened {
+                child_sid,
+                exec_turn_id,
+                continues_from,
+            } => {
+                if !watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&child_sid)
+                {
+                    return;
+                }
+                // A store mutation: claimed like every other one, so it
+                // cannot interleave with a dispatch's accept/bind pair.
+                let claim = Self::claim_delegation_store(gateway, &child_sid).await;
+                let (moved, changed) = {
+                    let mut guard =
+                        crate::latency::gateway_lock(gateway, "notifier.executing").await;
+                    // Move the bindings FIRST, so the executing mark that
+                    // follows finds the requests already on this turn. Both
+                    // under one lock hold: a reader must never catch a
+                    // request bound to a turn that has ended while the one
+                    // continuing it is already running.
+                    let moved = match continues_from.as_deref() {
+                        Some(from) => {
+                            // The vendor DID come back for the work: the
+                            // boundary held under `from` was a checkpoint
+                            // after all, not the answer.
+                            if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
+                                mirror.provisional.remove(from);
                             }
-                            None => false,
-                        };
-                        (
-                            moved,
-                            moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
-                        )
+                            guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+                        }
+                        None => false,
                     };
-                    if changed {
-                        // The executing flag alone is a display fact the next
-                        // write carries anyway; a REBINDING is not. A move that
-                        // never reaches disk leaves the request pointing at a
-                        // turn that has already ended, and a restart would then
-                        // read that turn's row as this request's answer.
-                        if let Err(error) = Self::persist_delegation_store(&gateway, &claim).await {
-                            if moved {
-                                tracing::warn!(
-                                    child = %child_sid,
-                                    turn = %exec_turn_id,
-                                    %error,
-                                    "ccteam-im: a continuation rebinding could not be made \
-                                     durable; a restart may resolve it off the turn it left"
-                                );
-                            }
+                    (
+                        moved,
+                        moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
+                    )
+                };
+                if changed {
+                    // The executing flag alone is a display fact the next
+                    // write carries anyway; a REBINDING is not. A move that
+                    // never reaches disk leaves the request pointing at a
+                    // turn that has already ended, and a restart would then
+                    // read that turn's row as this request's answer.
+                    if let Err(error) = Self::persist_delegation_store(gateway, &claim).await {
+                        if moved {
+                            tracing::warn!(
+                                child = %child_sid,
+                                turn = %exec_turn_id,
+                                %error,
+                                "ccteam-im: a continuation rebinding could not be made \
+                                 durable; a restart may resolve it off the turn it left"
+                            );
                         }
                     }
                 }
-                crate::delegation::DelegationPulse::Signal(signal) => {
-                    let watched = watch_set.read().unwrap().contains(&signal.child_sid);
-                    // Unwatched fleet chatter and watched mid-turn narration
-                    // create no gateway-lock traffic. The child pump already
-                    // mirrored narration into its ledger; only a vendor turn
-                    // boundary can notify a parent.
-                    if !watched || !signal.boundary {
-                        continue;
-                    }
-                    Self::deliver_delegation_signal_shared(Arc::clone(&gateway), signal).await;
+            }
+            crate::delegation::DelegationPulse::Signal(signal) => {
+                let watched = watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&signal.child_sid);
+                // Unwatched fleet chatter and watched mid-turn narration
+                // create no gateway-lock traffic. The child pump already
+                // mirrored narration into its ledger; only a vendor turn
+                // boundary can notify a parent.
+                if !watched || !signal.boundary {
+                    return;
                 }
+                Self::deliver_delegation_signal_shared(Arc::clone(gateway), signal).await;
             }
         }
     }
@@ -22430,6 +22484,7 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(Some("s1"))), "mpsc live ⇒ send ok");
         assert_eq!(mrx.recv().await.unwrap().sid.as_deref(), Some("s1"));
@@ -22445,9 +22500,72 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(None)), "no SSE subscriber ⇒ still ok");
         assert!(mrx.recv().await.is_some());
+    }
+
+    /// The log lines `f` emits on this thread, as `LEVEL message` text.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Issue #210: a closed delivery sink outside shutdown is an outage and
+    /// says so at ERROR, for every send shape; once the daemon has raised
+    /// the closing flag the same stop is quiet (no ERROR on a clean stop).
+    #[test]
+    fn closed_sink_logs_error_only_outside_shutdown() {
+        let (mtx, mrx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        drop(mrx);
+        let (btx, _) = tokio::sync::broadcast::channel::<GatewayEvent>(8);
+        let sink = GatewayEventSink {
+            mpsc: mtx,
+            broadcast: btx,
+            closing: Arc::default(),
+        };
+        let send_all = || {
+            assert!(!sink.send(fake_event(Some("s7"))));
+            assert!(!sink.send_delivery_only(fake_event(Some("s7"))));
+            assert!(!sink.send_broadcast_only(fake_event(Some("s7"))));
+        };
+
+        let outage = captured_logs(send_all);
+        assert_eq!(
+            outage.matches("ERROR").count(),
+            3,
+            "every send shape reports the outage: {outage}"
+        );
+        assert!(outage.contains("s7"), "the log names the session: {outage}");
+
+        sink.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let shutdown = captured_logs(send_all);
+        assert!(
+            !shutdown.contains("ERROR"),
+            "clean stop is quiet: {shutdown}"
+        );
+        assert!(shutdown.contains("DEBUG"), "{shutdown}");
     }
 
     /// `subscribe_events` hands out a live receiver off the gateway's held
