@@ -1282,6 +1282,11 @@ async fn daemon_replays_queued_durable_outbound_idempotently_once() {
         first_outbox[0].content,
         "queued exactly once across restarts"
     );
+    let sent_count = read_durable_outbound_rows()
+        .iter()
+        .filter(|row| row["id"] == "replay-idem-1" && row["state"] == "sent")
+        .count();
+    assert_eq!(sent_count, 1, "replay must append exactly one sent row");
 
     let second_mock = Arc::new(MockChannel::new());
     let mut second_channels: ChannelMap = std::collections::HashMap::new();
@@ -1315,12 +1320,14 @@ async fn daemon_replays_queued_durable_outbound_idempotently_once() {
         second_mock.outbox().await.is_empty(),
         "a durable row whose latest state is sent must not replay again"
     );
-    let rows = read_durable_outbound_rows();
-    let sent_count = rows
-        .iter()
-        .filter(|row| row["id"] == "replay-idem-1" && row["state"] == "sent")
-        .count();
-    assert_eq!(sent_count, 1, "replay must append exactly one sent row");
+    // The second start compacted the settled row away (issue #213): nothing
+    // is owed for the id, so nothing of it is left to replay.
+    assert!(
+        read_durable_outbound_rows()
+            .iter()
+            .all(|row| row["id"] != "replay-idem-1"),
+        "a delivered row is compacted out at the next start"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2161,6 +2168,9 @@ async fn daemon_restart_preserves_ws_gateway_session() {
     let _ = first_stop_tx.send(());
     first_daemon.await.unwrap();
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
+    // Read before the restart: the second start compacts delivered rows
+    // out of the ledger (issue #213).
+    let mut sent_contents = sent_durable_contents();
 
     let second_ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
     let (second_stop_tx, second_daemon) =
@@ -2197,12 +2207,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         &["before restart".to_string(), "after restart".to_string()]
     );
 
-    let rows = read_durable_outbound_rows();
-    let sent_contents: Vec<String> = rows
-        .iter()
-        .filter(|row| row["state"] == "sent")
-        .filter_map(|row| row["message"]["content"].as_str().map(str::to_string))
-        .collect();
+    sent_contents.extend(sent_durable_contents());
     // Cross-check against the ACTUAL delivered content observed above
     // (already prefix-verified) rather than a hand-computed guess, so the
     // optional auto-title tag can't desync this from the two assertions
@@ -3222,6 +3227,15 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
     );
 }
 
+/// Contents of the ledger's `sent` rows, in ledger order.
+fn sent_durable_contents() -> Vec<String> {
+    read_durable_outbound_rows()
+        .iter()
+        .filter(|row| row["state"] == "sent")
+        .filter_map(|row| row["message"]["content"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn read_durable_outbound_rows() -> Vec<serde_json::Value> {
     let path = dirs::home_dir()
         .unwrap()
@@ -3243,8 +3257,15 @@ fn write_durable_outbound_row(id: &str, channel: &str, state: &str, content: &st
         .join("im")
         .join("outbound.jsonl");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A current timestamp: replay gives up on a row queued past its age
+    // bound (issue #213), and this row stands for one queued just before a
+    // restart.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let row = serde_json::json!({
-        "ts_ms": 1,
+        "ts_ms": now_ms,
         "id": id,
         "inbound_id": format!("{id}-in"),
         "channel": channel,

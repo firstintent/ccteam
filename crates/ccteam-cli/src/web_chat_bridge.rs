@@ -679,8 +679,14 @@ mod tests {
     fn write_queued_web_outbound(ccteam_home: &Path, content: &str) {
         let path = ccteam_home.join("state").join("im").join("outbound.jsonl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A current timestamp: replay gives up on a row queued past its age
+        // bound (issue #213).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let row = serde_json::json!({
-            "ts_ms": 1_u64,
+            "ts_ms": now_ms,
             "id": "web-replay-1",
             "inbound_id": "web-replay",
             "channel": "web",
