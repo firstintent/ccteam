@@ -1855,7 +1855,16 @@ impl ClaudeStreamJsonAdapter {
                 );
             }
         }
-        Self::init_transport(transport).await
+        let init = Self::init_transport(transport).await;
+        if init.is_err() {
+            // The failed handshake already killed the child: a record left
+            // behind would read as a body that exited unobserved, and the
+            // next spawn would post-mortem a turn that never ran.
+            if let Some((project_dir, sid)) = body {
+                crate::execution::session_body::clear(project_dir, sid);
+            }
+        }
+        init
     }
 
     /// v0.9.0 W3 (F3, tech-design §0.4/§4.3) — the remote counterpart of
@@ -2053,11 +2062,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         };
         let env = spawn_spec::build_env(&spec.role, &ctx.slug, &ctx.secret, &ctx.sid);
 
-        // Try the resume spawn first when a prior transcript exists (or,
-        // remote, optimistically); on failure fall back to a fresh
-        // `--session-id` spawn and emit a chat_session_reset with an
-        // explicit reason (the honest context-loss signal — never silently
-        // synthesize). The transport-building step differs (local child vs
+        // Resume when a prior transcript exists (or, remote, optimistically).
+        // Remote: a failed resume falls back to a fresh `--session-id` spawn
+        // and emits a chat_session_reset with an explicit reason (the honest
+        // context-loss signal — never silently synthesize). Local: NO
+        // fallback — see the local arm. The transport-building step differs (local child vs
         // `ccteam-exec.v1` WS bridge — tech-design §0.4: execution location
         // is a transport parameter); everything after this `match` is
         // identical for both.
@@ -2091,31 +2100,30 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             }
         } else {
             let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
-            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body).await {
-                Ok(ok) => ok,
-                Err(resume_err) if resume => {
+            // `resume` here means the transcript `<uuid>.jsonl` is on disk, and
+            // claude refuses `--session-id <uuid>` for an existing transcript
+            // ("Session ID … is already in use", exit 1): a fresh fallback on
+            // the same uuid can never start, so it only turned one failed
+            // resume into a second, misleading failure. Surface the resume
+            // failure itself. Nothing sticks: the transcript is untouched and
+            // the next message tries `--resume` again (docs-local issue #211).
+            Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body)
+                .await
+                .map_err(|err| {
+                    if !resume {
+                        return err;
+                    }
                     tracing::warn!(
                         sid = %ctx.sid,
                         slug = %ctx.slug,
-                        error = %resume_err,
-                        "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
+                        error = %err,
+                        "claude-stream-json: --resume spawn failed; the transcript is kept and the next message retries it"
                     );
-                    let fresh =
-                        Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd, body).await?;
-                    if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
-                        let ev = build_chat_session_reset_event_with_reason(
-                            &spec.role,
-                            &ctx.sid,
-                            "resume_failed_fallback_to_fresh",
-                        );
-                        if let Err(err) = append_event(&progress_path, &ev) {
-                            tracing::warn!(error = %err, "claude-stream-json: append reset event failed");
-                        }
-                    }
-                    fresh
-                }
-                Err(e) => return Err(e),
-            }
+                    HarnessError::SpawnFailed(format!(
+                        "claude --resume {uuid} failed: {err}. The conversation is intact on \
+                         disk; send the message again to retry the resume"
+                    ))
+                })?
         };
 
         let identity = SessionIdentity {

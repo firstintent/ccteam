@@ -2278,40 +2278,45 @@ async fn fault_matrix_stream_json() {
     }
 }
 
-/// E3 — the resume→fresh fallback emits a `chat_session_reset` event
-/// carrying the sid + a reason (the honest "context was lost" signal),
-/// never silently. We force the resume spawn to die (FAKE_SJ_DIE_ON_RESUME)
-/// so start_thread falls back to a fresh `--session-id` spawn + the reset.
+/// A failed local `--resume` is surfaced, never "fallen back" from: claude
+/// refuses `--session-id <uuid>` once `<uuid>.jsonl` exists, so a fresh spawn
+/// on the same uuid can never start (docs-local issue #211). The error names
+/// the resume, nothing sticks (no body record, no reset event, the transcript
+/// untouched), and the next attempt resumes the same conversation.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn resume_failure_emits_reset_event_with_sid_and_reason() {
+async fn local_resume_failure_is_surfaced_and_retryable() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
-    // Pre-create the transcript so start_thread chooses --resume first.
+    // Pre-create the transcript so start_thread chooses --resume.
     let uuid = deterministic_session_uuid("demo", "s1");
     let dir = anthropic_project_dir(tmp.path()).expect("anthropic dir");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
-    // Resume spawn dies; fresh spawn lives.
+    let transcript = dir.join(format!("{uuid}.jsonl"));
+    std::fs::write(&transcript, "{}\n").unwrap();
     std::env::set_var("FAKE_SJ_DIE_ON_RESUME", "1");
     std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "1200");
 
     let adapter = ClaudeStreamJsonAdapter::new();
-    let h = adapter
+    let err = adapter
         .start_thread(
             &AgentSpecBrief { role: "a".into() },
             &ctx(tmp.path(), "demo", "s1"),
         )
         .await
-        .expect("start_thread should fall back to fresh after resume death");
-    // The fresh fallback ran (the recorded mode is session-id, not resume).
-    assert_eq!(argv_mode(tmp.path()), format!("session-id {uuid}"));
-
-    // The reset event landed in the progress jsonl with sid + reason.
-    // The path is `<ccteam root>/state/progress/<slug>.jsonl` — this test read
-    // it WITHOUT the `state/` segment, so it asserted on an always-empty file
-    // and failed deterministically wherever the emit path was correct. (The
-    // sibling `claude_tui_resume_test` spells the same path right.)
+        .expect_err("a failed resume is an error, not a fresh session");
+    assert!(
+        err.to_string().contains(&format!("--resume {uuid} failed")),
+        "the error names the resume: {err}"
+    );
+    // The last (only) spawn was the resume — no `--session-id` on that uuid.
+    assert_eq!(argv_mode(tmp.path()), format!("resume {uuid}"));
+    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "{}\n");
+    assert_eq!(
+        ccteam_harness::execution::session_body::probe(tmp.path(), "s1"),
+        ccteam_harness::execution::session_body::BodyProbe::Absent,
+        "the killed handshake child leaves no body record"
+    );
     let progress = tmp
         .path()
         .join(".ccteam")
@@ -2320,11 +2325,20 @@ async fn resume_failure_emits_reset_event_with_sid_and_reason() {
         .join("demo.jsonl");
     let body = std::fs::read_to_string(&progress).unwrap_or_default();
     assert!(
-        body.contains("\"s1\"") && body.contains("resume_failed_fallback_to_fresh"),
-        "reset event must carry sid + reason; got: {body}"
+        !body.contains("resume_failed_fallback_to_fresh"),
+        "no context-reset claim for a session whose context is intact: {body}"
     );
 
+    // The cause clears; the very next attempt resumes the same conversation.
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief { role: "a".into() },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("retry resumes");
+    assert_eq!(argv_mode(tmp.path()), format!("resume {uuid}"));
     std::env::remove_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS");
     adapter.close_thread(&h).await.unwrap();
 }
