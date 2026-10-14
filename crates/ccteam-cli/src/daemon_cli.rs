@@ -12,7 +12,7 @@
 //! - without `--json` → human prose on stdout.
 //! - deterministic failures exit 1 after emitting the JSON/human error.
 
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -784,9 +784,11 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
         let len = meta.len();
         if !same_file(&file, &meta) {
             // A daemon start rotated the log (`daemon.log` → `daemon.log.1`)
-            // and the new daemon writes a fresh file at the path: follow the
-            // path, not the inode we opened, or every line after the restart
-            // is missed (and the old file is replayed from its top).
+            // and the new daemon writes a fresh file at the path. Drain what
+            // the old daemon wrote since the last poll, then follow the path,
+            // not the inode we opened — or every line after the restart is
+            // missed (and the old file is replayed from its top).
+            print_appended(&mut file, offset)?;
             file =
                 std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
             offset = 0;
@@ -795,21 +797,20 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
             offset = 0;
         }
         if len > offset {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = Vec::new();
-            let reader = std::io::BufReader::new(&mut file);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => buf.push(l),
-                    Err(_) => break,
-                }
-            }
-            for l in &buf {
-                println!("{l}");
-            }
-            offset = len;
+            offset = print_appended(&mut file, offset)?;
         }
     }
+}
+
+/// Print everything in `file` past `offset`; returns the new end offset.
+fn print_appended(file: &mut std::fs::File, offset: u64) -> Result<u64> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        println!("{line}");
+    }
+    Ok(offset + bytes.len() as u64)
 }
 
 /// Does the open `file` still name the file whose metadata is `at_path`?

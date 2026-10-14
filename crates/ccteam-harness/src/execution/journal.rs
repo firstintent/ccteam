@@ -469,9 +469,17 @@ pub trait LineFold: Send + 'static {
 /// many user turns", "the current goal") used to re-read the whole file each
 /// time — O(session lifetime) per ask. Since the file only grows, the answer
 /// is a fold over its lines: keep the fold and its byte offset, and on the
-/// next ask read from that offset. A file that shrank or whose inode changed
-/// is a different file, and its fold restarts. A trailing line without `\n`
-/// is left for the next read (its writer may still be extending it).
+/// next ask read from that offset. A trailing line without `\n` is left for
+/// the next read (its writer may still be extending it).
+///
+/// CONTRACT — only for files that are append-only for the life of the path:
+/// the cache tells "same file, grown" from "different file" by (dev, inode)
+/// and `offset <= len` alone. A path whose file shrank or changed inode
+/// restarts its fold, but a file rewritten IN PLACE to at least its old
+/// length (or a new file that lands on the old inode and is already longer)
+/// is indistinguishable from an append, and its fold silently carries the
+/// old lines. turns.jsonl and the vendor transcripts are append-only; do not
+/// put a rewritten file behind this.
 ///
 /// Bounded: past `capacity` files the least recently read fold is dropped, and
 /// rebuilt from the file if asked again.

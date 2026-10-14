@@ -395,6 +395,7 @@ pub fn list_session_metas_reporting(
     };
     // Parsed metas from this directory's previous scan, keyed by chat-dir
     // name; replaced by what THIS scan saw, so it never outgrows the disk.
+    let scan_start = std::time::SystemTime::now();
     let mut previous = META_SCAN_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -421,7 +422,10 @@ pub fn list_session_metas_reporting(
             }
         };
         let name = entry.file_name();
-        if let Some(cached) = previous.remove(&name).filter(|c| c.stamp == stamp) {
+        if let Some(cached) = previous
+            .remove(&name)
+            .filter(|c| c.trusted && c.stamp == stamp)
+        {
             out.push(cached.meta.clone());
             seen.insert(name, cached);
             continue;
@@ -430,7 +434,15 @@ pub fn list_session_metas_reporting(
             Ok(raw) => match serde_json::from_str::<SessionMeta>(&raw) {
                 Ok(meta) => {
                     out.push(meta.clone());
-                    seen.insert(name, CachedMeta { stamp, meta });
+                    let trusted = stamp.settled_before(scan_start);
+                    seen.insert(
+                        name,
+                        CachedMeta {
+                            stamp,
+                            trusted,
+                            meta,
+                        },
+                    );
                 }
                 Err(err) => failures.push((
                     meta_path,
@@ -454,14 +466,26 @@ pub fn list_session_metas_reporting(
 /// and a long-lived project has thousands (issue #213: 1263) while only a few
 /// change between scans. Each scan therefore stats every `meta.json` but
 /// re-reads and re-parses only those whose stamp moved since the last scan.
-/// `meta.json` is only ever replaced by rename ([`write_session_meta`]), so a
-/// new write is a new inode — the stamp cannot miss one.
+///
+/// The stamp alone can miss a rewrite: `atomic_write_durable`'s temp file
+/// can land on the inode the previous rename freed (two rewrites put the
+/// path back on its original inode), a rewrite keeps the length (fixed-width
+/// RFC 3339 fields), and mtime only advances on the kernel's coarse tick
+/// (~4 ms here, 1 s on some filesystems). So the racy-timestamp rule git
+/// uses for its index: a cached parse is served only if the file's mtime was
+/// already [`RACY_WINDOW`] old when it was read — a later write must then
+/// carry a newer mtime. A file modified that recently is re-read every scan
+/// until it settles.
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 static META_SCAN_CACHE: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, HashMap<std::ffi::OsString, CachedMeta>>>,
 > = std::sync::LazyLock::new(Default::default);
 
 struct CachedMeta {
     stamp: MetaStamp,
+    /// The file's mtime was outside [`RACY_WINDOW`] when it was read.
+    trusted: bool,
     meta: SessionMeta,
 }
 
@@ -473,6 +497,13 @@ struct MetaStamp {
 }
 
 impl MetaStamp {
+    /// Was the file last modified at least [`RACY_WINDOW`] before `read_at`?
+    fn settled_before(&self, read_at: std::time::SystemTime) -> bool {
+        self.modified
+            .and_then(|modified| modified.checked_add(RACY_WINDOW))
+            .is_some_and(|settled| settled < read_at)
+    }
+
     fn of(stat: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         let file_id = {
@@ -734,13 +765,81 @@ mod title_tests {
             titles(),
             vec![("s1".into(), "one".into()), ("s2".into(), "two".into())]
         );
-        // Same length, same second: only the rename (new inode) tells.
+        // A settled file is served from cache; its rewrite is still seen
+        // (the new write carries a fresh mtime).
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(session_meta_path(tmp.path(), "s1"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        list_session_metas(tmp.path());
+        list_session_metas(tmp.path());
         write_session_meta(tmp.path(), &meta("s1", "uno")).unwrap();
         write_session_meta(tmp.path(), &meta("s3", "three")).unwrap();
         std::fs::remove_dir_all(chat_dir(tmp.path(), "s2")).unwrap();
         assert_eq!(
             titles(),
             vec![("s1".into(), "uno".into()), ("s3".into(), "three".into())]
+        );
+    }
+
+    /// Issue #213 (checker repro, 170/200 on ext4): two same-length rewrites
+    /// within one mtime tick can put `meta.json` back on its original inode
+    /// with an unchanged stamp — a fresh file must never be served from
+    /// cache.
+    #[test]
+    fn back_to_back_same_length_rewrites_are_never_missed() {
+        for _ in 0..50 {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let meta = |title: &str| SessionMeta {
+                title: Some(title.into()),
+                ..blank_meta()
+            };
+            write_session_meta(tmp.path(), &meta("one")).unwrap();
+            assert_eq!(
+                list_session_metas(tmp.path())[0].title.as_deref(),
+                Some("one")
+            );
+            write_session_meta(tmp.path(), &meta("two")).unwrap();
+            write_session_meta(tmp.path(), &meta("uno")).unwrap();
+            assert_eq!(
+                list_session_metas(tmp.path())[0].title.as_deref(),
+                Some("uno")
+            );
+        }
+    }
+
+    /// The same miss made deterministic: a rewrite that leaves inode, length
+    /// and mtime exactly as they were. A recently modified file is never
+    /// served from cache, so the new content is still read.
+    #[test]
+    fn an_unchanged_stamp_on_a_fresh_file_is_not_trusted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let meta = |title: &str| SessionMeta {
+            title: Some(title.into()),
+            ..blank_meta()
+        };
+        write_session_meta(tmp.path(), &meta("one")).unwrap();
+        assert_eq!(
+            list_session_metas(tmp.path())[0].title.as_deref(),
+            Some("one")
+        );
+        let path = session_meta_path(tmp.path(), "s1");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let body = serde_json::to_string_pretty(&meta("uno")).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut &file, body.as_bytes()).unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+        assert_eq!(
+            list_session_metas(tmp.path())[0].title.as_deref(),
+            Some("uno")
         );
     }
 

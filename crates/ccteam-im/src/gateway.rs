@@ -7737,7 +7737,7 @@ impl Gateway {
             let mut events = session.adapter.events(&session.thread);
             let digest = project_dir
                 .as_ref()
-                .map(|dir| ccteam_harness::execution::turns_mirror::digest(dir, &session_id))
+                .and_then(|dir| ccteam_harness::execution::turns_mirror::digest(dir, &session_id))
                 .unwrap_or_default();
             let mut seq: u64 = digest.max_answer_seq;
             // boundary re-read accounts for a row already appended
@@ -8603,13 +8603,13 @@ impl Gateway {
                             // before this one; this one is the next.
                             let durable = project_dir
                                 .as_ref()
-                                .map(|dir| {
+                                .and_then(|dir| {
                                     ccteam_harness::execution::turns_mirror::digest(
                                         dir,
                                         &session_id,
                                     )
-                                    .status_turns
                                 })
+                                .map(|digest| digest.status_turns)
                                 .unwrap_or(completed_turns);
                             completed_turns = durable.max(completed_turns).saturating_add(1);
                             vendor_turn = completed_turns;
@@ -18487,7 +18487,10 @@ fn refresh_session_activity_meta(
         return;
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
-    meta.turn_count = ccteam_harness::execution::turns_mirror::digest(project_dir, sid).user_turns;
+    // An unreadable mirror keeps the stored count rather than writing 0.
+    if let Some(digest) = ccteam_harness::execution::turns_mirror::digest(project_dir, sid) {
+        meta.turn_count = digest.user_turns;
+    }
     if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
     {
         meta.cost_usd = session.pricing(vendor).cost_usd;
@@ -28656,7 +28659,9 @@ mod tests {
         ];
         let project = tempfile::TempDir::new().unwrap();
         let digest = |sid: &str| {
-            ccteam_harness::execution::turns_mirror::digest(project.path(), sid).max_answer_seq
+            ccteam_harness::execution::turns_mirror::digest(project.path(), sid)
+                .unwrap()
+                .max_answer_seq
         };
         assert_eq!(digest("s7"), 0);
         for row in &rows {

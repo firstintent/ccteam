@@ -4784,7 +4784,7 @@ async fn read_wait_for_turn_boundary(
 
 /// The turn_id of the newest row in a session's durable mirror.
 fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<String> {
-    ccteam_harness::execution::turns_mirror::digest(&resolved.project_dir, &resolved.sid)
+    ccteam_harness::execution::turns_mirror::digest(&resolved.project_dir, &resolved.sid)?
         .last_turn_id
 }
 

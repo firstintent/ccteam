@@ -253,23 +253,29 @@ impl journal::LineFold for DigestFold {
     }
 }
 
-/// The session's [`TurnsDigest`] — empty when it has no turns.jsonl yet.
-pub fn digest(project_dir: &Path, sid: &str) -> TurnsDigest {
+/// The session's [`TurnsDigest`] — empty when it has no turns.jsonl yet,
+/// `None` when the file exists but cannot be read (callers keep what they
+/// knew rather than reporting zero turns).
+pub fn digest(project_dir: &Path, sid: &str) -> Option<TurnsDigest> {
     /// Sessions whose digest is kept: live ones are asked at every turn; a
     /// dropped digest is just rebuilt from the file.
     const MAX_CACHED_DIGESTS: usize = 512;
     static CACHE: std::sync::LazyLock<journal::FoldCache<DigestFold>> =
         std::sync::LazyLock::new(|| journal::FoldCache::new(MAX_CACHED_DIGESTS, None));
-    CACHE
-        .read(
-            &turns_jsonl_path(project_dir, sid),
-            || DigestFold {
-                prefix: format!("{sid}-"),
-                digest: TurnsDigest::default(),
-            },
-            |fold| fold.digest.clone(),
-        )
-        .unwrap_or_default()
+    let path = turns_jsonl_path(project_dir, sid);
+    let digest = CACHE.read(
+        &path,
+        || DigestFold {
+            prefix: format!("{sid}-"),
+            digest: TurnsDigest::default(),
+        },
+        |fold| fold.digest.clone(),
+    );
+    match digest {
+        Some(digest) => Some(digest),
+        None if !path.exists() => Some(TurnsDigest::default()),
+        None => None,
+    }
 }
 
 /// Return the last `n` parseable turns, in chronological order. F118
@@ -400,9 +406,9 @@ mod tests {
                 last_turn_id: turns.last().map(|t| t.turn_id.clone()),
             }
         };
-        assert_eq!(digest(tmp.path(), "s9"), TurnsDigest::default());
+        assert_eq!(digest(tmp.path(), "s9").unwrap(), TurnsDigest::default());
         append_turn(tmp.path(), "s9", &mk_turn("s9-3", "r", "hi", "a")).unwrap();
-        assert_eq!(digest(tmp.path(), "s9"), full(tmp.path()));
+        assert_eq!(digest(tmp.path(), "s9").unwrap(), full(tmp.path()));
         let mut done = mk_turn("s9-1", "r", "", "b");
         done.status = Some(TurnStatus {
             model: None,
@@ -417,13 +423,25 @@ mod tests {
         writeln!(file, "not-json").unwrap();
         write!(file, "{{\"turn_id\":\"torn").unwrap();
         drop(file);
-        let d = digest(tmp.path(), "s9");
+        let d = digest(tmp.path(), "s9").unwrap();
         assert_eq!(d, full(tmp.path()));
         assert_eq!((d.user_turns, d.status_turns, d.max_answer_seq), (1, 1, 3));
         append_turn(tmp.path(), "s9", &mk_turn("x-7", "r", "again", "c")).unwrap();
-        let d = digest(tmp.path(), "s9");
+        let d = digest(tmp.path(), "s9").unwrap();
         assert_eq!(d, full(tmp.path()));
         assert_eq!(d.last_turn_id.as_deref(), Some("x-7"));
+        // Present but unreadable is not "no turns".
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |m| fs::set_permissions(&path, fs::Permissions::from_mode(m)).unwrap();
+            mode(0o000);
+            let unreadable = fs::File::open(&path).is_err(); // root reads anyway
+            if unreadable {
+                assert_eq!(digest(tmp.path(), "s9"), None);
+            }
+            mode(0o644);
+        }
     }
 
     /// Issue #210: after an ENOSPC-torn tail the next appended turn lands on

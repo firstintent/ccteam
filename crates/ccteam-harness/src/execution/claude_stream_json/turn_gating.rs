@@ -40,7 +40,12 @@ const STOP_HOOK_RECENT_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 const STOP_HOOK_MARKER: &str = "Stop hook feedback";
 
 /// The first read of a transcript scans at most this much of its tail, so a
-/// huge transcript can't stall the statusline.
+/// huge transcript can't stall the statusline. Later reads fold in every
+/// appended line, so whether a goal set more than this far back is still
+/// visible depends on the cache's history: kept if this process has been
+/// folding the transcript since before it scrolled past the bound, not seen
+/// on a first read (a daemon restart, or a fold evicted past
+/// [`MAX_CACHED_TRANSCRIPTS`]).
 const FIRST_READ_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Transcripts whose fold is kept (see [`FoldCache`]) — a daemon outlives
