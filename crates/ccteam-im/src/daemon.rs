@@ -2302,18 +2302,49 @@ async fn finish_durable_outbound_send(
     }
 }
 
-async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
-    let path = durable_outbox_path_in(ccteam_root);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return;
+/// Past this size the ledger is compacted on the next append. Every reply
+/// costs a Queued + Sent pair (the full message twice), so an uncompacted
+/// ledger grows with every reply the daemon ever sent (issue #213: 80 MB
+/// after two months, all of it terminal) and the startup replay scans all of
+/// it. Compaction keeps it bounded by what is still owed.
+const DURABLE_OUTBOX_COMPACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Serializes every ledger append and compaction in this process — a
+/// compaction rewrites the file, so an append must not land between its read
+/// and its rename.
+fn durable_outbox_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// The rows still owed a delivery: the LATEST row of every id whose latest
+/// state is not `Sent`, in the order the ids were first queued. Streams the
+/// file line by line rather than holding it whole.
+fn read_owed_durable_outbound(path: &Path) -> Vec<DurableOutboundRow> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
     };
+    let mut order: Vec<String> = Vec::new();
     let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
-    for (line_idx, line) in raw.lines().enumerate() {
+    for (line_idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let Ok(line) = line else {
+            // Not UTF-8 or unreadable: same as a malformed row.
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<DurableOutboundRow>(line) {
+        match serde_json::from_str::<DurableOutboundRow>(&line) {
+            Ok(row) if row.state == DurableOutboundState::Sent => {
+                latest.remove(&row.id);
+            }
             Ok(row) => {
+                if !latest.contains_key(&row.id) {
+                    order.push(row.id.clone());
+                }
                 latest.insert(row.id.clone(), row);
             }
             Err(err) => {
@@ -2326,10 +2357,45 @@ async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
             }
         }
     }
-    for row in latest
-        .into_values()
-        .filter(|row| row.state != DurableOutboundState::Sent)
-    {
+    order
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
+        .collect()
+}
+
+/// Rewrite the ledger to just the rows still owed (see
+/// [`read_owed_durable_outbound`]). Caller holds [`durable_outbox_lock`].
+/// A delivered row carries nothing replay could use, so dropping it keeps the
+/// at-least-once contract intact: every Queued/Failed id survives with its
+/// latest row. Atomic (temp + rename), so a crash mid-compaction leaves the
+/// old ledger.
+fn compact_durable_outbox_locked(path: &Path) -> Result<Vec<DurableOutboundRow>> {
+    let owed = read_owed_durable_outbound(path);
+    if !path.exists() {
+        return Ok(owed);
+    }
+    let mut bytes = Vec::new();
+    for row in &owed {
+        serde_json::to_writer(&mut bytes, row)?;
+        bytes.push(b'\n');
+    }
+    ccteam_harness::execution::fs_atomic::atomic_write_durable(path, &bytes)?;
+    Ok(owed)
+}
+
+async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
+    let path = durable_outbox_path_in(ccteam_root);
+    let owed = {
+        let _guard = durable_outbox_lock();
+        match compact_durable_outbox_locked(&path) {
+            Ok(owed) => owed,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "ccteam-im: durable outbox compaction failed; replaying uncompacted");
+                read_owed_durable_outbound(&path)
+            }
+        }
+    };
+    for row in owed {
         let Some(channel) = channels.get(&row.channel) else {
             append_durable_outbound(
                 ccteam_root,
@@ -2371,11 +2437,15 @@ fn append_durable_outbound(ccteam_root: &Path, row: DurableOutboundRow) {
 }
 
 fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -> Result<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    append_durable_outbound_with_limit(ccteam_root, row, DURABLE_OUTBOX_COMPACT_BYTES)
+}
+
+fn append_durable_outbound_with_limit(
+    ccteam_root: &Path,
+    row: &DurableOutboundRow,
+    compact_bytes: u64,
+) -> Result<()> {
+    let _guard = durable_outbox_lock();
     let path = durable_outbox_path_in(ccteam_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2383,7 +2453,18 @@ fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -
     // One `write_all` per record (see `open_jsonl_append`).
     let mut line = serde_json::to_vec(row)?;
     line.push(b'\n');
-    ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?.write_all(&line)?;
+    let mut file = ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)?;
+    file.write_all(&line)?;
+    // Only a terminal row can shrink the ledger; checking there keeps the
+    // compaction off the Queued → send hot path.
+    if row.state != DurableOutboundState::Queued && file.metadata()?.len() > compact_bytes {
+        drop(file);
+        if let Err(err) = compact_durable_outbox_locked(&path) {
+            // The row is already appended; a failed compaction only defers
+            // the shrink to the next terminal append.
+            tracing::warn!(path = %path.display(), error = %err, "ccteam-im: durable outbox compaction failed");
+        }
+    }
     Ok(())
 }
 
@@ -2961,6 +3042,49 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "{raw}");
         assert_eq!(rows[0].id, "o-1");
+    }
+
+    /// Issue #213: delivered rows are compacted out once the ledger passes its
+    /// size bound, while every id still owed (Queued or Failed) keeps its
+    /// latest row — the at-least-once replay set is unchanged.
+    #[test]
+    fn durable_outbox_compaction_keeps_exactly_the_owed_rows() {
+        let root = TempDir::new().unwrap();
+        let row = |id: &str, state| DurableOutboundRow {
+            ts_ms: 1,
+            id: id.into(),
+            inbound_id: "in".into(),
+            channel: "trap".into(),
+            state,
+            message: SendMessage::new(format!("body of {id}"), "chat-1"),
+            platform_message_id: None,
+            error: None,
+        };
+        let append = |r: DurableOutboundRow| {
+            append_durable_outbound_with_limit(root.path(), &r, 4096).unwrap();
+        };
+        append(row("owed-queued", DurableOutboundState::Queued));
+        append(row("owed-failed", DurableOutboundState::Queued));
+        append(row("owed-failed", DurableOutboundState::Failed));
+        for i in 0..200 {
+            let id = format!("done-{i}");
+            append(row(&id, DurableOutboundState::Queued));
+            append(row(&id, DurableOutboundState::Sent));
+        }
+        let path = durable_outbox_path_in(root.path());
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len <= 4096 + 1024, "ledger stays bounded, got {len} bytes");
+
+        let owed = read_owed_durable_outbound(&path);
+        let ids: Vec<(&str, DurableOutboundState)> =
+            owed.iter().map(|r| (r.id.as_str(), r.state)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("owed-queued", DurableOutboundState::Queued),
+                ("owed-failed", DurableOutboundState::Failed),
+            ]
+        );
     }
 
     /// (v0.8.5 S4) End-to-end through the *real* security layer: a button

@@ -10,7 +10,7 @@
 //! monotonic sid counter (`state/sessions/next-sid`); on restart it cold-start
 //! rebuilds the live map from these `meta.json` files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -393,6 +393,14 @@ pub fn list_session_metas_reporting(
             return (vec![], failures);
         }
     };
+    // Parsed metas from this directory's previous scan, keyed by chat-dir
+    // name; replaced by what THIS scan saw, so it never outgrows the disk.
+    let mut previous = META_SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&chat_base)
+        .unwrap_or_default();
+    let mut seen: HashMap<std::ffi::OsString, CachedMeta> = HashMap::with_capacity(previous.len());
     let mut out: Vec<SessionMeta> = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -403,21 +411,82 @@ pub fn list_session_metas_reporting(
             }
         };
         let meta_path = entry.path().join("meta.json");
+        let stamp = match std::fs::metadata(&meta_path) {
+            Ok(stat) => MetaStamp::of(&stat),
+            // A chat dir with no `meta.json` is not a session at all.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                failures.push((meta_path, err));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if let Some(cached) = previous.remove(&name).filter(|c| c.stamp == stamp) {
+            out.push(cached.meta.clone());
+            seen.insert(name, cached);
+            continue;
+        }
         match std::fs::read_to_string(&meta_path) {
             Ok(raw) => match serde_json::from_str::<SessionMeta>(&raw) {
-                Ok(meta) => out.push(meta),
+                Ok(meta) => {
+                    out.push(meta.clone());
+                    seen.insert(name, CachedMeta { stamp, meta });
+                }
                 Err(err) => failures.push((
                     meta_path,
                     std::io::Error::new(std::io::ErrorKind::InvalidData, err),
                 )),
             },
-            // A chat dir with no `meta.json` is not a session at all.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => failures.push((meta_path, err)),
         }
     }
+    META_SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chat_base, seen);
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     (out, failures)
+}
+
+/// Every session listing (web status + team graph polls, the history sidebar,
+/// IM `/sessions` `/status` `@handle`) scans ALL of a project's session dirs,
+/// and a long-lived project has thousands (issue #213: 1263) while only a few
+/// change between scans. Each scan therefore stats every `meta.json` but
+/// re-reads and re-parses only those whose stamp moved since the last scan.
+/// `meta.json` is only ever replaced by rename ([`write_session_meta`]), so a
+/// new write is a new inode — the stamp cannot miss one.
+static META_SCAN_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, HashMap<std::ffi::OsString, CachedMeta>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+struct CachedMeta {
+    stamp: MetaStamp,
+    meta: SessionMeta,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MetaStamp {
+    file_id: (u64, u64),
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl MetaStamp {
+    fn of(stat: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let file_id = {
+            use std::os::unix::fs::MetadataExt;
+            (stat.dev(), stat.ino())
+        };
+        #[cfg(not(unix))]
+        let file_id = (0, 0);
+        Self {
+            file_id,
+            len: stat.len(),
+            modified: stat.modified().ok(),
+        }
+    }
 }
 
 // ── external vendor discovery ─────────────────────────────────────────────────
@@ -639,6 +708,40 @@ mod title_tests {
             spawned_by_role: None,
             delegation_depth: 0,
         }
+    }
+
+    /// Issue #213: a rescan re-reads only what changed, and still sees every
+    /// rewrite, new session and removed session.
+    #[test]
+    fn rescans_see_every_rewrite_addition_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let meta = |sid: &str, title: &str| SessionMeta {
+            sid: sid.into(),
+            title: Some(title.into()),
+            ..blank_meta()
+        };
+        write_session_meta(tmp.path(), &meta("s1", "one")).unwrap();
+        write_session_meta(tmp.path(), &meta("s2", "two")).unwrap();
+        let titles = || {
+            let mut t: Vec<(String, String)> = list_session_metas(tmp.path())
+                .into_iter()
+                .map(|m| (m.sid, m.title.unwrap_or_default()))
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(
+            titles(),
+            vec![("s1".into(), "one".into()), ("s2".into(), "two".into())]
+        );
+        // Same length, same second: only the rename (new inode) tells.
+        write_session_meta(tmp.path(), &meta("s1", "uno")).unwrap();
+        write_session_meta(tmp.path(), &meta("s3", "three")).unwrap();
+        std::fs::remove_dir_all(chat_dir(tmp.path(), "s2")).unwrap();
+        assert_eq!(
+            titles(),
+            vec![("s1".into(), "uno".into()), ("s3".into(), "three".into())]
+        );
     }
 
     // ---- truncate_title ----------------------------------------------------

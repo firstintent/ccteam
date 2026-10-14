@@ -7735,26 +7735,13 @@ impl Gateway {
             // state machine below rebuilds it whenever a stream ends.
             let attachment = session.adapter.event_attachment();
             let mut events = session.adapter.events(&session.thread);
-            let mut seq: u64 = project_dir
+            let digest = project_dir
                 .as_ref()
-                .and_then(|dir| {
-                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
-                })
-                .map(|turns| last_answer_seq(&session_id, &turns))
-                .unwrap_or(0);
-            let mut vendor_turn: u64 = project_dir
-                .as_ref()
-                .and_then(|dir| {
-                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
-                })
-                .map(|turns| {
-                    turns
-                        .iter()
-                        .filter(|turn| !turn.user.is_empty())
-                        .count()
-                        .saturating_sub(1) as u64
-                })
-                .unwrap_or(0); // boundary re-read accounts for a row already appended
+                .map(|dir| ccteam_harness::execution::turns_mirror::digest(dir, &session_id))
+                .unwrap_or_default();
+            let mut seq: u64 = digest.max_answer_seq;
+            // boundary re-read accounts for a row already appended
+            let mut vendor_turn: u64 = digest.user_turns.saturating_sub(1);
             let mut epoch: u64 = 0; // status epoch → one per turn
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
@@ -8616,15 +8603,12 @@ impl Gateway {
                             // before this one; this one is the next.
                             let durable = project_dir
                                 .as_ref()
-                                .and_then(|dir| {
-                                    ccteam_harness::execution::turns_mirror::read_all_turns(
+                                .map(|dir| {
+                                    ccteam_harness::execution::turns_mirror::digest(
                                         dir,
                                         &session_id,
                                     )
-                                    .ok()
-                                })
-                                .map(|turns| {
-                                    turns.iter().filter(|turn| turn.status.is_some()).count() as u64
+                                    .status_turns
                                 })
                                 .unwrap_or(completed_turns);
                             completed_turns = durable.max(completed_turns).saturating_add(1);
@@ -14631,8 +14615,7 @@ impl Gateway {
             .as_ref()
             .map(|projection| {
                 projection
-                    .project_snapshot(slug)
-                    .cost
+                    .cost_summary(slug)
                     .cost_24h_by_vendor
                     .get(crate::delegation::vendor_key(vendor))
                     .copied()
@@ -18504,9 +18487,7 @@ fn refresh_session_activity_meta(
         return;
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
-    meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
-        .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
-        .unwrap_or(meta.turn_count);
+    meta.turn_count = ccteam_harness::execution::turns_mirror::digest(project_dir, sid).user_turns;
     if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
     {
         meta.cost_usd = session.pricing(vendor).cost_usd;
@@ -19412,23 +19393,6 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
         | ThreadEvent::TurnCompleted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
     }
-}
-
-/// The highest `<sid>-<N>` row id this pump family has written — where a new
-/// pump resumes numbering. COUNTING rows was a proxy that held only while
-/// every such row had text: a closing row (empty `assistant`, #209) is not
-/// counted, so the next pump re-issued its id — and a turn id already in
-/// `notified_turns` silently swallows the completion that reuses it.
-fn last_answer_seq(
-    session_id: &str,
-    turns: &[ccteam_harness::execution::turns_mirror::TurnRecord],
-) -> u64 {
-    let prefix = format!("{session_id}-");
-    turns
-        .iter()
-        .filter_map(|turn| turn.turn_id.strip_prefix(&prefix)?.parse::<u64>().ok())
-        .max()
-        .unwrap_or(0)
 }
 
 /// What woke the event pump's stream branch: the vendor, or the deadline of
@@ -28690,8 +28654,16 @@ mod tests {
             row("interrupted:sj-1", "cut"),
             row("s70-9", "another session's prefix"),
         ];
-        assert_eq!(last_answer_seq("s7", &rows), 3);
-        assert_eq!(last_answer_seq("s7", &[]), 0);
+        let project = tempfile::TempDir::new().unwrap();
+        let digest = |sid: &str| {
+            ccteam_harness::execution::turns_mirror::digest(project.path(), sid).max_answer_seq
+        };
+        assert_eq!(digest("s7"), 0);
+        for row in &rows {
+            ccteam_harness::execution::turns_mirror::append_turn(project.path(), "s7", row)
+                .unwrap();
+        }
+        assert_eq!(digest("s7"), 3);
     }
 
     /// #209 — the parent hears the WHOLE turn: a long turn reaches the ledger

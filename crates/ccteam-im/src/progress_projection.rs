@@ -362,6 +362,17 @@ impl ProgressProjection {
         snapshot(&state, (self.clock)())
     }
 
+    /// Query the project's cost aggregate alone. Budget gates and fleet
+    /// headers ask for this on every `agent` call; a full
+    /// [`Self::project_snapshot`] deep-copies every session the journal ever
+    /// named (issue #213) just to read one number.
+    pub fn cost_summary(&self, slug: &str) -> CostSummary {
+        if let Err(error) = self.catch_up_for_query(slug) {
+            tracing::warn!(slug, %error, "progress projection cost catch-up failed");
+        }
+        cost_summary(&read_lock(&self.slug(slug).state), (self.clock)())
+    }
+
     /// Query one session accumulator without cloning the project's tail or
     /// sibling session map.
     pub fn session_snapshot(&self, slug: &str, sid: &str) -> Option<SessionProjection> {
@@ -677,7 +688,7 @@ fn fold_delegation(state: &mut SlugState, kind: &str, event: &Value, now: DateTi
     }
 }
 
-fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot {
+fn cost_summary(state: &SlugState, now: DateTime<Utc>) -> CostSummary {
     let oldest = minute(now).saturating_sub(MINUTES_24H);
     let mut cost = CostSummary {
         cost_total_usd: state.lifetime_cost,
@@ -691,6 +702,12 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
             *cost.cost_24h_by_vendor.entry(vendor.clone()).or_insert(0.0) += value;
         }
     }
+    cost
+}
+
+fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot {
+    let oldest = minute(now).saturating_sub(MINUTES_24H);
+    let cost = cost_summary(state, now);
     let mut delegations = state.delegations;
     for bucket in state
         .minute_delegations

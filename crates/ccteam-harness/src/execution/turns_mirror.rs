@@ -203,6 +203,75 @@ pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> 
     super::fs_atomic::read_jsonl(&path)
 }
 
+/// Counts the gateway asks of a session's turns.jsonl at every turn boundary
+/// (pump start, meta refresh, final answer, `agent` wait settle). Kept as an
+/// incremental fold ([`journal::FoldCache`]) so each ask reads only the rows
+/// appended since the last one, not the whole session history (issue #213).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnsDigest {
+    /// Rows with a non-empty `user` — the session's user turns.
+    pub user_turns: u64,
+    /// Rows carrying a `status` — one per completed execution turn (only the
+    /// final answer of a turn carries it).
+    pub status_turns: u64,
+    /// Highest `N` among `turn_id`s shaped `<sid>-<N>` — where a new pump
+    /// resumes numbering. COUNTING rows was a proxy that held only while
+    /// every such row had text: a closing row (empty `assistant`, #209) is
+    /// not counted, so the next pump re-issued its id — and a turn id already
+    /// in `notified_turns` silently swallows the completion that reuses it.
+    pub max_answer_seq: u64,
+    /// `turn_id` of the newest row.
+    pub last_turn_id: Option<String>,
+}
+
+struct DigestFold {
+    prefix: String,
+    digest: TurnsDigest,
+}
+
+impl journal::LineFold for DigestFold {
+    fn ingest(&mut self, line: &[u8]) {
+        // Same tolerance as `read_all_turns`: an unparseable row is skipped.
+        let Ok(turn) = serde_json::from_slice::<TurnRecord>(line) else {
+            return;
+        };
+        let d = &mut self.digest;
+        if !turn.user.is_empty() {
+            d.user_turns += 1;
+        }
+        if turn.status.is_some() {
+            d.status_turns += 1;
+        }
+        if let Some(seq) = turn
+            .turn_id
+            .strip_prefix(&self.prefix)
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            d.max_answer_seq = d.max_answer_seq.max(seq);
+        }
+        d.last_turn_id = Some(turn.turn_id);
+    }
+}
+
+/// The session's [`TurnsDigest`] — empty when it has no turns.jsonl yet.
+pub fn digest(project_dir: &Path, sid: &str) -> TurnsDigest {
+    /// Sessions whose digest is kept: live ones are asked at every turn; a
+    /// dropped digest is just rebuilt from the file.
+    const MAX_CACHED_DIGESTS: usize = 512;
+    static CACHE: std::sync::LazyLock<journal::FoldCache<DigestFold>> =
+        std::sync::LazyLock::new(|| journal::FoldCache::new(MAX_CACHED_DIGESTS, None));
+    CACHE
+        .read(
+            &turns_jsonl_path(project_dir, sid),
+            || DigestFold {
+                prefix: format!("{sid}-"),
+                digest: TurnsDigest::default(),
+            },
+            |fold| fold.digest.clone(),
+        )
+        .unwrap_or_default()
+}
+
 /// Return the last `n` parseable turns, in chronological order. F118
 /// `rebuild_from_turns_jsonl` uses this to bound the conversation
 /// history it injects into a fresh tmux session.
@@ -311,6 +380,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["t2", "t3"]
         );
+    }
+
+    /// Issue #213: the incremental digest answers exactly what a full re-read
+    /// would, across appends between asks, a corrupt row, and a torn tail.
+    #[test]
+    fn digest_tracks_appends_like_a_full_reread() {
+        let tmp = TempDir::new().unwrap();
+        let full = |dir: &Path| {
+            let turns = read_all_turns(dir, "s9").unwrap();
+            TurnsDigest {
+                user_turns: turns.iter().filter(|t| !t.user.is_empty()).count() as u64,
+                status_turns: turns.iter().filter(|t| t.status.is_some()).count() as u64,
+                max_answer_seq: turns
+                    .iter()
+                    .filter_map(|t| t.turn_id.strip_prefix("s9-")?.parse().ok())
+                    .max()
+                    .unwrap_or(0),
+                last_turn_id: turns.last().map(|t| t.turn_id.clone()),
+            }
+        };
+        assert_eq!(digest(tmp.path(), "s9"), TurnsDigest::default());
+        append_turn(tmp.path(), "s9", &mk_turn("s9-3", "r", "hi", "a")).unwrap();
+        assert_eq!(digest(tmp.path(), "s9"), full(tmp.path()));
+        let mut done = mk_turn("s9-1", "r", "", "b");
+        done.status = Some(TurnStatus {
+            model: None,
+            context: None,
+            turn: 1,
+            cost_usd: None,
+            tokens_total: None,
+        });
+        append_turn(tmp.path(), "s9", &done).unwrap();
+        let path = turns_jsonl_path(tmp.path(), "s9");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "not-json").unwrap();
+        write!(file, "{{\"turn_id\":\"torn").unwrap();
+        drop(file);
+        let d = digest(tmp.path(), "s9");
+        assert_eq!(d, full(tmp.path()));
+        assert_eq!((d.user_turns, d.status_turns, d.max_answer_seq), (1, 1, 3));
+        append_turn(tmp.path(), "s9", &mk_turn("x-7", "r", "again", "c")).unwrap();
+        let d = digest(tmp.path(), "s9");
+        assert_eq!(d, full(tmp.path()));
+        assert_eq!(d.last_turn_id.as_deref(), Some("x-7"));
     }
 
     /// Issue #210: after an ENOSPC-torn tail the next appended turn lands on

@@ -456,6 +456,127 @@ impl ReverseLines {
     }
 }
 
+/// A fold over the lines of an append-only journal — see [`FoldCache`].
+pub trait LineFold: Send + 'static {
+    /// One complete, non-blank line (without its `\n`), in file order.
+    fn ingest(&mut self, line: &[u8]);
+}
+
+/// Per-file folds over append-only journals, each fed only the lines appended
+/// since its last read (issue #213).
+///
+/// A question asked of a journal at every turn boundary or status poll ("how
+/// many user turns", "the current goal") used to re-read the whole file each
+/// time — O(session lifetime) per ask. Since the file only grows, the answer
+/// is a fold over its lines: keep the fold and its byte offset, and on the
+/// next ask read from that offset. A file that shrank or whose inode changed
+/// is a different file, and its fold restarts. A trailing line without `\n`
+/// is left for the next read (its writer may still be extending it).
+///
+/// Bounded: past `capacity` files the least recently read fold is dropped, and
+/// rebuilt from the file if asked again.
+pub struct FoldCache<F> {
+    entries: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FoldEntry<F>>>,
+    capacity: usize,
+    first_read_max: Option<u64>,
+}
+
+struct FoldEntry<F> {
+    file_id: (u64, u64),
+    /// Byte position just past the last complete line folded in.
+    offset: u64,
+    fold: F,
+    last_read: std::time::Instant,
+}
+
+impl<F: LineFold> FoldCache<F> {
+    /// `first_read_max` bounds a fold's FIRST read to the file's trailing
+    /// bytes (`None` = the whole file); the partial first line it may start
+    /// mid-way through just fails to parse in the fold.
+    pub fn new(capacity: usize, first_read_max: Option<u64>) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity: capacity.max(1),
+            first_read_max,
+        }
+    }
+
+    /// Bring `path`'s fold up to date and answer `query` from it. `None` when
+    /// the file is absent or unreadable.
+    pub fn read<R>(
+        &self,
+        path: &Path,
+        init: impl FnOnce() -> F,
+        query: impl FnOnce(&mut F) -> R,
+    ) -> Option<R> {
+        let mut file = File::open(path).ok()?;
+        let meta = file.metadata().ok()?;
+        let (file_id, len) = (fold_file_id(&meta), meta.len());
+        // Take the entry OUT for the read, so the lock is never held across
+        // file I/O (two concurrent asks of one file each fold their own; the
+        // later insert wins, both are correct).
+        let cached = self
+            .lock()
+            .remove(path)
+            .filter(|entry| entry.file_id == file_id && entry.offset <= len);
+        let mut entry = cached.unwrap_or_else(|| FoldEntry {
+            file_id,
+            offset: self.first_read_max.map_or(0, |max| len.saturating_sub(max)),
+            fold: init(),
+            last_read: std::time::Instant::now(),
+        });
+        if len > entry.offset {
+            file.seek(SeekFrom::Start(entry.offset)).ok()?;
+            let mut buf = Vec::new();
+            (&mut file)
+                .take(len - entry.offset)
+                .read_to_end(&mut buf)
+                .ok()?;
+            BYTES_READ.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            let complete = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            for line in buf[..complete].split(|b| *b == b'\n') {
+                let line = trim_ascii(line);
+                if !line.is_empty() {
+                    entry.fold.ingest(line);
+                }
+            }
+            entry.offset += complete as u64;
+        }
+        let answer = query(&mut entry.fold);
+        entry.last_read = std::time::Instant::now();
+        let mut entries = self.lock();
+        if entries.len() >= self.capacity && !entries.contains_key(path) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_read)
+                .map(|(path, _)| path.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(path.to_path_buf(), entry);
+        Some(answer)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<std::path::PathBuf, FoldEntry<F>>>
+    {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(unix)]
+fn fold_file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn fold_file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -494,6 +615,35 @@ mod tests {
             raw.extend_from_slice(b"{not-json");
         }
         std::fs::write(path, raw).unwrap();
+    }
+
+    /// Counts the lines folded in, so a test sees exactly what each read fed.
+    struct Lines(Vec<String>);
+    impl LineFold for Lines {
+        fn ingest(&mut self, line: &[u8]) {
+            self.0.push(String::from_utf8_lossy(line).into_owned());
+        }
+    }
+
+    /// Issue #213: a fold is fed each complete line once; a file that shrank
+    /// restarts its fold; past capacity the least recently read fold goes.
+    #[test]
+    fn fold_cache_feeds_each_line_once_and_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.jsonl"), dir.path().join("b.jsonl"));
+        let cache = FoldCache::new(1, None);
+        let read = |path: &Path| cache.read(path, || Lines(Vec::new()), |f| f.0.clone());
+        assert_eq!(read(&a), None, "absent file");
+        std::fs::write(&a, "one\n\ntw").unwrap();
+        assert_eq!(read(&a).unwrap(), vec!["one"]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&a).unwrap();
+        writeln!(f, "o").unwrap();
+        assert_eq!(read(&a).unwrap(), vec!["one", "two"]);
+        std::fs::write(&a, "x\n").unwrap();
+        assert_eq!(read(&a).unwrap(), vec!["x"], "shrunk file restarts");
+        std::fs::write(&b, "y\n").unwrap();
+        assert_eq!(read(&b).unwrap(), vec!["y"]);
+        assert_eq!(cache.lock().len(), 1, "capacity 1 evicted a");
     }
 
     #[test]
