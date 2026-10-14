@@ -469,6 +469,7 @@ fn scrub_note(report: &ccteam_core::CcteamHookScrubReport) -> Option<String> {
             "stripped {entries} retired ccteam entr{}",
             if *entries == 1 { "y" } else { "ies" }
         )),
+        A::Unreadable { error } => Some(format!("left untouched: cannot read it — {error}")),
         A::Unparseable { error } => Some(format!("left untouched: not valid JSON — {error}")),
         A::NotFound | A::NoChangeNeeded | A::WouldRemove { .. } => None,
     }
@@ -3758,6 +3759,12 @@ fn purge_project_managed_paths(
         A::NotFound | A::NoChangeNeeded => {}
         // Purge is explicit cleanup: refuse rather than silently skip a file
         // it could not inspect.
+        A::Unreadable { error } => {
+            anyhow::bail!(
+                "cannot purge ccteam entries from {}: cannot read it ({error})",
+                settings_local.display()
+            );
+        }
         A::Unparseable { error } => {
             anyhow::bail!(
                 "cannot purge ccteam entries from {}: not valid JSON ({error}); fix or delete it",
@@ -4800,6 +4807,30 @@ mod tests {
             run_init(&paths, opts()).unwrap_or_else(|e| panic!("{name}: re-init: {e:#}"));
             assert_eq!(std::fs::read_to_string(&local).unwrap(), body, "{name}");
         }
+    }
+
+    /// The init receipt names a read failure as such, not as invalid JSON.
+    #[test]
+    fn scrub_note_distinguishes_unreadable_from_unparseable() {
+        use ccteam_core::{CcteamHookScrubAction as A, CcteamHookScrubReport};
+        let note = |action| {
+            scrub_note(&CcteamHookScrubReport {
+                target: "x".into(),
+                action,
+            })
+            .unwrap()
+        };
+        let read = note(A::Unreadable {
+            error: "Is a directory (os error 21)".into(),
+        });
+        assert!(
+            read.contains("cannot read") && !read.contains("JSON"),
+            "{read}"
+        );
+        let parse = note(A::Unparseable {
+            error: "EOF while parsing".into(),
+        });
+        assert!(parse.contains("not valid JSON"), "{parse}");
     }
 
     /// `--force` re-runs overwrite user files. workflow.yaml lives in

@@ -449,6 +449,35 @@ async fn fresh_spawn_uses_session_id() {
     adapter.close_thread(&handle).await.unwrap();
 }
 
+/// docs-local issue #212 — a stream-json spawn writes no project Claude
+/// settings: the Telegram pin rides `--settings`, so the project gets no
+/// `.claude/` (and certainly no `settings.local.json`) from ccteam.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn spawn_writes_no_project_claude_settings() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut spawn_ctx = ctx(tmp.path(), "demo", "s1");
+    spawn_ctx.cwd = project.clone();
+    spawn_ctx.project_dir = project.clone();
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(&AgentSpecBrief { role: "".into() }, &spawn_ctx)
+        .await
+        .expect("start_thread");
+    assert!(
+        !project.join(".claude").join("settings.local.json").exists(),
+        "spawn must not write .claude/settings.local.json"
+    );
+    assert!(
+        !project.join(".claude").exists(),
+        "spawn must not create .claude/"
+    );
+    adapter.close_thread(&handle).await.unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn resume_spawn_uses_resume_when_transcript_exists() {

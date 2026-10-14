@@ -502,10 +502,13 @@ pub enum CcteamHookScrubAction {
     /// No ccteam hook entries found. Idempotent re-run after a successful
     /// scrub hits this branch.
     NoChangeNeeded,
-    /// The file exists but could not be read or is not valid JSON (an empty
-    /// file, a trailing comma …). It is left exactly as it is; the caller
-    /// decides whether that is fatal (`project rm --purge`) or a note
-    /// (project create / `ccteam init`, which must never fail on a user file).
+    /// The path exists but could not be read (a directory, no permission …).
+    /// Left exactly as it is; the caller decides whether that is fatal
+    /// (`project rm --purge`) or a note (project create / `ccteam init`,
+    /// which must never fail on a user file).
+    Unreadable { error: String },
+    /// The file was read but is not valid JSON (empty, a trailing comma …).
+    /// Left exactly as it is; same caller policy as `Unreadable`.
     Unparseable { error: String },
     /// `dry_run = true` — would have removed N hook command entries.
     WouldRemove { entries: usize },
@@ -555,17 +558,25 @@ pub fn remove_ccteam_hooks(settings_path: &Path, dry_run: bool) -> Result<Ccteam
         });
     }
 
-    let parsed = std::fs::read_to_string(settings_path)
-        .map_err(|e| e.to_string())
-        .and_then(|body| {
-            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| e.to_string())
-        });
-    let mut v = match parsed {
+    let untouched = |action| {
+        Ok(CcteamHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action,
+        })
+    };
+    let body = match std::fs::read_to_string(settings_path) {
+        Ok(body) => body,
+        Err(e) => {
+            return untouched(CcteamHookScrubAction::Unreadable {
+                error: e.to_string(),
+            })
+        }
+    };
+    let mut v: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(error) => {
-            return Ok(CcteamHookScrubReport {
-                target: settings_path.to_path_buf(),
-                action: CcteamHookScrubAction::Unparseable { error },
+        Err(e) => {
+            return untouched(CcteamHookScrubAction::Unparseable {
+                error: e.to_string(),
             })
         }
     };
@@ -576,6 +587,10 @@ pub fn remove_ccteam_hooks(settings_path: &Path, dry_run: bool) -> Result<Ccteam
             .get_mut("enabledPlugins")
             .and_then(|p| p.as_object_mut())
         {
+            // A `false` here cannot be told apart from one the user typed by
+            // hand; stripping it re-enables Telegram for the user's own
+            // non-ccteam claude runs in this dir — accepted, since ccteam
+            // wrote this exact pin into every project it spawned in.
             if plugins.get(TELEGRAM_PLUGIN_PIN) == Some(&serde_json::Value::Bool(false)) {
                 plugins.remove(TELEGRAM_PLUGIN_PIN);
                 removed += 1;
@@ -1372,6 +1387,22 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
         }
+    }
+
+    /// A path that exists but cannot be read (here: a directory) is
+    /// `Unreadable`, not mislabelled as invalid JSON.
+    #[test]
+    fn remove_ccteam_hooks_reports_unreadable_distinct_from_unparseable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::create_dir(&path).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert!(
+            matches!(report.action, CcteamHookScrubAction::Unreadable { .. }),
+            "{:?}",
+            report.action
+        );
+        assert!(path.is_dir(), "left as it was");
     }
 
     /// The Telegram pin ccteam wrote (`false`) is scrubbed — pruning an

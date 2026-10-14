@@ -366,13 +366,19 @@ pub fn bootstrap_project_at_dir(
     let settings_local = project_dir.join(".claude").join("settings.local.json");
     match crate::tool_surface::remove_ccteam_hooks(&settings_local, false) {
         Ok(report) => {
-            if let crate::tool_surface::CcteamHookScrubAction::Unparseable { error } = report.action
-            {
-                tracing::warn!(
+            use crate::tool_surface::CcteamHookScrubAction as A;
+            match report.action {
+                A::Unreadable { error } => tracing::warn!(
+                    path = %settings_local.display(),
+                    %error,
+                    "left .claude/settings.local.json untouched: cannot read it",
+                ),
+                A::Unparseable { error } => tracing::warn!(
                     path = %settings_local.display(),
                     %error,
                     "left .claude/settings.local.json untouched: not valid JSON",
-                );
+                ),
+                _ => {}
             }
         }
         Err(err) => tracing::warn!(
