@@ -4473,32 +4473,27 @@ impl Gateway {
     /// the SESSION. Returns `Ok(true)` when `sid` was detached and its body is
     /// now gone; `Ok(false)` when `sid` was not detached.
     ///
-    /// Waiting is the only automatic exit from DETACHED, and it is unbounded:
-    /// a body that lost its stdin is never driveable again, yet `claude` stays
+    /// A body that lost its stdin is never driveable again, and `claude` stays
     /// alive after stdin EOF for as long as any background task it started is
-    /// running (and self-continues when that task ends) — a dev server or a
-    /// watcher keeps it alive for good, and every message to the sid queues
-    /// behind it forever. `/stop` was the only way out, and it ends the
-    /// session (stopped, focus routes dropped), so the chat's next message
-    /// minted a new sid. This is the way out that keeps the sid: only the
-    /// process is signalled; the record, the queue, the focus routes and the
-    /// DETACHED entry stay, and the watcher takes the same path as a body
-    /// that exited on its own — recover what it said, rebuild by sid
-    /// (`--resume`, same context), drain the queued turns.
+    /// running. The watcher bounds that wait on its own once a turn is queued
+    /// (see [`Self::detached_wait_bound`]); this is the user's way to cut it
+    /// short. Only the process is signalled ([`session_body::kill_body`]: its
+    /// background children keep running); the queue, the focus routes and the
+    /// DETACHED entry stay, and the watcher takes the same path as a body that
+    /// exited on its own — recover what it said, rebuild by sid (`--resume`,
+    /// same context), drain the queued turns.
     pub(crate) async fn end_detached_body(&mut self, sid: &str) -> Result<bool> {
         let Some(detached) = self.detached.get(sid).cloned() else {
             return Ok(false);
         };
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
-        let ended = tokio::task::spawn_blocking(move || {
-            session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
-        })
-        .await
-        .context("join body terminate")??;
+        let ended = tokio::task::spawn_blocking(move || session_body::kill_body(&body, &sid_owned))
+            .await
+            .context("join body kill")??;
         if !ended {
             return Err(anyhow!(
-                "{sid}'s body (pid {}) is still alive after SIGTERM and SIGKILL",
+                "{sid}'s body (pid {}) is still alive after SIGKILL",
                 detached.body.pid
             ));
         }
@@ -4540,9 +4535,10 @@ impl Gateway {
         let receipt = format!(
             "⏳ {sid}'s process from before ccteam restarted is still running (body pid {}, \
              unobserved since {}): a turn it was finishing, or background tasks it started. Your \
-             message is queued (#{queued}) and is delivered when that process exits. \
-             `/interrupt {sid}` ends the process now and resumes {sid} on the same context \
-             (its background tasks end with it); `/stop {sid}` ends the session.",
+             message is queued (#{queued}). Once that process has gone quiet ccteam ends it and \
+             resumes {sid} on the same context with your message; background processes it \
+             started keep running. `/interrupt {sid}` does that now; `/stop {sid}` ends the \
+             session.",
             detached.body.pid, since
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
@@ -4585,11 +4581,87 @@ impl Gateway {
         }
         for d in detached {
             // Off the lock: a pure OS probe.
+            let mut reason = "exited";
             if session_body::body_is_alive(&d.body, &d.sid) {
-                continue;
+                let Some(bound) = Self::detached_wait_bound(gateway, &d).await else {
+                    continue;
+                };
+                let body = d.body.clone();
+                let sid = d.sid.clone();
+                match tokio::task::spawn_blocking(move || session_body::kill_body(&body, &sid))
+                    .await
+                {
+                    Ok(Ok(true)) => {}
+                    outcome => {
+                        tracing::warn!(session = %d.sid, pid = d.body.pid, ?outcome, "ccteam-im: could not end a detached body; still waiting for it");
+                        continue;
+                    }
+                }
+                tracing::info!(session = %d.sid, pid = d.body.pid, reason = bound, "ccteam-im: ended a detached body a queued turn was waiting on; resuming by sid");
+                reason = bound;
             }
-            Self::on_detached_body_exited_shared(gateway, d).await;
+            Self::on_detached_body_exited_shared(gateway, d, reason).await;
         }
+    }
+
+    /// How long a detached body's record must stay silent, with its last turn
+    /// ended, before a queued turn stops waiting for it.
+    const DETACHED_IDLE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long a detached body's record may stay silent with a turn still
+    /// open before a queued turn stops waiting for it. Long on purpose: a
+    /// foreground tool call writes nothing until it returns (claude's Bash tool
+    /// caps a call at 10 minutes), and a subagent's writes are counted too.
+    const DETACHED_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// The bound on waiting behind a detached body. `Some(reason)` when the
+    /// watcher should end the body's process now so the queued turns reach
+    /// the same sid; `None` to keep waiting.
+    ///
+    /// Policy (docs-local issue #211): only a turn queued for the sid ends the
+    /// wait — a body nobody is waiting on is left alone (its background work,
+    /// say a job scheduled for later, runs to its end). Then:
+    /// - `ended_idle`: the vendor record says the last turn ended and it has been
+    ///   silent for [`Self::DETACHED_IDLE_QUIET`]. The process is alive only for
+    ///   background tasks; it can never take the queued turn itself.
+    /// - `ended_stalled`: a turn is still open but the record has been silent for
+    ///   [`Self::DETACHED_STALL`] (or, with no readable record, the body has
+    ///   been detached that long).
+    ///
+    /// A body that is mid-turn and still writing keeps today's wait: it will
+    /// finish and exit. Ending the process is not ending the session (AGENTS.md
+    /// §三): sid, ledger and focus routes stay, and the queued turns are
+    /// delivered on the same context.
+    async fn detached_wait_bound(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        d: &DetachedBody,
+    ) -> Option<&'static str> {
+        if crate::pending_turns::pending_turn_count(&d.cwd, &d.sid) == 0 {
+            return None;
+        }
+        let meta = ccteam_harness::read_session_meta(&d.cwd, &d.sid).ok()?;
+        let adapter = {
+            let g = gateway.lock().await;
+            (g.adapter_factory)(meta.vendor, meta.protocol)
+        };
+        let activity = adapter
+            .detached_activity(&UnobservedTurnCtx {
+                sid: d.sid.clone(),
+                slug: d.slug.clone(),
+                cwd: d.cwd.clone(),
+                vendor_uuid: meta.vendor_uuid.clone(),
+                observed_until: chrono::Utc::now(),
+                last_observed_assistant: None,
+            })
+            .await;
+        let quiet_for = match activity {
+            Some(a) if a.turn_ended && a.quiet_for >= Self::DETACHED_IDLE_QUIET => {
+                return Some("ended_idle")
+            }
+            Some(a) => a.quiet_for,
+            None => (chrono::Utc::now() - d.since).to_std().unwrap_or_default(),
+        };
+        (quiet_for >= Self::DETACHED_STALL).then_some("ended_stalled")
     }
 
     /// A detached body exited on its own: forget it, recover + report what it
@@ -4597,6 +4669,7 @@ impl Gateway {
     async fn on_detached_body_exited_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         d: DetachedBody,
+        reason: &str,
     ) {
         {
             let mut g = gateway.lock().await;
@@ -4607,8 +4680,7 @@ impl Gateway {
             session_body::clear(&d.cwd, &d.sid);
         }
         tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
-        Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
-            .await;
+        Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, reason).await;
         Self::rebuild_one_shared(gateway, &d.sid).await;
         let mut g = gateway.lock().await;
         if g.sessions.contains_key(&d.sid) {
@@ -5680,7 +5752,7 @@ impl Gateway {
                 self.interrupt_session(&sid).await?;
                 if detached {
                     return Ok(Some(format!(
-                        "已结束 {sid} 重启前遗留的进程(连同它启动的后台任务);{sid} 正按原上下文恢复,排队的消息随后送达"
+                        "已结束 {sid} 重启前遗留的进程(它启动的后台进程继续运行);{sid} 正按原上下文恢复,排队的消息随后送达"
                     )));
                 }
                 Ok(Some(format!(
@@ -22215,6 +22287,131 @@ mod tests {
         assert_eq!(submitted, vec!["hello after restart".to_string()]);
     }
 
+    /// Restart a gateway over `tmp` with `sid`'s body still running and the
+    /// chat focused on it: the shape every detached-body wait test starts from.
+    async fn restarted_with_live_body(
+        tmp: &std::path::Path,
+        project_dir: &std::path::Path,
+        chat: &ChatKey,
+    ) -> (String, std::process::Child, Arc<FakeAdapter>, Gateway) {
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", project_dir);
+            gateway.enable_persistence(tmp).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+            gateway.current_session.set(chat, sid.clone());
+            gateway.persist_routing().unwrap();
+        }
+        let child = plant_body(project_dir, &sid);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", project_dir);
+        restarted.enable_persistence(tmp).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid));
+        (sid, child, fake, restarted)
+    }
+
+    fn set_activity(fake: &FakeAdapter, turn_ended: bool, quiet_secs: u64) {
+        *fake.detached_activity.lock().unwrap() = Some(ccteam_harness::DetachedActivity {
+            turn_ended,
+            quiet_for: std::time::Duration::from_secs(quiet_secs),
+        });
+    }
+
+    /// The wait behind a body from before a restart is bounded without anyone
+    /// knowing `/interrupt` (docs-local issue #211): once a turn is queued and
+    /// the body's record says its last turn ended and it has gone quiet, the
+    /// watcher ends that PROCESS and the SAME sid resumes on its context with
+    /// the queued turn. Until then — nobody waiting, a turn still open, or not
+    /// quiet long enough — the body is left alone.
+    #[tokio::test]
+    async fn a_queued_turn_ends_an_idle_detached_body_and_resumes_the_same_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+
+        // Idle, but nobody is waiting on it: its background work runs on.
+        set_activity(&fake, true, 600);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+
+        let id = gateway
+            .lock()
+            .await
+            .submit_to_sid(&sid, "hello after restart".into())
+            .await
+            .unwrap();
+        assert!(id.starts_with("queued-behind-body:"), "got {id}");
+        // A turn still open, or an ended one not quiet long enough: wait.
+        set_activity(&fake, false, 600);
+        Gateway::body_watch_tick(&gateway).await;
+        set_activity(&fake, true, 5);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+        assert_eq!(child.try_wait().unwrap(), None, "the body is untouched");
+
+        set_activity(&fake, true, 60);
+        Gateway::body_watch_tick(&gateway).await;
+        let status = child.wait().unwrap();
+        assert!(status.code().is_none(), "signalled: {status:?}");
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid), "the same sid is live again");
+        assert!(!g.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1, "exactly one body");
+        assert_eq!(g.current_session.get(&chat), Some(sid.clone()));
+        assert!(read_session_meta(&project_dir, &sid)
+            .unwrap()
+            .stopped_at
+            .is_none());
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+        let submitted: Vec<String> = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(submitted, vec!["hello after restart".to_string()]);
+    }
+
+    /// A body that is still mid-turn keeps the wait — but not forever: a turn
+    /// whose record has been silent past the stall bound is treated as idle.
+    #[tokio::test]
+    async fn a_queued_turn_ends_a_stalled_detached_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        restarted
+            .submit_to_sid(&sid, "are you there".into())
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, false, 29 * 60);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+
+        set_activity(&fake, false, 31 * 60);
+        Gateway::body_watch_tick(&gateway).await;
+        child.wait().unwrap();
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid));
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+    }
+
     /// A body record whose process is already GONE at restore time means the
     /// body finished (or died) while no daemon was watching. The session is
     /// rebuilt at once; the watcher's post-mortem then reports the unanswered
@@ -23781,6 +23978,8 @@ mod tests {
         /// tasks into a genuinely busy child and assert their queue positions
         /// without racing the pump.
         events_held: Arc<std::sync::atomic::AtomicBool>,
+        /// What `detached_activity` reports (`None` = no readable record).
+        detached_activity: Arc<std::sync::Mutex<Option<ccteam_harness::DetachedActivity>>>,
     }
 
     /// One thread's turn FIFO inside [`FakeAdapter`].
@@ -23858,6 +24057,7 @@ mod tests {
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                detached_activity: Arc::new(std::sync::Mutex::new(None)),
             }
         }
 
@@ -24145,6 +24345,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HarnessAdapter for FakeAdapter {
+        async fn detached_activity(
+            &self,
+            _ctx: &UnobservedTurnCtx,
+        ) -> Option<ccteam_harness::DetachedActivity> {
+            *self.detached_activity.lock().unwrap()
+        }
+
         fn name(&self) -> &'static str {
             "fake-gateway"
         }

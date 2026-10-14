@@ -453,6 +453,17 @@ pub struct RecoveredTurn {
     pub conclusion: Option<String>,
 }
 
+/// What a body that outlived its daemon is doing, read from the vendor's own
+/// durable record (see [`HarnessAdapter::detached_activity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachedActivity {
+    /// The newest turn in the record has ended: nothing is mid-turn, and the
+    /// process is alive only for work it started in the background.
+    pub turn_ended: bool,
+    /// How long the record has not grown.
+    pub quiet_for: std::time::Duration,
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -2003,6 +2014,18 @@ pub trait HarnessAdapter: Send + Sync {
     /// one. Never a prompt: this READS a vendor file, exactly like the
     /// terminal protocol's transcript track.
     async fn recover_unobserved_turn(&self, ctx: &UnobservedTurnCtx) -> Option<RecoveredTurn> {
+        let _ = ctx;
+        None
+    }
+
+    /// Is a body that outlived its daemon mid-turn, and how long has it been
+    /// silent? Read from the vendor's durable record (Claude's transcript
+    /// jsonl), the same file [`Self::recover_unobserved_turn`] reads. The
+    /// gateway uses it to bound the wait behind such a body.
+    ///
+    /// Default `None` = "this vendor keeps no record ccteam may read"; the
+    /// gateway then only applies its long stall bound.
+    async fn detached_activity(&self, ctx: &UnobservedTurnCtx) -> Option<DetachedActivity> {
         let _ = ctx;
         None
     }

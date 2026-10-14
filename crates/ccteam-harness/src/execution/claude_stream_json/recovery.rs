@@ -26,13 +26,14 @@
 //! parse is skipped, never guessed.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::RecoveredTurn;
+use crate::{DetachedActivity, RecoveredTurn};
 
 /// Read `path` and fold every assistant record with `timestamp >
 /// observed_until` into one [`RecoveredTurn`]. `None` when the file is
@@ -174,6 +175,66 @@ pub fn recover_after(
         usage,
         ended_at: ended_at.unwrap_or(observed_until),
         conclusion,
+    })
+}
+
+/// How much of the transcript's tail [`activity`] reads: enough for the last
+/// few records of any turn, bounded so a 200 MB transcript costs nothing.
+const ACTIVITY_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Read the activity of the body writing `path`: has its newest turn ended,
+/// and how long has the record been silent (the transcript and the
+/// subagent transcripts beside it, `<uuid>/subagents/*.jsonl`, which grow
+/// while a Task subagent works and the main file does not).
+///
+/// The newest turn has ended when the newest top-level conversation record
+/// (`type` user|assistant, not a sidechain) is an assistant message with
+/// `stop_reason: end_turn`. Anything after it — a tool result, a queued
+/// prompt, a background-task notification — means a turn is running again.
+/// Bookkeeping records (attachments, queue operations, titles) say nothing
+/// either way and are skipped. No conversation record in the tail reads as
+/// "not ended": the caller then waits for its long stall bound.
+pub fn activity(path: &Path, now: SystemTime) -> Option<DetachedActivity> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(ACTIVITY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let text = String::from_utf8_lossy(&tail);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        // The first line was cut by the seek.
+        lines.remove(0);
+    }
+    let mut turn_ended = false;
+    for line in lines.iter().rev() {
+        let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let kind = row.get("type").and_then(Value::as_str);
+        if !matches!(kind, Some("user") | Some("assistant")) {
+            continue;
+        }
+        if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        turn_ended = kind == Some("assistant")
+            && row.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn");
+        break;
+    }
+    let mut newest = std::fs::metadata(path).ok()?.modified().ok()?;
+    let subagents = path.with_extension("").join("subagents");
+    if let Ok(entries) = std::fs::read_dir(&subagents) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                newest = newest.max(modified);
+            }
+        }
+    }
+    Some(DetachedActivity {
+        turn_ended,
+        quiet_for: now.duration_since(newest).unwrap_or(Duration::ZERO),
     })
 }
 
@@ -331,5 +392,76 @@ mod tests {
         .unwrap();
         let cut = Utc.with_ymd_and_hms(2026, 8, 19, 2, 9, 0).unwrap();
         assert!(recover_after(&path, cut, None).is_none());
+    }
+
+    fn row(kind: &str, stop: Option<&str>, sidechain: bool) -> String {
+        let mut message = serde_json::json!({"role": kind, "content": "x"});
+        if let Some(stop) = stop {
+            message["stop_reason"] = Value::String(stop.into());
+        }
+        serde_json::json!({"type": kind, "isSidechain": sidechain, "message": message,
+            "timestamp": "2026-10-14T00:14:54Z"})
+        .to_string()
+    }
+
+    fn activity_of(lines: &[String]) -> DetachedActivity {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("u.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        activity(&path, SystemTime::now() + Duration::from_secs(90)).unwrap()
+    }
+
+    #[test]
+    fn activity_reads_an_ended_turn_through_bookkeeping_records() {
+        let got = activity_of(&[
+            row("user", None, false),
+            row("assistant", Some("end_turn"), false),
+            r#"{"type":"attachment"}"#.to_string(),
+            r#"{"type":"last-prompt"}"#.to_string(),
+        ]);
+        assert!(got.turn_ended);
+        assert!(got.quiet_for >= Duration::from_secs(89), "{got:?}");
+    }
+
+    #[test]
+    fn activity_reads_a_running_turn() {
+        // A tool call in flight, then a background-task notification that
+        // opened a new turn after an ended one: both are mid-turn.
+        assert!(!activity_of(&[row("assistant", Some("tool_use"), false)]).turn_ended);
+        assert!(
+            !activity_of(&[
+                row("assistant", Some("end_turn"), false),
+                row("user", None, false),
+            ])
+            .turn_ended
+        );
+        // A subagent's record does not end the parent's turn.
+        assert!(
+            !activity_of(&[
+                row("assistant", Some("tool_use"), false),
+                row("assistant", Some("end_turn"), true),
+            ])
+            .turn_ended
+        );
+    }
+
+    #[test]
+    fn activity_counts_subagent_writes_as_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("u.jsonl");
+        std::fs::write(&path, row("assistant", Some("tool_use"), false) + "\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let sub = tmp.path().join("u").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-a.jsonl"), "{}\n").unwrap();
+        let got = activity(&path, SystemTime::now()).unwrap();
+        assert!(got.quiet_for < Duration::from_secs(60), "{got:?}");
+        assert!(activity(&tmp.path().join("missing.jsonl"), SystemTime::now()).is_none());
     }
 }

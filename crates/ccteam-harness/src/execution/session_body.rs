@@ -29,8 +29,10 @@
 //!   forge a `body.json`. What this prevents is a *misattribution by ccteam
 //!   itself* (two bodies for one sid), not an attack.
 //! - [`terminate`] exists for EXPLICIT user stops (`/stop`, `agent_stop`,
-//!   project stop). The daemon never calls it on its own initiative — a
-//!   detached body is waited for, not killed (AGENTS.md §三 "永不主动 kill").
+//!   project stop). [`kill_body`] ends the PROCESS of a detached body whose
+//!   session is wanted again (`/interrupt`, or a queued turn behind a body
+//!   that is idle or stalled) and leaves the session — sid, ledger, focus —
+//!   alone (AGENTS.md §三 "kill 的是进程，不是会话").
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -197,6 +199,29 @@ pub fn terminate(body: &SessionBody, sid: &str, grace: Duration) -> Result<bool>
     }
     signal(body.pid, libc::SIGKILL)?;
     // SIGKILL is not instantaneous; give the kernel a moment to reap.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if !body_is_alive(body, sid) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(!body_is_alive(body, sid))
+}
+
+/// End a detached body's process and NOTHING else: one SIGKILL to the
+/// verified pid, then wait for it to go. Unlike [`terminate`], this gives
+/// the vendor no chance to clean up — on purpose. `claude` answers SIGTERM by
+/// killing every background task it started (measured, 2.1.296), and those
+/// are the user's work: a dev server, a stack, a job scheduled to run later.
+/// A SIGKILL leaves them running, reparented to init; ccteam signals only the
+/// one process it recorded. Callers use it only once the body has stopped
+/// writing, so no transcript line is cut. `Ok(true)` when the body is gone.
+pub fn kill_body(body: &SessionBody, sid: &str) -> Result<bool> {
+    if !body_is_alive(body, sid) {
+        return Ok(true);
+    }
+    signal(body.pid, libc::SIGKILL)?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
         if !body_is_alive(body, sid) {
@@ -448,5 +473,39 @@ mod tests {
         assert_eq!(probe(tmp.path(), "s12"), BodyProbe::Absent);
         record(tmp.path(), "", Some(std::process::id()), "test").unwrap();
         assert!(!body_path(tmp.path(), "").exists());
+    }
+
+    #[test]
+    fn kill_body_ends_the_body_and_leaves_its_background_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pidfile.display()))
+            .env(BODY_SID_ENV, "s13")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        record(tmp.path(), "s13", Some(child.id()), "test").unwrap();
+        let started = Instant::now();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "no bg pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let body = read(tmp.path(), "s13").unwrap();
+        // The test process is the body's parent: reap it while waiting.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(kill_body(&body, "s13").unwrap());
+        reaper.join().unwrap().unwrap();
+        assert!(process_exists(bg), "the background child keeps running");
+        signal(bg, libc::SIGKILL).unwrap();
     }
 }
