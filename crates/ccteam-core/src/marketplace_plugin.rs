@@ -18,9 +18,8 @@
 //!   equal the marketplace's declared `name`.
 //! - `enabledPlugins` — `"<plugin>@<marketplace>": true` turns a plugin on.
 //!
-//! ccteam writes both into the project's **`.claude/settings.local.json`** —
-//! the layer it already owns (same file as the managed hooks +
-//! `ensure_telegram_plugin_disabled`), so the user's committed
+//! ccteam writes both into the project's **`.claude/settings.local.json`**
+//! (gitignored local layer) — only when the user enables a plugin — so the user's committed
 //! `.claude/settings.json` is never touched. On the next launch in that
 //! project Claude Code sees the marketplace + the enabled plugin and does
 //! ALL of the fetch / native-dep / install work itself, sandboxed by the

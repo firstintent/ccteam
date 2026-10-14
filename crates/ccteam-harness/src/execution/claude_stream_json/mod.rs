@@ -2001,15 +2001,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 "Claude has no session-mode axis (DSH agent presets only today)",
             ));
         }
-        // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
-        // bot-token getUpdates poll structurally collides with ccteam's IM
-        // gateway). Same managed layer the tmux path uses; only this one
-        // plugin. A remote project's daemon-side `project_dir` is a DATA
-        // HOME, not a vendor working tree: never materialize `.claude/`
-        // there; the satellite's real working tree owns its settings.
-        if ctx.remote.is_none() {
-            crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
-        }
+        // The official Telegram plugin is pinned off through `--settings` in
+        // `spawn_spec::build_argv` — no project settings file is written
+        // (docs-local issue #212).
         let bin = spawn_spec::claude_bin();
         // §七 ⑤ — stable per-(slug,sid) uuid: the stateless resume key.
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);

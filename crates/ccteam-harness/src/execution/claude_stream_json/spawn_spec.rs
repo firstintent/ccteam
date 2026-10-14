@@ -111,6 +111,14 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // still handled by `--strict-mcp-config`; permissions by the flags
         // below.
         "--setting-sources=user,project,local".into(),
+        // Isolate the official Telegram plugin (its bot-token `getUpdates`
+        // long-poll structurally collides with ccteam's IM gateway) through
+        // claude's flag-settings layer: it outranks user/project/local, so the
+        // pin always wins, and it lives in argv — ccteam writes no
+        // `.claude/settings.local.json` for it (docs-local issue #212). Only
+        // this one plugin; every other stays exactly as the user set it.
+        "--settings".into(),
+        flag_settings_json(),
     ];
 
     // Curated per-session MCP (v0.8.24 C1): only load this config under
@@ -156,6 +164,17 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     argv.push(input.session_uuid.to_string());
 
     argv
+}
+
+/// The `--settings` JSON every stream-json spawn carries: only the Telegram
+/// plugin pin (see [`build_argv`]).
+fn flag_settings_json() -> String {
+    serde_json::json!({
+        "enabledPlugins": {
+            crate::execution::claude_tui::TELEGRAM_PLUGIN_ID: false,
+        }
+    })
+    .to_string()
 }
 
 /// Env pairs forwarded into the stream-json child. Mirrors the tmux
@@ -321,6 +340,26 @@ mod tests {
             "--replay-user-messages",
         ] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
+    }
+
+    /// docs-local issue #212 — the Telegram pin rides the flag-settings
+    /// layer (`--settings <json>`), not a project settings file, and carries
+    /// nothing but that one plugin.
+    #[test]
+    fn argv_pins_telegram_off_via_flag_settings() {
+        for resume in [false, true] {
+            let argv = build_argv("claude", &input("", "u-1", resume));
+            let at = argv
+                .iter()
+                .position(|a| a == "--settings")
+                .unwrap_or_else(|| panic!("missing --settings: {argv:?}"));
+            let v: serde_json::Value =
+                serde_json::from_str(&argv[at + 1]).expect("--settings value is JSON");
+            assert_eq!(
+                v,
+                serde_json::json!({"enabledPlugins": {"telegram@claude-plugins-official": false}})
+            );
         }
     }
 
