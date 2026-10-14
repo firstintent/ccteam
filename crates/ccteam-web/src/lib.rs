@@ -101,6 +101,12 @@ pub struct ServeOpts {
     /// `$CCTEAM_HOME` but is not the daemon, and letting it publish would
     /// point every `daemon status` at the wrong server.
     pub publish_endpoint: bool,
+    /// Fired (`notify_one`) once every listener is bound and the bound
+    /// addresses are published (`run/mcp-url`, `run/daemon-endpoint.json`).
+    /// The daemon body holds its `mcp.sock` — the socket `ccteam start`
+    /// probes for readiness — until this fires, so "started" never means
+    /// "the advertised `/mcp` URL still refuses connections".
+    pub bound: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl Default for ServeOpts {
@@ -123,6 +129,7 @@ impl Default for ServeOpts {
             no_auth_grace_secs: Some(5),
             build: None,
             publish_endpoint: false,
+            bound: None,
         }
     }
 }
@@ -370,6 +377,9 @@ where
             tracing::warn!(error = %err, "could not re-record the daemon MCP URL from the bound address");
         }
     }
+    if let Some(bound) = &opts.bound {
+        bound.notify_one();
+    }
     let state = build_state(paths, auth_state)
         .with_dsh_web(std::sync::Arc::clone(&supervisor))
         .with_health_identity(health);
@@ -522,6 +532,7 @@ mod tests {
             no_auth_grace_secs: Some(5),
             build: Some("abc1234".to_string()),
             publish_endpoint: false,
+            bound: None,
         };
         assert_eq!(opts.build.as_deref(), Some("abc1234"));
         assert!(!opts.no_auth);

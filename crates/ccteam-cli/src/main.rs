@@ -1808,16 +1808,24 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             )))
         };
 
+        // `ccteam start` reports "started" once `mcp.sock` answers, and every
+        // MCP client then dials the TCP `/mcp` that `run/mcp-url` advertises.
+        // Both listeners come up in separate tasks, so the socket waits for
+        // the web listener to be bound and published (docs-local issue #214:
+        // a client right after `start` got "connection refused").
+        let web_bound = (!web.disabled).then(|| std::sync::Arc::new(tokio::sync::Notify::new()));
         let web_handle = if web.disabled {
             None
         } else {
-            let opts = match parse_web_opts(&web) {
+            let mut opts = match parse_web_opts(&web) {
                 Ok(o) => o,
                 Err(err) => {
                     signal_task.abort();
                     return Err(err);
                 }
             };
+            opts.bound = web_bound.clone();
+            let web_exited = web_bound.clone();
             let mut rx = shutdown_rx.clone();
             let web_bridge = web_chat_bridge
                 .as_ref()
@@ -1848,7 +1856,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             let web_host_hub = host_hub.clone();
             let web_dsh_runtime = std::sync::Arc::clone(&dsh_runtime);
             Some(tokio::spawn(async move {
-                ccteam_web::serve_with_state_factory_and_shutdown(
+                let served = ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
                     move |paths, auth| {
                         let mut state = ccteam_web::AppState::with_auth(paths, auth);
@@ -1867,7 +1875,13 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         let _ = rx.changed().await;
                     },
                 )
-                .await
+                .await;
+                // A web that failed before binding must not hold the socket
+                // closed forever: the daemon stays up without it, as before.
+                if let Some(bound) = web_exited {
+                    bound.notify_one();
+                }
+                served
             }))
         };
 
@@ -1919,6 +1933,9 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         // session tools then report "gateway not running".
         let mcp_gateway = shared_gateway.clone();
         let mcp_handle = tokio::spawn(async move {
+            if let Some(bound) = web_bound {
+                bound.notified().await;
+            }
             serve_mcp_socket(paths, mcp_sink, mcp_pending, mcp_gateway, async move {
                 let _ = rx.changed().await;
             })
@@ -2336,6 +2353,8 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         // This IS the daemon body (`internal daemon-run`), so it owns the
         // endpoint publication; `ccteam internal web` deliberately does not.
         publish_endpoint: true,
+        // Set by the caller, which owns the `mcp.sock` it gates.
+        bound: None,
     })
 }
 
