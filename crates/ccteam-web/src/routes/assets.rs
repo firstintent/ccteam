@@ -158,3 +158,23 @@ fn serve_embedded(
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// The bundle must be compiled into the binary in every profile. A
+    /// disk-backed lookup returns `Cow::Owned` (read from the build
+    /// worktree's `web/dist/` at request time), which 500s once that
+    /// worktree is gone (#215); an embedded one is `Cow::Borrowed` static
+    /// data. Fails in a debug test build if `debug-embed` is dropped.
+    #[test]
+    fn spa_index_is_embedded_not_read_from_the_build_tree() {
+        let index = SpaAssets::get("index.html").expect("index.html in bundle");
+        assert!(
+            matches!(index.data, Cow::Borrowed(_)),
+            "SPA index.html is read from disk at runtime, not embedded"
+        );
+    }
+}
