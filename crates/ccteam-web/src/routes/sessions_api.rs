@@ -1164,7 +1164,7 @@ pub(crate) async fn handle_session_turn(
         Arc::clone(gw),
         &sid,
         text,
-        identity.is_admin,
+        &identity.web_chat_id(),
         deadline,
     )
     .await;

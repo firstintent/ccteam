@@ -407,7 +407,7 @@ async fn ask_external_choice(
             options: message_options,
             status: None,
             sid: Some(sid.to_string()),
-            slug: None,
+            slug: Some(ctx.slug.clone()),
         })
         .is_err()
     {
@@ -967,6 +967,7 @@ mod tests {
             thread_ts: None,
             role: "alice".to_string(),
             progress_path: None,
+            slug: "alpha".to_string(),
         }
     }
 
@@ -1092,6 +1093,8 @@ mod tests {
         assert_eq!(answer, PermissionAnswer::Timeout);
         let evt = rx.recv().await.expect("prompt event sent");
         assert_eq!(evt.thread_ts.as_deref(), Some("1700000000.000100"));
+        // Attributed to its project, so a tenant's fleet stream keeps it.
+        assert_eq!(evt.slug.as_deref(), Some("alpha"));
     }
 
     /// A closed sink (event consumer gone) fails safe to `Unavailable`

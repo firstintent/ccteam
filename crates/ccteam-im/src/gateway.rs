@@ -2389,6 +2389,11 @@ pub struct HitlPromptContext {
     /// `chat_permission_prompt_outstanding` operator-visibility line.
     /// `None` when the gateway was never given project paths (unit tests).
     pub progress_path: Option<PathBuf>,
+    /// The owning project's slug. Stamped on the prompt event so the
+    /// project-filtered fleet stream (`/api/v1/agents/events`) shows it to
+    /// everyone who can see the project — an unattributed frame reaches the
+    /// operator only, so a tenant never saw its own approval prompts there.
+    pub slug: String,
 }
 
 /// A live session's delivery route ([`Gateway::reply_target_for`]): the
@@ -14579,6 +14584,7 @@ impl Gateway {
             thread_ts,
             role: session.role.clone(),
             progress_path,
+            slug: session.project.clone(),
         })
     }
 
@@ -17400,16 +17406,16 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         text: String,
-        is_admin: bool,
+        web_chat_id: &str,
         deadline: GatewayDeadline,
     ) -> Result<String> {
-        if is_admin && text.trim_start().starts_with('/') {
+        if text.trim_start().starts_with('/') {
             let is_gateway_control = parse_session_directive(&text).is_none();
             if is_gateway_control {
                 return deadline
                     .lock(&gateway)
                     .await?
-                    .submit_web_sid(sid, text, true)
+                    .submit_web_sid(sid, text, web_chat_id)
                     .await;
             }
         }
@@ -17958,28 +17964,30 @@ impl Gateway {
     /// Regression fix: `/status` from the web console used to reach the vendor
     /// verbatim → "/status isn't available in this environment".
     ///
-    /// `is_admin` gates the control face: the fleet renders (`/status`,
-    /// `/sessions`) use the IM chat-level ACL (`chat_can_access` over the shared
-    /// `user:` pool), which is coarser than the web's per-tenant REST ACL
-    /// (`can_see_owner`) — so exposing it to a tenant could over-share another
-    /// tenant's sessions. It is therefore admin-only, matching the web Status /
-    /// 主机 / Settings nav (already `useMe().isAdmin`-gated). A non-admin caller
-    /// falls straight through to a turn/vendor-directive (today's behaviour).
+    /// Every web identity gets the same control face. `web_chat_id` is the
+    /// caller's own web frontend chat (`Identity::web_chat_id`: `web-api` for
+    /// the admin, the tenant id otherwise), so the commands run as THAT
+    /// principal — [`Self::principal`] resolves it to Operator or Tenant and the
+    /// fleet renders filter through the one shared visibility policy, exactly
+    /// as the tenant's own IM bot does. A tenant used to fall through to the
+    /// vendor here (Claude queued `/status` behind the running turn) on the
+    /// stale premise that the IM ACL was coarser than the web's.
     /// A2A `agent` keeps calling `submit_to_sid` directly, so
     /// agent→agent routing is deliberately never given the human control face.
     pub async fn submit_web_sid(
         &mut self,
         sid: &str,
         text: String,
-        is_admin: bool,
+        web_chat_id: &str,
     ) -> Result<String> {
-        if is_admin && text.trim_start().starts_with('/') {
-            let chat = web_api_chat();
+        if text.trim_start().starts_with('/') {
+            let chat = ChatKey::new("web", web_chat_id, web_chat_id);
             // Web navigates by URL, so the POST's `sid` is the authoritative
-            // focus: point the shared web chat at this session (+ its project)
-            // so `/status`/`/sessions` render THIS session in depth, matching
-            // the IM current-session semantics.
-            if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
+            // focus: point the caller's web chat at this session (+ its
+            // project) so `/status`/`/sessions` render THIS session in depth,
+            // matching the IM current-session semantics. A released session
+            // is focused too — `/status` renders it from its persisted facts.
+            if let Some(project) = self.project_slug_for_sid(sid) {
                 self.current_project.set(&chat, project);
                 self.focus_session(&chat, sid);
             }
@@ -27560,7 +27568,7 @@ mod tests {
 
         // Admin web console: `/status` is a gateway control command.
         let receipt = gateway
-            .submit_web_sid(&sid, "/status".into(), true)
+            .submit_web_sid(&sid, "/status".into(), "web-api")
             .await
             .unwrap();
         assert_eq!(receipt, format!("command:{sid}"));
@@ -27600,7 +27608,7 @@ mod tests {
 
         // Plain text → a real turn to the vendor.
         gateway
-            .submit_web_sid(&sid, "hello".into(), true)
+            .submit_web_sid(&sid, "hello".into(), "web-api")
             .await
             .unwrap();
         assert_eq!(
@@ -27611,25 +27619,67 @@ mod tests {
 
         // Vendor directive → recorded as a directive (not a gateway command).
         gateway
-            .submit_web_sid(&sid, "/model opus-x".into(), true)
+            .submit_web_sid(&sid, "/model opus-x".into(), "web-api")
             .await
             .unwrap();
         let directives = fake.directives.lock().await;
         assert_eq!(directives.len(), 1);
         assert_eq!(directives[0].1.name, "model");
+    }
 
-        // A non-admin caller never gets the gateway control face: `/status`
-        // falls through to `submit_to_sid` (today's behaviour; fleet renders
-        // stay admin-only), so the receipt is NOT a gateway `command:` marker.
-        drop(directives);
-        let receipt = gateway
-            .submit_web_sid(&sid, "/status".into(), false)
+    /// Admin/tenant parity: a tenant's web `/status` gets the SAME gateway
+    /// control face as the admin's — never queued to the vendor as literal
+    /// text — and it renders as the tenant's principal, so the admin's
+    /// session stays out of the tenant's fleet view.
+    #[tokio::test]
+    async fn submit_web_sid_gives_a_tenant_the_same_control_face() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let admin_sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
-        assert_ne!(
-            receipt,
-            format!("command:{sid}"),
-            "non-admin /status must NOT be handled by the gateway control face"
+        let tenant_sid = gateway
+            .create_session_api_proto(
+                "alpha".into(),
+                "writer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "alice".into(),
+            )
+            .await
+            .unwrap();
+        let mut rx = gateway.subscribe_events();
+
+        let receipt = gateway
+            .submit_web_sid(&tenant_sid, "/status".into(), "alice")
+            .await
+            .unwrap();
+        assert_eq!(receipt, format!("command:{tenant_sid}"));
+        assert!(
+            fake.submissions.lock().await.is_empty() && fake.directives.lock().await.is_empty(),
+            "a tenant's /status is a gateway command, never vendor input"
+        );
+        let ev = rx.try_recv().expect("status render emitted to SSE");
+        assert_eq!(ev.sid.as_deref(), Some(tenant_sid.as_str()));
+        assert!(
+            ev.content.contains(tenant_sid.as_str()),
+            "renders the tenant's own session: {}",
+            ev.content
+        );
+        // The admin's session shares project `alpha`; were it visible, the card
+        // would count it as a same-project sibling and point at `/sessions`.
+        assert!(
+            !ev.content.contains("/sessions"),
+            "the admin's {admin_sid} must not reach a tenant's /status: {}",
+            ev.content
         );
     }
 
@@ -28484,7 +28534,7 @@ mod tests {
 
         // Same session, same lack of focus — but now a human asked.
         gateway
-            .submit_web_sid("s1", "are you still there?".into(), false)
+            .submit_web_sid("s1", "are you still there?".into(), "alice")
             .await
             .unwrap();
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -29439,7 +29489,7 @@ mod tests {
             .unwrap()
             .sid;
         gateway
-            .submit_web_sid(&sid, "human typed this".into(), true)
+            .submit_web_sid(&sid, "human typed this".into(), "web-api")
             .await
             .unwrap();
 
