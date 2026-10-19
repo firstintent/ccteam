@@ -291,6 +291,32 @@ export function getHistory(
   return getJson<SessionHistory>(`${sessionUrl(sid)}${query ? `?${query}` : ""}`);
 }
 
+/** One finished step in full — `GET /api/v1/sessions/{sid}/steps/{step_id}`.
+ *  `input` is the call's arguments (pretty JSON / command / path / query);
+ *  `output` what it returned, or a reasoning block's text. Each field is
+ *  capped server-side; `truncated` says one was cut. */
+export interface StepRecord {
+  step_id: string;
+  ts: string;
+  kind: string;
+  name: string;
+  input?: string;
+  output?: string;
+  truncated: boolean;
+}
+
+/** Fetch a finished step. Rejects `NOT_FOUND` while the step still runs. */
+export function getStep(
+  sid: string,
+  stepId: string,
+  options: ReadRequestOptions = {},
+): Promise<StepRecord> {
+  return getJson<StepRecord>(
+    `${sessionUrl(sid)}/steps/${encodeURIComponent(stepId)}`,
+    options,
+  );
+}
+
 /** `GET /api/v1/sessions/{sid}/status` — the per-session statusline (model +
  *  context-window usage). A brand-new session reports `model`/`context`/
  *  `status_line` all `null`. 404 (unknown sid) maps to NOT_FOUND, 503 (no live

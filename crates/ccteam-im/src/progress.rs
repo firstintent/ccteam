@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 
+use ccteam_harness::execution::turns_mirror::StepRecord;
 use ccteam_harness::{ThreadEvent, ThreadItemDetails};
 use serde_json::Value;
 
@@ -155,12 +156,13 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
         _ => return None,
     };
     match &item.details {
-        ThreadItemDetails::ToolCall { name, args } => Some(SessionActivity {
+        ThreadItemDetails::ToolCall { name, args, .. } => Some(SessionActivity {
             kind: ActivityKind::ToolCall,
             name: name.clone(),
             summary: format!("{name}({})", preview_args(args)),
             status,
             item_id: item.id.clone(),
+            step_id: item.id.clone(),
         }),
         ThreadItemDetails::CommandExecution { cmd, .. } => Some(SessionActivity {
             kind: ActivityKind::CommandExec,
@@ -168,6 +170,7 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
             summary: format!("$ {}", truncate_for_preview(cmd)),
             status,
             item_id: item.id.clone(),
+            step_id: item.id.clone(),
         }),
         ThreadItemDetails::FileChange { path, kind } => Some(SessionActivity {
             kind: ActivityKind::FileChange,
@@ -175,6 +178,7 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
             summary: format!("{kind} {}", path.display()),
             status,
             item_id: item.id.clone(),
+            step_id: item.id.clone(),
         }),
         ThreadItemDetails::WebSearch { query } => Some(SessionActivity {
             kind: ActivityKind::WebSearch,
@@ -182,6 +186,7 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
             summary: truncate_for_preview(query),
             status,
             item_id: item.id.clone(),
+            step_id: item.id.clone(),
         }),
         ThreadItemDetails::Reasoning(text) => Some(SessionActivity {
             kind: ActivityKind::Thinking,
@@ -189,9 +194,91 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
             summary: truncate_for_preview(text),
             status: ActivityStatus::Update,
             item_id: item.id.clone(),
+            step_id: item.id.clone(),
         }),
         // The answer + errors are not activity (the pump routes them).
         ThreadItemDetails::AgentMessage(_) | ThreadItemDetails::Error(_) => None,
+    }
+}
+
+/// A step's input as the inspector shows it: a tool's arguments as pretty
+/// JSON (a bare string as is), a command line, a changed path, a query.
+/// `None` for reasoning and for a call that reported no input.
+pub(crate) fn step_input(details: &ThreadItemDetails) -> Option<String> {
+    match details {
+        ThreadItemDetails::ToolCall { args, .. } => match args {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => serde_json::to_string_pretty(other).ok(),
+        },
+        ThreadItemDetails::CommandExecution { cmd, .. } => Some(cmd.clone()),
+        ThreadItemDetails::FileChange { path, kind } => Some(format!("{kind} {}", path.display())),
+        ThreadItemDetails::WebSearch { query } => Some(query.clone()),
+        ThreadItemDetails::Reasoning(_)
+        | ThreadItemDetails::AgentMessage(_)
+        | ThreadItemDetails::Error(_) => None,
+    }
+}
+
+/// The step this event FINISHES, as the record `chat/<sid>/steps.jsonl` keeps
+/// for the web inspector: a completed tool / command / edit / search with its
+/// input and output, or a reasoning block with its text. `started_input` is
+/// the input the step's start carried, for a channel whose completion does not
+/// repeat it. `None` for a start, an answer, an error, an empty reasoning
+/// pulse, or a non-item event.
+pub(crate) fn finished_step(
+    evt: &ThreadEvent,
+    step_id: &str,
+    started_input: Option<&str>,
+) -> Option<StepRecord> {
+    let record = |kind: &str, name: &str, input: Option<String>, output: Option<String>| {
+        Some(StepRecord {
+            step_id: step_id.to_string(),
+            ts: chrono::Utc::now(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            input,
+            output,
+            truncated: false,
+        })
+    };
+    match evt {
+        ThreadEvent::ItemStarted { item }
+        | ThreadEvent::ItemUpdated { item }
+        | ThreadEvent::ItemCompleted { item } => {
+            if let ThreadItemDetails::Reasoning(text) = &item.details {
+                return if text.trim().is_empty() {
+                    None
+                } else {
+                    record("thinking", "", None, Some(text.clone()))
+                };
+            }
+            let ThreadEvent::ItemCompleted { item } = evt else {
+                return None;
+            };
+            // The call's own input as it started wins: a completion may not
+            // repeat it (ACP) or may report a different shape (pi completes a
+            // tool call as a command named after the tool).
+            let input = started_input
+                .map(str::to_string)
+                .or_else(|| step_input(&item.details));
+            match &item.details {
+                ThreadItemDetails::ToolCall { name, output, .. } => {
+                    record("tool_call", name, input, output.clone())
+                }
+                ThreadItemDetails::CommandExecution { output, .. } => {
+                    record("command_exec", "bash", input, output.clone())
+                }
+                ThreadItemDetails::FileChange { kind, .. } => {
+                    record("file_change", kind, input, None)
+                }
+                ThreadItemDetails::WebSearch { .. } => record("web_search", "web", input, None),
+                ThreadItemDetails::Reasoning(_)
+                | ThreadItemDetails::AgentMessage(_)
+                | ThreadItemDetails::Error(_) => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -303,7 +390,7 @@ impl ProgressFold {
         match evt {
             ThreadEvent::ItemStarted { item } | ThreadEvent::ItemCompleted { item } => {
                 match &item.details {
-                    ThreadItemDetails::ToolCall { name, args } => {
+                    ThreadItemDetails::ToolCall { name, args, .. } => {
                         let preview = format!("{name}({})", preview_args(args));
                         self.count_tool(&item.id, tool_category(name), name, preview)
                     }
@@ -425,6 +512,7 @@ mod tests {
                 details: ThreadItemDetails::ToolCall {
                     name: name.to_string(),
                     args,
+                    output: None,
                 },
             },
         }
@@ -437,6 +525,7 @@ mod tests {
                 details: ThreadItemDetails::ToolCall {
                     name: name.to_string(),
                     args: json!("result"),
+                    output: None,
                 },
             },
         }
@@ -517,6 +606,7 @@ mod tests {
                 details: ThreadItemDetails::CommandExecution {
                     cmd: "cargo build".into(),
                     status: "ok".into(),
+                    output: None,
                 },
             },
         });
@@ -600,6 +690,7 @@ mod tests {
                 details: ThreadItemDetails::CommandExecution {
                     cmd: "cargo build".into(),
                     status: "ok".into(),
+                    output: None,
                 },
             },
         })

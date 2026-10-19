@@ -113,7 +113,11 @@ impl PiTurnTranslator {
                     events: vec![ThreadEvent::ItemStarted {
                         item: ThreadItem {
                             id: format!("{}-tool-{}", active.turn_id, active.item_seq),
-                            details: ThreadItemDetails::ToolCall { name, args },
+                            details: ThreadItemDetails::ToolCall {
+                                name,
+                                args,
+                                output: None,
+                            },
                         },
                     }],
                     settled: false,
@@ -128,6 +132,7 @@ impl PiTurnTranslator {
                             details: ThreadItemDetails::CommandExecution {
                                 cmd: name,
                                 status: if is_error { "failed" } else { "completed" }.to_string(),
+                                output: None,
                             },
                         },
                     }],

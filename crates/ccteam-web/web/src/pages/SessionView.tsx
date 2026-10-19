@@ -23,6 +23,7 @@ import { InlineRename } from "../components/InlineRename";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
+import { StepInspector } from "../components/StepInspector";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
 import {
@@ -58,6 +59,7 @@ import {
   mergeHistory,
   nextRowId,
   saveRows,
+  stepIcon,
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
@@ -210,6 +212,26 @@ export default function SessionView({
   const [busySince, setBusySince] = useState<number | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
+  // Step view: which folded activity rows are expanded into their step list,
+  // and which step the inspector shows (looked up live in `rows`, so a running
+  // step flips to done — and its record loads — while the panel is open).
+  // Per-sid by construction: the shell remounts this view on a sid change.
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
+  const [inspected, setInspected] = useState<{ rowId: string; itemId: string } | null>(null);
+  const inspectedStep = useMemo(() => {
+    if (!inspected) return null;
+    const row = rows.find((r) => r.id === inspected.rowId);
+    return row?.fold?.steps?.find((st) => st.item_id === inspected.itemId) ?? null;
+  }, [inspected, rows]);
+  const closeInspector = useCallback(() => setInspected(null), []);
+  const toggleFold = useCallback((rowId: string) => {
+    setExpandedFolds((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+  }, []);
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
@@ -748,9 +770,57 @@ export default function SessionView({
                     );
                   }
                   if (row.kind === "activity") {
+                    const steps = row.fold?.steps ?? [];
+                    if (steps.length === 0) {
+                      return (
+                        <div key={row.id} className="msg activity">
+                          <div className="bubble">{row.content}</div>
+                          <RowTime ts={row.ts} lang={lang} />
+                        </div>
+                      );
+                    }
+                    const open = expandedFolds.has(row.id);
                     return (
                       <div key={row.id} className="msg activity">
-                        <div className="bubble">{row.content}</div>
+                        <button
+                          type="button"
+                          className="bubble fold-toggle"
+                          data-testid="fold-toggle"
+                          aria-expanded={open}
+                          title={open ? t("stepsHide") : t("stepsShow")}
+                          onClick={() => toggleFold(row.id)}
+                        >
+                          <span className="fold-caret" aria-hidden>
+                            {open ? "▾" : "▸"}
+                          </span>
+                          {row.content}
+                        </button>
+                        {open ? (
+                          <ol className="fold-steps" data-testid="fold-steps">
+                            {steps.map((step) => {
+                              const selected =
+                                inspected?.rowId === row.id && inspected.itemId === step.item_id;
+                              return (
+                                <li key={step.item_id || step.step_id}>
+                                  <button
+                                    type="button"
+                                    className={`fold-step${step.kind === "thinking" ? " thinking" : ""}${selected ? " selected" : ""}`}
+                                    data-testid="fold-step"
+                                    onClick={() =>
+                                      setInspected({ rowId: row.id, itemId: step.item_id })
+                                    }
+                                  >
+                                    <span aria-hidden>{stepIcon(step)}</span>
+                                    <span className="fold-step-summary">{step.summary}</span>
+                                    <span className="fold-step-state" aria-hidden>
+                                      {step.done ? "✓" : "…"}
+                                    </span>
+                                  </button>
+                                </li>
+                              );
+                            })}
+                          </ol>
+                        ) : null}
                         <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
@@ -818,6 +888,9 @@ export default function SessionView({
               <button type="button" className="jump-latest" onClick={jumpToBottom}>
                 <ArrowDown /> 回到最新
               </button>
+            ) : null}
+            {inspectedStep ? (
+              <StepInspector sid={sid} step={inspectedStep} lang={lang} onClose={closeInspector} />
             ) : null}
           </div>
 

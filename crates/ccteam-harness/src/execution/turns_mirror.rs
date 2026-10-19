@@ -289,6 +289,101 @@ pub fn last_n_turns(project_dir: &Path, sid: &str, n: usize) -> Result<Vec<TurnR
     .events)
 }
 
+/// The most one field of a [`StepRecord`] keeps (bytes, cut at a char
+/// boundary). A tool can return megabytes; the inspector needs enough to read,
+/// and an unbounded line would make every lookup scan pay for it.
+pub const STEP_FIELD_MAX_BYTES: usize = 256 * 1024;
+
+/// One finished step of a turn — a tool call with its input and output, or a
+/// reasoning block — kept in `<project>/.ccteam/chat/<sid>/steps.jsonl` for
+/// the web step inspector. Observability only: nothing replays or bills from
+/// it, and losing it loses no conversation (that is `turns.jsonl`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepRecord {
+    /// Unique across the session's life — the live activity frame carries it,
+    /// and it is what the inspector asks for.
+    pub step_id: String,
+    pub ts: DateTime<Utc>,
+    /// `tool_call` | `command_exec` | `file_change` | `web_search` | `thinking`.
+    pub kind: String,
+    /// Tool / category name; empty for thinking.
+    #[serde(default)]
+    pub name: String,
+    /// The call's input, pretty JSON or the bare command / query / path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// What the step returned — a tool's output, or the reasoning text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// Whether a field was cut at [`STEP_FIELD_MAX_BYTES`].
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl StepRecord {
+    /// Cap every field at [`STEP_FIELD_MAX_BYTES`], flagging the cut.
+    pub fn bounded(mut self) -> Self {
+        for field in [&mut self.input, &mut self.output].into_iter().flatten() {
+            if field.len() > STEP_FIELD_MAX_BYTES {
+                let mut cut = STEP_FIELD_MAX_BYTES;
+                while !field.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                field.truncate(cut);
+                self.truncated = true;
+            }
+        }
+        self
+    }
+}
+
+/// Resolve `<project>/.ccteam/chat/<sid>/steps.jsonl`.
+pub fn steps_jsonl_path(project_dir: &Path, sid: &str) -> PathBuf {
+    chat_dir(project_dir, sid).join("steps.jsonl")
+}
+
+/// Append one step (bounded first). The session's event pump is the only
+/// writer, so a line is never interleaved with another.
+pub fn append_step(project_dir: &Path, sid: &str, record: StepRecord) -> Result<()> {
+    ensure_dir(project_dir, sid)?;
+    let path = steps_jsonl_path(project_dir, sid);
+    let line = serde_json::to_string(&record.bounded())? + "\n";
+    let mut f = crate::execution::fs_atomic::open_jsonl_append(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("append to {}", path.display()))?;
+    Ok(())
+}
+
+/// The newest record for `step_id`, or `None` when the step never finished
+/// (or the file is absent). Lines are matched as bytes before being parsed,
+/// so a lookup parses one record, not the session's whole history; a torn or
+/// otherwise unreadable line is skipped, never an error for every lookup.
+pub fn find_step(project_dir: &Path, sid: &str, step_id: &str) -> Result<Option<StepRecord>> {
+    use std::io::BufRead;
+    let path = steps_jsonl_path(project_dir, sid);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    let needle = format!("\"step_id\":{}", serde_json::to_string(step_id)?);
+    let needle = needle.as_bytes();
+    let mut found = None;
+    for line in std::io::BufReader::new(file).split(b'\n') {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        if !line.windows(needle.len()).any(|w| w == needle) {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_slice::<StepRecord>(&line) {
+            if record.step_id == step_id {
+                found = Some(record);
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +638,61 @@ mod tests {
         assert!(encoded.get("outcome").is_none());
         assert!(encoded.get("error_kind").is_none());
         assert!(encoded.get("error").is_none());
+    }
+
+    fn step(id: &str, output: &str) -> StepRecord {
+        StepRecord {
+            step_id: id.to_string(),
+            ts: Utc::now(),
+            kind: "tool_call".to_string(),
+            name: "Bash".to_string(),
+            input: Some("{\"command\":\"ls\"}".to_string()),
+            output: Some(output.to_string()),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_step_is_found_by_id_and_the_newest_record_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_step(dir.path(), "s1", "p-1-a").unwrap(), None);
+        append_step(dir.path(), "s1", step("p-1-a", "first")).unwrap();
+        append_step(dir.path(), "s1", step("p-1-ab", "prefix sibling")).unwrap();
+        append_step(dir.path(), "s1", step("p-1-a", "second")).unwrap();
+        let got = find_step(dir.path(), "s1", "p-1-a").unwrap().unwrap();
+        assert_eq!(got.output.as_deref(), Some("second"));
+        assert_eq!(
+            find_step(dir.path(), "s1", "p-1-ab")
+                .unwrap()
+                .unwrap()
+                .output
+                .as_deref(),
+            Some("prefix sibling")
+        );
+        assert_eq!(find_step(dir.path(), "s2", "p-1-a").unwrap(), None);
+    }
+
+    #[test]
+    fn a_torn_line_with_broken_utf8_does_not_fail_every_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        append_step(dir.path(), "s1", step("p-1-a", "kept")).unwrap();
+        let path = steps_jsonl_path(dir.path(), "s1");
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"step_id\":\"p-1-b\",\"output\":\"\xe4\xb8")
+            .unwrap();
+        drop(f);
+        let got = find_step(dir.path(), "s1", "p-1-a").unwrap().unwrap();
+        assert_eq!(got.output.as_deref(), Some("kept"));
+        assert_eq!(find_step(dir.path(), "s1", "p-1-b").unwrap(), None);
+    }
+
+    #[test]
+    fn an_oversized_field_is_cut_at_a_char_boundary_and_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "é".repeat(STEP_FIELD_MAX_BYTES);
+        append_step(dir.path(), "s1", step("p-1-big", &big)).unwrap();
+        let got = find_step(dir.path(), "s1", "p-1-big").unwrap().unwrap();
+        assert!(got.truncated);
+        assert!(got.output.unwrap().len() <= STEP_FIELD_MAX_BYTES);
     }
 }

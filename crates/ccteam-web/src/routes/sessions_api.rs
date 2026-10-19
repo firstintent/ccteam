@@ -1781,6 +1781,75 @@ pub(crate) async fn handle_session_interrupt(
     }
 }
 
+/// `GET /api/v1/sessions/{sid}/steps/{step_id}`
+///
+/// One finished step of the session in full — a tool call's input and
+/// output, or a reasoning block's text — for the web step inspector. The live
+/// activity frame names the step (`activity.step_id`) but carries only a
+/// one-line summary; the detail is read on demand from the session's
+/// `<project_dir>/.ccteam/chat/<sid>/steps.jsonl`, so megabytes of tool
+/// output never ride the SSE stream. 404 for a step that has not finished
+/// (or never existed). Gated like every other `/sessions/{sid}/*` route.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}/steps/{step_id}",
+    tag = "sessions",
+    params(
+        ("sid" = String, Path, description = "Gateway session id (`s{n}`)"),
+        ("step_id" = String, Path, description = "The `activity.step_id` of a live activity frame")
+    ),
+    responses(
+        (status = 200, description = "The step `{step_id, ts, kind, name, input?, output?, truncated}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session, or a step not (yet) recorded"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_step(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path((sid, step_id)): Path<(String, String)>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let resolved = {
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.step").await;
+        guard.session_resolve_any(&sid)
+    };
+    let Some(resolved) = resolved else {
+        return unknown_session(&sid);
+    };
+    let found = tokio::task::spawn_blocking(move || {
+        ccteam_harness::execution::turns_mirror::find_step(
+            &resolved.project_dir,
+            &resolved.sid,
+            &step_id,
+        )
+    })
+    .await;
+    match found {
+        Ok(Ok(Some(record))) => Json(record).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "step not recorded (still running, or unknown)"})),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("reading steps of {sid} failed: {err:#}")})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("step lookup panicked: {err}")})),
+        )
+            .into_response(),
+    }
+}
+
 // ── v0.8.21 history / resume / external-import ───────────────────────────────
 
 /// `GET /api/v1/projects/{slug}/sessions/history`
@@ -2676,6 +2745,7 @@ mod tests {
                 summary: "Bash(ls -la)".into(),
                 status: ActivityStatus::Started,
                 item_id: "t1".into(),
+                step_id: "9f-1-t1".into(),
             },
         };
         let payload = session_event_payload(&ev);
@@ -2692,6 +2762,8 @@ mod tests {
         assert_eq!(act["summary"], "Bash(ls -la)");
         assert_eq!(act["status"], "started");
         assert_eq!(act["item_id"], "t1");
+        // What the step inspector fetches the full record by.
+        assert_eq!(act["step_id"], "9f-1-t1");
     }
 
     /// v0.8.7 review-fix (R-H1) — an approval ChoicePrompt event serializes its

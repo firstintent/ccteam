@@ -158,7 +158,35 @@ export interface ActivityFold {
   buckets: { emoji: string; label: string; count: number }[];
   /** Any reasoning step seen — drives the `💭 thinking…` head when no tool ran. */
   thinking: boolean;
+  /** The run's steps in order (newest last, capped at {@link FOLD_STEPS_CAP}) —
+   *  what the expanded row lists and the step inspector opens. Light on
+   *  purpose: the full input / output / reasoning is fetched by `step_id` on
+   *  demand, never stored in the per-sid localStorage buffer. Absent on a fold
+   *  persisted before the list existed. */
+  steps?: FoldStep[];
 }
+
+/** One step of a folded run, as the expanded activity row lists it. */
+export interface FoldStep {
+  item_id: string;
+  /** Empty when the daemon sent none — the step then has no full record. */
+  step_id: string;
+  kind: string;
+  name: string;
+  /** One-line preview: the call, or the opening of the reasoning. */
+  summary: string;
+  /** Whether the step finished (its record is then fetchable). */
+  done: boolean;
+}
+
+/** Most steps a fold keeps for the expanded list; older ones drop (the
+ *  counters above still count them). Kept small: every fold row is persisted
+ *  with the per-sid transcript. */
+export const FOLD_STEPS_CAP = 100;
+
+/** Longest step summary the list keeps — the rows buffer lives in a 5 MB
+ *  localStorage quota shared by every session; the full text is a fetch away. */
+const STEP_SUMMARY_MAX = 120;
 
 interface ActivityCategory {
   emoji: string;
@@ -221,25 +249,78 @@ function activityCategory(a: SessionActivity): ActivityCategory | null {
 
 /** A fresh, empty fold. */
 export function emptyFold(): ActivityFold {
-  return { seen: [], buckets: [], thinking: false };
+  return { seen: [], buckets: [], thinking: false, steps: [] };
+}
+
+/** A step is finished once its item completes; a reasoning block is whole
+ *  when it is reported (the daemon records it then). */
+function stepDone(a: SessionActivity): boolean {
+  return a.status === "completed" || a.kind === "thinking";
+}
+
+/** `steps` with `a` merged in: a known item updates in place (a completion
+ *  marks it done and fills a step id it lacked), a new one appends. */
+function foldStep(steps: readonly FoldStep[], a: SessionActivity): FoldStep[] {
+  const at = a.item_id ? steps.findIndex((s) => s.item_id === a.item_id) : -1;
+  if (at >= 0) {
+    const prev = steps[at]!;
+    const done = prev.done || stepDone(a);
+    const step_id = prev.step_id || a.step_id;
+    if (done === prev.done && step_id === prev.step_id) return steps as FoldStep[];
+    const next = [...steps];
+    next[at] = { ...prev, done, step_id };
+    return next;
+  }
+  const next = [
+    ...steps,
+    {
+      item_id: a.item_id,
+      step_id: a.step_id,
+      kind: a.kind,
+      name: a.name,
+      summary:
+        a.summary.length > STEP_SUMMARY_MAX ? `${a.summary.slice(0, STEP_SUMMARY_MAX)}…` : a.summary,
+      done: stepDone(a),
+    },
+  ];
+  return next.length > FOLD_STEPS_CAP ? next.slice(next.length - FOLD_STEPS_CAP) : next;
 }
 
 /** Fold one structured activity into `prev`, returning a NEW fold (pure +
- *  immutable). De-dups by `item_id`; a `thinking` step only flags the head. */
+ *  immutable). De-dups by `item_id`; a `thinking` step only flags the head.
+ *  Every step also lands in {@link ActivityFold.steps}. */
 export function foldActivity(prev: ActivityFold, a: SessionActivity): ActivityFold {
+  const prevSteps = prev.steps ?? [];
+  const steps = foldStep(prevSteps, a);
   // Already counted (start↔complete pair, or a repeated reasoning update):
-  // re-assert the thinking flag if needed, otherwise leave the fold untouched.
+  // re-assert the thinking flag if needed, otherwise only the step list moves.
   if (a.item_id && prev.seen.includes(a.item_id)) {
-    return a.kind === "thinking" && !prev.thinking ? { ...prev, thinking: true } : prev;
+    const thinking = prev.thinking || a.kind === "thinking";
+    if (thinking === prev.thinking && steps === prevSteps) return prev;
+    return { ...prev, thinking, steps };
   }
   const seen = a.item_id ? [...prev.seen, a.item_id] : prev.seen;
   const cat = activityCategory(a);
-  if (!cat) return { ...prev, seen, thinking: true };
+  if (!cat) return { ...prev, seen, thinking: true, steps };
   const buckets = prev.buckets.map((b) => ({ ...b }));
   const hit = buckets.find((b) => b.label === cat.label);
   if (hit) hit.count += 1;
   else buckets.push({ emoji: cat.emoji, label: cat.label, count: 1 });
-  return { ...prev, seen, buckets };
+  return { ...prev, seen, buckets, steps };
+}
+
+/** The icon the expanded list shows for a step — its fold category's. */
+export function stepIcon(step: Pick<FoldStep, "kind" | "name">): string {
+  if (step.kind === "thinking") return "💭";
+  const cat = activityCategory({
+    kind: step.kind,
+    name: step.name,
+    summary: "",
+    status: "",
+    item_id: "",
+    step_id: "",
+  });
+  return cat?.emoji ?? "🔧";
 }
 
 /** Render a fold to its one-line summary, mirroring `ProgressFold::render`:

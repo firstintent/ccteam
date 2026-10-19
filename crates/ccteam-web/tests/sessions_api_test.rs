@@ -1852,3 +1852,69 @@ async fn upload_endpoint_guards_project_body_and_name() {
     assert!(path.ends_with("evil.sh"), "basename kept: {path}");
     assert!(!project_dir.parent().unwrap().join("evil.sh").exists());
 }
+
+/// The step inspector's read: a recorded step comes back whole by the
+/// `step_id` its activity frame carried; one not (yet) recorded is a 404.
+#[tokio::test]
+async fn a_recorded_step_is_served_whole_by_its_step_id() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let output = "line\n".repeat(10_000);
+    ccteam_harness::execution::turns_mirror::append_step(
+        &project_dir,
+        &sid,
+        ccteam_harness::execution::turns_mirror::StepRecord {
+            step_id: "1a2b-3-sj-t1-2".into(),
+            ts: chrono::Utc::now(),
+            kind: "tool_call".into(),
+            name: "Bash".into(),
+            input: Some("{\"command\": \"seq 10000\"}".into()),
+            output: Some(output.clone()),
+            truncated: false,
+        },
+    )
+    .unwrap();
+
+    let step = client
+        .get(format!("{base}/sessions/{sid}/steps/1a2b-3-sj-t1-2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(step.status(), 200);
+    let step: Value = step.json().await.unwrap();
+    assert_eq!(step["name"], "Bash");
+    assert_eq!(step["output"].as_str().unwrap(), output, "served whole");
+    assert_eq!(step["truncated"], false);
+
+    let running = client
+        .get(format!("{base}/sessions/{sid}/steps/1a2b-3-sj-t1-9"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(running.status(), 404);
+}

@@ -194,6 +194,7 @@ fn tool_started(id: &str, name: &str, args: serde_json::Value) -> ThreadEvent {
             details: ThreadItemDetails::ToolCall {
                 name: name.into(),
                 args,
+                output: None,
             },
         },
     }
@@ -206,6 +207,7 @@ fn tool_completed(id: &str, name: &str) -> ThreadEvent {
             details: ThreadItemDetails::ToolCall {
                 name: name.into(),
                 args: serde_json::json!("result"),
+                output: None,
             },
         },
     }

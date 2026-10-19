@@ -119,6 +119,7 @@ export function parseAgentsEvent(raw: string): AgentsEvent | null {
       summary: typeof a.summary === "string" ? a.summary : "",
       status: typeof a.status === "string" ? a.status : "",
       item_id: typeof a.item_id === "string" ? a.item_id : "",
+      step_id: typeof a.step_id === "string" ? a.step_id : "",
     };
   }
   if (typeof obj.relation === "string") event.relation = obj.relation;

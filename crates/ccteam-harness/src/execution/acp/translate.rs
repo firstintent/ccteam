@@ -36,6 +36,10 @@ use crate::{
 /// pulse. First chunk of a streak always emits (interval elapsed).
 const LIVENESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The most reasoning one turn keeps for the step inspector (the step log
+/// caps a field at the same size).
+const THOUGHT_MAX_BYTES: usize = 256 * 1024;
+
 /// Per-turn final-text buffer for either a client- or vendor-started turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnBuffer {
@@ -245,6 +249,16 @@ pub struct SessionTranslateState {
     /// `pub` so vendor adapters can construct the state with struct update
     /// syntax (`..Default::default()`); not part of the public API surface.
     pub last_liveness_at: Option<Instant>,
+    /// The open turn's reasoning so far — every thought chunk, in order, up to
+    /// [`THOUGHT_MAX_BYTES`]. Thoughts never enter the answer; this is what a
+    /// liveness pulse reports, so the step inspector reads the whole thought
+    /// rather than whichever chunk a throttled pulse happened to carry.
+    pub thought: String,
+    /// How much of `thought` (bytes) a pulse has already reported.
+    pub thought_reported: usize,
+    /// A non-thought update arrived since the last thought chunk: the next
+    /// chunk starts a new paragraph.
+    pub thought_paused: bool,
 }
 
 impl SessionTranslateState {
@@ -337,6 +351,30 @@ impl SessionTranslateState {
         self.prompt_boundary_seen = false;
         // Fresh turn → first thought/message chunk should emit immediately.
         self.last_liveness_at = None;
+        self.reset_thought();
+    }
+
+    fn reset_thought(&mut self) {
+        self.thought.clear();
+        self.thought_reported = 0;
+        self.thought_paused = false;
+    }
+
+    /// Add one thought chunk to the turn's reasoning (bounded).
+    fn append_thought(&mut self, chunk: &str) {
+        if chunk.is_empty() || self.thought.len() >= THOUGHT_MAX_BYTES {
+            return;
+        }
+        if self.thought_paused && !self.thought.is_empty() {
+            self.thought.push_str("\n\n");
+        }
+        self.thought_paused = false;
+        let room = THOUGHT_MAX_BYTES.saturating_sub(self.thought.len());
+        let mut take = chunk.len().min(room);
+        while !chunk.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.thought.push_str(&chunk[..take]);
     }
 
     /// Mark the turn just begun as a context probe, whose reply is read as
@@ -375,6 +413,7 @@ impl SessionTranslateState {
         let turn_id = super::turn_runner::next_acp_turn_id();
         self.vendor_started_buffer = Some(TurnBuffer::new(turn_id.clone()));
         self.last_liveness_at = None;
+        self.reset_thought();
         // `Submitted`, not a vendor continuation: what opens this turn is a
         // line ccteam delivered (an interjection grok admitted while idle),
         // simply without a matching `session/prompt` RPC. ACP has no way for
@@ -550,8 +589,54 @@ fn apply_session_update(
         .get("sessionUpdate")
         .or_else(|| update.get("type"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
+    // Reasoning that a throttled pulse never reported is complete once the
+    // agent moves on to anything else: report it now, so the step inspector
+    // holds the whole thought.
+    let mut out = Vec::new();
+    if kind != "agent_thought_chunk" {
+        out.extend(flush_thought(state));
+        state.thought_paused = true;
+    }
+    out.extend(translate_session_update(
+        state,
+        params,
+        update,
+        &kind,
+        vendor_started,
+    ));
+    out
+}
+
+/// The turn's reasoning as one unthrottled pulse, when some of it is
+/// unreported. Same item id as the throttled pulses: one step per turn.
+fn flush_thought(state: &mut SessionTranslateState) -> Option<ThreadEvent> {
+    if state.thought.len() <= state.thought_reported {
+        return None;
+    }
+    let turn_id = state
+        .vendor_started_buffer
+        .as_ref()
+        .or(state.buffer.as_ref())
+        .map(|b| b.turn_id.clone())?;
+    state.thought_reported = state.thought.len();
+    Some(ThreadEvent::ItemUpdated {
+        item: ThreadItem {
+            id: format!("{turn_id}-live-thought"),
+            details: ThreadItemDetails::Reasoning(state.thought.clone()),
+        },
+    })
+}
+
+fn translate_session_update(
+    state: &mut SessionTranslateState,
+    params: &Value,
+    update: Value,
+    kind: &str,
+    vendor_started: bool,
+) -> Vec<ThreadEvent> {
     match kind {
         "agent_message_chunk" => {
             let text = extract_chunk_text(&update).unwrap_or_default();
@@ -567,8 +652,16 @@ fn apply_session_update(
         "agent_thought_chunk" => {
             // Thoughts never enter final text; still pulse liveness (Grok can
             // think for many minutes with zero tool calls).
-            let text = extract_chunk_text(&update).unwrap_or_default();
-            maybe_liveness_event(state, "thought", ThreadItemDetails::Reasoning(text))
+            state.append_thought(&extract_chunk_text(&update).unwrap_or_default());
+            let events = maybe_liveness_event(
+                state,
+                "thought",
+                ThreadItemDetails::Reasoning(state.thought.clone()),
+            );
+            if !events.is_empty() {
+                state.thought_reported = state.thought.len();
+            }
+            events
         }
         "user_message_chunk" => {
             // User echo ignored (and not a liveness signal for the agent turn).
@@ -615,6 +708,16 @@ fn apply_session_update(
                 details: ThreadItemDetails::ToolCall {
                     name,
                     args: update.get("rawInput").cloned().unwrap_or(Value::Null),
+                    // The result rides the completing update: `rawOutput`
+                    // when the agent reports one, else its content blocks.
+                    output: (status == "completed")
+                        .then(|| {
+                            update
+                                .get("rawOutput")
+                                .or_else(|| update.get("content"))
+                                .map(crate::tool_result_text)
+                        })
+                        .flatten(),
                 },
             };
             // A new tool call ends whatever the agent was saying before it:
@@ -1483,8 +1586,23 @@ mod tests {
                 }),
             },
         );
-        assert_eq!(msg.len(), 1, "message chunk after throttle must pulse");
+        // The thought the throttle withheld is complete once the agent moves
+        // on: it is reported whole — every chunk, one step — ahead of the
+        // message pulse.
+        assert_eq!(msg.len(), 2, "flushed thought + message pulse: {msg:?}");
         match &msg[0] {
+            ThreadEvent::ItemUpdated { item } => {
+                assert_eq!(item.id, thought_id(&thought[0]));
+                match &item.details {
+                    ThreadItemDetails::Reasoning(t) => {
+                        assert_eq!(t, "thinking hardmore thought")
+                    }
+                    other => panic!("expected Reasoning, got {other:?}"),
+                }
+            }
+            other => panic!("expected ItemUpdated, got {other:?}"),
+        }
+        match &msg[1] {
             ThreadEvent::ItemUpdated { item } => match &item.details {
                 ThreadItemDetails::AgentMessage(t) => assert_eq!(t, "Hello"),
                 other => panic!("expected AgentMessage, got {other:?}"),
@@ -1493,6 +1611,13 @@ mod tests {
         }
         // Buffer still accumulates for the final answer.
         assert_eq!(st.buffer.as_ref().unwrap().text, "Hello");
+    }
+
+    fn thought_id(event: &ThreadEvent) -> String {
+        match event {
+            ThreadEvent::ItemUpdated { item } => item.id.clone(),
+            other => panic!("expected ItemUpdated, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2104,6 +2104,11 @@ pub struct SessionActivity {
     pub status: ActivityStatus,
     /// Adapter item id — lets the web dedup/merge a start↔complete pair.
     pub item_id: String,
+    /// The step's id in `chat/<sid>/steps.jsonl` — what the web inspector
+    /// fetches its full input / output / reasoning by. Unique across the
+    /// session's life (item ids restart every turn); recorded once the step
+    /// finishes, so a running step's id does not resolve yet.
+    pub step_id: String,
 }
 
 /// The category of one [`SessionActivity`] step.
@@ -8373,6 +8378,21 @@ impl Gateway {
             // boundary re-read accounts for a row already appended
             let mut vendor_turn: u64 = digest.user_turns.saturating_sub(1);
             let mut epoch: u64 = 0; // status epoch → one per turn
+                                    // Step ids must stay unique across pump lives (`epoch` and the
+                                    // adapters' item ids both restart), since `steps.jsonl` outlives
+                                    // them: one nonce per pump.
+            let step_nonce = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            // The current turn's step inputs by item id (a completion may not
+            // repeat its call's input) and the steps already recorded.
+            let mut step_turn: u64 = 0;
+            let mut step_inputs: HashMap<String, String> = HashMap::new();
+            let mut steps_recorded: HashMap<String, usize> = HashMap::new();
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
             let mut last_emit: Option<Instant> = None;
@@ -9962,7 +9982,22 @@ impl Gateway {
                             // update / complete), independent of whether the
                             // fold bucketed it — both fire. IM drops it (strict
                             // no-op arm); web renders activity cards.
-                            if let Some(activity) = crate::progress::activity_for(&evt) {
+                            if let Some(mut activity) = crate::progress::activity_for(&evt) {
+                                if step_turn != epoch {
+                                    step_turn = epoch;
+                                    step_inputs.clear();
+                                    steps_recorded.clear();
+                                }
+                                activity.step_id =
+                                    format!("{step_nonce}-{epoch}-{}", activity.item_id);
+                                record_finished_step(
+                                    project_dir.as_deref(),
+                                    &session_id,
+                                    &evt,
+                                    &activity,
+                                    &mut step_inputs,
+                                    &mut steps_recorded,
+                                );
                                 if !emit_activity(&tx, &session, &session_id, epoch, activity) {
                                     break;
                                 }
@@ -20051,6 +20086,49 @@ fn emit_progress(
     })
 }
 
+/// Keep a finished step for the web inspector: remember what a step started
+/// with, and append the record once it completes. A tool step is written
+/// once; a reasoning step again whenever its text has grown (an ACP turn
+/// reports one thought that keeps growing), the newest record winning on
+/// read. A write failure loses inspector detail only, so it is logged, never
+/// raised.
+fn record_finished_step(
+    project_dir: Option<&std::path::Path>,
+    session_id: &str,
+    evt: &ThreadEvent,
+    activity: &SessionActivity,
+    step_inputs: &mut HashMap<String, String>,
+    steps_recorded: &mut HashMap<String, usize>,
+) {
+    let Some(project_dir) = project_dir else {
+        return;
+    };
+    if let ThreadEvent::ItemStarted { item } = evt {
+        if let Some(input) = crate::progress::step_input(&item.details) {
+            step_inputs.insert(item.id.clone(), input);
+        }
+    }
+    let recorded = steps_recorded.get(&activity.step_id).copied();
+    if recorded.is_some() && activity.kind != ActivityKind::Thinking {
+        return;
+    }
+    let started = step_inputs.get(&activity.item_id).map(String::as_str);
+    let Some(record) = crate::progress::finished_step(evt, &activity.step_id, started) else {
+        return;
+    };
+    let size = record.output.as_deref().map_or(0, str::len);
+    if recorded.is_some_and(|prev| size <= prev) {
+        return;
+    }
+    steps_recorded.insert(activity.step_id.clone(), size);
+    step_inputs.remove(&activity.item_id);
+    if let Err(err) =
+        ccteam_harness::execution::turns_mirror::append_step(project_dir, session_id, record)
+    {
+        tracing::warn!(sid = %session_id, %err, "recording a finished step failed");
+    }
+}
+
 /// Emit one structured `Activity` gateway event (v0.8.19) for the given
 /// step, keyed to the same progress `status_key` as the turn's folded
 /// status. IM drops it (a strict no-op arm); web renders it. The `content`
@@ -20439,6 +20517,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::ToolCall {
                         name: "Bash".into(),
                         args: serde_json::json!({}),
+                        output: None,
                     },
                 },
             },
@@ -20463,6 +20542,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::ToolCall {
                         name: "Bash".into(),
                         args: serde_json::json!({}),
+                        output: None,
                     },
                 },
             },
@@ -20476,6 +20556,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::CommandExecution {
                         cmd: "sleep 600".into(),
                         status: "running".into(),
+                        output: None,
                     },
                 },
             },
@@ -27627,6 +27708,92 @@ mod tests {
         assert_eq!(directives[0].1.name, "model");
     }
 
+    /// The web step inspector reads what the pump records: a tool's input
+    /// from its start (an ACP completion repeats none) with its output from the
+    /// completion, one record per step however often it is re-reported, and a
+    /// reasoning block's text — each under the `step_id` its activity frame
+    /// carries.
+    #[test]
+    fn the_pump_records_each_finished_step_once_under_its_frame_step_id() {
+        use ccteam_harness::execution::turns_mirror::find_step;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut inputs = HashMap::new();
+        let mut recorded = HashMap::new();
+        let mut feed = |evt: ThreadEvent| {
+            let mut activity = crate::progress::activity_for(&evt).expect("a step");
+            activity.step_id = format!("n-1-{}", activity.item_id);
+            record_finished_step(
+                Some(dir.path()),
+                "s7",
+                &evt,
+                &activity,
+                &mut inputs,
+                &mut recorded,
+            );
+            activity.step_id
+        };
+        let tool = |output: Option<&str>, args: serde_json::Value| ThreadItem {
+            id: "call-1".into(),
+            details: ThreadItemDetails::ToolCall {
+                name: "Bash".into(),
+                args,
+                output: output.map(str::to_string),
+            },
+        };
+        let started = feed(ThreadEvent::ItemStarted {
+            item: tool(None, serde_json::json!({"command": "ls"})),
+        });
+        assert_eq!(
+            find_step(dir.path(), "s7", &started).unwrap(),
+            None,
+            "still running"
+        );
+        let done = feed(ThreadEvent::ItemCompleted {
+            item: tool(Some("a.txt"), serde_json::Value::Null),
+        });
+        assert_eq!(done, started, "start and completion are one step");
+        feed(ThreadEvent::ItemCompleted {
+            item: tool(Some("re-reported"), serde_json::Value::Null),
+        });
+        let step = find_step(dir.path(), "s7", &done)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(step.kind, "tool_call");
+        assert_eq!(step.input.as_deref(), Some("{\n  \"command\": \"ls\"\n}"));
+        assert_eq!(
+            step.output.as_deref(),
+            Some("a.txt"),
+            "recorded once, first finish"
+        );
+
+        let thought = feed(ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r-1".into(),
+                details: ThreadItemDetails::Reasoning("weighing two fixes".into()),
+            },
+        });
+        let step = find_step(dir.path(), "s7", &thought)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(step.kind, "thinking");
+        assert_eq!(step.output.as_deref(), Some("weighing two fixes"));
+        // A thought that keeps growing under one item (ACP) is re-recorded;
+        // the newest record is the one the inspector reads.
+        feed(ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r-1".into(),
+                details: ThreadItemDetails::Reasoning("weighing two fixes, picking B".into()),
+            },
+        });
+        let step = find_step(dir.path(), "s7", &thought)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(
+            step.output.as_deref(),
+            Some("weighing two fixes, picking B")
+        );
+    }
+
     /// Admin/tenant parity: a tenant's web `/status` gets the SAME gateway
     /// control face as the admin's — never queued to the vendor as literal
     /// text — and it renders as the tenant's principal, so the admin's
@@ -30606,6 +30773,7 @@ mod tests {
                 details: ThreadItemDetails::ToolCall {
                     name: "Bash".into(),
                     args: serde_json::json!({"command": "make test"}),
+                    output: None,
                 },
             };
             if done {

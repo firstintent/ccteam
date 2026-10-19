@@ -13,6 +13,7 @@ import {
   eventToRow,
   foldActivity,
   emptyFold,
+  FOLD_STEPS_CAP,
   historyToRows,
   leadingClosingStatus,
   loadRows,
@@ -244,6 +245,7 @@ describe("chatTranscript activity fold (v0.8.21 — mirrors IM ProgressFold)", (
     summary: "",
     status: "started",
     item_id: "",
+    step_id: "",
     ...a,
   });
   const actEv = (a: Partial<SessionActivity>, id?: string): SessionEvent => ({
@@ -316,6 +318,44 @@ describe("chatTranscript activity fold (v0.8.21 — mirrors IM ProgressFold)", (
     expect(rows[0].kind).toBe("activity");
     expect(rows[0].content).toBe("$ cargo build");
     expect(rows[0].fold).toBeUndefined();
+  });
+
+  it("lists every step once, marking a tool done when it completes", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ name: "Bash", summary: "Bash(ls)", item_id: "t1", step_id: "n-1-t1" }));
+    rows = appendEvent(rows, actEv({ kind: "thinking", name: "", summary: "weighing", item_id: "r1", step_id: "n-1-r1", status: "update" }));
+    rows = appendEvent(rows, actEv({ kind: "thinking", name: "", summary: "weighing", item_id: "r1", step_id: "n-1-r1", status: "update" }));
+    expect(rows[0].fold?.steps?.map((s) => [s.item_id, s.done])).toEqual([
+      ["t1", false],
+      ["r1", true],
+    ]);
+    rows = appendEvent(rows, actEv({ name: "Bash", summary: "Bash(ls)", item_id: "t1", step_id: "n-1-t1", status: "completed" }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].fold?.steps?.[0]).toEqual({
+      item_id: "t1",
+      step_id: "n-1-t1",
+      kind: "tool_call",
+      name: "Bash",
+      summary: "Bash(ls)",
+      done: true,
+    });
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×1");
+  });
+
+  it("keeps only the newest FOLD_STEPS_CAP steps while counting all", () => {
+    let fold = emptyFold();
+    for (let i = 0; i < FOLD_STEPS_CAP + 5; i++)
+      fold = foldActivity(fold, act({ name: "Read", item_id: `r${i}` }));
+    expect(fold.steps).toHaveLength(FOLD_STEPS_CAP);
+    expect(fold.steps?.[0]?.item_id).toBe("r5");
+    expect(renderFold(fold)).toBe(`⏳ working… · 📖 read ×${FOLD_STEPS_CAP + 5}`);
+  });
+
+  it("a fold persisted before the step list existed still folds", () => {
+    const legacy = { seen: ["a"], buckets: [{ emoji: "🔧", label: "bash", count: 1 }], thinking: false };
+    const next = foldActivity(legacy, act({ name: "Read", item_id: "b" }));
+    expect(next.steps?.map((s) => s.item_id)).toEqual(["b"]);
+    expect(renderFold(next)).toBe("⏳ working… · 🔧 bash ×1 · 📖 read ×1");
   });
 
   it("foldActivity/renderFold are pure (no mutation of prev)", () => {

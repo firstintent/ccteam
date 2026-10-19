@@ -1604,6 +1604,10 @@ pub enum ThreadItemDetails {
     CommandExecution {
         cmd: String,
         status: String,
+        /// The command's output, on the item that completes it — see
+        /// [`ThreadItemDetails::ToolCall::output`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     FileChange {
         path: PathBuf,
@@ -1611,12 +1615,84 @@ pub enum ThreadItemDetails {
     },
     ToolCall {
         name: String,
+        /// The call's input. A completing item repeats it when the channel
+        /// still has it, `Null` otherwise — readers key a step by item id.
         args: serde_json::Value,
+        /// What the tool returned, as text — set only on the item that
+        /// completes the call, `None` where the vendor reports no result.
+        /// Observability only (the web step inspector); never an answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     WebSearch {
         query: String,
     },
     Error(String),
+}
+
+/// Flatten a tool result into the text a step inspector shows: a bare
+/// string as is; an Anthropic / ACP content-block array as its text blocks,
+/// one per line, with every non-text block (an image, a diff) named in
+/// brackets rather than dropped; a result object by its `text` / `output`
+/// field when it has one, as compact JSON otherwise.
+pub fn tool_result_text(content: &serde_json::Value) -> String {
+    use serde_json::Value;
+    fn block_text(block: &Value) -> String {
+        match block {
+            Value::String(s) => s.clone(),
+            Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(Value::as_str) {
+                    return text.to_string();
+                }
+                // ACP wraps a block one level deeper: `{type:"content", content:{…}}`.
+                if let Some(inner) = map.get("content") {
+                    return tool_result_text(inner);
+                }
+                // A result object (an ACP `rawOutput` such as `{output, metadata}`).
+                if let Some(output) = map.get("output").and_then(Value::as_str) {
+                    return output.to_string();
+                }
+                match map.get("type").and_then(Value::as_str) {
+                    Some(kind) => format!("[{kind}]"),
+                    None => block.to_string(),
+                }
+            }
+            other => other.to_string(),
+        }
+    }
+    match content {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(block_text)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => block_text(content),
+        other => other.to_string(),
+    }
+}
+
+/// The output a Codex item reports (`codex exec --json` snake_case or the
+/// app-server's camelCase): a command's `aggregated_output`, or an MCP call's
+/// `result.content` — its `error.message` when it failed. `None` while the
+/// item is still running, or when it carries neither.
+pub fn codex_item_output(item: &serde_json::Value) -> Option<String> {
+    if let Some(out) = item
+        .get("aggregatedOutput")
+        .or_else(|| item.get("aggregated_output"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(out.to_string());
+    }
+    if let Some(content) = item.get("result").and_then(|r| r.get("content")) {
+        return Some(tool_result_text(content));
+    }
+    item.get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`].
@@ -2859,5 +2935,48 @@ mod tests {
         assert_eq!(sh.harness, "codex");
         assert!(sh.job_id.is_none());
         assert_eq!(sh.pid, Some(9001));
+    }
+
+    #[test]
+    fn tool_result_text_flattens_every_result_shape() {
+        use serde_json::json;
+        assert_eq!(tool_result_text(&json!("plain")), "plain");
+        assert_eq!(tool_result_text(&serde_json::Value::Null), "");
+        assert_eq!(
+            tool_result_text(&json!([
+                {"type": "text", "text": "one"},
+                {"type": "content", "content": {"type": "text", "text": "two"}},
+                {"type": "diff", "path": "a.rs"}
+            ])),
+            "one\ntwo\n[diff]"
+        );
+        assert_eq!(tool_result_text(&json!({"exit": 0})), r#"{"exit":0}"#);
+        assert_eq!(
+            tool_result_text(&json!({"output": "built", "metadata": {"exit": 0}})),
+            "built"
+        );
+    }
+
+    #[test]
+    fn codex_item_output_reads_commands_and_mcp_calls() {
+        use serde_json::json;
+        assert_eq!(
+            codex_item_output(&json!({"aggregatedOutput": "ok\n"})).as_deref(),
+            Some("ok\n")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"aggregated_output": "snake"})).as_deref(),
+            Some("snake")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"result": {"content": [{"type": "text", "text": "r"}]}}))
+                .as_deref(),
+            Some("r")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"error": {"message": "boom"}})).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(codex_item_output(&json!({"status": "inProgress"})), None);
     }
 }

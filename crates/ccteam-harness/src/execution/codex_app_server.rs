@@ -3858,6 +3858,7 @@ fn translate_item_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("in_progress"),
                 ),
+                output: crate::codex_item_output(&item_val),
             }
         }
         Some("file_change") | Some("fileChange") => {
@@ -3909,6 +3910,7 @@ fn translate_item_event(
                 .unwrap_or("")
                 .to_string(),
             args: item_val.get("arguments").cloned().unwrap_or(Value::Null),
+            output: crate::codex_item_output(&item_val),
         },
         Some("web_search") | Some("webSearch") => ThreadItemDetails::WebSearch {
             query: item_val
