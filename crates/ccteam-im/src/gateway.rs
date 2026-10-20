@@ -1277,13 +1277,24 @@ struct DelegationProgressRecord {
     reason: Option<String>,
 }
 
-/// One resolved request and the notification turn (if any) it earns.
+/// One resolved request, and whether a notification carries it.
 struct DelegationDelivery {
     request: ccteam_harness::DelegationRequest,
-    /// `None` = `notify:off`, or a parent already blocking on this exact
+    /// `false` = `notify:off`, or a parent already blocking on this exact
     /// request inline (it is about to hold the answer; a pushed copy would
     /// cost it a whole extra turn of context).
-    notification: Option<String>,
+    notified: bool,
+}
+
+/// The ONE completion turn a parent receives for a boundary: the turn's answer
+/// once, naming every request of that parent it settles. A turn has one
+/// answer however many lines were steered into it, so it is told once
+/// (F-GOV-233: sixteen steers into one turn came back as sixteen identical
+/// notifications).
+struct ParentNotification {
+    parent_sid: String,
+    request_ids: Vec<String>,
+    text: String,
 }
 
 struct DelegationDeliveryPlan {
@@ -1295,6 +1306,8 @@ struct DelegationDeliveryPlan {
     /// Every request this boundary resolves — each with its OWN parent, notify
     /// mode and title. A turn can answer several (injected steers share one).
     deliveries: Vec<DelegationDelivery>,
+    /// What is actually sent: one turn per parent that is owed one.
+    notifications: Vec<ParentNotification>,
     emitter: DelegationProgressEmitter,
 }
 
@@ -1530,8 +1543,11 @@ fn stranded_boundary_signals(
             // because it was killed (issue #197 E). The request
             // bound to it is already terminal, so this is the second
             // of two independent guards — the row itself says no.
+            // A row with no text still ends its turn when it carries the
+            // turn's status: the closing row of a turn that said nothing
+            // (F-GOV-233) or whose text went out mid-turn (#209).
             t.outcome.as_deref() != Some(INTERRUPTED_OUTCOME)
-                && !t.assistant.is_empty()
+                && (!t.assistant.is_empty() || t.status.is_some())
                 && !store.notified_turns.iter().any(|n| n == &t.turn_id)
         })
         .cloned()
@@ -9364,7 +9380,22 @@ impl Gateway {
                             // turn count (status-bearing rows) came up short.
                             // Empty `assistant`: it says nothing new, and every
                             // reader of answers already skips such a row.
-                            if released_mid_turn {
+                            //
+                            // A turn that ended having said NOTHING at all (a
+                            // "no reply needed" line acknowledged silently) gets
+                            // the same row: it is the durable fact that the turn
+                            // ended, the boundary any request bound to it is
+                            // settled by — live and after a restart alike.
+                            // Without it such a request sat `executing` for good
+                            // (F-GOV-233). Only a SETTLED end: a boundary the
+                            // vendor will continue past answers nothing yet.
+                            let silent_end = matches!(
+                                &evt,
+                                ThreadEvent::TurnCompleted { continuation, .. }
+                                    if continuation.is_settled()
+                            ) && turn_last_answer.is_none()
+                                && turn_said.is_empty();
+                            if released_mid_turn || silent_end {
                                 if let Some(dir) = project_dir.as_ref() {
                                     seq = seq.saturating_add(1);
                                     let record = ccteam_harness::execution::turns_mirror::TurnRecord {
@@ -9392,16 +9423,27 @@ impl Gateway {
                                             _ => None,
                                         },
                                     };
-                                    if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                    match ccteam_harness::execution::turns_mirror::append_turn(
                                         dir,
                                         &session_id,
                                         &record,
                                     ) {
-                                        tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
-                                        );
+                                        // The silent turn's row IS its answer: the
+                                        // boundary below names it, and only once it
+                                        // is on disk (append → notify).
+                                        Ok(_) if silent_end => {
+                                            turn_covered.push(record.turn_id.clone());
+                                            turn_last_answer =
+                                                Some((record.turn_id.clone(), String::new()));
+                                        }
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                session = %session_id,
+                                                error = %err,
+                                                "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -16784,18 +16826,46 @@ impl Gateway {
                 "ccteam-im: redelivering a completion a previous life never finished"
             );
         }
+        // Per request: is it carried by a notification at all?
         let mut deliveries = Vec::new();
         for request in resolved {
             let claimed_inline = mirror.wait_claimed(&request);
             if claimed_inline {
                 mirror.suppressed.insert(request.request_id.clone());
             }
-            // The excerpt cap comes from the REQUEST's own mode: `brief` wakes
-            // the parent at the same boundary as `final`, with a quarter of
-            // the text.
-            let excerpt_cap = crate::delegation::notification_answer_max_chars(request.notify);
-            let notification = (request.notify != NotifyMode::Off && !claimed_inline).then(|| {
-                crate::delegation::build_notification_text_with_outcome(
+            let notified = request.notify != NotifyMode::Off && !claimed_inline;
+            deliveries.push(DelegationDelivery { request, notified });
+        }
+        // Per parent: ONE notification naming every carried request, in
+        // dispatch order. The excerpt cap is the widest any of them asked for
+        // (`final` over `brief`): the parent reads the answer once.
+        let mut parents: Vec<&str> = Vec::new();
+        for delivery in deliveries.iter().filter(|d| d.notified) {
+            if !parents.contains(&delivery.request.parent_sid.as_str()) {
+                parents.push(&delivery.request.parent_sid);
+            }
+        }
+        let notifications = parents
+            .into_iter()
+            .map(|parent| {
+                let carried: Vec<&ccteam_harness::DelegationRequest> = deliveries
+                    .iter()
+                    .filter(|d| d.notified && d.request.parent_sid == parent)
+                    .map(|d| &d.request)
+                    .collect();
+                let answered: Vec<crate::delegation::AnsweredRequest<'_>> = carried
+                    .iter()
+                    .map(|request| crate::delegation::AnsweredRequest {
+                        id: &request.request_id,
+                        title: request.title.as_deref(),
+                    })
+                    .collect();
+                let excerpt_cap = carried
+                    .iter()
+                    .map(|request| crate::delegation::notification_answer_max_chars(request.notify))
+                    .max()
+                    .unwrap_or(crate::delegation::NOTIFICATION_ANSWER_MAX_CHARS);
+                let text = crate::delegation::build_notification_text_with_outcome(
                     &crate::delegation::DelegationSummary {
                         sid: &signal.child_sid,
                         vendor: vendor_str(signal.vendor),
@@ -16813,24 +16883,25 @@ impl Gateway {
                         cost_usd: None,
                         answer: &signal.tail,
                         conclusion: signal.conclusion.as_deref(),
-                        request_id: Some(&request.request_id),
-                        title: request.title.as_deref(),
+                        requests: &answered,
                         remaining_queued,
                     },
                     excerpt_cap,
-                )
-            });
-            deliveries.push(DelegationDelivery {
-                request,
-                notification,
-            });
-        }
+                );
+                ParentNotification {
+                    parent_sid: parent.to_string(),
+                    request_ids: carried.iter().map(|r| r.request_id.clone()).collect(),
+                    text,
+                }
+            })
+            .collect();
         Some(DelegationDeliveryPlan {
             signal,
             generation,
             dedup_key,
             slug,
             deliveries,
+            notifications,
             emitter,
         })
     }
@@ -17068,41 +17139,47 @@ impl Gateway {
                 .await;
         }
         let mut failed: Vec<String> = Vec::new();
-        for delivery in &plan.deliveries {
-            let Some(text) = delivery.notification.as_ref() else {
-                continue;
-            };
+        for notification in &plan.notifications {
             match Self::submit_to_sid_shared(
                 Arc::clone(&gateway),
-                &delivery.request.parent_sid,
-                text.clone(),
+                &notification.parent_sid,
+                notification.text.clone(),
                 GatewayDeadline::start(),
             )
             .await
             {
                 Ok(_) => {
-                    plan.emitter
-                        .emit(DelegationProgressRecord {
-                            slug: plan.slug.clone(),
-                            event: ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
-                                .to_string(),
-                            parent_sid: delivery.request.parent_sid.clone(),
-                            child_sid: child.clone(),
-                            vendor: plan.signal.vendor,
-                            host: plan.signal.host.clone(),
-                            turn: Some(plan.signal.turn_id.clone()),
-                            title: delivery.request.title.clone(),
-                            reason: None,
-                        })
-                        .await;
+                    // The ledger edge belongs to the request: one `notified`
+                    // row per request the turn carried.
+                    for delivery in plan
+                        .deliveries
+                        .iter()
+                        .filter(|d| notification.request_ids.contains(&d.request.request_id))
+                    {
+                        plan.emitter
+                            .emit(DelegationProgressRecord {
+                                slug: plan.slug.clone(),
+                                event:
+                                    ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
+                                        .to_string(),
+                                parent_sid: delivery.request.parent_sid.clone(),
+                                child_sid: child.clone(),
+                                vendor: plan.signal.vendor,
+                                host: plan.signal.host.clone(),
+                                turn: Some(plan.signal.turn_id.clone()),
+                                title: delivery.request.title.clone(),
+                                reason: None,
+                            })
+                            .await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
-                        parent = %delivery.request.parent_sid, %child, %error,
-                        request = %delivery.request.request_id,
-                        "ccteam-im: delegation notify failed; dropping that request"
+                        parent = %notification.parent_sid, %child, %error,
+                        requests = ?notification.request_ids,
+                        "ccteam-im: delegation notify failed; dropping those requests"
                     );
-                    failed.push(delivery.request.request_id.clone());
+                    failed.extend(notification.request_ids.iter().cloned());
                 }
             }
         }
@@ -17151,7 +17228,7 @@ impl Gateway {
                     request.state = terminal;
                     request.queue_position = None;
                     request.answered_turn = Some(plan.signal.turn_id.clone());
-                    request.notified = delivery.notification.is_some();
+                    request.notified = delivery.notified;
                 }
             }
             if current.store.outstanding().count() == 0 {
@@ -38264,27 +38341,29 @@ mod tests {
         )
         .await;
 
-        // The grace runs out with no continuation: the parent is woken by the
-        // boundary the ping joined, once per request it resolved.
-        let notes = await_notifications(&project_dir, &parent, 2).await;
-        assert_eq!(
-            notes.len(),
-            2,
-            "one wake-up per resolved request: {notes:?}"
-        );
-        for note in &notes {
-            assert!(
-                note.user.contains("compose unified"),
-                "the joined turn's answer is what is delivered: {}",
-                note.user
-            );
-        }
-        assert!(
-            notes.iter().any(|n| n.user.contains(&request_id))
-                && notes.iter().any(|n| n.user.contains(&ping_id)),
-            "each request is named in its own notification: {notes:?}"
-        );
+        // The grace runs out with no continuation: the parent is woken ONCE by
+        // the boundary the ping joined, the one notification naming both
+        // requests it resolved (F-GOV-233).
+        let notes = await_notifications(&project_dir, &parent, 1).await;
         let rows = await_request_state(&gateway, &child, "answered").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = notes;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "one wake-up for the turn: {notes:?}");
+        let note = &notes[0].user;
+        assert!(
+            note.contains("compose unified"),
+            "the joined turn's answer is what is delivered: {note}"
+        );
+        assert_eq!(
+            note.matches("compose unified").count(),
+            1,
+            "the answer is told once: {note}"
+        );
+        assert!(
+            note.contains(&request_id) && note.contains(&ping_id),
+            "the notification names every request it settles: {note}"
+        );
         assert!(
             rows.iter()
                 .all(|row| row["state"] == serde_json::json!("answered")),
@@ -38303,6 +38382,158 @@ mod tests {
                 .get(&child)
                 .is_none_or(|mirror| mirror.provisional.is_empty()),
             "nothing is left held"
+        );
+    }
+
+    /// F-GOV-233 (excore s1390 → s1403, 2026-10-19) — the parent steered
+    /// sixteen lines into one long running turn; when it ended, every request
+    /// bound to it got its own copy of the same answer: sixteen identical
+    /// notifications in one second. A turn has ONE answer, so a parent is told
+    /// once, the notification naming every request of its that the turn
+    /// settles. Each request is still resolved and recorded on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn steers_into_one_turn_are_answered_by_one_notification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, fake, parent, child, request_id, identity, exec_a) =
+            scripted_child(&project_dir, paths).await;
+        let mut ids = vec![request_id];
+        {
+            let mut gw = gateway.lock().await;
+            for n in 0..15 {
+                let id = gw
+                    .accept_delegation_request(
+                        &DelegationStoreClaim::for_test(&child),
+                        &parent,
+                        if n % 2 == 0 {
+                            ccteam_harness::NotifyMode::Brief
+                        } else {
+                            ccteam_harness::NotifyMode::Final
+                        },
+                        None,
+                        TurnRouting::Inject,
+                        None,
+                    )
+                    .expect("the child accepts the steer");
+                gw.bind_delegation_request_for_test(
+                    &DelegationStoreClaim::for_test(&child),
+                    &id,
+                    &exec_a,
+                );
+                ids.push(id);
+            }
+        }
+
+        play_turn(
+            &fake,
+            &identity,
+            &exec_a,
+            ccteam_harness::TurnOpening::Submitted,
+            "HANDOFF written: runbook, inventory, proofs",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+
+        let _ = await_notifications(&project_dir, &parent, 1).await;
+        let _ = await_request_state(&gateway, &child, "answered").await;
+        let rows = gateway.lock().await.delegation_request_rows(&child, 100);
+        assert_eq!(rows.len(), 16, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row["state"] == serde_json::json!("answered")),
+            "every steer is settled on its own: {rows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "one notification for one turn: {notes:?}");
+        let note = &notes[0].user;
+        assert_eq!(note.matches("HANDOFF written").count(), 1, "{note}");
+        assert!(note.contains("answers 16 requests"), "{note}");
+        for id in &ids {
+            assert!(note.contains(id.as_str()), "{id} is named: {note}");
+        }
+        assert!(
+            !note.contains("still queued"),
+            "nothing is left owed: {note}"
+        );
+    }
+
+    /// F-GOV-233, second half — a turn that ends WITHOUT saying anything (a
+    /// "no reply needed" note codex acknowledged silently) still ended: the
+    /// request bound to it is settled, and the parent hears "(no reply)"
+    /// instead of that request sitting `executing` for good, counted as
+    /// "still queued" in every later notification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_turn_that_says_nothing_still_settles_its_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, fake, parent, child, _first, identity, exec_a) =
+            scripted_child(&project_dir, paths).await;
+        // The first task's turn answers normally — it also settles whatever
+        // answer the dispatch left pending, so the silent turn below starts
+        // from nothing, as a live child's does.
+        play_turn(
+            &fake,
+            &identity,
+            &exec_a,
+            ccteam_harness::TurnOpening::Submitted,
+            "README ready",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+        let _ = await_notifications(&project_dir, &parent, 1).await;
+
+        let exec_b = "exec-silent";
+        let note_id = {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Brief,
+                    Some("no reply needed".into()),
+                    TurnRouting::Inject,
+                    None,
+                )
+                .expect("the child accepts the note");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                exec_b,
+            );
+            id
+        };
+        play_turn(
+            &fake,
+            &identity,
+            exec_b,
+            ccteam_harness::TurnOpening::Submitted,
+            "",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+
+        let notes = await_notifications(&project_dir, &parent, 2).await;
+        let note = &notes.last().expect("the silent turn's notification").user;
+        assert!(note.contains(&note_id), "{note}");
+        assert!(note.contains("(no reply)"), "{note}");
+        assert!(
+            !note.contains("README ready"),
+            "never another turn's answer: {note}"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(&child, 10);
+        assert!(
+            rows.iter()
+                .all(|row| row["state"] == serde_json::json!("answered")),
+            "nothing is left executing: {rows:?}"
         );
     }
 
@@ -38627,15 +38858,19 @@ mod tests {
                     opening,
                 },
             ));
-            queue.push_back((
-                identity.to_string(),
-                ThreadEvent::ItemCompleted {
-                    item: ccteam_harness::ThreadItem {
-                        id: format!("{turn_id}-msg"),
-                        details: ThreadItemDetails::AgentMessage(text.to_string()),
+            // An empty `text` is a turn that said nothing at all: no answer
+            // item, as a vendor that acknowledges silently reports it.
+            if !text.is_empty() {
+                queue.push_back((
+                    identity.to_string(),
+                    ThreadEvent::ItemCompleted {
+                        item: ccteam_harness::ThreadItem {
+                            id: format!("{turn_id}-msg"),
+                            details: ThreadItemDetails::AgentMessage(text.to_string()),
+                        },
                     },
-                },
-            ));
+                ));
+            }
             queue.push_back((
                 identity.to_string(),
                 ThreadEvent::TurnCompleted {
@@ -41347,6 +41582,91 @@ mod tests {
             count_notifications(&project_dir, &parent_sid),
             1,
             "a second reconcile is a no-op (exactly-once)"
+        );
+    }
+
+    /// F-GOV-233 — the silent turn's closing row is what a restart settles its
+    /// request by: a child that ended a turn WITHOUT any text while the daemon
+    /// was down still answers the request bound to it, with "(no reply)",
+    /// instead of leaving it `executing` for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_settles_a_request_whose_turn_said_nothing() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Codex,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s98";
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                exec_turn_id: Some("exec-silent".into()),
+                turn_id: format!("{child_sid}-5"),
+                ts: chrono::Utc::now(),
+                vendor: "codex".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: String::new(),
+                usage: serde_json::Value::Null,
+                status: Some(ccteam_harness::TurnStatus {
+                    model: None,
+                    context: None,
+                    turn: 2,
+                    cost_usd: None,
+                    tokens_total: None,
+                }),
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: None,
+                continues_exec_turn: None,
+            },
+        )
+        .unwrap();
+        Gateway::seed_delegation_store_for_test(
+            &project_dir,
+            &DelegationStoreClaim::for_test(child_sid),
+            &test_delegation_store(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Brief,
+                Some("no reply needed".into()),
+                Some("exec-silent".into()),
+            ),
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let mut note = None;
+        for _ in 0..200 {
+            note = read_all_turns(&project_dir, &parent_sid)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|turn| turn.user.contains(" done · "));
+            if note.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let note = note.expect("the silent turn's request is settled after a restart");
+        assert!(note.user.contains("(no reply)"), "{}", note.user);
+        let store = ccteam_harness::read_delegation_requests(&project_dir, child_sid).unwrap();
+        assert!(
+            store.outstanding().next().is_none(),
+            "nothing is left executing: {store:?}"
         );
     }
 

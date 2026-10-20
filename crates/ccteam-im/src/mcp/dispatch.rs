@@ -4064,6 +4064,10 @@ async fn finish_dispatch_wait(
     let answer_turn_id = record
         .map(|turn| turn.turn_id.as_str())
         .unwrap_or(&receipt.turn_id);
+    let answered: Vec<crate::delegation::AnsweredRequest<'_>> = request_id
+        .map(|id| crate::delegation::AnsweredRequest { id, title: None })
+        .into_iter()
+        .collect();
     DelegationSummary {
         sid: child_sid,
         vendor: &vendor,
@@ -4084,11 +4088,10 @@ async fn finish_dispatch_wait(
             .map(|turn| turn.assistant.as_str())
             .unwrap_or_default(),
         conclusion: record.and_then(|turn| turn.conclusion.as_deref()),
-        request_id,
         // The header of an inline result names the task the caller is holding;
         // it asked for this one by id, so the label adds nothing and the queue
         // count belongs to the push path.
-        title: None,
+        requests: &answered,
         remaining_queued: 0,
     }
     .inline_result()
