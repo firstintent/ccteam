@@ -1406,6 +1406,128 @@ pub struct ThreadStatus {
     pub stop_hook_blocks: Option<u32>,
 }
 
+/// What a session's context window is MADE OF — the structured peer of
+/// [`ContextUsage`]'s two numbers, for the web context panel (issue #21).
+///
+/// Every number is the harness's OWN accounting (Claude: the
+/// `get_context_usage` control_request that also backs its `/context`), never
+/// a ccteam estimate: the point is to let a user see where the window goes
+/// without asking the model to guess. Vendor-neutral so another harness with a
+/// breakdown channel fills the same shape; one without answers `None`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    /// The harness that reported it (`"claude"`).
+    pub vendor: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// When the harness was asked. A released session shows its last
+    /// turn-end snapshot, and the panel has to say how old that is.
+    pub captured_at: DateTime<Utc>,
+    pub used_tokens: u64,
+    pub window_tokens: u64,
+    /// Occupancy at which the harness compacts on its own; `None` when it
+    /// doesn't say (or auto-compaction is off).
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
+    /// In the harness's own order. `used` categories sum to `used_tokens`.
+    #[serde(default)]
+    pub categories: Vec<ContextCategory>,
+    /// The conversation itself, split by what produced it — the view that
+    /// answers "which tool is eating my context". `None` before the first
+    /// message or when the harness doesn't split it.
+    #[serde(default)]
+    pub messages: Option<ContextMessages>,
+    /// Real API accounting of the most recent request (cache read vs write vs
+    /// uncached input), as opposed to the estimated categories above.
+    #[serde(default)]
+    pub last_request: Option<ContextRequestUsage>,
+}
+
+/// One slice of the window.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextCategory {
+    /// Stable machine id (`memory_files`, `messages`, …).
+    pub id: String,
+    /// The harness's display name.
+    pub name: String,
+    pub tokens: u64,
+    pub kind: ContextCategoryKind,
+    /// The entries that make up this slice (memory file paths, skills, MCP
+    /// tools, agents, …); empty when the harness doesn't itemize it.
+    #[serde(default)]
+    pub items: Vec<ContextItem>,
+}
+
+/// Whether a category actually occupies the window. `Deferred` exists so a
+/// tool schema the model has NOT loaded is never read as context spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCategoryKind {
+    #[default]
+    Used,
+    Deferred,
+    /// Held back for auto-compaction.
+    Buffer,
+    Free,
+}
+
+/// One itemized entry of a [`ContextCategory`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub name: String,
+    /// Where it came from (`Project` / `User` memory, a skill's settings
+    /// scope, an MCP tool's server).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// A secondary locator, typically the file path behind the entry.
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub tokens: u64,
+    /// For deferrable entries: whether it is loaded into the window now.
+    #[serde(default)]
+    pub loaded: Option<bool>,
+}
+
+/// The conversation part of the window, split by origin.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextMessages {
+    pub tool_call_tokens: u64,
+    pub tool_result_tokens: u64,
+    /// Harness-injected context riding on messages (reminders, hook output,
+    /// file snapshots, …).
+    pub attachment_tokens: u64,
+    pub assistant_tokens: u64,
+    pub user_tokens: u64,
+    /// What the harness counted but could not attribute to the above.
+    #[serde(default)]
+    pub other_tokens: u64,
+    #[serde(default)]
+    pub tools: Vec<ContextToolUsage>,
+    #[serde(default)]
+    pub attachments: Vec<ContextAttachmentUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextToolUsage {
+    pub name: String,
+    pub call_tokens: u64,
+    pub result_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextAttachmentUsage {
+    pub name: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextRequestUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
 /// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
@@ -1981,6 +2103,17 @@ pub trait HarnessAdapter: Send + Sync {
     /// It is account-, not session-, scoped — the gateway queries it once on any
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
+        None
+    }
+
+    /// What this LIVE session's context window is made of, asked of the
+    /// harness right now (issue #21). OPTIONAL (default `None`): only adapters
+    /// with a breakdown channel implement it (Claude stream-json via
+    /// `get_context_usage`). Callers fall back to the session's persisted
+    /// snapshot ([`crate::execution::session_status::read_context_file`]) when
+    /// this answers `None`, so an adapter that persists one at turn end stays
+    /// readable after the session is released.
+    async fn context_breakdown(&self, _h: &ThreadHandle) -> Option<ContextBreakdown> {
         None
     }
 

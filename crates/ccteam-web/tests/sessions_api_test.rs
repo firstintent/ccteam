@@ -123,6 +123,32 @@ impl HarnessAdapter for FakeAdapter {
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         Ok(ThreadStatus::default())
     }
+
+    /// Only the claude double has a breakdown channel — the codex one models a
+    /// harness that cannot itemize its window.
+    async fn context_breakdown(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Option<ccteam_harness::ContextBreakdown> {
+        (self.vendor == AgentVendor::Claude).then(|| breakdown(42))
+    }
+}
+
+fn breakdown(used: u64) -> ccteam_harness::ContextBreakdown {
+    ccteam_harness::ContextBreakdown {
+        vendor: "claude".into(),
+        captured_at: chrono::Utc::now(),
+        used_tokens: used,
+        window_tokens: 100,
+        categories: vec![ccteam_harness::ContextCategory {
+            id: "messages".into(),
+            name: "Messages".into(),
+            tokens: used,
+            kind: ccteam_harness::ContextCategoryKind::Used,
+            items: Vec::new(),
+        }],
+        ..Default::default()
+    }
 }
 
 fn seed_role_with_model(project_dir: &std::path::Path, role: &str, model: Option<&str>) {
@@ -637,6 +663,93 @@ async fn session_rows_carry_context_pct_once_observed() {
     let after = rows(base, client).await;
     assert_eq!(after[0]["sid"], sid.as_str());
     assert_eq!(after[0]["context_pct"], 63, "{after}");
+}
+
+/// Issue #21 — the context sidebar's source: a resident session is asked
+/// live; once it is gone the turn-end snapshot answers (`live: false`); a
+/// harness with no breakdown and no snapshot answers `null`, not an error.
+#[tokio::test]
+async fn session_context_is_live_then_falls_back_to_the_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+    let create = |vendor: &'static str| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            client
+                .post(format!("{base}/projects/demo/sessions"))
+                .json(&serde_json::json!({"role": "", "vendor": vendor}))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["sid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let context = |sid: String| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let r = client
+                .get(format!("{base}/sessions/{sid}/context"))
+                .send()
+                .await
+                .unwrap();
+            (
+                r.status().as_u16(),
+                r.json::<Value>().await.unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    let sid = create("claude").await;
+    let (code, live) = context(sid.clone()).await;
+    assert_eq!(code, 200, "{live}");
+    assert_eq!(live["sid"], sid.as_str());
+    assert_eq!(live["live"], true);
+    assert_eq!(live["breakdown"]["used_tokens"], 42);
+    assert_eq!(live["breakdown"]["categories"][0]["kind"], "used");
+
+    let stopped = client
+        .post(format!("{base}/sessions/{sid}/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), 200);
+    let (code, gone) = context(sid.clone()).await;
+    assert_eq!(code, 200, "a stopped session is still readable: {gone}");
+    assert_eq!(gone["live"], false);
+    assert!(gone["breakdown"].is_null(), "no snapshot yet: {gone}");
+
+    ccteam_harness::execution::session_status::write_context_file(
+        &project_dir,
+        &sid,
+        &breakdown(7),
+    );
+    let (_, snap) = context(sid.clone()).await;
+    assert_eq!(snap["live"], false);
+    assert_eq!(snap["breakdown"]["used_tokens"], 7);
+
+    let codex = create("codex").await;
+    let (code, none) = context(codex).await;
+    assert_eq!(code, 200);
+    assert_eq!(none["live"], false);
+    assert!(none["breakdown"].is_null(), "{none}");
+
+    let (code, _) = context("s999".into()).await;
+    assert_eq!(code, 404);
 }
 
 /// End-to-end user flow over a real router + real gateway: create a session
@@ -1203,6 +1316,7 @@ async fn rename_session_denies_cross_tenant_project() {
     for (method, path) in [
         ("GET", format!("{base}/sessions/{sid}")),
         ("GET", format!("{base}/sessions/{sid}/status")),
+        ("GET", format!("{base}/sessions/{sid}/context")),
         ("GET", format!("{base}/projects/demo/sessions")),
     ] {
         let r = client

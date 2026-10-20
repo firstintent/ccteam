@@ -17,6 +17,7 @@
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
 //! - `POST   /api/v1/sessions/{sid}/stop`             → stop → 200 `{stopped:true}`
 //! - `POST   /api/v1/sessions/{sid}/interrupt`        → interrupt running turn → 200 `{interrupted:true}`
+//! - `GET    /api/v1/sessions/{sid}/context`          → `{sid, live, breakdown}` context composition
 //!
 //! **No-gateway contract (locked W5b)**: the standalone "internal web"
 //! path runs without a daemon gateway ([`AppState::gateway`] = `None`).
@@ -822,6 +823,69 @@ pub(crate) async fn handle_session_status(
         "status_line": status.status_suffix(),
     }))
     .into_response()
+}
+
+/// `GET /api/v1/sessions/{sid}/context`
+///
+/// What the session's context window is made of (issue #21) — the harness's
+/// own per-category accounting (system prompt, tools, memory files, skills,
+/// MCP, the conversation split by tool and attachment), for the SPA's context
+/// sidebar. A resident session is asked right now (`live: true`; Claude answers
+/// without running a turn); otherwise — or if the live ask fails — the last
+/// turn-end snapshot is served (`live: false`, its `captured_at` says how
+/// old). `breakdown: null` = this harness has no breakdown channel and no
+/// snapshot exists. Same lock-drop discipline as the status endpoint: resolve
+/// under the gateway lock, await the harness after dropping it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}/context",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "`{sid, live, breakdown}`; `breakdown` = `{vendor, model, captured_at, used_tokens, window_tokens, auto_compact_threshold, categories:[{id, name, tokens, kind: used|deferred|buffer|free, items:[{name, source, detail, tokens, loaded}]}], messages:{tool_call_tokens, tool_result_tokens, attachment_tokens, assistant_tokens, user_tokens, other_tokens, tools:[{name, call_tokens, result_tokens}], attachments:[{name, tokens}]}, last_request:{input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens}}` or null", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_context(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let (resident, resolved) = {
+        let guard = gw.lock().await;
+        (
+            guard.session_status_handle(&sid),
+            guard.session_resolve_any(&sid),
+        )
+    };
+    let Some(resolved) = resolved else {
+        return unknown_session(&sid);
+    };
+    let fresh = match resident {
+        Some((adapter, thread)) => adapter.context_breakdown(&thread).await,
+        None => None,
+    };
+    let live = fresh.is_some();
+    let breakdown = match fresh {
+        Some(b) => Some(b),
+        None => {
+            let (dir, snapshot_sid) = (resolved.project_dir, sid.clone());
+            tokio::task::spawn_blocking(move || {
+                ccteam_harness::execution::session_status::read_context_file(&dir, &snapshot_sid)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+    };
+    Json(json!({ "sid": sid, "live": live, "breakdown": breakdown })).into_response()
 }
 
 /// POST body for a turn submission — `text` (required unless `attachments`

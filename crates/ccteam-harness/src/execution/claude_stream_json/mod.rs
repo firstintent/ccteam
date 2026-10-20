@@ -28,6 +28,7 @@
 //! - **No terminal scraping**: there is no terminal — naturally satisfied.
 
 pub mod bridge;
+mod context;
 pub mod protocol;
 pub mod recovery;
 pub mod spawn_spec;
@@ -51,7 +52,7 @@ use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
-use crate::execution::session_status::{read_status_file, write_status_file};
+use crate::execution::session_status::{read_status_file, write_context_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, DetachedActivity,
@@ -1183,6 +1184,15 @@ fn dead_ccteam_tool_face(sys: &protocol::SystemMsg) -> Option<String> {
 /// (the caller then falls back to the usage-sum + heuristic). Short timeout —
 /// it must never stall the status tap.
 async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)> {
+    get_context_breakdown(transport)
+        .await
+        .map(|b| (b.used_tokens, b.window_tokens))
+}
+
+/// The same `get_context_usage` answer, kept whole: what the window is made
+/// of (issue #21). One request serves both the statusline numbers and the
+/// context panel, so the panel costs claude nothing extra per turn.
+async fn get_context_breakdown(transport: &StreamJsonTransport) -> Option<crate::ContextBreakdown> {
     let body = transport
         .request_control("get_context_usage", json!({}), Duration::from_secs(3))
         .await
@@ -1190,13 +1200,7 @@ async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)
     if body.subtype != "success" {
         return None;
     }
-    let resp = body.response.as_ref()?;
-    let used = resp.get("totalTokens").and_then(|v| v.as_u64())?;
-    let window = resp
-        .get("maxTokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| resp.get("rawMaxTokens").and_then(|v| v.as_u64()))?;
-    Some((used, window))
+    context::parse_context_usage(body.response.as_ref()?, Utc::now())
 }
 
 /// `get_usage` control_request → ACCOUNT-level usage / rate-limits
@@ -1588,10 +1592,20 @@ async fn refresh_context_after_turn(
     project_dir: &Path,
     sid: &str,
 ) {
-    let real = get_context_usage(transport).await;
+    let breakdown = get_context_breakdown(transport).await;
+    // The turn-end breakdown doubles as the session's context snapshot, so a
+    // released session can still show what its window held (and `/compact`,
+    // a turn like any other, refreshes it).
+    if let Some(b) = &breakdown {
+        write_context_file(project_dir, sid, b);
+    }
     let snapshot = if let Ok(mut s) = status.lock() {
-        s.context = real.map(|(used, window)| {
-            crate::ContextUsage::known(used, window, crate::ContextSource::Derived)
+        s.context = breakdown.map(|b| {
+            crate::ContextUsage::known(
+                b.used_tokens,
+                b.window_tokens,
+                crate::ContextSource::Derived,
+            )
         });
         let is_1m = matches!(&s.context, Some(c) if c.window_tokens >= 1_000_000);
         if is_1m {
@@ -2854,6 +2868,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // on any ONE live claude session to build the `/status` header.
         let live = self.lookup(&h.identity)?;
         get_account_usage(&live.transport).await
+    }
+
+    async fn context_breakdown(&self, h: &ThreadHandle) -> Option<crate::ContextBreakdown> {
+        let live = self.lookup(&h.identity)?;
+        get_context_breakdown(&live.transport).await
     }
 
     async fn running_tasks(&self, h: &ThreadHandle) -> Vec<crate::RunningTask> {

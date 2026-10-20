@@ -105,7 +105,11 @@ while True:
             # maxTokens 1000000 can ONLY come from get_context_usage → it both
             # proves the source AND drives the [1m] model-id tag.
             emit({"type":"control_response","response":{"subtype":"success",
-                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":1000000,"percentage":1}}})
+                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":1000000,"percentage":1,
+                  "categories":[{"id":"memory_files","name":"Memory files","tokens":12000,"kind":"used"},
+                                {"id":"messages","name":"Messages","tokens":345,"kind":"used"},
+                                {"id":"free_space","name":"Free space","tokens":987655,"kind":"free"}],
+                  "memoryFiles":[{"path":"/p/CLAUDE.md","type":"Project","tokens":12000}]}}})
         elif os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
             emit({"type":"control_response","response":{"subtype":"error",
                   "request_id":rid,"error":"unsupported model"}})
@@ -1801,6 +1805,51 @@ async fn stream_json_status_survives_release_via_persisted_file() {
         .expect("persisted context survives session release");
     assert_eq!(c.used_tokens, Some(12_345));
     assert_eq!(c.window_tokens, 1_000_000);
+}
+
+/// Issue #21 — the context panel reads the live session's breakdown straight
+/// from claude (no turn needed), and the turn-end answer is kept as
+/// `context.json` so a released session still has one to show.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn context_breakdown_is_live_and_snapshotted_at_turn_end() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let live = adapter
+        .context_breakdown(&handle)
+        .await
+        .expect("a live session answers before its first turn");
+    assert_eq!((live.used_tokens, live.window_tokens), (12_345, 1_000_000));
+    assert_eq!(live.categories.len(), 3);
+    assert_eq!(live.categories[0].items[0].name, "/p/CLAUDE.md");
+
+    let snapshot_file = tmp.path().join(".ccteam/chat/s1/context.json");
+    assert!(!snapshot_file.exists(), "asking is not snapshotting");
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+    assert!(
+        snapshot_file.exists(),
+        "the snapshot lands before the turn's end is visible"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    assert_eq!(adapter.context_breakdown(&handle).await, None);
+    let snap = ccteam_harness::execution::session_status::read_context_file(tmp.path(), "s1")
+        .expect("released session keeps its last breakdown");
+    assert_eq!(snap.vendor, "claude");
+    assert_eq!(snap.categories[0].id, "memory_files");
 }
 
 /// `docs-local/issues/#14②` — claude writer family: the status tap persists a
