@@ -210,6 +210,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ### Status / 成本
 
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
+- **上下文侧栏**:在 web 控制台点会话头部的 `model · ctx` 标签(或右上角的侧栏按钮),右侧打开侧栏(切换会话时保持打开),显示上下文窗口由什么组成:system prompt、工具、memory 文件(每个 `CLAUDE.md` / 记忆文件按路径列出)、skills、MCP 工具与说明、自定义 agent,以及对话本身按工具(调用 vs 结果 token)和附件类型的拆分,外加上一次请求的缓存读 / 缓存写 / 未缓存输入。harness 延迟加载(未载入)的工具单独列出,因为它们不占窗口。数字是 harness 自己的账(Claude `/context` 的数据),不是让模型去估:在线会话每次打开和点「刷新」都现查,turn 结束时侧栏自动刷新(所以 `/compact` 后立刻看得到变化);已释放的会话显示最后一个 turn 结束时的快照并标出时间。目前只支持 Claude stream-json 会话,其他 harness 仍只显示 ctx 百分比。REST:`GET /api/v1/sessions/{sid}/context`。
 - 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
 
 ### 标准资源 API(给集成方)
