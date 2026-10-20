@@ -1476,3 +1476,123 @@ select:focus-visible,
 .dsh-empty code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-hover); padding: 3px 9px; border-radius: 6px; color: var(--text); }
 .dsh-spin { width: 30px; height: 30px; border: 3px solid var(--border); border-top-color: var(--dsh); border-radius: 50%; animation: att-spin .8s linear infinite; }
 .dsh-error-tail { font-family: var(--font-mono); font-size: 11.5px; color: var(--red-text); background: var(--red-soft); border-radius: 8px; padding: 9px 12px; max-width: 540px; white-space: pre-wrap; text-align: left; max-height: 150px; overflow: auto; margin: 0; }
+
+/* ============ CONTEXT PANEL — per-session right sidebar ============
+   Docked beside the chat (`.conv-body` = [`.conv-main` | `.ctx-panel`]);
+   ≤820px it becomes a right-edge overlay drawer with a backdrop. Skin follows
+   conv-head / agents-panel. The eight categorical slots are the validated
+   dataviz default palette (adjacent-pair CVD ΔE ≥ 8 in both modes; the dark
+   column is the same hues re-stepped for the dark surface, not a flip); a
+   category's slot is fixed by id in `lib/contextBreakdown.ts`. */
+:root {
+  --ctx-1: #2a78d6; --ctx-2: #eb6834; --ctx-3: #1baf7a; --ctx-4: #eda100;
+  --ctx-5: #e87ba4; --ctx-6: #008300; --ctx-7: #6250d6; --ctx-8: #e34948;
+}
+html.dark {
+  --ctx-1: #3987e5; --ctx-2: #d95926; --ctx-3: #199e70; --ctx-4: #c98500;
+  --ctx-5: #d55181; --ctx-6: #008300; --ctx-7: #9085e9; --ctx-8: #e66767;
+}
+.conv-body { flex: 1; min-height: 0; display: flex; flex-direction: row; position: relative; }
+.conv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.ctx-panel {
+  width: 360px; flex: none; min-height: 0; display: flex; flex-direction: column;
+  border-left: 1px solid var(--border-soft); background: var(--bg-side); outline: none;
+}
+.ctx-head {
+  display: flex; align-items: center; gap: 4px; flex: none;
+  padding: 9px 10px 9px 16px; border-bottom: 1px solid var(--border-soft);
+}
+.ctx-head .ctx-title { font-size: 13px; font-weight: 600; margin-right: auto; }
+.ctx-body {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px 22px;
+  display: flex; flex-direction: column; gap: 16px; font-size: 12.5px;
+}
+.ctx-backdrop { display: none; }
+/* The header chip doubles as the entry point; the dedicated toggle lives next
+   to the cost pill and shows the docked state. */
+.chip-btn { background: none; cursor: pointer; line-height: inherit; }
+.chip-btn:hover, .chip-btn:focus-visible { background: var(--bg-soft); color: var(--text); }
+.ctx-toggle.on { background: var(--bg-soft); color: var(--text); }
+/* header line: model · used / window · live|snapshot */
+.ctx-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.ctx-usage { font: 12px var(--font-mono); color: var(--text-muted); white-space: nowrap; }
+.ctx-badge {
+  font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap;
+}
+.ctx-badge.live { color: var(--green-text); background: var(--green-soft); border-color: transparent; }
+/* the stacked window bar: 2px surface gaps between fills, free space = the track */
+.ctx-meter-wrap { position: relative; padding: 3px 0; }
+.ctx-meter { display: flex; gap: 2px; height: 14px; border-radius: 4px; overflow: hidden; background: var(--bg-soft); }
+.ctx-seg { flex: 0 1 auto; min-width: 3px; height: 100%; border-radius: 2px; }
+.ctx-seg.other { background: var(--text-faint); }
+.ctx-seg.buffer { background: repeating-linear-gradient(135deg, var(--text-faint) 0 2px, transparent 2px 6px); opacity: .75; }
+.ctx-seg.free { flex: 1 1 0; min-width: 0; background: transparent; }
+.ctx-threshold { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--ink); opacity: .55; }
+/* sections */
+.ctx-sec h4 {
+  display: flex; align-items: baseline; gap: 8px; margin: 0 0 6px;
+  font-size: 11px; font-weight: 500; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px;
+}
+.ctx-sec h4 .ctx-h-num { font: 11px var(--font-mono); color: var(--text-muted); text-transform: none; letter-spacing: 0; }
+.ctx-sec h5 { margin: 12px 0 4px; font-size: 11.5px; font-weight: 500; color: var(--text-muted); }
+.ctx-note { margin: 0 0 6px; font-size: 11.5px; line-height: 1.5; color: var(--text-faint); }
+.ctx-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.ctx-table th {
+  padding: 2px 4px; text-align: left; font-size: 10.5px; font-weight: 500;
+  color: var(--text-faint); border-bottom: 1px solid var(--border-soft);
+}
+.ctx-table td { padding: 4px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; color: var(--text); }
+.ctx-table .num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; width: 60px; }
+.ctx-table .total { font-weight: 600; }
+.ctx-table .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-table .name.mono { font-family: var(--font-mono); font-size: 11.5px; }
+.ctx-tools .num { width: 52px; }
+.ctx-sw { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: -1px; }
+.ctx-sw.other { background: var(--text-faint); }
+.ctx-sw.buffer { background: repeating-linear-gradient(135deg, var(--text-faint) 0 2px, transparent 2px 4px); }
+.ctx-sw.free { border: 1px solid var(--border); background: var(--bg-soft); }
+.ctx-sw.none { border: 1px dashed var(--border); }
+.ctx-row-btn, .ctx-row-static { display: flex; align-items: center; gap: 2px; width: 100%; min-width: 0; }
+.ctx-row-btn { background: none; border: none; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ctx-row-btn svg { width: 12px; height: 12px; flex: none; color: var(--text-faint); margin-left: -2px; }
+.ctx-row-btn:hover .name, .ctx-row-btn:focus-visible .name { text-decoration: underline; text-underline-offset: 2px; }
+.ctx-row-btn .name, .ctx-row-static .name { flex: 1; }
+.ctx-row-static { padding-left: 12px; }
+.ctx-count { font: 10.5px var(--font-mono); color: var(--text-faint); flex: none; }
+.ctx-cat.buffer td, .ctx-cat.free td { color: var(--text-muted); }
+.ctx-item td { padding-left: 26px; color: var(--text-muted); font-size: 12px; background: var(--bg-soft); }
+.ctx-item td.num { padding-left: 4px; }
+.ctx-item .ctx-item-name { font-family: var(--font-mono); font-size: 11.5px; }
+.ctx-item .ctx-item-detail { font: 10.5px var(--font-mono); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-tag {
+  display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px; vertical-align: 1px;
+  border: 1px solid var(--border); font-size: 10px; color: var(--text-faint); white-space: nowrap;
+}
+.ctx-tag.warn { color: var(--accent, #b45309); border-color: currentColor; }
+/* deferred = listed, muted, never in the bar */
+.ctx-muted .ctx-table td { color: var(--text-faint); }
+.ctx-muted .ctx-row-btn .name { color: var(--text-muted); }
+.ctx-mini { display: block; height: 3px; margin-top: 3px; border-radius: 2px; background: var(--bg-hover); overflow: hidden; }
+.ctx-mini > span { display: block; height: 100%; background: var(--text-faint); border-radius: 2px; }
+.ctx-cache { font: 12px var(--font-mono); color: var(--text-muted); line-height: 1.7; }
+.ctx-cache b { color: var(--text); font-weight: 600; }
+.ctx-empty { color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+.ctx-empty p { margin: 0 0 8px; }
+.ctx-loading { color: var(--text-faint); font-size: 12.5px; }
+.ctx-error {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; font-size: 12px; color: var(--red-text); background: var(--red-soft);
+}
+@keyframes ctx-spin { to { transform: rotate(360deg); } }
+.ctx-spin { animation: ctx-spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .ctx-spin { animation: none; opacity: .5; } }
+@media (max-width: 1100px) { .ctx-panel { width: 320px; } }
+@media (max-width: 820px) {
+  .ctx-panel {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 110;
+    width: min(92vw, 380px); background: var(--bg-card); box-shadow: var(--shadow-menu);
+    border-left: 1px solid var(--border);
+  }
+  .ctx-backdrop { display: block; position: fixed; inset: 0; z-index: 105; border: none; background: rgba(0,0,0,.28); }
+}
