@@ -62,7 +62,8 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 </p>
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
-- a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
+- a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input; a turn's folded activity row opens into its steps, and each step into its full thinking text or tool input and output
+- a context sidebar per session: what its context window is made of — system prompt, tools, each memory file by path, skills, MCP tools, agents, the conversation split by tool and attachment, last-request cache use — taken from the harness's own accounting, refreshed when a turn ends (Claude sessions)
 - a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place, and a Runs tab listing every ccteam Flow run with the sessions it hired
 - a DSH page that opens DeepSeek Harness Web inside ccteam: the daemon authenticates the request, starts or attaches the right local DSH web instance, and gives each logged-in user a separate DSH home
 - a cost pill with daily budget caps
