@@ -129,14 +129,33 @@ pub(crate) struct DelegationSummary<'a> {
     /// The turn's conclusion when the vendor marked one shorter than `answer`
     /// (the ledger row's `conclusion`): what a bounded excerpt shows first.
     pub conclusion: Option<&'a str>,
-    /// The REQUEST this completion answers. The parent needs it to tell which
-    /// of its outstanding tasks came back (issue #201: three dispatches to one
-    /// child produced three identical-looking reports).
-    pub request_id: Option<&'a str>,
-    /// That request's own label — never a later dispatch's.
-    pub title: Option<&'a str>,
+    /// The REQUESTS this completion answers, in dispatch order. The parent
+    /// needs them to tell which of its outstanding tasks came back (issue
+    /// #201: three dispatches to one child produced three identical-looking
+    /// reports). Several when lines were steered into one running turn: that
+    /// turn has ONE answer, so it is reported once, naming every request it
+    /// settles (F-GOV-233: sixteen steers, sixteen identical notifications).
+    pub requests: &'a [AnsweredRequest<'a>],
     /// How many of this child's requests are still outstanding AFTER this one.
     pub remaining_queued: usize,
+}
+
+/// One request a completion settles, as its header names it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AnsweredRequest<'a> {
+    pub id: &'a str,
+    /// That request's own label — never a later dispatch's.
+    pub title: Option<&'a str>,
+}
+
+impl AnsweredRequest<'_> {
+    /// `«title» req-…`, or the bare id.
+    fn label(&self) -> String {
+        match self.title.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(title) => format!("«{title}» {}", self.id),
+            None => self.id.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,11 +249,24 @@ impl DelegationSummary<'_> {
         // several tasks on one child could not tell its reports apart at all
         // before this (issue #201) — and, told nothing about the queue, it
         // re-sent the same instruction three times.
-        if let Some(title) = self.title.map(str::trim).filter(|t| !t.is_empty()) {
-            first.push_str(&format!(" · «{title}»"));
-        }
-        if let Some(request_id) = self.request_id.filter(|id| !id.is_empty()) {
-            first.push_str(&format!(" · {request_id}"));
+        let named: Vec<&AnsweredRequest<'_>> =
+            self.requests.iter().filter(|r| !r.id.is_empty()).collect();
+        match named.as_slice() {
+            [] => {}
+            [one] => {
+                if let Some(title) = one.title.map(str::trim).filter(|t| !t.is_empty()) {
+                    first.push_str(&format!(" · «{title}»"));
+                }
+                first.push_str(&format!(" · {}", one.id));
+            }
+            many => {
+                let labels: Vec<String> = many.iter().map(|r| r.label()).collect();
+                first.push_str(&format!(
+                    " · answers {} requests: {}",
+                    many.len(),
+                    labels.join(", ")
+                ));
+            }
         }
         if self.remaining_queued > 0 {
             first.push_str(&format!(" · {} still queued", self.remaining_queued));
@@ -245,7 +277,11 @@ impl DelegationSummary<'_> {
             full_answer_marker(omitted, total_chars, self.sid, self.turn_id)
         });
         if answer.text.is_empty() {
-            first
+            // Said explicitly: a bare header reads like a truncated message.
+            match self.outcome {
+                DelegationOutcome::Done => format!("{first}\n(no reply)"),
+                DelegationOutcome::Failed { .. } => first,
+            }
         } else {
             format!("{first}\n{}", answer.text)
         }
@@ -255,8 +291,8 @@ impl DelegationSummary<'_> {
         let mut result = serde_json::Map::new();
         result.insert("sid".into(), serde_json::json!(self.sid));
         result.insert("turn_id".into(), serde_json::json!(self.turn_id));
-        if let Some(request_id) = self.request_id.filter(|id| !id.is_empty()) {
-            result.insert("request_id".into(), serde_json::json!(request_id));
+        if let Some(request) = self.requests.first().filter(|r| !r.id.is_empty()) {
+            result.insert("request_id".into(), serde_json::json!(request.id));
         }
         result.insert("turn".into(), serde_json::json!(self.turn));
         let (kind, error) = match &self.outcome {
@@ -784,8 +820,7 @@ mod tests {
             cost_usd: None,
             answer: "hello",
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
@@ -894,8 +929,7 @@ mod tests {
             cost_usd: Some(0.42),
             answer: "wave done",
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         };
         assert_eq!(
@@ -926,8 +960,7 @@ mod tests {
             cost_usd: None,
             answer: &long,
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         };
         // `final` (the default) and `brief` differ only in the excerpt cap.
@@ -978,8 +1011,7 @@ mod tests {
             cost_usd: None,
             answer: &answer,
             conclusion: Some(&receipt),
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         };
         let text = summary.notification_text(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS);
@@ -1109,8 +1141,7 @@ mod tests {
             cost_usd: None,
             answer: "ok",
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         }
         .inline_result();
@@ -1137,8 +1168,7 @@ mod tests {
             cost_usd: None,
             answer: "oops",
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         };
         assert_eq!(
@@ -1159,8 +1189,7 @@ mod tests {
             cost_usd: None,
             answer: "ok",
             conclusion: None,
-            request_id: None,
-            title: None,
+            requests: &[],
             remaining_queued: 0,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);

@@ -150,7 +150,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PATCH", "/api/v1/sessions/{sid}"),
         // live statusline (model + context-window usage) for the SPA top bar.
         ("GET", "/api/v1/sessions/{sid}/status"),
+        // issue #21 — context composition for the session's context sidebar.
+        ("GET", "/api/v1/sessions/{sid}/context"),
         ("POST", "/api/v1/sessions/{sid}/turn"),
+        ("GET", "/api/v1/sessions/{sid}/steps/{step_id}"),
         // v0.8.7 review-fix (R-H1) — web HITL token-resolve endpoint.
         ("POST", "/api/v1/sessions/{sid}/resolve"),
         ("GET", "/api/v1/sessions/{sid}/events"),

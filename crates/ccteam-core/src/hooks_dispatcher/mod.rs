@@ -42,7 +42,7 @@ pub const HOOK_VIA_DAEMON_ENV: &str = "CCTEAM_HOOK_VIA_DAEMON";
 ///
 /// Read at two points that MUST agree: the install-time branch in
 /// `ensure_chat_hooks_installed` (which hook command string to write
-/// into `.claude/settings.json`) and the sink-bind decision in
+/// into `.claude/settings.local.json`) and the sink-bind decision in
 /// `ccteam start` (whether to bind the `hook.sock` listener). Sharing
 /// this helper guarantees they never drift.
 ///

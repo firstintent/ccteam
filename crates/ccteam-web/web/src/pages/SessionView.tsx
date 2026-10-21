@@ -17,16 +17,19 @@
 // byte-exact `ccteam-pty.v1` relay via TerminalView.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Clock, Pencil, X } from "lucide-react";
+import { ArrowDown, Clock, PanelRightClose, PanelRightOpen, Pencil, X } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import { ContextPanel } from "../components/ContextPanel";
 import { InlineRename } from "../components/InlineRename";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
+import { StepInspector } from "../components/StepInspector";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
 import {
   foldSessionLiveness,
+  isTurnBoundary,
   turnInFlight,
   useSessionEvents,
   type TurnMark,
@@ -58,10 +61,16 @@ import {
   mergeHistory,
   nextRowId,
   saveRows,
+  stepIcon,
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
 import { contextPct, formatElapsed, formatTurnStatus } from "../lib/statusLine";
+import {
+  isNarrowViewport,
+  readContextPanelOpen,
+  writeContextPanelOpen,
+} from "../lib/contextBreakdown";
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -210,12 +219,65 @@ export default function SessionView({
   const [busySince, setBusySince] = useState<number | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
+  // Step view: which folded activity rows are expanded into their step list,
+  // and which step the inspector shows (looked up live in `rows`, so a running
+  // step flips to done — and its record loads — while the panel is open).
+  // Per-sid by construction: the shell remounts this view on a sid change.
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
+  const [inspected, setInspected] = useState<{ rowId: string; itemId: string } | null>(null);
+  const inspectedStep = useMemo(() => {
+    if (!inspected) return null;
+    const row = rows.find((r) => r.id === inspected.rowId);
+    return row?.fold?.steps?.find((st) => st.item_id === inspected.itemId) ?? null;
+  }, [inspected, rows]);
+  const closeInspector = useCallback(() => setInspected(null), []);
+  const toggleFold = useCallback((rowId: string) => {
+    setExpandedFolds((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+  }, []);
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
 
+  // ---- context panel (the right sidebar) ------------------------------------
+  // Docked/closed is a per-browser LAYOUT preference: it survives this
+  // component's per-sid remount by living in localStorage. A phone viewport
+  // never auto-restores it (the panel is a chat-covering overlay there — the
+  // user re-opens it). `ctxOpenedByUser` tells the panel whether to take
+  // focus: yes after a click, no when the docked state was merely restored.
+  const [ctxOpen, setCtxOpen] = useState(
+    () =>
+      readContextPanelOpen(typeof localStorage === "undefined" ? null : localStorage) &&
+      !isNarrowViewport(typeof window === "undefined" ? undefined : window),
+  );
+  const [ctxOpenedByUser, setCtxOpenedByUser] = useState(false);
+  const ctxToggleRef = useRef<HTMLButtonElement>(null);
+  const setContextOpen = useCallback((next: boolean, byUser: boolean) => {
+    setCtxOpen(next);
+    setCtxOpenedByUser(byUser);
+    writeContextPanelOpen(typeof localStorage === "undefined" ? null : localStorage, next);
+  }, []);
+  const toggleContext = useCallback(
+    () => setContextOpen(!ctxOpen, true),
+    [ctxOpen, setContextOpen],
+  );
+  // Closing from inside the panel (Esc / ×) hands focus back to the toggle.
+  const closeContext = useCallback(() => {
+    setContextOpen(false, false);
+    ctxToggleRef.current?.focus();
+  }, [setContextOpen]);
+
   const { events, lastError, gatewayUnavailable, connectionEpoch } =
     useSessionEvents(sid);
+
+  // A turn ending is the moment the window changes, so the panel re-fetches
+  // on the newest boundary frame's id (identity, not a count: the ring drops
+  // its oldest frames once full, so a count could stand still).
+  const latestTurnEndId = [...events].reverse().find((event) => isTurnBoundary(event))?.id;
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
   // view of its current length so an authoritative history reseed can install
@@ -634,10 +696,20 @@ export default function SessionView({
             <span className="chip">@ {session.host}</span>
           ) : null}
           {displayStatusModel ? (
-            <span className="chip" title="model · context window">
+            // The `model · ctx N%` chip IS the entry point into the context
+            // panel — the affordance sits on the number it explains.
+            <button
+              type="button"
+              className="chip chip-btn"
+              data-testid="ctx-chip"
+              title={t("ctxOpen")}
+              aria-label={`${t("ctxOpen")} · ${displayStatusModel}`}
+              aria-pressed={ctxOpen}
+              onClick={toggleContext}
+            >
               {displayStatusModel}
               {displayCtxPct !== null ? ` · ctx ${Math.round(displayCtxPct)}%` : ""}
-            </span>
+            </button>
           ) : null}
         </div>
         <div className="tabs">
@@ -660,228 +732,310 @@ export default function SessionView({
           ) : null}
         </div>
         <CostPill />
+        {/* Always-present toggle (the chip above needs a reported status; this
+            one is the way in before the first turn and for every harness —
+            the panel itself explains when there is nothing to show). */}
+        <button
+          ref={ctxToggleRef}
+          type="button"
+          className={`icon-btn sm ctx-toggle${ctxOpen ? " on" : ""}`}
+          data-testid="ctx-toggle"
+          title={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
+          aria-label={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
+          aria-pressed={ctxOpen}
+          onClick={toggleContext}
+        >
+          {ctxOpen ? <PanelRightClose /> : <PanelRightOpen />}
+        </button>
       </div>
 
-      {showTerminal && session?.project ? (
-        <div className="term-wrap">
-          <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
-        </div>
-      ) : (
-        <>
-          <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
-            <div
-              ref={scrollRef}
-              onScroll={onTranscriptScroll}
-              className="chat-scroll"
-              data-testid="chat-scroll"
-            >
-              <div className="chat-inner">
-                {historyError ? (
-                  <div className="msg system" data-testid="history-error" role="alert">
-                    <div className="bubble">
-                      {t("historyLoadFailed")}: {historyError}{" "}
+      {/* [chat column | context panel] — the panel is a docked right
+          sidebar beside the chat (an overlay drawer ≤820px, see index.css),
+          mounted only while open so mount = fetch. */}
+      <div className="conv-body">
+        <div className="conv-main">
+          {showTerminal && session?.project ? (
+            <div className="term-wrap">
+              <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
+            </div>
+          ) : (
+            <>
+              <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+                <div
+                  ref={scrollRef}
+                  onScroll={onTranscriptScroll}
+                  className="chat-scroll"
+                  data-testid="chat-scroll"
+                >
+                  <div className="chat-inner">
+                    {historyError ? (
+                      <div className="msg system" data-testid="history-error" role="alert">
+                        <div className="bubble">
+                          {t("historyLoadFailed")}: {historyError}{" "}
+                          <button
+                            type="button"
+                            className="btn ghost mini"
+                            data-testid="history-retry"
+                            onClick={() => seedHistory(false)}
+                          >
+                            {t("retry")}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                    {historyPage.hasMore ? (
                       <button
                         type="button"
-                        className="btn ghost mini"
-                        data-testid="history-retry"
-                        onClick={() => seedHistory(false)}
+                        className="btn ghost mini self-center"
+                        data-testid="load-earlier"
+                        disabled={historyPage.loadingEarlier}
+                        onClick={loadEarlier}
                       >
-                        {t("retry")}
+                        {historyPage.loadingEarlier
+                          ? lang === "en"
+                            ? "Loading…"
+                            : "加载中…"
+                          : lang === "en"
+                            ? "Load earlier"
+                            : "加载更早消息"}
                       </button>
-                    </div>
+                    ) : null}
+                    {rows.map((row) => {
+                      if (row.kind === "approval") {
+                        return (
+                          <div key={row.id} className="msg approval fade-in">
+                            <span className="who">{t("approve")}</span>
+                            <div className="bubble">
+                              {row.content}
+                              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+                                {(row.options ?? []).map((opt, i) => (
+                                  <button
+                                    key={`${row.id}-${i}`}
+                                    type="button"
+                                    className="btn primary mini"
+                                    disabled={row.resolved}
+                                    style={row.resolved ? { opacity: 0.45 } : undefined}
+                                    onClick={() => resolveApproval(row, i)}
+                                  >
+                                    {opt.label}
+                                  </button>
+                                ))}
+                              </div>
+                              {row.resolved ? (
+                                <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-faint)" }}>
+                                  已回应
+                                </div>
+                              ) : null}
+                            </div>
+                            <RowTime ts={row.ts} lang={lang} />
+                          </div>
+                        );
+                      }
+                      if (row.kind === "system") {
+                        return (
+                          <div key={row.id} className="msg system fade-in">
+                            <div className="bubble">{row.content}</div>
+                            <RowTime ts={row.ts} lang={lang} />
+                          </div>
+                        );
+                      }
+                      if (row.kind === "activity") {
+                        const steps = row.fold?.steps ?? [];
+                        if (steps.length === 0) {
+                          return (
+                            <div key={row.id} className="msg activity">
+                              <div className="bubble">{row.content}</div>
+                              <RowTime ts={row.ts} lang={lang} />
+                            </div>
+                          );
+                        }
+                        const open = expandedFolds.has(row.id);
+                        return (
+                          <div key={row.id} className="msg activity">
+                            <button
+                              type="button"
+                              className="bubble fold-toggle"
+                              data-testid="fold-toggle"
+                              aria-expanded={open}
+                              title={open ? t("stepsHide") : t("stepsShow")}
+                              onClick={() => toggleFold(row.id)}
+                            >
+                              <span className="fold-caret" aria-hidden>
+                                {open ? "▾" : "▸"}
+                              </span>
+                              {row.content}
+                            </button>
+                            {open ? (
+                              <ol className="fold-steps" data-testid="fold-steps">
+                                {steps.map((step) => {
+                                  const selected =
+                                    inspected?.rowId === row.id && inspected.itemId === step.item_id;
+                                  return (
+                                    <li key={step.item_id || step.step_id}>
+                                      <button
+                                        type="button"
+                                        className={`fold-step${step.kind === "thinking" ? " thinking" : ""}${selected ? " selected" : ""}`}
+                                        data-testid="fold-step"
+                                        onClick={() =>
+                                          setInspected({ rowId: row.id, itemId: step.item_id })
+                                        }
+                                      >
+                                        <span aria-hidden>{stepIcon(step)}</span>
+                                        <span className="fold-step-summary">{step.summary}</span>
+                                        <span className="fold-step-state" aria-hidden>
+                                          {step.done ? "✓" : "…"}
+                                        </span>
+                                      </button>
+                                    </li>
+                                  );
+                                })}
+                              </ol>
+                            ) : null}
+                            <RowTime ts={row.ts} lang={lang} />
+                          </div>
+                        );
+                      }
+                      if (row.kind === "user") {
+                        return (
+                          <div key={row.id} className="msg user fade-in">
+                            <span className="who">you</span>
+                            <div className="bubble">{row.content}</div>
+                            <RowTime ts={row.ts} lang={lang} />
+                          </div>
+                        );
+                      }
+                      if (row.kind === "tool") {
+                        return (
+                          <div key={row.id} className="msg tool fade-in">
+                            <div className="bubble">{row.content}</div>
+                            <RowTime ts={row.ts} lang={lang} />
+                          </div>
+                        );
+                      }
+                      // assistant — full Markdown document (红线: never plain text).
+                      return (
+                        <div key={row.id} className="msg agent fade-in">
+                          <div className="bubble md">
+                            {row.content ? <Markdown content={row.content} /> : null}
+                            <OutboundAttachments
+                              project={session?.project}
+                              attachments={row.attachments}
+                            />
+                          </div>
+                          {(() => {
+                            // ONE footer line, no bubble header:
+                            // `HH:MM · claude · s12 · <model> · turn N · ctx N%` —
+                            // identity + model + metrics once, in the order the IM
+                            // status line uses (`render_status_line`), so the two
+                            // surfaces read the same. The ledger lives on the
+                            // session pages.
+                            const footer = formatTurnStatus(row.status);
+                            const model = row.status?.model || displayStatusModel;
+                            const tail = [vendor, sid, model, footer?.text]
+                              .filter((part): part is string => !!part)
+                              .join(" · ");
+                            return (
+                              <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                                <RowTime ts={row.ts} lang={lang} />
+                                {row.ts ? ` · ${tail}` : tail}
+                              </span>
+                            );
+                          })()}
+                        </div>
+                      );
+                    })}
+                    {busy ? (
+                      <div className="msg agent" aria-label="生成中" data-testid="streaming-cursor">
+                        <div className="bubble">
+                          <span className="cursor" />
+                          <BusyHeartbeat since={busySince} lastEventTs={lastEventTs} lang={lang} />
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
-                {historyPage.hasMore ? (
-                  <button
-                    type="button"
-                    className="btn ghost mini self-center"
-                    data-testid="load-earlier"
-                    disabled={historyPage.loadingEarlier}
-                    onClick={loadEarlier}
-                  >
-                    {historyPage.loadingEarlier
-                      ? lang === "en"
-                        ? "Loading…"
-                        : "加载中…"
-                      : lang === "en"
-                        ? "Load earlier"
-                        : "加载更早消息"}
+                </div>
+                {showJump ? (
+                  <button type="button" className="jump-latest" onClick={jumpToBottom}>
+                    <ArrowDown /> 回到最新
                   </button>
                 ) : null}
-                {rows.map((row) => {
-                  if (row.kind === "approval") {
-                    return (
-                      <div key={row.id} className="msg approval fade-in">
-                        <span className="who">{t("approve")}</span>
-                        <div className="bubble">
-                          {row.content}
-                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
-                            {(row.options ?? []).map((opt, i) => (
-                              <button
-                                key={`${row.id}-${i}`}
-                                type="button"
-                                className="btn primary mini"
-                                disabled={row.resolved}
-                                style={row.resolved ? { opacity: 0.45 } : undefined}
-                                onClick={() => resolveApproval(row, i)}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                          {row.resolved ? (
-                            <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-faint)" }}>
-                              已回应
-                            </div>
-                          ) : null}
-                        </div>
-                        <RowTime ts={row.ts} lang={lang} />
-                      </div>
-                    );
-                  }
-                  if (row.kind === "system") {
-                    return (
-                      <div key={row.id} className="msg system fade-in">
-                        <div className="bubble">{row.content}</div>
-                        <RowTime ts={row.ts} lang={lang} />
-                      </div>
-                    );
-                  }
-                  if (row.kind === "activity") {
-                    return (
-                      <div key={row.id} className="msg activity">
-                        <div className="bubble">{row.content}</div>
-                        <RowTime ts={row.ts} lang={lang} />
-                      </div>
-                    );
-                  }
-                  if (row.kind === "user") {
-                    return (
-                      <div key={row.id} className="msg user fade-in">
-                        <span className="who">you</span>
-                        <div className="bubble">{row.content}</div>
-                        <RowTime ts={row.ts} lang={lang} />
-                      </div>
-                    );
-                  }
-                  if (row.kind === "tool") {
-                    return (
-                      <div key={row.id} className="msg tool fade-in">
-                        <div className="bubble">{row.content}</div>
-                        <RowTime ts={row.ts} lang={lang} />
-                      </div>
-                    );
-                  }
-                  // assistant — full Markdown document (红线: never plain text).
-                  return (
-                    <div key={row.id} className="msg agent fade-in">
-                      <div className="bubble md">
-                        {row.content ? <Markdown content={row.content} /> : null}
-                        <OutboundAttachments
-                          project={session?.project}
-                          attachments={row.attachments}
-                        />
-                      </div>
-                      {(() => {
-                        // ONE footer line, no bubble header:
-                        // `HH:MM · claude · s12 · <model> · turn N · ctx N%` —
-                        // identity + model + metrics once, in the order the IM
-                        // status line uses (`render_status_line`), so the two
-                        // surfaces read the same. The ledger lives on the
-                        // session pages.
-                        const footer = formatTurnStatus(row.status);
-                        const model = row.status?.model || displayStatusModel;
-                        const tail = [vendor, sid, model, footer?.text]
-                          .filter((part): part is string => !!part)
-                          .join(" · ");
-                        return (
-                          <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
-                            <RowTime ts={row.ts} lang={lang} />
-                            {row.ts ? ` · ${tail}` : tail}
-                          </span>
-                        );
-                      })()}
-                    </div>
-                  );
-                })}
-                {busy ? (
-                  <div className="msg agent" aria-label="生成中" data-testid="streaming-cursor">
-                    <div className="bubble">
-                      <span className="cursor" />
-                      <BusyHeartbeat since={busySince} lastEventTs={lastEventTs} lang={lang} />
-                    </div>
-                  </div>
+                {inspectedStep ? (
+                  <StepInspector sid={sid} step={inspectedStep} lang={lang} onClose={closeInspector} />
                 ) : null}
               </div>
-            </div>
-            {showJump ? (
-              <button type="button" className="jump-latest" onClick={jumpToBottom}>
-                <ArrowDown /> 回到最新
-              </button>
-            ) : null}
-          </div>
 
-          <div className="conv-composer-wrap">
-            <div className="composer-group">
-              {scheduled.length > 0 ? (
-                <div className="scheduled-queue" data-testid="scheduled-queue">
-                  <div className="scheduled-head">
-                    <Clock />
-                    <span>{t("scheduleQueue")}</span>
-                  </div>
-                  {scheduled.map((item) => (
-                    <div key={item.id} className={`scheduled-row ${item.status}`}>
-                      <time
-                        dateTime={item.send_at}
-                        title={`${t("scheduleLocalTime")}: ${item.send_at}`}
-                      >
-                        {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
-                          month: "2-digit",
-                          day: "2-digit",
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </time>
-                      <span className="scheduled-preview" title={item.text}>
-                        {item.text.replace(/\s+/g, " ").trim().slice(0, 80)}
-                      </span>
-                      {item.status === "failed" ? (
-                        <span className="scheduled-error" title={item.fail_reason ?? ""}>
-                          {t("scheduleFailed")}
-                        </span>
-                      ) : null}
-                      <button
-                        type="button"
-                        aria-label={`${t("scheduleCancel")} ${item.id}`}
-                        title={`${t("scheduleCancel")} ${item.id}`}
-                        onClick={() => removeScheduled(item.id)}
-                      >
-                        <X />
-                      </button>
+              <div className="conv-composer-wrap">
+                <div className="composer-group">
+                  {scheduled.length > 0 ? (
+                    <div className="scheduled-queue" data-testid="scheduled-queue">
+                      <div className="scheduled-head">
+                        <Clock />
+                        <span>{t("scheduleQueue")}</span>
+                      </div>
+                      {scheduled.map((item) => (
+                        <div key={item.id} className={`scheduled-row ${item.status}`}>
+                          <time
+                            dateTime={item.send_at}
+                            title={`${t("scheduleLocalTime")}: ${item.send_at}`}
+                          >
+                            {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
+                              month: "2-digit",
+                              day: "2-digit",
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
+                          </time>
+                          <span className="scheduled-preview" title={item.text}>
+                            {item.text.replace(/\s+/g, " ").trim().slice(0, 80)}
+                          </span>
+                          {item.status === "failed" ? (
+                            <span className="scheduled-error" title={item.fail_reason ?? ""}>
+                              {t("scheduleFailed")}
+                            </span>
+                          ) : null}
+                          <button
+                            type="button"
+                            aria-label={`${t("scheduleCancel")} ${item.id}`}
+                            title={`${t("scheduleCancel")} ${item.id}`}
+                            onClick={() => removeScheduled(item.id)}
+                          >
+                            <X />
+                          </button>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  ) : null}
+                  <ChatComposer
+                    draftKey={sid}
+                    lang={lang}
+                    placeholderKey="convPh"
+                    busy={busy}
+                    onStop={interruptActive}
+                    onSend={submitText}
+                    draft={lockedDraft}
+                    onDraftChange={() => {}}
+                    locked
+                    modelLabel={displayStatusModel ?? ""}
+                    effortLabel={statusEffort ?? ""}
+                    uploadSlug={session?.project}
+                    onSchedule={scheduleText}
+                    scheduleTimezone={daemonTimezone}
+                  />
                 </div>
-              ) : null}
-              <ChatComposer
-                draftKey={sid}
-                lang={lang}
-                placeholderKey="convPh"
-                busy={busy}
-                onStop={interruptActive}
-                onSend={submitText}
-                draft={lockedDraft}
-                onDraftChange={() => {}}
-                locked
-                modelLabel={displayStatusModel ?? ""}
-                effortLabel={statusEffort ?? ""}
-                uploadSlug={session?.project}
-                onSchedule={scheduleText}
-                scheduleTimezone={daemonTimezone}
-              />
-            </div>
-          </div>
-        </>
-      )}
+              </div>
+            </>
+          )}
+        </div>
+        {ctxOpen ? (
+          <ContextPanel
+            sid={sid}
+            lang={lang}
+            onClose={closeContext}
+            refreshKey={latestTurnEndId}
+            focusOnMount={ctxOpenedByUser}
+          />
+        ) : null}
+      </div>
     </section>
   );
 }

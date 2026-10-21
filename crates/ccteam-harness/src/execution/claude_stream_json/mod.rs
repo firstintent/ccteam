@@ -28,11 +28,13 @@
 //! - **No terminal scraping**: there is no terminal — naturally satisfied.
 
 pub mod bridge;
+mod context;
 pub mod protocol;
 pub mod recovery;
 pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
+mod turn_gating;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -50,13 +52,13 @@ use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
-use crate::execution::session_status::{read_status_file, write_status_file};
+use crate::execution::session_status::{read_status_file, write_context_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, Directive,
-    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnobservedTurnCtx,
+    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, DetachedActivity,
+    Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting,
+    TurnSubmission, UnobservedTurnCtx,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -1182,6 +1184,15 @@ fn dead_ccteam_tool_face(sys: &protocol::SystemMsg) -> Option<String> {
 /// (the caller then falls back to the usage-sum + heuristic). Short timeout —
 /// it must never stall the status tap.
 async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)> {
+    get_context_breakdown(transport)
+        .await
+        .map(|b| (b.used_tokens, b.window_tokens))
+}
+
+/// The same `get_context_usage` answer, kept whole: what the window is made
+/// of (issue #21). One request serves both the statusline numbers and the
+/// context panel, so the panel costs claude nothing extra per turn.
+async fn get_context_breakdown(transport: &StreamJsonTransport) -> Option<crate::ContextBreakdown> {
     let body = transport
         .request_control("get_context_usage", json!({}), Duration::from_secs(3))
         .await
@@ -1189,13 +1200,7 @@ async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)
     if body.subtype != "success" {
         return None;
     }
-    let resp = body.response.as_ref()?;
-    let used = resp.get("totalTokens").and_then(|v| v.as_u64())?;
-    let window = resp
-        .get("maxTokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| resp.get("rawMaxTokens").and_then(|v| v.as_u64()))?;
-    Some((used, window))
+    context::parse_context_usage(body.response.as_ref()?, Utc::now())
 }
 
 /// `get_usage` control_request → ACCOUNT-level usage / rate-limits
@@ -1561,155 +1566,6 @@ pub fn persisted_session_model(project_dir: &Path, sid: &str) -> Option<String> 
         })
 }
 
-/// Read at most the trailing `max_bytes` of a file as a UTF-8 string (lossy).
-/// Bounds a `goal_status` scan so a huge transcript can't stall the statusline;
-/// a partial first line (when we seek mid-file) just fails to parse and is
-/// skipped by the caller.
-fn read_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len > max_bytes {
-        f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// What the transcript says about the session's turn GATING: the goal it is
-/// working toward, and how often a Stop hook has refused to let its turn end.
-/// Read together because they come from ONE file read of the same tail — and
-/// because they are one answer: a goal whose condition is not met yet is
-/// exactly what keeps refusing (GitHub #206).
-struct TurnGating {
-    goal: Option<crate::GoalStatus>,
-    /// Refusals inside [`STOP_HOOK_RECENT_WINDOW`].
-    stop_hook_blocks: u32,
-}
-
-/// How far back a Stop-hook refusal still counts as describing the session's
-/// state NOW. The transcript has no turn-boundary marker to bound the scan
-/// with, and an all-time count would keep accusing a session whose hook was
-/// removed hours ago — a wall-clock window is the honest bound a reader can
-/// also state out loud ("N times in the last hour").
-const STOP_HOOK_RECENT_WINDOW: chrono::Duration = chrono::Duration::hours(1);
-
-/// The marker Claude writes for a Stop hook that denied a stop. Verified
-/// against a real transcript (2026-09-11, `excore`): one record per refusal,
-/// `{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook
-/// feedback:…"}}`.
-const STOP_HOOK_MARKER: &str = "Stop hook feedback";
-
-/// The session's current `/goal` + Stop-hook refusals, read from the Claude
-/// transcript. Claude writes the active goal as a `{type:"attachment",
-/// attachment:{type: "goal_status", condition, met}}` record on the user turn —
-/// it is NOT on the stream-json stdout stream and has no control_request (both
-/// verified by live probe), so the only read path is the transcript jsonl (the
-/// same file the TUI adapter tails — reading it is the blessed path, not
-/// terminal scraping). `None` when the transcript is absent or unreadable,
-/// which is what makes "cannot tell" distinguishable from "nothing refused".
-fn read_turn_gating(cwd: &Path, uuid: &str) -> Option<TurnGating> {
-    let path = anthropic_project_dir(cwd)?.join(format!("{uuid}.jsonl"));
-    let body = read_transcript_tail(&path, 8 * 1024 * 1024)?;
-    Some(TurnGating {
-        goal: parse_latest_goal_status(&body),
-        stop_hook_blocks: count_recent_stop_hook_blocks(&body, chrono::Utc::now()),
-    })
-}
-
-/// Count the Stop-hook refusals in the last [`STOP_HOOK_RECENT_WINDOW`].
-///
-/// Same cost discipline as [`parse_latest_goal_status`]: scan from the END,
-/// `contains` pre-filter before any parse, and stop at the first refusal older
-/// than the window (the transcript is append-ordered, so everything before it
-/// is older still). A refusal with no readable timestamp is counted — it is a
-/// refusal that happened; only a DATED one can be ruled out of the window.
-fn count_recent_stop_hook_blocks(body: &str, now: chrono::DateTime<chrono::Utc>) -> u32 {
-    let floor = now - STOP_HOOK_RECENT_WINDOW;
-    let mut blocks = 0u32;
-    for line in body.lines().rev() {
-        if !line.contains(STOP_HOOK_MARKER) {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        // The marker has to be the message's OWN text, not a quotation of it
-        // inside some other record (an assistant explaining the hook, a tool
-        // result echoing the transcript).
-        let text = v
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default();
-        if !text.trim_start().starts_with(STOP_HOOK_MARKER) {
-            continue;
-        }
-        let dated = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| t.with_timezone(&chrono::Utc));
-        if dated.is_some_and(|at| at < floor) {
-            break;
-        }
-        blocks = blocks.saturating_add(1);
-    }
-    blocks
-}
-
-/// Scan transcript jsonl lines for the LAST `goal_status` attachment. A later
-/// `/goal clear` (or an empty condition) resets it to `None`. Pure (no fs) so
-/// it is unit-testable; `read_turn_gating` wraps it with the file read.
-///
-/// COST DISCIPLINE (2026-08-02): the tail handed here is up to 8 MB and this
-/// runs on every statusline read — per live session on the team graph, so a
-/// naive full parse is tens of millions of JSON parses per page refresh. Two
-/// properties keep it cheap without changing the answer:
-/// - scan from the END and return the first hit (the LAST record — identical
-///   result, but an active goal is found within a few lines);
-/// - `contains` pre-filter before `serde_json` (a goal record is rare, and
-///   substring scanning is orders of magnitude cheaper than parsing).
-fn parse_latest_goal_status(body: &str) -> Option<crate::GoalStatus> {
-    for line in body.lines().rev() {
-        // Cheap reject: only lines that literally mention the marker can match.
-        if !line.contains("goal_status") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(att) = v.get("attachment") else {
-            continue;
-        };
-        if att.get("type").and_then(|t| t.as_str()) != Some("goal_status") {
-            continue;
-        }
-        let condition = att
-            .get("condition")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        let met = att.get("met").and_then(|m| m.as_bool()).unwrap_or(false);
-        // A cleared goal carries an empty condition → no active goal. This is
-        // the LAST record, so it decides on its own — nothing earlier can
-        // revive a cleared goal.
-        return if condition.trim().is_empty() {
-            None
-        } else {
-            // Claude's goal has no state axis beyond `met` — its "why is this
-            // goal not advancing" fact is `stop_hook_blocks`.
-            Some(crate::GoalStatus {
-                condition,
-                met,
-                state: None,
-            })
-        };
-    }
-    None
-}
-
 /// Translate one outbound message and forward its events to the stream's
 /// channel. `Err(())` means the consumer dropped the stream (stop).
 async fn forward(
@@ -1736,10 +1592,20 @@ async fn refresh_context_after_turn(
     project_dir: &Path,
     sid: &str,
 ) {
-    let real = get_context_usage(transport).await;
+    let breakdown = get_context_breakdown(transport).await;
+    // The turn-end breakdown doubles as the session's context snapshot, so a
+    // released session can still show what its window held (and `/compact`,
+    // a turn like any other, refreshes it).
+    if let Some(b) = &breakdown {
+        write_context_file(project_dir, sid, b);
+    }
     let snapshot = if let Ok(mut s) = status.lock() {
-        s.context = real.map(|(used, window)| {
-            crate::ContextUsage::known(used, window, crate::ContextSource::Derived)
+        s.context = breakdown.map(|b| {
+            crate::ContextUsage::known(
+                b.used_tokens,
+                b.window_tokens,
+                crate::ContextSource::Derived,
+            )
         });
         let is_1m = matches!(&s.context, Some(c) if c.window_tokens >= 1_000_000);
         if is_1m {
@@ -1855,7 +1721,16 @@ impl ClaudeStreamJsonAdapter {
                 );
             }
         }
-        Self::init_transport(transport).await
+        let init = Self::init_transport(transport).await;
+        if init.is_err() {
+            // The failed handshake already killed the child: a record left
+            // behind would read as a body that exited unobserved, and the
+            // next spawn would post-mortem a turn that never ran.
+            if let Some((project_dir, sid)) = body {
+                crate::execution::session_body::clear(project_dir, sid);
+            }
+        }
+        init
     }
 
     /// v0.9.0 W3 (F3, tech-design §0.4/§4.3) — the remote counterpart of
@@ -1992,15 +1867,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 "Claude has no session-mode axis (DSH agent presets only today)",
             ));
         }
-        // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
-        // bot-token getUpdates poll structurally collides with ccteam's IM
-        // gateway). Same managed layer the tmux path uses; only this one
-        // plugin. A remote project's daemon-side `project_dir` is a DATA
-        // HOME, not a vendor working tree: never materialize `.claude/`
-        // there; the satellite's real working tree owns its settings.
-        if ctx.remote.is_none() {
-            crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
-        }
+        // The official Telegram plugin is pinned off through `--settings` in
+        // `spawn_spec::build_argv` — no project settings file is written
+        // (docs-local issue #212).
         let bin = spawn_spec::claude_bin();
         // §七 ⑤ — stable per-(slug,sid) uuid: the stateless resume key.
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);
@@ -2053,11 +1922,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         };
         let env = spawn_spec::build_env(&spec.role, &ctx.slug, &ctx.secret, &ctx.sid);
 
-        // Try the resume spawn first when a prior transcript exists (or,
-        // remote, optimistically); on failure fall back to a fresh
-        // `--session-id` spawn and emit a chat_session_reset with an
-        // explicit reason (the honest context-loss signal — never silently
-        // synthesize). The transport-building step differs (local child vs
+        // Resume when a prior transcript exists (or, remote, optimistically).
+        // Remote: a failed resume falls back to a fresh `--session-id` spawn
+        // and emits a chat_session_reset with an explicit reason (the honest
+        // context-loss signal — never silently synthesize). Local: NO
+        // fallback — see the local arm. The transport-building step differs (local child vs
         // `ccteam-exec.v1` WS bridge — tech-design §0.4: execution location
         // is a transport parameter); everything after this `match` is
         // identical for both.
@@ -2091,31 +1960,30 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             }
         } else {
             let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
-            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body).await {
-                Ok(ok) => ok,
-                Err(resume_err) if resume => {
+            // `resume` here means the transcript `<uuid>.jsonl` is on disk, and
+            // claude refuses `--session-id <uuid>` for an existing transcript
+            // ("Session ID … is already in use", exit 1): a fresh fallback on
+            // the same uuid can never start, so it only turned one failed
+            // resume into a second, misleading failure. Surface the resume
+            // failure itself. Nothing sticks: the transcript is untouched and
+            // the next message tries `--resume` again (docs-local issue #211).
+            Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body)
+                .await
+                .map_err(|err| {
+                    if !resume {
+                        return err;
+                    }
                     tracing::warn!(
                         sid = %ctx.sid,
                         slug = %ctx.slug,
-                        error = %resume_err,
-                        "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
+                        error = %err,
+                        "claude-stream-json: --resume spawn failed; the transcript is kept and the next message retries it"
                     );
-                    let fresh =
-                        Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd, body).await?;
-                    if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
-                        let ev = build_chat_session_reset_event_with_reason(
-                            &spec.role,
-                            &ctx.sid,
-                            "resume_failed_fallback_to_fresh",
-                        );
-                        if let Err(err) = append_event(&progress_path, &ev) {
-                            tracing::warn!(error = %err, "claude-stream-json: append reset event failed");
-                        }
-                    }
-                    fresh
-                }
-                Err(e) => return Err(e),
-            }
+                    HarnessError::SpawnFailed(format!(
+                        "claude --resume {uuid} failed: {err}. The conversation is intact on \
+                         disk; the next resume retries it"
+                    ))
+                })?
         };
 
         let identity = SessionIdentity {
@@ -2692,6 +2560,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         .flatten()
     }
 
+    async fn detached_activity(&self, ctx: &UnobservedTurnCtx) -> Option<DetachedActivity> {
+        if ctx.vendor_uuid.is_empty() {
+            return None;
+        }
+        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        tokio::task::spawn_blocking(move || recovery::activity(&path, std::time::SystemTime::now()))
+            .await
+            .ok()
+            .flatten()
+    }
+
     async fn handle_directive(
         &self,
         h: &ThreadHandle,
@@ -2964,8 +2843,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // (probed) — read the current one from the transcript (cwd + the vendor
         // uuid name the file). Overrides any goal from a persisted snapshot.
         //
-        // OFF THE RUNTIME (2026-08-02): this is SYNC fs — it seeks and reads up
-        // to 8 MB, then scans it. Doing that inside an `async fn` parks a Tokio
+        // OFF THE RUNTIME (2026-08-02): this is SYNC fs — the first read of a
+        // transcript scans up to 8 MB (later reads only what was appended, see
+        // `turn_gating`). Doing that inside an `async fn` parks a Tokio
         // worker thread, and this call is fanned out per live session by the
         // team graph, so enough live sessions starve the runtime and EVERY
         // endpoint the daemon serves (plus every vendor event pump) stalls
@@ -2973,7 +2853,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // it belongs.
         if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
             let (cwd, uuid) = (PathBuf::from(cwd), h.identity.clone());
-            let gating = tokio::task::spawn_blocking(move || read_turn_gating(&cwd, &uuid))
+            let gating = tokio::task::spawn_blocking(move || turn_gating::read(&cwd, &uuid))
                 .await
                 .unwrap_or(None);
             status.goal = gating.as_ref().and_then(|gating| gating.goal.clone());
@@ -2988,6 +2868,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // on any ONE live claude session to build the `/status` header.
         let live = self.lookup(&h.identity)?;
         get_account_usage(&live.transport).await
+    }
+
+    async fn context_breakdown(&self, h: &ThreadHandle) -> Option<crate::ContextBreakdown> {
+        let live = self.lookup(&h.identity)?;
+        get_context_breakdown(&live.transport).await
     }
 
     async fn running_tasks(&self, h: &ThreadHandle) -> Vec<crate::RunningTask> {
@@ -3515,10 +3400,10 @@ mod account_usage_tests {
 mod effort_tests {
     use super::protocol::{McpServerStatus, SystemMsg};
     use super::{
-        claude_model_options, count_recent_stop_hook_blocks, dead_ccteam_tool_face,
-        is_model_placeholder, normalize_effort, parse_latest_goal_status, persisted_session_model,
-        preserve_1m_tag, reflect_task_event, set_effort_level, split_model_effort,
-        task_outlives_turn, write_status_file, ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
+        claude_model_options, dead_ccteam_tool_face, is_model_placeholder, normalize_effort,
+        persisted_session_model, preserve_1m_tag, reflect_task_event, set_effort_level,
+        split_model_effort, task_outlives_turn, write_status_file, ClaudeModelOption, TaskTracker,
+        EFFORT_LEVELS,
     };
     use crate::ThreadStatus;
     use std::sync::Mutex;
@@ -3857,73 +3742,6 @@ mod effort_tests {
             tasks.lock().unwrap().tasks.is_empty(),
             "task_updated killed must evict"
         );
-    }
-
-    #[test]
-    fn parse_latest_goal_status_takes_the_last_record_and_honors_clear() {
-        // No goal record → None.
-        assert!(parse_latest_goal_status(r#"{"type":"user"}"#).is_none());
-        // One active goal.
-        let one = r#"{"type":"assistant"}
-{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship payments"}}"#;
-        let g = parse_latest_goal_status(one).unwrap();
-        assert_eq!(g.condition, "ship payments");
-        assert!(!g.met);
-        // The LAST record wins (met flips true).
-        let two = format!(
-            "{one}\n{}",
-            r#"{"type":"attachment","attachment":{"type":"goal_status","met":true,"condition":"ship payments"}}"#
-        );
-        assert!(parse_latest_goal_status(&two).unwrap().met);
-        // A trailing clear (empty condition) → no active goal.
-        let cleared = format!(
-            "{one}\n{}",
-            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":""}}"#
-        );
-        assert!(parse_latest_goal_status(&cleared).is_none());
-        // Half-flushed / non-JSON lines are skipped, not fatal.
-        assert!(parse_latest_goal_status("{partial\n{\"x\":1}").is_none());
-    }
-
-    /// GitHub #206 (P2) — a `/goal` Stop hook that refuses every stop is why a
-    /// session can be silent for hours, and the transcript records each
-    /// refusal. Count the recent ones so `/status` can say so; a refusal from
-    /// a hook that is long gone must not keep accusing the session.
-    #[test]
-    fn stop_hook_refusals_are_counted_within_the_recent_window() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-11T05:08:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let refusal = |ts: &str| {
-            format!(
-                r#"{{"type":"user","isMeta":true,"timestamp":"{ts}","message":{{"role":"user","content":"Stop hook feedback:\n[keep going]"}}}}"#
-            )
-        };
-        // Nothing to count.
-        assert_eq!(count_recent_stop_hook_blocks("", now), 0);
-        assert_eq!(
-            count_recent_stop_hook_blocks(r#"{"type":"assistant"}"#, now),
-            0
-        );
-        // Two refusals inside the window, one hours old → the old one stops
-        // the scan instead of inflating the count.
-        let body = [
-            refusal("2026-09-10T17:29:00Z"),
-            r#"{"type":"assistant"}"#.to_string(),
-            refusal("2026-09-11T04:24:00Z"),
-            // The millisecond form a real transcript writes (probed
-            // 2026-09-11: 123 refusals in `excore`'s live session).
-            refusal("2026-09-11T05:07:30.470Z"),
-        ]
-        .join("\n");
-        assert_eq!(count_recent_stop_hook_blocks(&body, now), 2);
-        // A quotation of the marker is not a refusal — only a message whose
-        // OWN text is the hook's feedback counts.
-        let quoted = r#"{"type":"assistant","timestamp":"2026-09-11T05:07:40Z","message":{"role":"assistant","content":"the Stop hook feedback says to keep going"}}"#;
-        assert_eq!(count_recent_stop_hook_blocks(quoted, now), 0);
-        // An undated refusal happened; only a DATED one can be ruled out.
-        let undated = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\nnot yet"}}"#;
-        assert_eq!(count_recent_stop_hook_blocks(undated, now), 1);
     }
 
     #[test]

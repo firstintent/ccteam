@@ -875,9 +875,14 @@ fn translate_command_execution_status_camelcase_folds_to_snake() {
     let e = translate_notification(&n, "t-1").unwrap();
     match e {
         ThreadEvent::ItemStarted { item } => match item.details {
-            ccteam_harness::ThreadItemDetails::CommandExecution { cmd, status } => {
+            ccteam_harness::ThreadItemDetails::CommandExecution {
+                cmd,
+                status,
+                output,
+            } => {
                 assert_eq!(cmd, "cargo test");
                 assert_eq!(status, "in_progress", "camelCase status must fold to snake");
+                assert_eq!(output, None, "a running command has no output yet");
             }
             other => panic!("expected CommandExecution, got {other:?}"),
         },

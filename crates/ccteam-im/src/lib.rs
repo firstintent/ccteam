@@ -74,6 +74,7 @@ pub mod router;
 pub mod sanitize;
 pub mod scheduled;
 mod session_catalog;
+pub mod supervise;
 pub mod three_layer_sec;
 pub mod transport;
 /// Wire shape for vendor-account usage, shared by the MCP `status` body and

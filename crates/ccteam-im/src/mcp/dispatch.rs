@@ -2445,8 +2445,7 @@ async fn pre_agent_policy_gate(
             children: facts.children,
             delegated: facts.delegated,
             cost_24h_usd: facts.projection.as_ref().and_then(|projection| {
-                (!facts.slug.is_empty())
-                    .then(|| projection.project_snapshot(&facts.slug).cost.cost_24h_usd)
+                (!facts.slug.is_empty()).then(|| projection.cost_summary(&facts.slug).cost_24h_usd)
             }),
         },
     }
@@ -4065,6 +4064,10 @@ async fn finish_dispatch_wait(
     let answer_turn_id = record
         .map(|turn| turn.turn_id.as_str())
         .unwrap_or(&receipt.turn_id);
+    let answered: Vec<crate::delegation::AnsweredRequest<'_>> = request_id
+        .map(|id| crate::delegation::AnsweredRequest { id, title: None })
+        .into_iter()
+        .collect();
     DelegationSummary {
         sid: child_sid,
         vendor: &vendor,
@@ -4085,11 +4088,10 @@ async fn finish_dispatch_wait(
             .map(|turn| turn.assistant.as_str())
             .unwrap_or_default(),
         conclusion: record.and_then(|turn| turn.conclusion.as_deref()),
-        request_id,
         // The header of an inline result names the task the caller is holding;
         // it asked for this one by id, so the label adds nothing and the queue
         // count belongs to the push path.
-        title: None,
+        requests: &answered,
         remaining_queued: 0,
     }
     .inline_result()
@@ -4785,10 +4787,8 @@ async fn read_wait_for_turn_boundary(
 
 /// The turn_id of the newest row in a session's durable mirror.
 fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<String> {
-    ccteam_harness::execution::turns_mirror::read_all_turns(&resolved.project_dir, &resolved.sid)
-        .ok()?
-        .pop()
-        .map(|turn| turn.turn_id)
+    ccteam_harness::execution::turns_mirror::digest(&resolved.project_dir, &resolved.sid)?
+        .last_turn_id
 }
 
 /// Wait (briefly, bounded) for the notifier to record which of `waiting_on`

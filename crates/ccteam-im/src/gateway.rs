@@ -884,6 +884,11 @@ pub struct Gateway {
     post_mortem_pending: Vec<(String, String, PathBuf, SessionBody)>,
     /// Wakes the body watcher early (a new detached sid, a post-mortem).
     body_watch_notify: Arc<tokio::sync::Notify>,
+    /// The end of each detached body ccteam is carrying out, keyed by sid:
+    /// in progress, done (with what it left running) or failed. A std mutex
+    /// so a kill task without the gateway can hand its result over; the
+    /// watcher waits for that hand-over before it reports or rebuilds.
+    body_ends: Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
     projects: BTreeMap<String, PathBuf>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
@@ -959,6 +964,11 @@ pub struct Gateway {
     next_scheduled: u64,
     /// Durable scheduled rows indexed by globally unique short id.
     scheduled_items: BTreeMap<String, ScheduledEntry>,
+    /// Scheduled ids whose fire has begun in this daemon life. An id stays
+    /// here until its row is completed or failed, so a fire that panicked
+    /// between delivery and bookkeeping is never sent again on the next
+    /// pass (at most once per daemon life; a restart re-reads the store).
+    scheduled_firing: HashSet<String>,
     /// Wakes the lightweight next-fire timer after create/cancel/GC.
     scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
@@ -971,6 +981,11 @@ pub struct Gateway {
     /// is wired or on the standalone path. The pump tees through
     /// [`GatewayEventSink`]; the held sender is the source for new receivers.
     events_broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// Set once the daemon begins a clean stop, before it aborts the
+    /// delivery consumer: a pump's last send then meets a closed sink, which
+    /// is expected and logged quietly instead of as a delivery outage.
+    /// Shared with every [`GatewayEventSink`] this gateway hands out.
+    event_delivery_closing: Arc<std::sync::atomic::AtomicBool>,
     event_pumps: BTreeMap<String, tokio::task::JoinHandle<()>>,
     /// Outstanding choice prompts (v0.8.5 D3/D4/D6). Its own lock — held
     /// separately from the gateway so a long External await (D6, W2) never
@@ -1262,13 +1277,24 @@ struct DelegationProgressRecord {
     reason: Option<String>,
 }
 
-/// One resolved request and the notification turn (if any) it earns.
+/// One resolved request, and whether a notification carries it.
 struct DelegationDelivery {
     request: ccteam_harness::DelegationRequest,
-    /// `None` = `notify:off`, or a parent already blocking on this exact
+    /// `false` = `notify:off`, or a parent already blocking on this exact
     /// request inline (it is about to hold the answer; a pushed copy would
     /// cost it a whole extra turn of context).
-    notification: Option<String>,
+    notified: bool,
+}
+
+/// The ONE completion turn a parent receives for a boundary: the turn's answer
+/// once, naming every request of that parent it settles. A turn has one
+/// answer however many lines were steered into it, so it is told once
+/// (F-GOV-233: sixteen steers into one turn came back as sixteen identical
+/// notifications).
+struct ParentNotification {
+    parent_sid: String,
+    request_ids: Vec<String>,
+    text: String,
 }
 
 struct DelegationDeliveryPlan {
@@ -1280,6 +1306,8 @@ struct DelegationDeliveryPlan {
     /// Every request this boundary resolves — each with its OWN parent, notify
     /// mode and title. A turn can answer several (injected steers share one).
     deliveries: Vec<DelegationDelivery>,
+    /// What is actually sent: one turn per parent that is owed one.
+    notifications: Vec<ParentNotification>,
     emitter: DelegationProgressEmitter,
 }
 
@@ -1515,8 +1543,11 @@ fn stranded_boundary_signals(
             // because it was killed (issue #197 E). The request
             // bound to it is already terminal, so this is the second
             // of two independent guards — the row itself says no.
+            // A row with no text still ends its turn when it carries the
+            // turn's status: the closing row of a turn that said nothing
+            // (F-GOV-233) or whose text went out mid-turn (#209).
             t.outcome.as_deref() != Some(INTERRUPTED_OUTCOME)
-                && !t.assistant.is_empty()
+                && (!t.assistant.is_empty() || t.status.is_some())
                 && !store.notified_turns.iter().any(|n| n == &t.turn_id)
         })
         .cloned()
@@ -2089,6 +2120,11 @@ pub struct SessionActivity {
     pub status: ActivityStatus,
     /// Adapter item id — lets the web dedup/merge a start↔complete pair.
     pub item_id: String,
+    /// The step's id in `chat/<sid>/steps.jsonl` — what the web inspector
+    /// fetches its full input / output / reasoning by. Unique across the
+    /// session's life (item ids restart every turn); recorded once the step
+    /// finishes, so a running step's id does not resolve yet.
+    pub step_id: String,
 }
 
 /// The category of one [`SessionActivity`] step.
@@ -2279,6 +2315,8 @@ struct GatewayEventSink {
     mpsc: tokio::sync::mpsc::UnboundedSender<GatewayEvent>,
     /// Fan-out for per-session SSE subscribers.
     broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+    /// The gateway's [`Gateway::close_event_delivery`] flag.
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GatewayEventSink {
@@ -2290,7 +2328,7 @@ impl GatewayEventSink {
         // Broadcast first (cheap clone); a `SendError` here just means no SSE
         // subscriber is attached, which is normal.
         let _ = self.broadcast.send(event.clone());
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// Send a delivery-only event to the daemon egress without publishing it
@@ -2298,7 +2336,7 @@ impl GatewayEventSink {
     /// original sid-keyed Answer already feeds SSE, while the duplicate is a
     /// phone notification only.
     fn send_delivery_only(&self, event: GatewayEvent) -> bool {
-        self.mpsc.send(event).is_ok()
+        self.deliver(event)
     }
 
     /// v0.10.1 — publish to the SSE fan-out (web console + the inline-wait
@@ -2307,8 +2345,45 @@ impl GatewayEventSink {
     /// pump-liveness signal as [`Self::send`] (the mpsc being closed is still
     /// "the daemon exited"), so a caller's `if !send { break }` is unchanged.
     fn send_broadcast_only(&self, event: GatewayEvent) -> bool {
+        let live = !self.mpsc.is_closed();
+        if !live {
+            self.log_consumer_gone(&event);
+        }
         let _ = self.broadcast.send(event);
-        !self.mpsc.is_closed()
+        live
+    }
+
+    /// The mpsc leg shared by every send shape. A closed mpsc is the pump's
+    /// stop signal, and every pump stops on it, so it is logged HERE (once
+    /// per stopping pump, every send site covered): outside daemon shutdown
+    /// it means no session's reply reaches IM/web/turns any more (issue #210:
+    /// the consumer died during ENOSPC and every pump stopped silently).
+    fn deliver(&self, event: GatewayEvent) -> bool {
+        match self.mpsc.send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::SendError(event)) => {
+                self.log_consumer_gone(&event);
+                false
+            }
+        }
+    }
+
+    fn log_consumer_gone(&self, event: &GatewayEvent) {
+        let sid = event.sid.as_deref().unwrap_or("-");
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!(
+                sid,
+                event_id = %event.id,
+                "ccteam-im: delivery closed for shutdown; stopping this session's event pump"
+            );
+            return;
+        }
+        tracing::error!(
+            sid,
+            event_id = %event.id,
+            channel = %event.channel,
+            "ccteam-im: gateway event consumer is gone; stopping this session's event pump"
+        );
     }
 }
 
@@ -2335,6 +2410,11 @@ pub struct HitlPromptContext {
     /// `chat_permission_prompt_outstanding` operator-visibility line.
     /// `None` when the gateway was never given project paths (unit tests).
     pub progress_path: Option<PathBuf>,
+    /// The owning project's slug. Stamped on the prompt event so the
+    /// project-filtered fleet stream (`/api/v1/agents/events`) shows it to
+    /// everyone who can see the project — an unattributed frame reaches the
+    /// operator only, so a tenant never saw its own approval prompts there.
+    pub slug: String,
 }
 
 /// A live session's delivery route ([`Gateway::reply_target_for`]): the
@@ -2588,6 +2668,24 @@ pub struct DetachedBody {
     pub since: chrono::DateTime<chrono::Utc>,
     /// `daemon_restart` today (found alive at startup / first touch).
     pub reason: &'static str,
+    /// Set while ccteam is ending this body's process, and why: `stopping`
+    /// (a user stop — the watcher leaves it to the stop), `interrupted` (a
+    /// user `/interrupt`) or `ended_idle` / `ended_stalled` (a queued turn was waiting on a
+    /// body gone idle or stalled). The watcher records the exit under it.
+    pub ending: Option<&'static str>,
+}
+
+/// Where ccteam's end of one detached body stands (see `Gateway::body_ends`).
+#[derive(Debug, Clone)]
+enum BodyEnd {
+    /// The kill is running; nothing about this body may be reported yet.
+    /// `token` names this kill, so only it writes the outcome; `since` lets a
+    /// hand-over that never comes (its task gone) age into `Failed`.
+    InProgress { token: u64, since: Instant },
+    /// The body is gone; what it left running, for the report.
+    Ended(Vec<session_body::Orphan>),
+    /// The kill failed; the mark must be lifted and the body watched again.
+    Failed,
 }
 
 impl DetachedBody {
@@ -3578,6 +3676,7 @@ impl Gateway {
             detached: BTreeMap::new(),
             post_mortem_pending: Vec::new(),
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
+            body_ends: Arc::new(std::sync::Mutex::new(HashMap::new())),
             projects,
             operator_chats: BTreeMap::new(),
             button_channels: BTreeSet::new(),
@@ -3596,9 +3695,11 @@ impl Gateway {
             next_session: 0,
             next_scheduled: 0,
             scheduled_items: BTreeMap::new(),
+            scheduled_firing: HashSet::new(),
             scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
+            event_delivery_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_pumps: BTreeMap::new(),
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
@@ -3666,11 +3767,20 @@ impl Gateway {
         self.event_sink = Some(GatewayEventSink {
             mpsc: tx,
             broadcast: self.events_broadcast.clone(),
+            closing: Arc::clone(&self.event_delivery_closing),
         });
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// The flag the daemon raises when it begins a clean stop, before it
+    /// aborts the delivery consumer: from then on a closed delivery sink is
+    /// shutdown, not an outage, so pumps that stop on it log at debug. Handed
+    /// out so the daemon can raise it without taking the gateway lock.
+    pub fn event_delivery_closing(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.event_delivery_closing)
     }
 
     /// v0.9.0 W2 (F2) — wire the sender the detached event pumps use to signal a
@@ -4295,6 +4405,7 @@ impl Gateway {
             body,
             since: chrono::Utc::now(),
             reason,
+            ending: None,
         };
         tracing::info!(
             session = %sid,
@@ -4443,6 +4554,11 @@ impl Gateway {
         let Some(detached) = self.detached.remove(sid) else {
             return Ok(false);
         };
+        // What an earlier end of this body left running belongs to the
+        // incarnation the stop ends; never report it for a later one.
+        if let Ok(mut map) = self.body_ends.lock() {
+            map.remove(sid);
+        }
         self.principals.forget(sid);
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
@@ -4467,6 +4583,248 @@ impl Gateway {
         self.persist_routing()?;
         tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
         Ok(true)
+    }
+
+    /// An EXPLICIT user `/interrupt` of a detached body: end the PROCESS, keep
+    /// the SESSION. Returns `Ok(true)` when `sid` was detached (its process is
+    /// now being ended); `Ok(false)` when `sid` was not detached.
+    ///
+    /// The `&mut` door (IM commands, buttons) cannot drop the gateway lock, so
+    /// the kill runs on its own task and wakes the watcher when done; nothing
+    /// waits on it under the lock. The REST door awaits it off the lock
+    /// instead ([`Self::end_detached_body_shared`]).
+    pub(crate) fn end_detached_body(&mut self, sid: &str) -> bool {
+        self.settle_body_ends();
+        let Some(detached) = self.detached.get_mut(sid) else {
+            return false;
+        };
+        if detached.ending.is_some() {
+            return true;
+        }
+        detached.ending = Some("interrupted");
+        let body = detached.body.clone();
+        let sid_owned = sid.to_string();
+        let notify = Arc::clone(&self.body_watch_notify);
+        let ends = Arc::clone(&self.body_ends);
+        let token = Self::start_body_end(&ends, sid);
+        tokio::spawn(async move {
+            // A failure is handed over as `Failed`: the next reader lifts the
+            // mark, or every later /interrupt would be a no-op and a natural
+            // exit would be recorded as interrupted.
+            if let Err(error) =
+                Self::end_body_process(body, sid_owned.clone(), "interrupted", ends, token).await
+            {
+                tracing::warn!(session = %sid_owned, %error, "ccteam-im: could not end a detached body on interrupt");
+            }
+            notify.notify_one();
+        });
+        tracing::info!(session = %sid, "ccteam-im: ending a detached body on user interrupt; it resumes by sid");
+        true
+    }
+
+    async fn body_end_in_progress(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) -> bool {
+        let g = gateway.lock().await;
+        g.body_ends
+            .lock()
+            .map(|map| matches!(map.get(sid), Some(BodyEnd::InProgress { .. })))
+            .unwrap_or(false)
+    }
+
+    /// How long a kill may stay `InProgress` before its hand-over is treated
+    /// as lost (a kill takes at most the SIGTERM grace plus the SIGKILL wait).
+    const BODY_END_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Mark a kill of `sid`'s body as started; returns its token.
+    fn start_body_end(ends: &Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>, sid: &str) -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self::set_body_end(
+            ends,
+            sid,
+            BodyEnd::InProgress {
+                token,
+                since: Instant::now(),
+            },
+        );
+        token
+    }
+
+    fn set_body_end(
+        ends: &Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
+        sid: &str,
+        end: BodyEnd,
+    ) {
+        if let Ok(mut map) = ends.lock() {
+            map.insert(sid.to_string(), end);
+        }
+    }
+
+    /// Lift the mark of every body whose end FAILED (handed over by a kill
+    /// task), so it is watched — and interruptible — again. Called by every
+    /// reader of the mark before it trusts it.
+    fn settle_body_ends(&mut self) {
+        let failed: Vec<String> = match self.body_ends.lock() {
+            Ok(mut map) => {
+                let failed: Vec<String> = map
+                    .iter()
+                    .filter(|(_, end)| match end {
+                        BodyEnd::Failed => true,
+                        // A hand-over that never came is a failed end.
+                        BodyEnd::InProgress { since, .. } => {
+                            since.elapsed() >= Self::BODY_END_STALE
+                        }
+                        BodyEnd::Ended(_) => false,
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                for sid in &failed {
+                    map.remove(sid);
+                }
+                failed
+            }
+            Err(_) => return,
+        };
+        for sid in failed {
+            if let Some(detached) = self.detached.get_mut(&sid) {
+                if detached.ending != Some("stopping") {
+                    detached.ending = None;
+                }
+            }
+        }
+    }
+
+    /// How long a body is given to exit on SIGTERM before its group is
+    /// SIGKILLed (an explicit stop).
+    const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// End one detached body off the lock: a stop ends its whole group
+    /// ([`session_body::terminate`]); anything that keeps the session ends
+    /// only the process ([`session_body::kill_body`]). The caller has set the
+    /// sid's entry in `ends` to `InProgress`; this hands the outcome over in
+    /// the same entry — `Ended` with what it left running, or `Failed`.
+    async fn end_body_process(
+        body: SessionBody,
+        sid: String,
+        why: &'static str,
+        ends: Arc<std::sync::Mutex<HashMap<String, BodyEnd>>>,
+        token: u64,
+    ) -> Result<()> {
+        let outcome = Self::run_body_end(body, &sid, why).await;
+        // Only this kill's own entry: a stale or superseded kill must not
+        // leave a result for a later incarnation of the sid.
+        if let Ok(mut map) = ends.lock() {
+            if matches!(map.get(&sid), Some(BodyEnd::InProgress { token: t, .. }) if *t == token) {
+                map.insert(
+                    sid.clone(),
+                    match &outcome {
+                        Ok(left) => BodyEnd::Ended(left.clone()),
+                        Err(_) => BodyEnd::Failed,
+                    },
+                );
+            }
+        }
+        outcome.map(|_| ())
+    }
+
+    async fn run_body_end(
+        body: SessionBody,
+        sid: &str,
+        why: &'static str,
+    ) -> Result<Vec<session_body::Orphan>> {
+        let pid = body.pid;
+        #[cfg(test)]
+        if tests::FAIL_BODY_END_PIDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&pid)
+        {
+            return Err(anyhow!("test: ending body pid {pid} failed"));
+        }
+        #[cfg(test)]
+        if tests::SLOW_BODY_END_PIDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&pid)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let sid_for_task = sid.to_string();
+        let left = tokio::task::spawn_blocking(move || {
+            if why == "stopping" {
+                session_body::terminate(&body, &sid_for_task, Self::TERMINATE_GRACE)
+                    .map(|gone| gone.then(Vec::new))
+            } else {
+                session_body::kill_body(&body, &sid_for_task)
+            }
+        })
+        .await
+        .context("join body end")??;
+        left.ok_or_else(|| anyhow!("{sid}'s process (pid {pid}) is still alive after SIGKILL"))
+    }
+
+    /// End a detached body's process OFF the gateway lock, marking the entry
+    /// with `why` first (see [`DetachedBody::ending`]). `Ok(false)` when `sid`
+    /// is not detached, or when another end already owns it; `Err` when the
+    /// process outlived the kill (the mark is cleared and the body stays
+    /// watched).
+    ///
+    /// An existing mark is never overwritten, except by a stop: the watcher
+    /// decides off the lock, so it can reach here after a user's `/stop` (or
+    /// `/interrupt`) already marked the body, and relabelling that end would
+    /// let the watcher rebuild a session the user just stopped.
+    pub async fn end_detached_body_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        why: &'static str,
+    ) -> Result<bool> {
+        let (body, ends, token) = {
+            let mut g = gateway.lock().await;
+            g.settle_body_ends();
+            let ends = Arc::clone(&g.body_ends);
+            let Some(detached) = g.detached.get_mut(sid) else {
+                return Ok(false);
+            };
+            match detached.ending {
+                None => {}
+                Some(current) if why == "stopping" && current != "stopping" => {}
+                Some(_) => return Ok(false),
+            }
+            detached.ending = Some(why);
+            let body = detached.body.clone();
+            let token = Self::start_body_end(&ends, sid);
+            (body, ends, token)
+        };
+        // The kill and its hand-over run on their own task: a caller that
+        // goes away mid-kill (a web client disconnecting drops this future)
+        // must not leave the hand-over unwritten and the sid stuck.
+        let ended = tokio::spawn(Self::end_body_process(
+            body,
+            sid.to_string(),
+            why,
+            ends,
+            token,
+        ))
+        .await
+        .unwrap_or_else(|join| Err(anyhow!("body end task failed: {join}")));
+        let mut g = gateway.lock().await;
+        if ended.is_err() {
+            g.settle_body_ends();
+        }
+        g.body_watch_notify.notify_one();
+        ended.map(|()| true)
+    }
+
+    /// `/interrupt` for a caller holding the shared handle (the REST route):
+    /// a detached body is ended off the lock and its error is reported as it
+    /// is; a live session is interrupted as [`Self::interrupt_session`] does.
+    pub async fn interrupt_session_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<()> {
+        if Self::end_detached_body_shared(gateway, sid, "interrupted").await? {
+            return Ok(());
+        }
+        gateway.lock().await.interrupt_session(sid).await
     }
 
     /// Queue a turn behind a detached body (the session is not driveable
@@ -4500,9 +4858,12 @@ impl Gateway {
         let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
         let since = detached.since.to_rfc3339();
         let receipt = format!(
-            "⏳ {sid} is still finishing a turn that started before ccteam restarted \
-             (body pid {}, unobserved since {}). Your message is queued (#{queued}) and will be \
-             delivered as soon as that turn ends; `/stop` ends it now.",
+            "⏳ {sid}'s process from before ccteam restarted is still running (body pid {}, \
+             unobserved since {}): a turn it was finishing, or background tasks it started. Your \
+             message is queued (#{queued}). Once that process has gone quiet ccteam ends it \
+             and resumes {sid} on the same context with your message; background processes \
+             it started keep running and are listed then. `/interrupt {sid}` does that now; \
+             `/stop {sid}` ends the session and that process with its background processes.",
             detached.body.pid, since
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
@@ -4535,21 +4896,135 @@ impl Gateway {
     pub async fn body_watch_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) {
         let (detached, post_mortems) = {
             let mut g = gateway.lock().await;
+            g.settle_body_ends();
             (
                 g.detached.values().cloned().collect::<Vec<_>>(),
                 std::mem::take(&mut g.post_mortem_pending),
             )
         };
+        // Each body under its own containment: the batch was taken off the
+        // gateway, so one panicking post-mortem must not drop the rest of it.
         for (sid, slug, cwd, body) in post_mortems {
-            Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited").await;
+            crate::supervise::contain_panic(
+                "body watcher",
+                &sid,
+                Self::recover_and_report_shared(
+                    gateway,
+                    &sid,
+                    &slug,
+                    &cwd,
+                    body.pid,
+                    "exited",
+                    &[],
+                ),
+            )
+            .await;
         }
         for d in detached {
-            // Off the lock: a pure OS probe.
-            if session_body::body_is_alive(&d.body, &d.sid) {
-                continue;
-            }
-            Self::on_detached_body_exited_shared(gateway, d).await;
+            let sid = d.sid.clone();
+            crate::supervise::contain_panic("body watcher", &sid, async {
+                // A stop owns its body's end.
+                if d.ending == Some("stopping") {
+                    return;
+                }
+                // A kill ccteam is carrying out has not handed over yet: what
+                // it left running must be in the report, so wait for it.
+                if Self::body_end_in_progress(gateway, &d.sid).await {
+                    return;
+                }
+                // Off the lock: a pure OS probe.
+                if session_body::body_is_alive(&d.body, &d.sid) {
+                    // An interrupt still being carried out does not suspend the
+                    // bound: if that kill failed, the bound is what still ends it.
+                    let Some(bound) = Self::detached_wait_bound(gateway, &d).await else {
+                        return;
+                    };
+                    tracing::info!(session = %d.sid, pid = d.body.pid, bound, "ccteam-im: ending a detached body a queued turn is waiting on; resuming by sid");
+                    match Self::end_detached_body_shared(gateway, &d.sid, bound).await {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(error) => {
+                            tracing::warn!(session = %d.sid, pid = d.body.pid, %error, "ccteam-im: could not end a detached body; still waiting for it");
+                            return;
+                        }
+                    }
+                }
+                let reason = d.ending.unwrap_or("exited");
+                let reason = {
+                    // The mark may have been set after the snapshot.
+                    let g = gateway.lock().await;
+                    g.detached
+                        .get(&d.sid)
+                        .and_then(|current| current.ending)
+                        .unwrap_or(reason)
+                };
+                if reason == "stopping" {
+                    return;
+                }
+                Self::on_detached_body_exited_shared(gateway, d, reason).await;
+            })
+            .await;
         }
+    }
+
+    /// How long a detached body's record must stay silent, with its last turn
+    /// ended, before a queued turn stops waiting for it.
+    const DETACHED_IDLE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long a detached body's record may stay silent with a turn still
+    /// open before a queued turn stops waiting for it. Long on purpose: a
+    /// foreground tool call writes nothing until it returns (claude's Bash tool
+    /// caps a call at 10 minutes), and a subagent's writes are counted too.
+    const DETACHED_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// The bound on waiting behind a detached body. `Some(reason)` when the
+    /// watcher should end the body's process now so the queued turns reach
+    /// the same sid; `None` to keep waiting.
+    ///
+    /// Policy (docs-local issue #211): only a turn queued for the sid ends the
+    /// wait — a body nobody is waiting on is left alone (its background work,
+    /// say a job scheduled for later, runs to its end). Then:
+    /// - `ended_idle`: the vendor record says the last turn ended and it has been
+    ///   silent for [`Self::DETACHED_IDLE_QUIET`]. The process is alive only for
+    ///   background tasks; it can never take the queued turn itself.
+    /// - `ended_stalled`: a turn is still open but the record has been silent for
+    ///   [`Self::DETACHED_STALL`] (or, with no readable record, the body has
+    ///   been detached that long).
+    ///
+    /// A body that is mid-turn and still writing keeps today's wait: it will
+    /// finish and exit. Ending the process is not ending the session (AGENTS.md
+    /// §三): sid, ledger and focus routes stay, and the queued turns are
+    /// delivered on the same context.
+    async fn detached_wait_bound(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        d: &DetachedBody,
+    ) -> Option<&'static str> {
+        if crate::pending_turns::pending_turn_count(&d.cwd, &d.sid) == 0 {
+            return None;
+        }
+        let meta = ccteam_harness::read_session_meta(&d.cwd, &d.sid).ok()?;
+        let adapter = {
+            let g = gateway.lock().await;
+            (g.adapter_factory)(meta.vendor, meta.protocol)
+        };
+        let activity = adapter
+            .detached_activity(&UnobservedTurnCtx {
+                sid: d.sid.clone(),
+                slug: d.slug.clone(),
+                cwd: d.cwd.clone(),
+                vendor_uuid: meta.vendor_uuid.clone(),
+                observed_until: chrono::Utc::now(),
+                last_observed_assistant: None,
+            })
+            .await;
+        let quiet_for = match activity {
+            Some(a) if a.turn_ended && a.quiet_for >= Self::DETACHED_IDLE_QUIET => {
+                return Some("ended_idle")
+            }
+            Some(a) => a.quiet_for,
+            None => (chrono::Utc::now() - d.since).to_std().unwrap_or_default(),
+        };
+        (quiet_for >= Self::DETACHED_STALL).then_some("ended_stalled")
     }
 
     /// A detached body exited on its own: forget it, recover + report what it
@@ -4557,19 +5032,77 @@ impl Gateway {
     async fn on_detached_body_exited_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         d: DetachedBody,
+        reason: &str,
     ) {
-        {
+        let mut orphans = {
             let mut g = gateway.lock().await;
+            // A user stop that marked the body after the watcher read its
+            // mark owns the end from here.
+            if g.detached.get(&d.sid).and_then(|current| current.ending) == Some("stopping") {
+                return;
+            }
+            // Take the kill's hand-over in the same breath as the entry; a
+            // kill that has not handed over yet is waited for (next tick).
+            let end = match g.body_ends.lock() {
+                Ok(mut map) => match map.get(&d.sid) {
+                    Some(BodyEnd::InProgress { .. }) => return,
+                    _ => map.remove(&d.sid),
+                },
+                Err(_) => None,
+            };
             if g.detached.remove(&d.sid).is_none() {
                 // Stopped by a user between the snapshot and now.
                 return;
             }
             session_body::clear(&d.cwd, &d.sid);
-        }
+            match end {
+                Some(BodyEnd::Ended(left)) => left,
+                _ => Vec::new(),
+            }
+        };
         tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
-        Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
-            .await;
-        Self::rebuild_one_shared(gateway, &d.sid).await;
+        // Re-verify by start time: a pid reused since the kill is not ours.
+        orphans.retain(session_body::Orphan::still_running);
+        Self::recover_and_report_shared(
+            gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, reason, &orphans,
+        )
+        .await;
+        if !orphans.is_empty() {
+            // The user's work outlived the process ccteam ended: say where
+            // it is, so a port it holds is not a mystery to anyone.
+            let g = gateway.lock().await;
+            if let Ok(meta) = ccteam_harness::read_session_meta(&d.cwd, &d.sid) {
+                let reply_to = g.owner_reply_target_for_meta(&d.slug, &meta);
+                let list = orphans
+                    .iter()
+                    .map(|o| format!("pid {} `{}`", o.pid, o.cmd))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sid = &d.sid;
+                g.emit_user_signal(GatewayEvent {
+                    interim: false,
+                    id: format!(
+                        "gateway-orphans-{sid}-{}",
+                        chrono::Utc::now().timestamp_millis()
+                    ),
+                    channel: reply_to.channel.clone(),
+                    chat_id: reply_to.chat_id.clone(),
+                    thread_ts: reply_to.thread.clone(),
+                    content: format!(
+                        "ℹ️ {sid}'s old process was ended; what it started is still running, \
+                         unattended: {list}. ccteam does not stop these — the resumed {sid} \
+                         does not know about them."
+                    ),
+                    kind: GatewayEventKind::Answer,
+                    attachments: Vec::new(),
+                    options: Vec::new(),
+                    status: None,
+                    sid: Some(sid.clone()),
+                    slug: Some(d.slug.clone()),
+                });
+            }
+        }
+        let failure = Self::rebuild_one_shared(gateway, &d.sid).await;
         let mut g = gateway.lock().await;
         if g.sessions.contains_key(&d.sid) {
             g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
@@ -4577,7 +5110,135 @@ impl Gateway {
                 tracing::warn!(%error, "ccteam-im: persist routing after body exit failed");
             }
             g.drain_and_dispatch_pending_turns(&d.sid).await;
+        } else if let Some(error) = failure {
+            // The process is gone but the session did not come back: whoever
+            // was promised it would must hear why. A human's queued turns stay
+            // in the FIFO and go out, in order, ahead of the next message that
+            // reaches this sid (see `submit_resolved`). A delegated task is
+            // withdrawn instead and its parent told so below: the parent's own
+            // retry is then the only run of it, never a second, late one.
+            let withdrawn = crate::pending_turns::withdraw_delegated_turns(&d.cwd, &d.sid)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(session = %d.sid, %error, "pending_turns: could not withdraw delegated tasks");
+                    Vec::new()
+                });
+            let queued = crate::pending_turns::pending_turn_count(&d.cwd, &d.sid);
+            let Ok(meta) = ccteam_harness::read_session_meta(&d.cwd, &d.sid) else {
+                return;
+            };
+            let reply_to = g.owner_reply_target_for_meta(&d.slug, &meta);
+            let sid = &d.sid;
+            g.emit_user_signal(GatewayEvent {
+                interim: false,
+                id: format!(
+                    "gateway-resume-failed-{sid}-{}",
+                    chrono::Utc::now().timestamp_millis()
+                ),
+                channel: reply_to.channel.clone(),
+                chat_id: reply_to.chat_id.clone(),
+                thread_ts: reply_to.thread.clone(),
+                content: format!(
+                    "⚠️ {sid}'s old process has ended, but {sid} could not be resumed: {error}. \
+                     {queued} queued message(s) are kept and go out ahead of the next message \
+                     to {sid} once a resume succeeds; if it keeps failing, `/new` starts a \
+                     fresh session."
+                ),
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                status: None,
+                sid: Some(sid.clone()),
+                slug: Some(d.slug.clone()),
+            });
+            // A delegation parent waiting on a task queued here would wait
+            // forever: answer it through the normal completion path, as an
+            // honest failure. Its task line was withdrawn above.
+            let answer = (
+                withdrawn,
+                meta.vendor,
+                meta.host.clone(),
+                meta.turn_count,
+                error,
+            );
+            drop(g);
+            let (withdrawn, vendor, host, turn, error) = answer;
+            Self::answer_withdrawn_requests(gateway, &d.sid, withdrawn, vendor, host, turn, &error)
+                .await;
         }
+    }
+
+    /// Answer the parents of delegated tasks that were withdrawn because
+    /// `sid` could not be resumed: a terminal failure each parent receives
+    /// through the ordinary completion path — bound to a turn of its own, so
+    /// the delivery is matched by identity, durable, deduplicated across a
+    /// restart, and submitted to the parent the way any completion is (a live
+    /// parent is steered, a released one gets the pending FIFO and a resume).
+    async fn answer_withdrawn_requests(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        request_ids: Vec<String>,
+        vendor: AgentVendor,
+        host: String,
+        turn: u64,
+        error: &str,
+    ) {
+        if request_ids.is_empty() {
+            return;
+        }
+        let exec_turn_id = format!(
+            "{sid}-resume-failed-{}",
+            chrono::Utc::now().timestamp_millis()
+        );
+        {
+            let claim = Self::claim_delegation_store(gateway, sid).await;
+            let bound = {
+                let mut g = gateway.lock().await;
+                let Some(mirror) = g.delegations.get_mut(sid) else {
+                    return;
+                };
+                let mut bound = 0;
+                for request_id in &request_ids {
+                    if let Some(request) = mirror.store.get_mut(request_id) {
+                        if !request.state.is_terminal() {
+                            request.turn_id = Some(exec_turn_id.clone());
+                            request.state = ccteam_harness::RequestState::Submitted;
+                            bound += 1;
+                        }
+                    }
+                }
+                bound
+            };
+            if bound == 0 {
+                return;
+            }
+            if let Err(error) = Self::persist_delegation_store(gateway, &claim).await {
+                tracing::warn!(session = %sid, %error, "ccteam-im: withdrawn tasks' binding is not durable; a restart re-reads them as outstanding");
+            }
+        }
+        Self::deliver_delegation_signal_shared(
+            Arc::clone(gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: sid.to_string(),
+                turn_id: exec_turn_id.clone(),
+                exec_turn_id: Some(exec_turn_id.clone()),
+                tail: format!(
+                    "{sid} could not be resumed after its old process ended: {error}. \
+                     The task was withdrawn and did not run; send it again to retry."
+                ),
+                vendor,
+                host,
+                boundary: true,
+                continuation: ccteam_harness::TurnContinuation::Settled,
+                vendor_error: true,
+                interim_notes: 0,
+                covered_turns: vec![exec_turn_id],
+                context_pct: None,
+                turn,
+                error_kind: Some("resume_failed".to_string()),
+                conclusion: None,
+            },
+        )
+        .await;
     }
 
     /// Recover what `sid`'s body said while unobserved (vendor record via the
@@ -4593,7 +5254,18 @@ impl Gateway {
         cwd: &Path,
         pid: u32,
         reason: &str,
+        orphans: &[session_body::Orphan],
     ) -> bool {
+        let exited_event = |recovered: bool| {
+            let mut event =
+                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
+                    sid, slug, reason, pid, recovered,
+                );
+            if !orphans.is_empty() {
+                event["orphans"] = serde_json::json!(orphans);
+            }
+            event
+        };
         // IO off the lock: the mirror tells us where observation stopped.
         let turns =
             ccteam_harness::execution::turns_mirror::read_all_turns(cwd, sid).unwrap_or_default();
@@ -4644,12 +5316,7 @@ impl Gateway {
             // Nothing ran unobserved (an idle body) — nothing to report, and
             // the lifecycle row still closes the detached window.
             let g = gateway.lock().await;
-            g.append_progress_event(
-                slug,
-                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
-                    sid, slug, reason, pid, false,
-                ),
-            );
+            g.append_progress_event(slug, exited_event(false));
             return false;
         }
         let now = chrono::Utc::now();
@@ -4676,18 +5343,31 @@ impl Gateway {
                     continues_exec_turn: None,
                 },
                 format!(
-                    "↩️ {sid} finished this turn while ccteam was restarting; its answer was \
-                     recovered from the vendor's own record:\n\n{}",
+                    "↩️ {sid} {}; its answer was recovered from the vendor's own record:\n\n{}",
+                    unobserved_end_phrase(reason),
                     turn.assistant
                 ),
                 false,
             ),
             None => {
-                let note = format!(
-                    "⚠️ {sid}'s turn ended while ccteam was restarting and its answer could not \
-                     be recovered (the vendor keeps no record ccteam may read). The session's \
-                     own context is intact — send a follow-up and it will report what it did."
-                );
+                let note = match reason {
+                    "interrupted" | "ended_idle" | "ended_stalled" => format!(
+                        "⚠️ {sid}'s process from before ccteam restarted was ended ({}) before \
+                         its answer could be recovered. The session's own context is intact — \
+                         it resumes now; ask it what it did.",
+                        if reason == "interrupted" {
+                            "by /interrupt"
+                        } else {
+                            "a message was waiting and it had gone quiet"
+                        }
+                    ),
+                    _ => format!(
+                        "⚠️ {sid}'s turn ended while ccteam was restarting and its answer could \
+                         not be recovered (the vendor keeps no record ccteam may read). The \
+                         session's own context is intact — send a follow-up and it will report \
+                         what it did."
+                    ),
+                };
                 (
                     note.clone(),
                     ccteam_harness::execution::turns_mirror::TurnRecord {
@@ -4745,16 +5425,7 @@ impl Gateway {
             if let Err(error) = g.persist_session_meta(cwd, &meta) {
                 tracing::warn!(session = %sid, %error, "ccteam-im: failed to persist meta after recovery");
             }
-            g.append_progress_event(
-                slug,
-                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
-                    sid,
-                    slug,
-                    reason,
-                    pid,
-                    recovered.is_some(),
-                ),
-            );
+            g.append_progress_event(slug, exited_event(recovered.is_some()));
             g.emit_user_signal(GatewayEvent {
                 interim: false,
                 id: format!("gateway-recovered-{turn_id}"),
@@ -4809,40 +5480,41 @@ impl Gateway {
     /// A typed detached refusal is an info (the watcher keeps it); anything
     /// else warns. Boot no longer calls this: see
     /// [`Self::reconcile_restored_sessions`] for why a restart spawns nothing.
-    async fn rebuild_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
+    async fn rebuild_one_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Option<String> {
         let plan_and_reply = {
             let mut g = gateway.lock().await;
             if g.sessions.contains_key(sid) {
-                None
+                return None;
             } else {
                 match g.find_meta_for_sid(sid) {
                     Ok((slug, cwd, meta)) => {
                         let reply_to = g.owner_reply_target_for_meta(&slug, &meta);
                         match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
-                            Ok(plan) => Some((plan, reply_to)),
+                            Ok(plan) => (plan, reply_to),
                             Err(err) if is_body_detached_error(&err) => {
                                 tracing::info!(
                                     session = %sid,
                                     "ccteam-im: restore deferred; the session's body from before the restart is still running (watched, not duplicated)"
                                 );
-                                None
+                                return None;
                             }
                             Err(err) => {
                                 tracing::warn!(session = %sid, error = %err, "ccteam-im: restore skipped; project host binding changed");
-                                None
+                                return Some(format!("{err:#}"));
                             }
                         }
                     }
                     Err(_) => {
                         tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
-                        None
+                        return Some("its meta.json is missing".to_string());
                     }
                 }
             }
         };
-        let Some((plan, reply_to)) = plan_and_reply else {
-            return;
-        };
+        let (plan, reply_to) = plan_and_reply;
         // Spawn OUTSIDE the lock — the slow part.
         match Self::spawn_for_plan(&plan).await {
             Ok(thread) => {
@@ -4853,7 +5525,9 @@ impl Gateway {
                     .await
                 {
                     tracing::warn!(session = %sid, error = %err, "ccteam-im: stale restored session discarded");
+                    return Some(format!("{err:#}"));
                 }
+                None
             }
             Err(err) => {
                 let sid_owned = plan.sid.clone();
@@ -4863,6 +5537,7 @@ impl Gateway {
                     error = %err,
                     "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
                 );
+                Some(format!("{err:#}"))
             }
         }
     }
@@ -5629,15 +6304,20 @@ impl Gateway {
                 };
                 // Own-only ACL — identical to /stop (a chat can interrupt only
                 // its own / the shared web-pool session).
-                let accessible = self
-                    .sessions
-                    .get(&sid)
-                    .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or(false);
+                let detached = self.is_session_detached(&sid);
+                let accessible = match self.sessions.get(&sid) {
+                    Some(s) => self.chat_can_access(chat, s),
+                    None => detached && self.chat_can_access_sid(chat, &sid),
+                };
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
                 self.interrupt_session(&sid).await?;
+                if detached {
+                    return Ok(Some(format!(
+                        "正在结束 {sid} 重启前遗留的进程(它启动的后台进程继续运行,结束后会列出);{sid} 随后按原上下文恢复,排队的消息接着送达"
+                    )));
+                }
                 Ok(Some(format!(
                     "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
                 )))
@@ -7706,27 +8386,29 @@ impl Gateway {
             // state machine below rebuilds it whenever a stream ends.
             let attachment = session.adapter.event_attachment();
             let mut events = session.adapter.events(&session.thread);
-            let mut seq: u64 = project_dir
+            let digest = project_dir
                 .as_ref()
-                .and_then(|dir| {
-                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
-                })
-                .map(|turns| last_answer_seq(&session_id, &turns))
-                .unwrap_or(0);
-            let mut vendor_turn: u64 = project_dir
-                .as_ref()
-                .and_then(|dir| {
-                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
-                })
-                .map(|turns| {
-                    turns
-                        .iter()
-                        .filter(|turn| !turn.user.is_empty())
-                        .count()
-                        .saturating_sub(1) as u64
-                })
-                .unwrap_or(0); // boundary re-read accounts for a row already appended
+                .and_then(|dir| ccteam_harness::execution::turns_mirror::digest(dir, &session_id))
+                .unwrap_or_default();
+            let mut seq: u64 = digest.max_answer_seq;
+            // boundary re-read accounts for a row already appended
+            let mut vendor_turn: u64 = digest.user_turns.saturating_sub(1);
             let mut epoch: u64 = 0; // status epoch → one per turn
+                                    // Step ids must stay unique across pump lives (`epoch` and the
+                                    // adapters' item ids both restart), since `steps.jsonl` outlives
+                                    // them: one nonce per pump.
+            let step_nonce = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            // The current turn's step inputs by item id (a completion may not
+            // repeat its call's input) and the steps already recorded.
+            let mut step_turn: u64 = 0;
+            let mut step_inputs: HashMap<String, String> = HashMap::new();
+            let mut steps_recorded: HashMap<String, usize> = HashMap::new();
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
             let mut last_emit: Option<Instant> = None;
@@ -8588,15 +9270,12 @@ impl Gateway {
                             let durable = project_dir
                                 .as_ref()
                                 .and_then(|dir| {
-                                    ccteam_harness::execution::turns_mirror::read_all_turns(
+                                    ccteam_harness::execution::turns_mirror::digest(
                                         dir,
                                         &session_id,
                                     )
-                                    .ok()
                                 })
-                                .map(|turns| {
-                                    turns.iter().filter(|turn| turn.status.is_some()).count() as u64
-                                })
+                                .map(|digest| digest.status_turns)
                                 .unwrap_or(completed_turns);
                             completed_turns = durable.max(completed_turns).saturating_add(1);
                             vendor_turn = completed_turns;
@@ -8701,7 +9380,22 @@ impl Gateway {
                             // turn count (status-bearing rows) came up short.
                             // Empty `assistant`: it says nothing new, and every
                             // reader of answers already skips such a row.
-                            if released_mid_turn {
+                            //
+                            // A turn that ended having said NOTHING at all (a
+                            // "no reply needed" line acknowledged silently) gets
+                            // the same row: it is the durable fact that the turn
+                            // ended, the boundary any request bound to it is
+                            // settled by — live and after a restart alike.
+                            // Without it such a request sat `executing` for good
+                            // (F-GOV-233). Only a SETTLED end: a boundary the
+                            // vendor will continue past answers nothing yet.
+                            let silent_end = matches!(
+                                &evt,
+                                ThreadEvent::TurnCompleted { continuation, .. }
+                                    if continuation.is_settled()
+                            ) && turn_last_answer.is_none()
+                                && turn_said.is_empty();
+                            if released_mid_turn || silent_end {
                                 if let Some(dir) = project_dir.as_ref() {
                                     seq = seq.saturating_add(1);
                                     let record = ccteam_harness::execution::turns_mirror::TurnRecord {
@@ -8729,16 +9423,27 @@ impl Gateway {
                                             _ => None,
                                         },
                                     };
-                                    if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                    match ccteam_harness::execution::turns_mirror::append_turn(
                                         dir,
                                         &session_id,
                                         &record,
                                     ) {
-                                        tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
-                                        );
+                                        // The silent turn's row IS its answer: the
+                                        // boundary below names it, and only once it
+                                        // is on disk (append → notify).
+                                        Ok(_) if silent_end => {
+                                            turn_covered.push(record.turn_id.clone());
+                                            turn_last_answer =
+                                                Some((record.turn_id.clone(), String::new()));
+                                        }
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                session = %session_id,
+                                                error = %err,
+                                                "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9319,7 +10024,22 @@ impl Gateway {
                             // update / complete), independent of whether the
                             // fold bucketed it — both fire. IM drops it (strict
                             // no-op arm); web renders activity cards.
-                            if let Some(activity) = crate::progress::activity_for(&evt) {
+                            if let Some(mut activity) = crate::progress::activity_for(&evt) {
+                                if step_turn != epoch {
+                                    step_turn = epoch;
+                                    step_inputs.clear();
+                                    steps_recorded.clear();
+                                }
+                                activity.step_id =
+                                    format!("{step_nonce}-{epoch}-{}", activity.item_id);
+                                record_finished_step(
+                                    project_dir.as_deref(),
+                                    &session_id,
+                                    &evt,
+                                    &activity,
+                                    &mut step_inputs,
+                                    &mut steps_recorded,
+                                );
                                 if !emit_activity(&tx, &session, &session_id, epoch, activity) {
                                     break;
                                 }
@@ -10059,6 +10779,7 @@ impl Gateway {
             .filter(|entry| {
                 entry.item.status == crate::scheduled::ScheduledStatus::Pending
                     && entry.item.send_at <= now
+                    && !self.scheduled_firing.contains(&entry.item.id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -10071,11 +10792,24 @@ impl Gateway {
                 );
                 continue;
             }
-            let result = self.submit_scheduled_user_turn(&entry.item).await;
+            // In flight BEFORE the submit: whatever happens after this point,
+            // the row is not picked up again by a later pass.
+            self.scheduled_firing.insert(entry.item.id.clone());
+            // One poison row must cost that row, not every later due row (a
+            // panic escaping here would restart the scheduler on the same
+            // sorted batch, forever).
+            let result = crate::supervise::contain_panic(
+                "scheduled scheduler",
+                &entry.item.id,
+                self.submit_scheduled_user_turn(&entry.item),
+            )
+            .await;
             match result {
-                Ok(()) => self.complete_scheduled_fire(&entry),
-                Err(err) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+                Some(Ok(())) => self.complete_scheduled_fire(&entry),
+                Some(Err(err)) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+                None => self.fail_scheduled(&entry.item.id, "panicked while firing".to_string()),
             }
+            self.scheduled_firing.remove(&entry.item.id);
         }
     }
 
@@ -10773,35 +11507,44 @@ impl Gateway {
                 )?;
                 return Ok(SubmitResult::Queued { receipt, id });
             }
-            return Err(err);
+            return Err(undelivered_after_resume_failure(session_id, err));
         }
         // v0.8.24 F5 — if the child is not live (starting/resuming/dead),
         // enqueue the user text (FIFO, file-backed) and revive; drain after
         // live so turns are not lost. Gateway remains the sole turns writer
         // (drain re-enters submit_resolved once live). Callers get the real
         // drained turn id when resume+submit succeeds.
+        //
+        // The same FIFO also holds lines that queued earlier and are still
+        // undelivered — behind a body from before a restart whose session
+        // then failed to come back. Every path that brings a session back
+        // ends here before the new line is submitted, so a backlog always
+        // goes out first and in order (docs-local issue #211).
         let not_live = match self.sessions.get(session_id) {
             Some(s) => !s.adapter.thread_is_live(&s.thread),
             None => {
                 return Err(anyhow!("current session missing: {session_id}"));
             }
         };
-        if not_live {
-            let (project, channel) = {
-                let s = self
-                    .sessions
-                    .get(session_id)
-                    .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        let (project, channel) = {
+            let s = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+            (s.project.clone(), chat.channel.clone())
+        };
+        let cwd = self
+            .projects
+            .get(&project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+        let backlog = crate::pending_turns::pending_turn_count(&cwd, session_id) > 0;
+        if not_live || backlog {
+            if let Some(s) = self.sessions.get(session_id) {
                 if let Ok(mut target) = s.reply_to.lock() {
                     *target = chat.clone();
                 }
-                (s.project.clone(), chat.channel.clone())
-            };
-            let cwd = self
-                .projects
-                .get(&project)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+            }
             // No request identity on this path by construction: it is the
             // IM / web / notifier submit, and it drains within this same call —
             // the line never outlives it the way a detached-body queue does.
@@ -10814,7 +11557,18 @@ impl Gateway {
                 intent.pending(),
                 None,
             )?;
-            self.resume_dead_session(session_id).await?;
+            if not_live {
+                if let Err(err) = self.resume_dead_session(session_id).await {
+                    // Not delivered: take this line back so "send it again"
+                    // cannot deliver it twice. An older backlog stays queued.
+                    if let Err(error) =
+                        crate::pending_turns::withdraw_last_pending_turn(&cwd, session_id, &payload)
+                    {
+                        tracing::warn!(sid = %session_id, %error, "pending_turns: could not withdraw an undelivered line");
+                    }
+                    return Err(undelivered_after_resume_failure(session_id, err));
+                }
+            }
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
             let id = drained_ids
                 .into_iter()
@@ -13907,6 +14661,7 @@ impl Gateway {
             thread_ts,
             role: session.role.clone(),
             progress_path,
+            slug: session.project.clone(),
         })
     }
 
@@ -14486,30 +15241,38 @@ impl Gateway {
         }
         let mut released = Vec::new();
         for row in ripe {
-            // Off the lock: the vendor's own answer to "is background work
-            // still running here".
-            if row
-                .adapter
-                .running_tasks(&row.thread)
-                .await
-                .iter()
-                .any(|task| task.outlives_turn())
-            {
-                continue;
-            }
-            match Self::release_session_shared(
-                gateway,
-                &row.sid,
-                row.generation,
-                ReleaseReason::Idle,
-            )
-            .await
-            {
-                Ok(true) => released.push(row.sid.clone()),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+            // Per session: one release that panics must not skip every
+            // session after it on every pass.
+            let freed = crate::supervise::contain_panic("idle-release sweeper", &row.sid, async {
+                // Off the lock: the vendor's own answer to "is background work
+                // still running here".
+                if row
+                    .adapter
+                    .running_tasks(&row.thread)
+                    .await
+                    .iter()
+                    .any(|task| task.outlives_turn())
+                {
+                    return false;
                 }
+                match Self::release_session_shared(
+                    gateway,
+                    &row.sid,
+                    row.generation,
+                    ReleaseReason::Idle,
+                )
+                .await
+                {
+                    Ok(released) => released,
+                    Err(error) => {
+                        tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                        false
+                    }
+                }
+            })
+            .await;
+            if freed == Some(true) {
+                released.push(row.sid.clone());
             }
         }
         released
@@ -14602,8 +15365,7 @@ impl Gateway {
             .as_ref()
             .map(|projection| {
                 projection
-                    .project_snapshot(slug)
-                    .cost
+                    .cost_summary(slug)
                     .cost_24h_by_vendor
                     .get(crate::delegation::vendor_key(vendor))
                     .copied()
@@ -16064,18 +16826,46 @@ impl Gateway {
                 "ccteam-im: redelivering a completion a previous life never finished"
             );
         }
+        // Per request: is it carried by a notification at all?
         let mut deliveries = Vec::new();
         for request in resolved {
             let claimed_inline = mirror.wait_claimed(&request);
             if claimed_inline {
                 mirror.suppressed.insert(request.request_id.clone());
             }
-            // The excerpt cap comes from the REQUEST's own mode: `brief` wakes
-            // the parent at the same boundary as `final`, with a quarter of
-            // the text.
-            let excerpt_cap = crate::delegation::notification_answer_max_chars(request.notify);
-            let notification = (request.notify != NotifyMode::Off && !claimed_inline).then(|| {
-                crate::delegation::build_notification_text_with_outcome(
+            let notified = request.notify != NotifyMode::Off && !claimed_inline;
+            deliveries.push(DelegationDelivery { request, notified });
+        }
+        // Per parent: ONE notification naming every carried request, in
+        // dispatch order. The excerpt cap is the widest any of them asked for
+        // (`final` over `brief`): the parent reads the answer once.
+        let mut parents: Vec<&str> = Vec::new();
+        for delivery in deliveries.iter().filter(|d| d.notified) {
+            if !parents.contains(&delivery.request.parent_sid.as_str()) {
+                parents.push(&delivery.request.parent_sid);
+            }
+        }
+        let notifications = parents
+            .into_iter()
+            .map(|parent| {
+                let carried: Vec<&ccteam_harness::DelegationRequest> = deliveries
+                    .iter()
+                    .filter(|d| d.notified && d.request.parent_sid == parent)
+                    .map(|d| &d.request)
+                    .collect();
+                let answered: Vec<crate::delegation::AnsweredRequest<'_>> = carried
+                    .iter()
+                    .map(|request| crate::delegation::AnsweredRequest {
+                        id: &request.request_id,
+                        title: request.title.as_deref(),
+                    })
+                    .collect();
+                let excerpt_cap = carried
+                    .iter()
+                    .map(|request| crate::delegation::notification_answer_max_chars(request.notify))
+                    .max()
+                    .unwrap_or(crate::delegation::NOTIFICATION_ANSWER_MAX_CHARS);
+                let text = crate::delegation::build_notification_text_with_outcome(
                     &crate::delegation::DelegationSummary {
                         sid: &signal.child_sid,
                         vendor: vendor_str(signal.vendor),
@@ -16093,24 +16883,25 @@ impl Gateway {
                         cost_usd: None,
                         answer: &signal.tail,
                         conclusion: signal.conclusion.as_deref(),
-                        request_id: Some(&request.request_id),
-                        title: request.title.as_deref(),
+                        requests: &answered,
                         remaining_queued,
                     },
                     excerpt_cap,
-                )
-            });
-            deliveries.push(DelegationDelivery {
-                request,
-                notification,
-            });
-        }
+                );
+                ParentNotification {
+                    parent_sid: parent.to_string(),
+                    request_ids: carried.iter().map(|r| r.request_id.clone()).collect(),
+                    text,
+                }
+            })
+            .collect();
         Some(DelegationDeliveryPlan {
             signal,
             generation,
             dedup_key,
             slug,
             deliveries,
+            notifications,
             emitter,
         })
     }
@@ -16348,41 +17139,47 @@ impl Gateway {
                 .await;
         }
         let mut failed: Vec<String> = Vec::new();
-        for delivery in &plan.deliveries {
-            let Some(text) = delivery.notification.as_ref() else {
-                continue;
-            };
+        for notification in &plan.notifications {
             match Self::submit_to_sid_shared(
                 Arc::clone(&gateway),
-                &delivery.request.parent_sid,
-                text.clone(),
+                &notification.parent_sid,
+                notification.text.clone(),
                 GatewayDeadline::start(),
             )
             .await
             {
                 Ok(_) => {
-                    plan.emitter
-                        .emit(DelegationProgressRecord {
-                            slug: plan.slug.clone(),
-                            event: ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
-                                .to_string(),
-                            parent_sid: delivery.request.parent_sid.clone(),
-                            child_sid: child.clone(),
-                            vendor: plan.signal.vendor,
-                            host: plan.signal.host.clone(),
-                            turn: Some(plan.signal.turn_id.clone()),
-                            title: delivery.request.title.clone(),
-                            reason: None,
-                        })
-                        .await;
+                    // The ledger edge belongs to the request: one `notified`
+                    // row per request the turn carried.
+                    for delivery in plan
+                        .deliveries
+                        .iter()
+                        .filter(|d| notification.request_ids.contains(&d.request.request_id))
+                    {
+                        plan.emitter
+                            .emit(DelegationProgressRecord {
+                                slug: plan.slug.clone(),
+                                event:
+                                    ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
+                                        .to_string(),
+                                parent_sid: delivery.request.parent_sid.clone(),
+                                child_sid: child.clone(),
+                                vendor: plan.signal.vendor,
+                                host: plan.signal.host.clone(),
+                                turn: Some(plan.signal.turn_id.clone()),
+                                title: delivery.request.title.clone(),
+                                reason: None,
+                            })
+                            .await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
-                        parent = %delivery.request.parent_sid, %child, %error,
-                        request = %delivery.request.request_id,
-                        "ccteam-im: delegation notify failed; dropping that request"
+                        parent = %notification.parent_sid, %child, %error,
+                        requests = ?notification.request_ids,
+                        "ccteam-im: delegation notify failed; dropping those requests"
                     );
-                    failed.push(delivery.request.request_id.clone());
+                    failed.extend(notification.request_ids.iter().cloned());
                 }
             }
         }
@@ -16431,7 +17228,7 @@ impl Gateway {
                     request.state = terminal;
                     request.queue_position = None;
                     request.answered_turn = Some(plan.signal.turn_id.clone());
-                    request.notified = delivery.notification.is_some();
+                    request.notified = delivery.notified;
                 }
             }
             if current.store.outstanding().count() == 0 {
@@ -16478,73 +17275,102 @@ impl Gateway {
                 .delegation_watch_set,
         );
         while let Some(pulse) = rx.recv().await {
-            match pulse {
-                crate::delegation::DelegationPulse::TurnOpened {
-                    child_sid,
-                    exec_turn_id,
-                    continues_from,
-                } => {
-                    if !watch_set.read().unwrap().contains(&child_sid) {
-                        continue;
-                    }
-                    // A store mutation: claimed like every other one, so it
-                    // cannot interleave with a dispatch's accept/bind pair.
-                    let claim = Self::claim_delegation_store(&gateway, &child_sid).await;
-                    let (moved, changed) = {
-                        let mut guard =
-                            crate::latency::gateway_lock(&gateway, "notifier.executing").await;
-                        // Move the bindings FIRST, so the executing mark that
-                        // follows finds the requests already on this turn. Both
-                        // under one lock hold: a reader must never catch a
-                        // request bound to a turn that has ended while the one
-                        // continuing it is already running.
-                        let moved = match continues_from.as_deref() {
-                            Some(from) => {
-                                // The vendor DID come back for the work: the
-                                // boundary held under `from` was a checkpoint
-                                // after all, not the answer.
-                                if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
-                                    mirror.provisional.remove(from);
-                                }
-                                guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+            let child = match &pulse {
+                crate::delegation::DelegationPulse::TurnOpened { child_sid, .. } => {
+                    child_sid.clone()
+                }
+                crate::delegation::DelegationPulse::Signal(signal) => signal.child_sid.clone(),
+            };
+            // The only notifier: a panic on one pulse must not end parent
+            // notification for every delegation (issue #210 failure class).
+            crate::supervise::contain_panic(
+                "delegation notifier",
+                &format!("child={child}"),
+                Self::handle_delegation_pulse(&gateway, &watch_set, pulse),
+            )
+            .await;
+        }
+    }
+
+    /// One pulse of [`Self::run_delegation_notifier`].
+    async fn handle_delegation_pulse(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        watch_set: &std::sync::RwLock<HashSet<String>>,
+        pulse: crate::delegation::DelegationPulse,
+    ) {
+        match pulse {
+            crate::delegation::DelegationPulse::TurnOpened {
+                child_sid,
+                exec_turn_id,
+                continues_from,
+            } => {
+                if !watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&child_sid)
+                {
+                    return;
+                }
+                // A store mutation: claimed like every other one, so it
+                // cannot interleave with a dispatch's accept/bind pair.
+                let claim = Self::claim_delegation_store(gateway, &child_sid).await;
+                let (moved, changed) = {
+                    let mut guard =
+                        crate::latency::gateway_lock(gateway, "notifier.executing").await;
+                    // Move the bindings FIRST, so the executing mark that
+                    // follows finds the requests already on this turn. Both
+                    // under one lock hold: a reader must never catch a
+                    // request bound to a turn that has ended while the one
+                    // continuing it is already running.
+                    let moved = match continues_from.as_deref() {
+                        Some(from) => {
+                            // The vendor DID come back for the work: the
+                            // boundary held under `from` was a checkpoint
+                            // after all, not the answer.
+                            if let Some(mirror) = guard.delegations.get_mut(&child_sid) {
+                                mirror.provisional.remove(from);
                             }
-                            None => false,
-                        };
-                        (
-                            moved,
-                            moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
-                        )
+                            guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+                        }
+                        None => false,
                     };
-                    if changed {
-                        // The executing flag alone is a display fact the next
-                        // write carries anyway; a REBINDING is not. A move that
-                        // never reaches disk leaves the request pointing at a
-                        // turn that has already ended, and a restart would then
-                        // read that turn's row as this request's answer.
-                        if let Err(error) = Self::persist_delegation_store(&gateway, &claim).await {
-                            if moved {
-                                tracing::warn!(
-                                    child = %child_sid,
-                                    turn = %exec_turn_id,
-                                    %error,
-                                    "ccteam-im: a continuation rebinding could not be made \
-                                     durable; a restart may resolve it off the turn it left"
-                                );
-                            }
+                    (
+                        moved,
+                        moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
+                    )
+                };
+                if changed {
+                    // The executing flag alone is a display fact the next
+                    // write carries anyway; a REBINDING is not. A move that
+                    // never reaches disk leaves the request pointing at a
+                    // turn that has already ended, and a restart would then
+                    // read that turn's row as this request's answer.
+                    if let Err(error) = Self::persist_delegation_store(gateway, &claim).await {
+                        if moved {
+                            tracing::warn!(
+                                child = %child_sid,
+                                turn = %exec_turn_id,
+                                %error,
+                                "ccteam-im: a continuation rebinding could not be made \
+                                 durable; a restart may resolve it off the turn it left"
+                            );
                         }
                     }
                 }
-                crate::delegation::DelegationPulse::Signal(signal) => {
-                    let watched = watch_set.read().unwrap().contains(&signal.child_sid);
-                    // Unwatched fleet chatter and watched mid-turn narration
-                    // create no gateway-lock traffic. The child pump already
-                    // mirrored narration into its ledger; only a vendor turn
-                    // boundary can notify a parent.
-                    if !watched || !signal.boundary {
-                        continue;
-                    }
-                    Self::deliver_delegation_signal_shared(Arc::clone(&gateway), signal).await;
+            }
+            crate::delegation::DelegationPulse::Signal(signal) => {
+                let watched = watch_set
+                    .read()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&signal.child_sid);
+                // Unwatched fleet chatter and watched mid-turn narration
+                // create no gateway-lock traffic. The child pump already
+                // mirrored narration into its ledger; only a vendor turn
+                // boundary can notify a parent.
+                if !watched || !signal.boundary {
+                    return;
                 }
+                Self::deliver_delegation_signal_shared(Arc::clone(gateway), signal).await;
             }
         }
     }
@@ -16692,16 +17518,16 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         text: String,
-        is_admin: bool,
+        web_chat_id: &str,
         deadline: GatewayDeadline,
     ) -> Result<String> {
-        if is_admin && text.trim_start().starts_with('/') {
+        if text.trim_start().starts_with('/') {
             let is_gateway_control = parse_session_directive(&text).is_none();
             if is_gateway_control {
                 return deadline
                     .lock(&gateway)
                     .await?
-                    .submit_web_sid(sid, text, true)
+                    .submit_web_sid(sid, text, web_chat_id)
                     .await;
             }
         }
@@ -17250,28 +18076,30 @@ impl Gateway {
     /// Regression fix: `/status` from the web console used to reach the vendor
     /// verbatim → "/status isn't available in this environment".
     ///
-    /// `is_admin` gates the control face: the fleet renders (`/status`,
-    /// `/sessions`) use the IM chat-level ACL (`chat_can_access` over the shared
-    /// `user:` pool), which is coarser than the web's per-tenant REST ACL
-    /// (`can_see_owner`) — so exposing it to a tenant could over-share another
-    /// tenant's sessions. It is therefore admin-only, matching the web Status /
-    /// 主机 / Settings nav (already `useMe().isAdmin`-gated). A non-admin caller
-    /// falls straight through to a turn/vendor-directive (today's behaviour).
+    /// Every web identity gets the same control face. `web_chat_id` is the
+    /// caller's own web frontend chat (`Identity::web_chat_id`: `web-api` for
+    /// the admin, the tenant id otherwise), so the commands run as THAT
+    /// principal — [`Self::principal`] resolves it to Operator or Tenant and the
+    /// fleet renders filter through the one shared visibility policy, exactly
+    /// as the tenant's own IM bot does. A tenant used to fall through to the
+    /// vendor here (Claude queued `/status` behind the running turn) on the
+    /// stale premise that the IM ACL was coarser than the web's.
     /// A2A `agent` keeps calling `submit_to_sid` directly, so
     /// agent→agent routing is deliberately never given the human control face.
     pub async fn submit_web_sid(
         &mut self,
         sid: &str,
         text: String,
-        is_admin: bool,
+        web_chat_id: &str,
     ) -> Result<String> {
-        if is_admin && text.trim_start().starts_with('/') {
-            let chat = web_api_chat();
+        if text.trim_start().starts_with('/') {
+            let chat = ChatKey::new("web", web_chat_id, web_chat_id);
             // Web navigates by URL, so the POST's `sid` is the authoritative
-            // focus: point the shared web chat at this session (+ its project)
-            // so `/status`/`/sessions` render THIS session in depth, matching
-            // the IM current-session semantics.
-            if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
+            // focus: point the caller's web chat at this session (+ its
+            // project) so `/status`/`/sessions` render THIS session in depth,
+            // matching the IM current-session semantics. A released session
+            // is focused too — `/status` renders it from its persisted facts.
+            if let Some(project) = self.project_slug_for_sid(sid) {
                 self.current_project.set(&chat, project);
                 self.focus_session(&chat, sid);
             }
@@ -17390,7 +18218,27 @@ impl Gateway {
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
     ) -> Result<StopOutcome> {
+        // The whole stop runs on its own task: a caller that goes away
+        // mid-kill (a web client disconnecting drops this future) must not
+        // leave a body ended but its session never stopped — marked
+        // `stopping` forever, with messages queued behind a dead process.
+        let gateway = Arc::clone(gateway);
+        let sid = sid.to_string();
+        tokio::spawn(async move { Self::stop_session_owned(&gateway, &sid).await })
+            .await
+            .unwrap_or_else(|join| Err(anyhow!("stop task failed: {join}")))
+    }
+
+    async fn stop_session_owned(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<StopOutcome> {
         let claim = Self::claim_delegation_store(gateway, sid).await;
+        // A detached body is ended HERE, off the gateway lock (the kill can
+        // take the whole SIGTERM grace); the stop below then finds it gone.
+        if let Err(error) = Self::end_detached_body_shared(gateway, sid, "stopping").await {
+            tracing::warn!(session = %sid, %error, "ccteam-im: stop could not end the detached body off the lock; the stop retries it");
+        }
         let stopped = {
             let mut guard = crate::latency::gateway_lock(gateway, "session.stop").await;
             guard.stop_session(sid).await
@@ -17891,6 +18739,13 @@ impl Gateway {
         }
         let already_stopped = meta.stopped_at.is_some();
         self.principals.forget(sid);
+        // A rebuild already spawning this sid off the lock (the watcher's, or
+        // an on-demand resume) must not install it after the stop: without
+        // its reservation, `apply_rebuilt_session` discards the thread.
+        self.rebuild_reservations.remove(sid);
+        if let Ok(mut map) = self.body_ends.lock() {
+            map.remove(sid);
+        }
         self.current_session.retain_values(|v| v != sid);
         self.record_explicit_stop(sid);
         if !already_stopped {
@@ -17948,7 +18803,15 @@ impl Gateway {
     /// applies `chat_can_access` first) and the web `POST
     /// /sessions/{sid}/interrupt` route (which applies the project ACL via
     /// `gate_sid` first). Unknown sid → `Err` so the web edge can 404.
+    ///
+    /// A DETACHED sid (its body outlived the previous daemon) has no control
+    /// channel left to interrupt through, so the interrupt ends that body
+    /// instead and the session comes back by sid — see
+    /// [`Self::end_detached_body`].
     pub async fn interrupt_session(&mut self, sid: &str) -> Result<()> {
+        if self.end_detached_body(sid) {
+            return Ok(());
+        }
         let session = self
             .sessions
             .get(sid)
@@ -18475,9 +19338,10 @@ fn refresh_session_activity_meta(
         return;
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
-    meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
-        .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
-        .unwrap_or(meta.turn_count);
+    // An unreadable mirror keeps the stored count rather than writing 0.
+    if let Some(digest) = ccteam_harness::execution::turns_mirror::digest(project_dir, sid) {
+        meta.turn_count = digest.user_turns;
+    }
     if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
     {
         meta.cost_usd = session.pricing(vendor).cost_usd;
@@ -18490,6 +19354,30 @@ fn refresh_session_activity_meta(
 }
 
 /// Admin-web fallback for an unowned legacy resource or an unknown sid.
+/// The error a submit returns when the session it targets could not be
+/// brought back: what failed, that THIS message was not delivered (so sending
+/// it again is safe), and the way out when retrying keeps failing. The cause
+/// stays downcastable for typed callers.
+fn undelivered_after_resume_failure(sid: &str, err: anyhow::Error) -> anyhow::Error {
+    let advice = format!(
+        "{sid} could not be resumed: {err:#}. This message was not delivered — send it again \
+         to retry; if it keeps failing, `/new` starts a fresh session."
+    );
+    err.context(advice)
+}
+
+/// How a recovered answer says the unobserved turn came to an end, by the
+/// reason its body's exit was recorded under.
+fn unobserved_end_phrase(reason: &str) -> &'static str {
+    match reason {
+        "interrupted" => "was working while ccteam restarted, until /interrupt ended that process",
+        "ended_idle" | "ended_stalled" => {
+            "was working while ccteam restarted, until a waiting message ended that process"
+        }
+        _ => "finished this turn while ccteam was restarting",
+    }
+}
+
 fn web_api_chat() -> ChatKey {
     ChatKey::new("web", "web-api", "web-api")
 }
@@ -19275,6 +20163,49 @@ fn emit_progress(
     })
 }
 
+/// Keep a finished step for the web inspector: remember what a step started
+/// with, and append the record once it completes. A tool step is written
+/// once; a reasoning step again whenever its text has grown (an ACP turn
+/// reports one thought that keeps growing), the newest record winning on
+/// read. A write failure loses inspector detail only, so it is logged, never
+/// raised.
+fn record_finished_step(
+    project_dir: Option<&std::path::Path>,
+    session_id: &str,
+    evt: &ThreadEvent,
+    activity: &SessionActivity,
+    step_inputs: &mut HashMap<String, String>,
+    steps_recorded: &mut HashMap<String, usize>,
+) {
+    let Some(project_dir) = project_dir else {
+        return;
+    };
+    if let ThreadEvent::ItemStarted { item } = evt {
+        if let Some(input) = crate::progress::step_input(&item.details) {
+            step_inputs.insert(item.id.clone(), input);
+        }
+    }
+    let recorded = steps_recorded.get(&activity.step_id).copied();
+    if recorded.is_some() && activity.kind != ActivityKind::Thinking {
+        return;
+    }
+    let started = step_inputs.get(&activity.item_id).map(String::as_str);
+    let Some(record) = crate::progress::finished_step(evt, &activity.step_id, started) else {
+        return;
+    };
+    let size = record.output.as_deref().map_or(0, str::len);
+    if recorded.is_some_and(|prev| size <= prev) {
+        return;
+    }
+    steps_recorded.insert(activity.step_id.clone(), size);
+    step_inputs.remove(&activity.item_id);
+    if let Err(err) =
+        ccteam_harness::execution::turns_mirror::append_step(project_dir, session_id, record)
+    {
+        tracing::warn!(sid = %session_id, %err, "recording a finished step failed");
+    }
+}
+
 /// Emit one structured `Activity` gateway event (v0.8.19) for the given
 /// step, keyed to the same progress `status_key` as the turn's folded
 /// status. IM drops it (a strict no-op arm); web renders it. The `content`
@@ -19383,23 +20314,6 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
         | ThreadEvent::TurnCompleted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
     }
-}
-
-/// The highest `<sid>-<N>` row id this pump family has written — where a new
-/// pump resumes numbering. COUNTING rows was a proxy that held only while
-/// every such row had text: a closing row (empty `assistant`, #209) is not
-/// counted, so the next pump re-issued its id — and a turn id already in
-/// `notified_turns` silently swallows the completion that reuses it.
-fn last_answer_seq(
-    session_id: &str,
-    turns: &[ccteam_harness::execution::turns_mirror::TurnRecord],
-) -> u64 {
-    let prefix = format!("{session_id}-");
-    turns
-        .iter()
-        .filter_map(|turn| turn.turn_id.strip_prefix(&prefix)?.parse::<u64>().ok())
-        .max()
-        .unwrap_or(0)
 }
 
 /// What woke the event pump's stream branch: the vendor, or the deadline of
@@ -19680,6 +20594,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::ToolCall {
                         name: "Bash".into(),
                         args: serde_json::json!({}),
+                        output: None,
                     },
                 },
             },
@@ -19704,6 +20619,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::ToolCall {
                         name: "Bash".into(),
                         args: serde_json::json!({}),
+                        output: None,
                     },
                 },
             },
@@ -19717,6 +20633,7 @@ mod open_work_items_tests {
                     details: ThreadItemDetails::CommandExecution {
                         cmd: "sleep 600".into(),
                         status: "running".into(),
+                        output: None,
                     },
                 },
             },
@@ -20577,6 +21494,15 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Body pids whose end the gateway must fail (`end_body_process`): the
+    /// only way to exercise a failed kill without a process ccteam cannot
+    /// signal. Keyed by pid so parallel tests never see each other's.
+    pub(super) static FAIL_BODY_END_PIDS: std::sync::Mutex<Vec<u32>> =
+        std::sync::Mutex::new(Vec::new());
+    /// Body pids whose end takes 300 ms, so a test can drop its caller mid-kill.
+    pub(super) static SLOW_BODY_END_PIDS: std::sync::Mutex<Vec<u32>> =
+        std::sync::Mutex::new(Vec::new());
+
     use super::*;
     use ccteam_harness::{
         ChoiceOption, ContextSource, ContextUsage, ExecutionMode, HarnessError, ThreadItem,
@@ -20889,6 +21815,38 @@ mod tests {
     /// process, and — the load-bearing half — the chat that was driving it
     /// KEEPS pointing at it, so the next plain message resumes the SAME sid
     /// instead of silently opening a new session on a fresh context.
+    /// Issue #210 follow-up: one session whose release panics costs that
+    /// session's release, not every session after it on every pass.
+    #[tokio::test]
+    async fn idle_release_tick_releases_the_rest_when_one_row_panics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 60,
+            ..Default::default()
+        });
+        for chat in ["chat-1", "chat-2"] {
+            gateway
+                .handle_text("mock", chat, "alice", "hello")
+                .await
+                .unwrap();
+        }
+        for sid in ["s1", "s2"] {
+            gateway.settle_turn_for_tests(sid);
+            gateway.backdate_residency_for_tests(sid, std::time::Duration::from_secs(120));
+        }
+        let poison = gateway.sessions["s1"].thread.identity.clone();
+        fake.panic_running_tasks_for.lock().unwrap().insert(poison);
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s2"]);
+        assert!(gateway.lock().await.is_session_live("s1"));
+    }
+
     #[tokio::test]
     async fn idle_release_frees_the_process_and_the_next_message_resumes_the_same_sid() {
         let tmp = tempfile::tempdir().unwrap();
@@ -22086,6 +23044,846 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
+    /// A body that never exits on its own (real `claude` after stdin EOF stays
+    /// alive while a background task it started runs) must not hold its sid
+    /// hostage: `/interrupt` ends that PROCESS and the SAME sid comes back on
+    /// its context — not stopped, the chat's focus kept, the turns queued
+    /// behind the body delivered (docs-local issue #211).
+    #[tokio::test]
+    async fn interrupt_ends_a_detached_body_and_resumes_the_same_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+            gateway.current_session.set(&chat, sid.clone());
+            gateway.persist_routing().unwrap();
+        }
+        let mut child = plant_body(&project_dir, &sid);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid));
+        let replies = restarted
+            .submit_to_current(&chat, "", "hello after restart".into())
+            .await
+            .unwrap();
+        assert!(
+            replies
+                .iter()
+                .any(|r| r.contains(&format!("/interrupt {sid}"))),
+            "the receipt names the way out that keeps the session: {replies:?}"
+        );
+
+        let replies = restarted
+            .handle_text("web", "web-api", "web-api", "/interrupt")
+            .await
+            .unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("正在结束")),
+            "the bare /interrupt reached the detached focus: {replies:?}"
+        );
+        // The kill runs on its own task, off the gateway lock: yield to it.
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "body not ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(status.code().is_none(), "signalled: {status:?}");
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        // The watcher waits for the kill task's hand-over before it rebuilds.
+        let started = std::time::Instant::now();
+        while !gateway.lock().await.is_session_live(&sid) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "rebuilt once the kill handed over"
+            );
+            Gateway::body_watch_tick(&gateway).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid), "the same sid is live again");
+        assert!(!g.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1, "exactly one body");
+        assert_eq!(g.current_session.get(&chat), Some(sid.clone()));
+        assert!(
+            read_session_meta(&project_dir, &sid)
+                .unwrap()
+                .stopped_at
+                .is_none(),
+            "an interrupt is not a stop"
+        );
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+        let submitted: Vec<String> = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(submitted, vec!["hello after restart".to_string()]);
+    }
+
+    /// Issue #210 follow-up: the post-mortem batch is taken off the gateway in
+    /// one go, so one panicking post-mortem must not drop the others.
+    #[tokio::test]
+    async fn body_watch_tick_runs_every_post_mortem_when_one_panics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        let first = spawn_managed(&mut gateway).await;
+        let second = spawn_managed(&mut gateway).await;
+        fake.panic_recover_for.lock().unwrap().insert(first.clone());
+        let body = ccteam_harness::execution::session_body::SessionBody {
+            pid: 1,
+            fingerprint: String::new(),
+            adapter: String::new(),
+            recorded_at: String::new(),
+        };
+        for sid in [&first, &second] {
+            gateway.post_mortem_pending.push((
+                sid.clone(),
+                "alpha".into(),
+                project_dir.clone(),
+                body.clone(),
+            ));
+        }
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::body_watch_tick(&gateway).await;
+        assert_eq!(
+            *fake.recovered_for.lock().unwrap(),
+            vec![first, second],
+            "the post-mortem after the panicking one still ran"
+        );
+    }
+
+    /// Restart a gateway over `tmp` with `sid`'s body still running and the
+    /// chat focused on it: the shape every detached-body wait test starts from.
+    async fn restarted_with_live_body(
+        tmp: &std::path::Path,
+        project_dir: &std::path::Path,
+        chat: &ChatKey,
+    ) -> (String, std::process::Child, Arc<FakeAdapter>, Gateway) {
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", project_dir);
+            gateway.enable_persistence(tmp).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+            gateway.current_session.set(chat, sid.clone());
+            gateway.persist_routing().unwrap();
+        }
+        let child = plant_body(project_dir, &sid);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", project_dir);
+        restarted.enable_persistence(tmp).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid));
+        (sid, child, fake, restarted)
+    }
+
+    fn set_activity(fake: &FakeAdapter, turn_ended: bool, quiet_secs: u64) {
+        *fake.detached_activity.lock().unwrap() = Some(ccteam_harness::DetachedActivity {
+            turn_ended,
+            quiet_for: std::time::Duration::from_secs(quiet_secs),
+        });
+    }
+
+    /// The wait behind a body from before a restart is bounded without anyone
+    /// knowing `/interrupt` (docs-local issue #211): once a turn is queued and
+    /// the body's record says its last turn ended and it has gone quiet, the
+    /// watcher ends that PROCESS and the SAME sid resumes on its context with
+    /// the queued turn. Until then — nobody waiting, a turn still open, or not
+    /// quiet long enough — the body is left alone.
+    #[tokio::test]
+    async fn a_queued_turn_ends_an_idle_detached_body_and_resumes_the_same_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+
+        // Idle, but nobody is waiting on it: its background work runs on.
+        set_activity(&fake, true, 600);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+
+        let id = gateway
+            .lock()
+            .await
+            .submit_to_sid(&sid, "hello after restart".into())
+            .await
+            .unwrap();
+        assert!(id.starts_with("queued-behind-body:"), "got {id}");
+        // A turn still open, or an ended one not quiet long enough: wait.
+        set_activity(&fake, false, 600);
+        Gateway::body_watch_tick(&gateway).await;
+        set_activity(&fake, true, 5);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+        assert_eq!(child.try_wait().unwrap(), None, "the body is untouched");
+
+        set_activity(&fake, true, 60);
+        Gateway::body_watch_tick(&gateway).await;
+        let status = child.wait().unwrap();
+        assert!(status.code().is_none(), "signalled: {status:?}");
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid), "the same sid is live again");
+        assert!(!g.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1, "exactly one body");
+        assert_eq!(g.current_session.get(&chat), Some(sid.clone()));
+        assert!(read_session_meta(&project_dir, &sid)
+            .unwrap()
+            .stopped_at
+            .is_none());
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+        let submitted: Vec<String> = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(submitted, vec!["hello after restart".to_string()]);
+    }
+
+    /// A body that is still mid-turn keeps the wait — but not forever: a turn
+    /// whose record has been silent past the stall bound is treated as idle.
+    #[tokio::test]
+    async fn a_queued_turn_ends_a_stalled_detached_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        restarted
+            .submit_to_sid(&sid, "are you there".into())
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, false, 29 * 60);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+
+        set_activity(&fake, false, 31 * 60);
+        Gateway::body_watch_tick(&gateway).await;
+        child.wait().unwrap();
+        let g = gateway.lock().await;
+        assert!(g.is_session_live(&sid));
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+    }
+
+    fn progress_paths(tmp: &std::path::Path) -> ccteam_core::CcteamPaths {
+        ccteam_core::CcteamPaths {
+            root: tmp.join("home"),
+            projects_root: tmp.join("projects"),
+        }
+    }
+
+    /// Poll the project's progress ledger until a line matches `needle`.
+    async fn ledger_has(paths: &ccteam_core::CcteamPaths, needle: &str) -> bool {
+        for _ in 0..100 {
+            let body = std::fs::read_to_string(paths.progress_jsonl("alpha")).unwrap_or_default();
+            if body.lines().any(|l| l.contains(needle)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn submitted_texts(fake: &FakeAdapter) -> Vec<String> {
+        fake.submissions
+            .try_lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect()
+    }
+
+    /// The automatic path records itself honestly: the ledger says the
+    /// process was ended for a waiting turn (`ended_idle`), not that it
+    /// exited on its own.
+    #[tokio::test]
+    async fn an_auto_ended_body_is_recorded_as_such() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let paths = progress_paths(tmp.path());
+        restarted.enable_project_creation(paths.clone());
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, true, 60);
+        Gateway::body_watch_tick(&gateway).await;
+        child.wait().unwrap();
+        assert!(
+            ledger_has(&paths, r#""reason":"ended_idle""#).await,
+            "the exit is recorded under ended_idle"
+        );
+        let ledger = std::fs::read_to_string(paths.progress_jsonl("alpha")).unwrap();
+        assert!(
+            !ledger
+                .lines()
+                .any(|l| l.contains("session_body_exited") && l.contains(r#""reason":"exited""#)),
+            "not recorded as a natural exit: {ledger}"
+        );
+        assert!(gateway.lock().await.is_session_live(&sid));
+    }
+
+    /// Ending a body for a waiting turn never signals what it started: the
+    /// background child keeps running, and the user and the ledger are told
+    /// exactly which processes were left running unattended (checker A).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_ended_body_reports_the_background_processes_it_left_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut planted, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        // Swap the planted body for one that started a background process.
+        body_gone(&mut planted);
+        let pidfile = tmp.path().join("bg.pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 62 & echo $! > {}; wait", pidfile.display()))
+            .env(ccteam_harness::execution::session_body::BODY_SID_ENV, &sid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        ccteam_harness::execution::session_body::record(
+            &project_dir,
+            &sid,
+            Some(child.id()),
+            "test",
+        )
+        .unwrap();
+        let bg = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        restarted.detached.get_mut(&sid).unwrap().body =
+            ccteam_harness::execution::session_body::read(&project_dir, &sid).unwrap();
+        let paths = progress_paths(tmp.path());
+        restarted.enable_project_creation(paths.clone());
+        let mut events = restarted.subscribe_events();
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, true, 60);
+        Gateway::body_watch_tick(&gateway).await;
+        child.wait().unwrap();
+
+        assert!(
+            ccteam_harness::execution::session_body::process_exists(bg),
+            "the background process is never signalled"
+        );
+        let mut told = false;
+        while let Ok(event) = events.try_recv() {
+            if event.content.contains("still running, unattended")
+                && event.content.contains(&format!("pid {bg} `sleep 62`"))
+            {
+                told = true;
+            }
+        }
+        assert!(told, "the reply target is told what is still running");
+        assert!(ledger_has(&paths, r#""orphans":[{"cmd":"sleep 62","fingerprint":""#).await);
+        assert!(ledger_has(&paths, &format!(r#""pid":{bg}}}]"#)).await);
+        assert!(gateway.lock().await.is_session_live(&sid));
+        unsafe {
+            libc::kill(bg as i32, libc::SIGKILL);
+        }
+    }
+
+    /// The watcher decides off the lock, so it can reach a body a user's
+    /// `/stop` (or `/interrupt`) already marked. It must never relabel that
+    /// end: a stop it overwrote would be undone by the watcher's rebuild
+    /// (checker D1). Only a stop may take over an interrupt.
+    #[tokio::test]
+    async fn the_watcher_never_relabels_a_users_stop_or_interrupt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        // A /stop is in flight: it marked the body and is ending it.
+        restarted.detached.get_mut(&sid).unwrap().ending = Some("stopping");
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        set_activity(&fake, true, 600);
+        Gateway::body_watch_tick(&gateway).await;
+        assert_eq!(
+            child.try_wait().unwrap(),
+            None,
+            "the watcher did not end it"
+        );
+        {
+            let g = gateway.lock().await;
+            assert_eq!(g.detached.get(&sid).unwrap().ending, Some("stopping"));
+            assert!(
+                !g.is_session_live(&sid),
+                "nothing was rebuilt over the stop"
+            );
+        }
+        assert!(
+            !Gateway::end_detached_body_shared(&gateway, &sid, "ended_idle")
+                .await
+                .unwrap()
+        );
+        // The body dies (the stop's kill): still the stop's to finish.
+        body_gone(&mut child);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0, "no rebuild");
+
+        // An interrupt in flight is not relabelled by the automatic path...
+        gateway.lock().await.detached.get_mut(&sid).unwrap().ending = Some("interrupted");
+        assert!(
+            !Gateway::end_detached_body_shared(&gateway, &sid, "ended_idle")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            gateway.lock().await.detached.get(&sid).unwrap().ending,
+            Some("interrupted")
+        );
+        // ...but a stop may take it over.
+        assert!(
+            Gateway::end_detached_body_shared(&gateway, &sid, "stopping")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// An interrupt whose kill fails must not leave its mark behind: the next
+    /// `/interrupt` really ends the body instead of replying "正在结束" and
+    /// doing nothing (checker D2).
+    #[tokio::test]
+    async fn a_failed_interrupt_lifts_its_mark() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, _fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let pid = child.id();
+        FAIL_BODY_END_PIDS.lock().unwrap().push(pid);
+        assert!(restarted.end_detached_body(&sid));
+        // Let the kill task run and fail.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if matches!(
+                restarted.body_ends.lock().unwrap().get(&sid),
+                Some(BodyEnd::Failed)
+            ) {
+                break;
+            }
+        }
+        FAIL_BODY_END_PIDS.lock().unwrap().retain(|p| *p != pid);
+        assert_eq!(
+            child.try_wait().unwrap(),
+            None,
+            "the failed kill left it alive"
+        );
+
+        assert!(
+            restarted.end_detached_body(&sid),
+            "a second interrupt is taken"
+        );
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the second interrupt must really end the body"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(status.code().is_none(), "signalled: {status:?}");
+    }
+
+    /// A body can be seen dead while the kill that ended it has not handed
+    /// over yet: the report waits for the hand-over instead of going out
+    /// without the orphans, and an orphan whose pid now belongs to another
+    /// process (start time changed) is never named (checker N1).
+    #[tokio::test]
+    async fn the_report_waits_for_the_kill_and_names_only_its_own_orphans() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let mut events = restarted.subscribe_events();
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        restarted.detached.get_mut(&sid).unwrap().ending = Some("interrupted");
+        Gateway::start_body_end(&restarted.body_ends, &sid);
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        // The kill took the body, but has not handed over.
+        body_gone(&mut child);
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_detached(&sid), "deferred");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+
+        // Hand-over: one orphan whose pid is now somebody else (this test
+        // process, with a start time that does not match).
+        let reused = std::process::id();
+        Gateway::set_body_end(
+            &gateway.lock().await.body_ends,
+            &sid,
+            BodyEnd::Ended(vec![ccteam_harness::execution::session_body::Orphan {
+                pid: reused,
+                cmd: "npm run dev".to_string(),
+                fingerprint: "0".to_string(),
+            }]),
+        );
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.is_session_live(&sid));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !event.content.contains("still running, unattended"),
+                "a reused pid is not reported: {}",
+                event.content
+            );
+        }
+        assert!(gateway.lock().await.body_ends.lock().unwrap().is_empty());
+    }
+
+    /// A caller that goes away mid-kill (a web client disconnecting drops the
+    /// REST future) must not strand the sid: the kill and its hand-over run
+    /// on their own task, the watcher still resumes the session and delivers
+    /// its queue (checker C1). A hand-over that never comes ages out.
+    #[tokio::test]
+    async fn a_dropped_interrupt_caller_does_not_strand_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        restarted.submit_to_sid(&sid, "hi".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        let pid = child.id();
+        SLOW_BODY_END_PIDS.lock().unwrap().push(pid);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Gateway::interrupt_session_shared(&gateway, &sid),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller went away mid-kill");
+        let started = std::time::Instant::now();
+        while !gateway.lock().await.is_session_live(&sid) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the session must come back without its caller"
+            );
+            let _ = child.try_wait();
+            Gateway::body_watch_tick(&gateway).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        SLOW_BODY_END_PIDS.lock().unwrap().retain(|p| *p != pid);
+        assert_eq!(submitted_texts(&fake), vec!["hi"]);
+
+        // A hand-over that never comes is settled as a failed end.
+        let mut g = gateway.lock().await;
+        g.detached.insert(
+            "s99".into(),
+            DetachedBody {
+                sid: "s99".into(),
+                slug: "alpha".into(),
+                cwd: project_dir.clone(),
+                body: ccteam_harness::execution::session_body::SessionBody {
+                    pid: 0,
+                    fingerprint: String::new(),
+                    adapter: "fake".into(),
+                    recorded_at: String::new(),
+                },
+                since: chrono::Utc::now(),
+                reason: "daemon_restart",
+                ending: Some("interrupted"),
+            },
+        );
+        Gateway::set_body_end(
+            &g.body_ends,
+            "s99",
+            BodyEnd::InProgress {
+                token: 0,
+                since: Instant::now()
+                    .checked_sub(Gateway::BODY_END_STALE)
+                    .expect("a monotonic clock older than 30s"),
+            },
+        );
+        g.settle_body_ends();
+        assert_eq!(g.detached.get("s99").unwrap().ending, None);
+        assert!(g.body_ends.lock().unwrap().get("s99").is_none());
+    }
+
+    /// End to end: a delegated task queued behind a body whose session then
+    /// fails to come back is withdrawn, its PARENT — a real session — receives
+    /// the "withdrawn, did not run, send it again" turn through the ordinary
+    /// completion path, the request is no longer outstanding, and a restart's
+    /// reconcile does not tell the parent a second time (checker item 4).
+    #[tokio::test]
+    async fn a_withdrawn_task_answers_its_parent_once_through_the_completion_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (child, mut body, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let parent = spawn_managed(&mut restarted).await;
+        let request_id = restarted
+            .accept_delegation_request(
+                &DelegationStoreClaim::for_test(&child),
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("build the thing".into()),
+                TurnRouting::Queue,
+                None,
+            )
+            .expect("accepted");
+        crate::pending_turns::enqueue_pending_turn(
+            &project_dir,
+            &child,
+            "build the thing",
+            Some("mcp".into()),
+            false,
+            TurnIntent::from_origin(TurnOrigin::Internal).pending(),
+            Some(request_id.clone()),
+        )
+        .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        fake.fail_starts.store(1, Ordering::SeqCst);
+        Gateway::interrupt_session_shared(&gateway, &child)
+            .await
+            .unwrap();
+        body.wait().unwrap();
+        Gateway::body_watch_tick(&gateway).await;
+
+        let told: Vec<String> = submitted_texts(&fake)
+            .into_iter()
+            .filter(|text| text.contains("withdrawn and did not run"))
+            .collect();
+        assert_eq!(told.len(), 1, "the parent is told once: {told:?}");
+        assert!(told[0].contains(&request_id), "{}", told[0]);
+        {
+            let g = gateway.lock().await;
+            assert!(
+                g.outstanding_request_ids(&child, &parent).is_empty(),
+                "the request is settled"
+            );
+            assert!(g
+                .delegation_request_state(&child, &request_id)
+                .is_some_and(|state| state.is_terminal()));
+        }
+        assert!(!submitted_texts(&fake)
+            .iter()
+            .any(|t| t == "build the thing"));
+
+        // A restart reconciles the store and tells the parent nothing new.
+        let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut again = Gateway::new(fake2.clone(), "alpha", &project_dir);
+        again.enable_persistence(tmp.path()).unwrap();
+        let again = Arc::new(tokio::sync::Mutex::new(again));
+        Gateway::reconcile_delegations(Arc::clone(&again)).await;
+        assert!(
+            !submitted_texts(&fake2)
+                .iter()
+                .any(|text| text.contains("withdrawn")),
+            "no second notification after a restart"
+        );
+        assert!(again
+            .lock()
+            .await
+            .outstanding_request_ids(&child, &parent)
+            .is_empty());
+    }
+
+    /// A REST `/stop` whose client goes away mid-kill still finishes the
+    /// stop: the session ends up stopped, not detached with a `stopping` mark
+    /// nobody will ever lift (checker item a).
+    #[tokio::test]
+    async fn a_dropped_stop_caller_still_stops_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, _fake, restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        let pid = child.id();
+        SLOW_BODY_END_PIDS.lock().unwrap().push(pid);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            Gateway::stop_session_shared(&gateway, &sid),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller went away mid-stop");
+        let started = std::time::Instant::now();
+        loop {
+            let _ = child.try_wait();
+            let stopped = read_session_meta(&project_dir, &sid)
+                .unwrap()
+                .stopped_at
+                .is_some();
+            if stopped && !gateway.lock().await.is_session_detached(&sid) {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the stop must finish without its caller"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        SLOW_BODY_END_PIDS.lock().unwrap().retain(|p| *p != pid);
+    }
+
+    /// When the session does not come back after its old process ended, the
+    /// people promised a resume are told why, the queued turns are kept, and
+    /// the next message delivers them FIRST, in order — never ahead of them,
+    /// never stranded (checker finding B, docs-local issue #211).
+    #[tokio::test]
+    async fn a_failed_rebuild_reports_and_the_queue_goes_out_first_on_the_next_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+        let (sid, mut child, fake, mut restarted) =
+            restarted_with_live_body(tmp.path(), &project_dir, &chat).await;
+        let paths = progress_paths(tmp.path());
+        restarted.enable_project_creation(paths.clone());
+        let mut events = restarted.subscribe_events();
+        restarted.submit_to_sid(&sid, "Q1".into()).await.unwrap();
+        // A parent's delegated task, queued behind the same body: withdrawn
+        // when the parent is told the resume failed, so it never runs late.
+        crate::pending_turns::enqueue_pending_turn(
+            &project_dir,
+            &sid,
+            "TASK",
+            Some("mcp".into()),
+            false,
+            TurnIntent::from_origin(TurnOrigin::Internal).pending(),
+            Some("req-7".into()),
+        )
+        .unwrap();
+        restarted.submit_to_sid(&sid, "Q2".into()).await.unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+
+        fake.fail_starts.store(1, Ordering::SeqCst);
+        Gateway::interrupt_session_shared(&gateway, &sid)
+            .await
+            .expect("the REST door ends the body off the lock");
+        child.wait().unwrap();
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(!gateway.lock().await.is_session_live(&sid));
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            2,
+            "the human lines are kept; the delegated task is withdrawn"
+        );
+        let mut told = false;
+        while let Ok(event) = events.try_recv() {
+            if event.content.contains("could not be resumed")
+                && event.content.contains("2 queued message(s) are kept")
+            {
+                told = true;
+            }
+        }
+        assert!(
+            told,
+            "the reply target hears why the session did not come back"
+        );
+        // The parent side is covered end to end by
+        // `a_withdrawn_task_answers_its_parent_once_through_the_completion_path`.
+        assert!(ledger_has(&paths, r#""reason":"interrupted""#).await);
+
+        let id = gateway
+            .lock()
+            .await
+            .submit_to_sid(&sid, "M3".into())
+            .await
+            .unwrap();
+        assert!(!id.starts_with("queued-behind-body:"), "got {id}");
+        assert_eq!(submitted_texts(&fake), vec!["Q1", "Q2", "M3"]);
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0
+        );
+    }
+
+    /// A message enqueued for a dead in-map child whose resume then fails is
+    /// taken back: the error says it was NOT delivered (so sending it again
+    /// is safe) and names `/new`, and resending delivers it exactly once
+    /// (checker finding D).
+    #[tokio::test]
+    async fn a_failed_resume_takes_the_undelivered_message_back() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        let sid = spawn_managed(&mut gateway).await;
+        fake.live.store(false, Ordering::SeqCst);
+        fake.fail_starts.store(1, Ordering::SeqCst);
+
+        let err = gateway
+            .submit_to_sid(&sid, "hello".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was not delivered"), "{err}");
+        assert!(err.contains("`/new`"), "{err}");
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0,
+            "the undelivered line is not left to go out later"
+        );
+        gateway.submit_to_sid(&sid, "hello".into()).await.unwrap();
+        assert_eq!(submitted_texts(&fake), vec!["hello"]);
+    }
+
     /// A body record whose process is already GONE at restore time means the
     /// body finished (or died) while no daemon was watching. The session is
     /// rebuilt at once; the watcher's post-mortem then reports the unanswered
@@ -22401,6 +24199,7 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(Some("s1"))), "mpsc live ⇒ send ok");
         assert_eq!(mrx.recv().await.unwrap().sid.as_deref(), Some("s1"));
@@ -22416,9 +24215,72 @@ mod tests {
         let sink = GatewayEventSink {
             mpsc: mtx,
             broadcast: btx,
+            closing: Arc::default(),
         };
         assert!(sink.send(fake_event(None)), "no SSE subscriber ⇒ still ok");
         assert!(mrx.recv().await.is_some());
+    }
+
+    /// The log lines `f` emits on this thread, as `LEVEL message` text.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Issue #210: a closed delivery sink outside shutdown is an outage and
+    /// says so at ERROR, for every send shape; once the daemon has raised
+    /// the closing flag the same stop is quiet (no ERROR on a clean stop).
+    #[test]
+    fn closed_sink_logs_error_only_outside_shutdown() {
+        let (mtx, mrx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        drop(mrx);
+        let (btx, _) = tokio::sync::broadcast::channel::<GatewayEvent>(8);
+        let sink = GatewayEventSink {
+            mpsc: mtx,
+            broadcast: btx,
+            closing: Arc::default(),
+        };
+        let send_all = || {
+            assert!(!sink.send(fake_event(Some("s7"))));
+            assert!(!sink.send_delivery_only(fake_event(Some("s7"))));
+            assert!(!sink.send_broadcast_only(fake_event(Some("s7"))));
+        };
+
+        let outage = captured_logs(send_all);
+        assert_eq!(
+            outage.matches("ERROR").count(),
+            3,
+            "every send shape reports the outage: {outage}"
+        );
+        assert!(outage.contains("s7"), "the log names the session: {outage}");
+
+        sink.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let shutdown = captured_logs(send_all);
+        assert!(
+            !shutdown.contains("ERROR"),
+            "clean stop is quiet: {shutdown}"
+        );
+        assert!(shutdown.contains("DEBUG"), "{shutdown}");
     }
 
     /// `subscribe_events` hands out a live receiver off the gateway's held
@@ -23633,6 +25495,12 @@ mod tests {
         /// sweeper never lets go of a session whose vendor is still carrying
         /// work.
         running_tasks: Arc<Mutex<Vec<RunningTask>>>,
+        /// Thread identities whose `running_tasks` probe panics, and sids
+        /// whose `recover_unobserved_turn` panics — one poison row in a
+        /// sweep. `recovered_for` records every recovery asked for.
+        panic_running_tasks_for: Arc<std::sync::Mutex<HashSet<String>>>,
+        panic_recover_for: Arc<std::sync::Mutex<HashSet<String>>>,
+        recovered_for: Arc<std::sync::Mutex<Vec<String>>>,
         /// What `account_usage` reports (`None` = no usage channel, the
         /// trait default). Account-scoped: every session sharing this fake
         /// answers with the same windows, exactly like one vendor account.
@@ -23652,6 +25520,10 @@ mod tests {
         /// tasks into a genuinely busy child and assert their queue positions
         /// without racing the pump.
         events_held: Arc<std::sync::atomic::AtomicBool>,
+        /// How many upcoming `start_thread` calls fail (a rejected resume).
+        fail_starts: Arc<AtomicUsize>,
+        /// What `detached_activity` reports (`None` = no readable record).
+        detached_activity: Arc<std::sync::Mutex<Option<ccteam_harness::DetachedActivity>>>,
     }
 
     /// One thread's turn FIFO inside [`FakeAdapter`].
@@ -23725,10 +25597,15 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
                 running_tasks: Arc::new(Mutex::new(Vec::new())),
+                panic_running_tasks_for: Arc::default(),
+                panic_recover_for: Arc::default(),
+                recovered_for: Arc::default(),
                 account_usage: Arc::new(Mutex::new(None)),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                detached_activity: Arc::new(std::sync::Mutex::new(None)),
+                fail_starts: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -23776,6 +25653,11 @@ mod tests {
                 .lock()
                 .await
                 .push((h.identity.clone(), text.clone()));
+            // A submit that panics AFTER the line was delivered — the worst
+            // case for anything that retries on failure.
+            if text.contains("PANIC_AFTER_DELIVERY") {
+                panic!("fake adapter panicked after delivering {text:?}");
+            }
             let turn_id = turn_id.to_string();
             if self.emit_turn_started {
                 self.events.lock().await.push_back((
@@ -24016,6 +25898,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HarnessAdapter for FakeAdapter {
+        async fn detached_activity(
+            &self,
+            _ctx: &UnobservedTurnCtx,
+        ) -> Option<ccteam_harness::DetachedActivity> {
+            *self.detached_activity.lock().unwrap()
+        }
+
         fn name(&self) -> &'static str {
             "fake-gateway"
         }
@@ -24030,6 +25919,15 @@ mod tests {
             ctx: &SpawnCtx,
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_starts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(HarnessError::SpawnFailed(
+                    "fake: claude --resume rejected".to_string(),
+                ));
+            }
             if let Some(barrier) = self.start_barrier.as_ref() {
                 if barrier.armed.load(Ordering::SeqCst) {
                     barrier.entered.fetch_add(1, Ordering::SeqCst);
@@ -24232,8 +26130,27 @@ mod tests {
             Ok(())
         }
 
-        async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
+        async fn running_tasks(&self, h: &ThreadHandle) -> Vec<RunningTask> {
+            if self
+                .panic_running_tasks_for
+                .lock()
+                .unwrap()
+                .contains(&h.identity)
+            {
+                panic!("fake running_tasks panicked for {}", h.identity);
+            }
             self.running_tasks.lock().await.clone()
+        }
+
+        async fn recover_unobserved_turn(
+            &self,
+            ctx: &ccteam_harness::UnobservedTurnCtx,
+        ) -> Option<ccteam_harness::RecoveredTurn> {
+            self.recovered_for.lock().unwrap().push(ctx.sid.clone());
+            if self.panic_recover_for.lock().unwrap().contains(&ctx.sid) {
+                panic!("fake recover panicked for {}", ctx.sid);
+            }
+            None
         }
 
         async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
@@ -25809,7 +27726,7 @@ mod tests {
 
         // Admin web console: `/status` is a gateway control command.
         let receipt = gateway
-            .submit_web_sid(&sid, "/status".into(), true)
+            .submit_web_sid(&sid, "/status".into(), "web-api")
             .await
             .unwrap();
         assert_eq!(receipt, format!("command:{sid}"));
@@ -25849,7 +27766,7 @@ mod tests {
 
         // Plain text → a real turn to the vendor.
         gateway
-            .submit_web_sid(&sid, "hello".into(), true)
+            .submit_web_sid(&sid, "hello".into(), "web-api")
             .await
             .unwrap();
         assert_eq!(
@@ -25860,25 +27777,153 @@ mod tests {
 
         // Vendor directive → recorded as a directive (not a gateway command).
         gateway
-            .submit_web_sid(&sid, "/model opus-x".into(), true)
+            .submit_web_sid(&sid, "/model opus-x".into(), "web-api")
             .await
             .unwrap();
         let directives = fake.directives.lock().await;
         assert_eq!(directives.len(), 1);
         assert_eq!(directives[0].1.name, "model");
+    }
 
-        // A non-admin caller never gets the gateway control face: `/status`
-        // falls through to `submit_to_sid` (today's behaviour; fleet renders
-        // stay admin-only), so the receipt is NOT a gateway `command:` marker.
-        drop(directives);
-        let receipt = gateway
-            .submit_web_sid(&sid, "/status".into(), false)
+    /// The web step inspector reads what the pump records: a tool's input
+    /// from its start (an ACP completion repeats none) with its output from the
+    /// completion, one record per step however often it is re-reported, and a
+    /// reasoning block's text — each under the `step_id` its activity frame
+    /// carries.
+    #[test]
+    fn the_pump_records_each_finished_step_once_under_its_frame_step_id() {
+        use ccteam_harness::execution::turns_mirror::find_step;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut inputs = HashMap::new();
+        let mut recorded = HashMap::new();
+        let mut feed = |evt: ThreadEvent| {
+            let mut activity = crate::progress::activity_for(&evt).expect("a step");
+            activity.step_id = format!("n-1-{}", activity.item_id);
+            record_finished_step(
+                Some(dir.path()),
+                "s7",
+                &evt,
+                &activity,
+                &mut inputs,
+                &mut recorded,
+            );
+            activity.step_id
+        };
+        let tool = |output: Option<&str>, args: serde_json::Value| ThreadItem {
+            id: "call-1".into(),
+            details: ThreadItemDetails::ToolCall {
+                name: "Bash".into(),
+                args,
+                output: output.map(str::to_string),
+            },
+        };
+        let started = feed(ThreadEvent::ItemStarted {
+            item: tool(None, serde_json::json!({"command": "ls"})),
+        });
+        assert_eq!(
+            find_step(dir.path(), "s7", &started).unwrap(),
+            None,
+            "still running"
+        );
+        let done = feed(ThreadEvent::ItemCompleted {
+            item: tool(Some("a.txt"), serde_json::Value::Null),
+        });
+        assert_eq!(done, started, "start and completion are one step");
+        feed(ThreadEvent::ItemCompleted {
+            item: tool(Some("re-reported"), serde_json::Value::Null),
+        });
+        let step = find_step(dir.path(), "s7", &done)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(step.kind, "tool_call");
+        assert_eq!(step.input.as_deref(), Some("{\n  \"command\": \"ls\"\n}"));
+        assert_eq!(
+            step.output.as_deref(),
+            Some("a.txt"),
+            "recorded once, first finish"
+        );
+
+        let thought = feed(ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r-1".into(),
+                details: ThreadItemDetails::Reasoning("weighing two fixes".into()),
+            },
+        });
+        let step = find_step(dir.path(), "s7", &thought)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(step.kind, "thinking");
+        assert_eq!(step.output.as_deref(), Some("weighing two fixes"));
+        // A thought that keeps growing under one item (ACP) is re-recorded;
+        // the newest record is the one the inspector reads.
+        feed(ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r-1".into(),
+                details: ThreadItemDetails::Reasoning("weighing two fixes, picking B".into()),
+            },
+        });
+        let step = find_step(dir.path(), "s7", &thought)
+            .unwrap()
+            .expect("recorded");
+        assert_eq!(
+            step.output.as_deref(),
+            Some("weighing two fixes, picking B")
+        );
+    }
+
+    /// Admin/tenant parity: a tenant's web `/status` gets the SAME gateway
+    /// control face as the admin's — never queued to the vendor as literal
+    /// text — and it renders as the tenant's principal, so the admin's
+    /// session stays out of the tenant's fleet view.
+    #[tokio::test]
+    async fn submit_web_sid_gives_a_tenant_the_same_control_face() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let admin_sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
-        assert_ne!(
-            receipt,
-            format!("command:{sid}"),
-            "non-admin /status must NOT be handled by the gateway control face"
+        let tenant_sid = gateway
+            .create_session_api_proto(
+                "alpha".into(),
+                "writer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "alice".into(),
+            )
+            .await
+            .unwrap();
+        let mut rx = gateway.subscribe_events();
+
+        let receipt = gateway
+            .submit_web_sid(&tenant_sid, "/status".into(), "alice")
+            .await
+            .unwrap();
+        assert_eq!(receipt, format!("command:{tenant_sid}"));
+        assert!(
+            fake.submissions.lock().await.is_empty() && fake.directives.lock().await.is_empty(),
+            "a tenant's /status is a gateway command, never vendor input"
+        );
+        let ev = rx.try_recv().expect("status render emitted to SSE");
+        assert_eq!(ev.sid.as_deref(), Some(tenant_sid.as_str()));
+        assert!(
+            ev.content.contains(tenant_sid.as_str()),
+            "renders the tenant's own session: {}",
+            ev.content
+        );
+        // The admin's session shares project `alpha`; were it visible, the card
+        // would count it as a same-project sibling and point at `/sessions`.
+        assert!(
+            !ev.content.contains("/sessions"),
+            "the admin's {admin_sid} must not reach a tenant's /status: {}",
+            ev.content
         );
     }
 
@@ -26733,7 +28778,7 @@ mod tests {
 
         // Same session, same lack of focus — but now a human asked.
         gateway
-            .submit_web_sid("s1", "are you still there?".into(), false)
+            .submit_web_sid("s1", "are you still there?".into(), "alice")
             .await
             .unwrap();
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -27688,7 +29733,7 @@ mod tests {
             .unwrap()
             .sid;
         gateway
-            .submit_web_sid(&sid, "human typed this".into(), true)
+            .submit_web_sid(&sid, "human typed this".into(), "web-api")
             .await
             .unwrap();
 
@@ -28661,8 +30706,18 @@ mod tests {
             row("interrupted:sj-1", "cut"),
             row("s70-9", "another session's prefix"),
         ];
-        assert_eq!(last_answer_seq("s7", &rows), 3);
-        assert_eq!(last_answer_seq("s7", &[]), 0);
+        let project = tempfile::TempDir::new().unwrap();
+        let digest = |sid: &str| {
+            ccteam_harness::execution::turns_mirror::digest(project.path(), sid)
+                .unwrap()
+                .max_answer_seq
+        };
+        assert_eq!(digest("s7"), 0);
+        for row in &rows {
+            ccteam_harness::execution::turns_mirror::append_turn(project.path(), "s7", row)
+                .unwrap();
+        }
+        assert_eq!(digest("s7"), 3);
     }
 
     /// #209 — the parent hears the WHOLE turn: a long turn reaches the ledger
@@ -28795,6 +30850,7 @@ mod tests {
                 details: ThreadItemDetails::ToolCall {
                     name: "Bash".into(),
                     args: serde_json::json!({"command": "make test"}),
+                    output: None,
                 },
             };
             if done {
@@ -36285,27 +38341,29 @@ mod tests {
         )
         .await;
 
-        // The grace runs out with no continuation: the parent is woken by the
-        // boundary the ping joined, once per request it resolved.
-        let notes = await_notifications(&project_dir, &parent, 2).await;
-        assert_eq!(
-            notes.len(),
-            2,
-            "one wake-up per resolved request: {notes:?}"
-        );
-        for note in &notes {
-            assert!(
-                note.user.contains("compose unified"),
-                "the joined turn's answer is what is delivered: {}",
-                note.user
-            );
-        }
-        assert!(
-            notes.iter().any(|n| n.user.contains(&request_id))
-                && notes.iter().any(|n| n.user.contains(&ping_id)),
-            "each request is named in its own notification: {notes:?}"
-        );
+        // The grace runs out with no continuation: the parent is woken ONCE by
+        // the boundary the ping joined, the one notification naming both
+        // requests it resolved (F-GOV-233).
+        let notes = await_notifications(&project_dir, &parent, 1).await;
         let rows = await_request_state(&gateway, &child, "answered").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = notes;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "one wake-up for the turn: {notes:?}");
+        let note = &notes[0].user;
+        assert!(
+            note.contains("compose unified"),
+            "the joined turn's answer is what is delivered: {note}"
+        );
+        assert_eq!(
+            note.matches("compose unified").count(),
+            1,
+            "the answer is told once: {note}"
+        );
+        assert!(
+            note.contains(&request_id) && note.contains(&ping_id),
+            "the notification names every request it settles: {note}"
+        );
         assert!(
             rows.iter()
                 .all(|row| row["state"] == serde_json::json!("answered")),
@@ -36324,6 +38382,158 @@ mod tests {
                 .get(&child)
                 .is_none_or(|mirror| mirror.provisional.is_empty()),
             "nothing is left held"
+        );
+    }
+
+    /// F-GOV-233 (excore s1390 → s1403, 2026-10-19) — the parent steered
+    /// sixteen lines into one long running turn; when it ended, every request
+    /// bound to it got its own copy of the same answer: sixteen identical
+    /// notifications in one second. A turn has ONE answer, so a parent is told
+    /// once, the notification naming every request of its that the turn
+    /// settles. Each request is still resolved and recorded on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn steers_into_one_turn_are_answered_by_one_notification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, fake, parent, child, request_id, identity, exec_a) =
+            scripted_child(&project_dir, paths).await;
+        let mut ids = vec![request_id];
+        {
+            let mut gw = gateway.lock().await;
+            for n in 0..15 {
+                let id = gw
+                    .accept_delegation_request(
+                        &DelegationStoreClaim::for_test(&child),
+                        &parent,
+                        if n % 2 == 0 {
+                            ccteam_harness::NotifyMode::Brief
+                        } else {
+                            ccteam_harness::NotifyMode::Final
+                        },
+                        None,
+                        TurnRouting::Inject,
+                        None,
+                    )
+                    .expect("the child accepts the steer");
+                gw.bind_delegation_request_for_test(
+                    &DelegationStoreClaim::for_test(&child),
+                    &id,
+                    &exec_a,
+                );
+                ids.push(id);
+            }
+        }
+
+        play_turn(
+            &fake,
+            &identity,
+            &exec_a,
+            ccteam_harness::TurnOpening::Submitted,
+            "HANDOFF written: runbook, inventory, proofs",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+
+        let _ = await_notifications(&project_dir, &parent, 1).await;
+        let _ = await_request_state(&gateway, &child, "answered").await;
+        let rows = gateway.lock().await.delegation_request_rows(&child, 100);
+        assert_eq!(rows.len(), 16, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row["state"] == serde_json::json!("answered")),
+            "every steer is settled on its own: {rows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "one notification for one turn: {notes:?}");
+        let note = &notes[0].user;
+        assert_eq!(note.matches("HANDOFF written").count(), 1, "{note}");
+        assert!(note.contains("answers 16 requests"), "{note}");
+        for id in &ids {
+            assert!(note.contains(id.as_str()), "{id} is named: {note}");
+        }
+        assert!(
+            !note.contains("still queued"),
+            "nothing is left owed: {note}"
+        );
+    }
+
+    /// F-GOV-233, second half — a turn that ends WITHOUT saying anything (a
+    /// "no reply needed" note codex acknowledged silently) still ended: the
+    /// request bound to it is settled, and the parent hears "(no reply)"
+    /// instead of that request sitting `executing` for good, counted as
+    /// "still queued" in every later notification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_turn_that_says_nothing_still_settles_its_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, fake, parent, child, _first, identity, exec_a) =
+            scripted_child(&project_dir, paths).await;
+        // The first task's turn answers normally — it also settles whatever
+        // answer the dispatch left pending, so the silent turn below starts
+        // from nothing, as a live child's does.
+        play_turn(
+            &fake,
+            &identity,
+            &exec_a,
+            ccteam_harness::TurnOpening::Submitted,
+            "README ready",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+        let _ = await_notifications(&project_dir, &parent, 1).await;
+
+        let exec_b = "exec-silent";
+        let note_id = {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Brief,
+                    Some("no reply needed".into()),
+                    TurnRouting::Inject,
+                    None,
+                )
+                .expect("the child accepts the note");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                exec_b,
+            );
+            id
+        };
+        play_turn(
+            &fake,
+            &identity,
+            exec_b,
+            ccteam_harness::TurnOpening::Submitted,
+            "",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+
+        let notes = await_notifications(&project_dir, &parent, 2).await;
+        let note = &notes.last().expect("the silent turn's notification").user;
+        assert!(note.contains(&note_id), "{note}");
+        assert!(note.contains("(no reply)"), "{note}");
+        assert!(
+            !note.contains("README ready"),
+            "never another turn's answer: {note}"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(&child, 10);
+        assert!(
+            rows.iter()
+                .all(|row| row["state"] == serde_json::json!("answered")),
+            "nothing is left executing: {rows:?}"
         );
     }
 
@@ -36648,15 +38858,19 @@ mod tests {
                     opening,
                 },
             ));
-            queue.push_back((
-                identity.to_string(),
-                ThreadEvent::ItemCompleted {
-                    item: ccteam_harness::ThreadItem {
-                        id: format!("{turn_id}-msg"),
-                        details: ThreadItemDetails::AgentMessage(text.to_string()),
+            // An empty `text` is a turn that said nothing at all: no answer
+            // item, as a vendor that acknowledges silently reports it.
+            if !text.is_empty() {
+                queue.push_back((
+                    identity.to_string(),
+                    ThreadEvent::ItemCompleted {
+                        item: ccteam_harness::ThreadItem {
+                            id: format!("{turn_id}-msg"),
+                            details: ThreadItemDetails::AgentMessage(text.to_string()),
+                        },
                     },
-                },
-            ));
+                ));
+            }
             queue.push_back((
                 identity.to_string(),
                 ThreadEvent::TurnCompleted {
@@ -39170,6 +41384,7 @@ mod tests {
                 },
                 since: chrono::Utc::now(),
                 reason: "test",
+                ending: None,
             },
         );
 
@@ -39367,6 +41582,91 @@ mod tests {
             count_notifications(&project_dir, &parent_sid),
             1,
             "a second reconcile is a no-op (exactly-once)"
+        );
+    }
+
+    /// F-GOV-233 — the silent turn's closing row is what a restart settles its
+    /// request by: a child that ended a turn WITHOUT any text while the daemon
+    /// was down still answers the request bound to it, with "(no reply)",
+    /// instead of leaving it `executing` for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_settles_a_request_whose_turn_said_nothing() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Codex,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s98";
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                exec_turn_id: Some("exec-silent".into()),
+                turn_id: format!("{child_sid}-5"),
+                ts: chrono::Utc::now(),
+                vendor: "codex".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: String::new(),
+                usage: serde_json::Value::Null,
+                status: Some(ccteam_harness::TurnStatus {
+                    model: None,
+                    context: None,
+                    turn: 2,
+                    cost_usd: None,
+                    tokens_total: None,
+                }),
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: None,
+                continues_exec_turn: None,
+            },
+        )
+        .unwrap();
+        Gateway::seed_delegation_store_for_test(
+            &project_dir,
+            &DelegationStoreClaim::for_test(child_sid),
+            &test_delegation_store(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Brief,
+                Some("no reply needed".into()),
+                Some("exec-silent".into()),
+            ),
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let mut note = None;
+        for _ in 0..200 {
+            note = read_all_turns(&project_dir, &parent_sid)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|turn| turn.user.contains(" done · "));
+            if note.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let note = note.expect("the silent turn's request is settled after a restart");
+        assert!(note.user.contains("(no reply)"), "{}", note.user);
+        let store = ccteam_harness::read_delegation_requests(&project_dir, child_sid).unwrap();
+        assert!(
+            store.outstanding().next().is_none(),
+            "nothing is left executing: {store:?}"
         );
     }
 
@@ -39804,6 +42104,69 @@ mod tests {
         assert!(submissions.iter().any(|(_, text)| text == "/model opus"));
         assert!(fake.directives.lock().await.is_empty());
         assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    /// Issue #210 follow-up: a scheduled row whose submit panics after the
+    /// line was delivered fires exactly once (it is failed, not retried), and
+    /// the rows due after it in the same batch still fire.
+    #[tokio::test]
+    async fn scheduled_fire_that_panics_fires_once_and_later_rows_still_fire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let mut sids = Vec::new();
+        for _ in 0..2 {
+            sids.push(
+                gateway
+                    .create_session_api(
+                        "alpha".into(),
+                        "reviewer".into(),
+                        AgentVendor::Claude,
+                        PermissionMode::Skip,
+                    )
+                    .await
+                    .unwrap()
+                    .sid,
+            );
+        }
+        let mut ids = Vec::new();
+        for (sid, text, ago) in [
+            (&sids[0], "PANIC_AFTER_DELIVERY", 20),
+            (&sids[1], "second", 10),
+        ] {
+            let item = gateway
+                .create_scheduled_message(
+                    sid,
+                    text.into(),
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                    "user:web-api".into(),
+                    None,
+                )
+                .unwrap();
+            gateway
+                .scheduled_items
+                .get_mut(&item.id)
+                .unwrap()
+                .item
+                .send_at = chrono::Utc::now() - chrono::Duration::seconds(ago);
+            ids.push(item.id);
+        }
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+
+        let submissions = fake.submissions.lock().await.clone();
+        let sent = |needle: &str| submissions.iter().filter(|(_, t)| t == needle).count();
+        assert_eq!(sent("PANIC_AFTER_DELIVERY"), 1, "fired exactly once");
+        assert_eq!(sent("second"), 1, "the later row still fired");
+        let poison = &gateway.scheduled_items[&ids[0]].item;
+        assert_eq!(poison.status, crate::scheduled::ScheduledStatus::Failed);
+        assert_eq!(poison.fail_reason.as_deref(), Some("panicked while firing"));
+        assert!(
+            !gateway.scheduled_items.contains_key(&ids[1]),
+            "second completed"
+        );
     }
 
     #[tokio::test]

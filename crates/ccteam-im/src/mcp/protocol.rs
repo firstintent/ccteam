@@ -406,7 +406,7 @@ pub(crate) fn status_project_rows(
         .iter()
         .filter(|project| visible(&project.state))
         .map(|p| {
-            let cost = projection.project_snapshot(&p.state.slug).cost;
+            let cost = projection.cost_summary(&p.state.slug);
             json!({
                 "slug": p.state.slug,
                 "cost_24h_usd": cost.cost_24h_usd,

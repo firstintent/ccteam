@@ -453,6 +453,17 @@ pub struct RecoveredTurn {
     pub conclusion: Option<String>,
 }
 
+/// What a body that outlived its daemon is doing, read from the vendor's own
+/// durable record (see [`HarnessAdapter::detached_activity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachedActivity {
+    /// The newest turn in the record has ended: nothing is mid-turn, and the
+    /// process is alive only for work it started in the background.
+    pub turn_ended: bool,
+    /// How long the record has not grown.
+    pub quiet_for: std::time::Duration,
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -1395,6 +1406,128 @@ pub struct ThreadStatus {
     pub stop_hook_blocks: Option<u32>,
 }
 
+/// What a session's context window is MADE OF — the structured peer of
+/// [`ContextUsage`]'s two numbers, for the web context panel (issue #21).
+///
+/// Every number is the harness's OWN accounting (Claude: the
+/// `get_context_usage` control_request that also backs its `/context`), never
+/// a ccteam estimate: the point is to let a user see where the window goes
+/// without asking the model to guess. Vendor-neutral so another harness with a
+/// breakdown channel fills the same shape; one without answers `None`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    /// The harness that reported it (`"claude"`).
+    pub vendor: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// When the harness was asked. A released session shows its last
+    /// turn-end snapshot, and the panel has to say how old that is.
+    pub captured_at: DateTime<Utc>,
+    pub used_tokens: u64,
+    pub window_tokens: u64,
+    /// Occupancy at which the harness compacts on its own; `None` when it
+    /// doesn't say (or auto-compaction is off).
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
+    /// In the harness's own order. `used` categories sum to `used_tokens`.
+    #[serde(default)]
+    pub categories: Vec<ContextCategory>,
+    /// The conversation itself, split by what produced it — the view that
+    /// answers "which tool is eating my context". `None` before the first
+    /// message or when the harness doesn't split it.
+    #[serde(default)]
+    pub messages: Option<ContextMessages>,
+    /// Real API accounting of the most recent request (cache read vs write vs
+    /// uncached input), as opposed to the estimated categories above.
+    #[serde(default)]
+    pub last_request: Option<ContextRequestUsage>,
+}
+
+/// One slice of the window.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextCategory {
+    /// Stable machine id (`memory_files`, `messages`, …).
+    pub id: String,
+    /// The harness's display name.
+    pub name: String,
+    pub tokens: u64,
+    pub kind: ContextCategoryKind,
+    /// The entries that make up this slice (memory file paths, skills, MCP
+    /// tools, agents, …); empty when the harness doesn't itemize it.
+    #[serde(default)]
+    pub items: Vec<ContextItem>,
+}
+
+/// Whether a category actually occupies the window. `Deferred` exists so a
+/// tool schema the model has NOT loaded is never read as context spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCategoryKind {
+    #[default]
+    Used,
+    Deferred,
+    /// Held back for auto-compaction.
+    Buffer,
+    Free,
+}
+
+/// One itemized entry of a [`ContextCategory`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub name: String,
+    /// Where it came from (`Project` / `User` memory, a skill's settings
+    /// scope, an MCP tool's server).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// A secondary locator, typically the file path behind the entry.
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub tokens: u64,
+    /// For deferrable entries: whether it is loaded into the window now.
+    #[serde(default)]
+    pub loaded: Option<bool>,
+}
+
+/// The conversation part of the window, split by origin.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextMessages {
+    pub tool_call_tokens: u64,
+    pub tool_result_tokens: u64,
+    /// Harness-injected context riding on messages (reminders, hook output,
+    /// file snapshots, …).
+    pub attachment_tokens: u64,
+    pub assistant_tokens: u64,
+    pub user_tokens: u64,
+    /// What the harness counted but could not attribute to the above.
+    #[serde(default)]
+    pub other_tokens: u64,
+    #[serde(default)]
+    pub tools: Vec<ContextToolUsage>,
+    #[serde(default)]
+    pub attachments: Vec<ContextAttachmentUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextToolUsage {
+    pub name: String,
+    pub call_tokens: u64,
+    pub result_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContextAttachmentUsage {
+    pub name: String,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextRequestUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
 /// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
@@ -1593,6 +1726,10 @@ pub enum ThreadItemDetails {
     CommandExecution {
         cmd: String,
         status: String,
+        /// The command's output, on the item that completes it — see
+        /// [`ThreadItemDetails::ToolCall::output`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     FileChange {
         path: PathBuf,
@@ -1600,12 +1737,84 @@ pub enum ThreadItemDetails {
     },
     ToolCall {
         name: String,
+        /// The call's input. A completing item repeats it when the channel
+        /// still has it, `Null` otherwise — readers key a step by item id.
         args: serde_json::Value,
+        /// What the tool returned, as text — set only on the item that
+        /// completes the call, `None` where the vendor reports no result.
+        /// Observability only (the web step inspector); never an answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     WebSearch {
         query: String,
     },
     Error(String),
+}
+
+/// Flatten a tool result into the text a step inspector shows: a bare
+/// string as is; an Anthropic / ACP content-block array as its text blocks,
+/// one per line, with every non-text block (an image, a diff) named in
+/// brackets rather than dropped; a result object by its `text` / `output`
+/// field when it has one, as compact JSON otherwise.
+pub fn tool_result_text(content: &serde_json::Value) -> String {
+    use serde_json::Value;
+    fn block_text(block: &Value) -> String {
+        match block {
+            Value::String(s) => s.clone(),
+            Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(Value::as_str) {
+                    return text.to_string();
+                }
+                // ACP wraps a block one level deeper: `{type:"content", content:{…}}`.
+                if let Some(inner) = map.get("content") {
+                    return tool_result_text(inner);
+                }
+                // A result object (an ACP `rawOutput` such as `{output, metadata}`).
+                if let Some(output) = map.get("output").and_then(Value::as_str) {
+                    return output.to_string();
+                }
+                match map.get("type").and_then(Value::as_str) {
+                    Some(kind) => format!("[{kind}]"),
+                    None => block.to_string(),
+                }
+            }
+            other => other.to_string(),
+        }
+    }
+    match content {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(block_text)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => block_text(content),
+        other => other.to_string(),
+    }
+}
+
+/// The output a Codex item reports (`codex exec --json` snake_case or the
+/// app-server's camelCase): a command's `aggregated_output`, or an MCP call's
+/// `result.content` — its `error.message` when it failed. `None` while the
+/// item is still running, or when it carries neither.
+pub fn codex_item_output(item: &serde_json::Value) -> Option<String> {
+    if let Some(out) = item
+        .get("aggregatedOutput")
+        .or_else(|| item.get("aggregated_output"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(out.to_string());
+    }
+    if let Some(content) = item.get("result").and_then(|r| r.get("content")) {
+        return Some(tool_result_text(content));
+    }
+    item.get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`].
@@ -1897,6 +2106,17 @@ pub trait HarnessAdapter: Send + Sync {
         None
     }
 
+    /// What this LIVE session's context window is made of, asked of the
+    /// harness right now (issue #21). OPTIONAL (default `None`): only adapters
+    /// with a breakdown channel implement it (Claude stream-json via
+    /// `get_context_usage`). Callers fall back to the session's persisted
+    /// snapshot ([`crate::execution::session_status::read_context_file`]) when
+    /// this answers `None`, so an adapter that persists one at turn end stays
+    /// readable after the session is released.
+    async fn context_breakdown(&self, _h: &ThreadHandle) -> Option<ContextBreakdown> {
+        None
+    }
+
     /// The session's currently-running subagent / workflow tasks, as reported by
     /// the harness's OWN task lifecycle (never folded or counted by ccteam).
     /// OPTIONAL (default empty): only adapters with task introspection
@@ -2003,6 +2223,18 @@ pub trait HarnessAdapter: Send + Sync {
     /// one. Never a prompt: this READS a vendor file, exactly like the
     /// terminal protocol's transcript track.
     async fn recover_unobserved_turn(&self, ctx: &UnobservedTurnCtx) -> Option<RecoveredTurn> {
+        let _ = ctx;
+        None
+    }
+
+    /// Is a body that outlived its daemon mid-turn, and how long has it been
+    /// silent? Read from the vendor's durable record (Claude's transcript
+    /// jsonl), the same file [`Self::recover_unobserved_turn`] reads. The
+    /// gateway uses it to bound the wait behind such a body.
+    ///
+    /// Default `None` = "this vendor keeps no record ccteam may read"; the
+    /// gateway then only applies its long stall bound.
+    async fn detached_activity(&self, ctx: &UnobservedTurnCtx) -> Option<DetachedActivity> {
         let _ = ctx;
         None
     }
@@ -2836,5 +3068,48 @@ mod tests {
         assert_eq!(sh.harness, "codex");
         assert!(sh.job_id.is_none());
         assert_eq!(sh.pid, Some(9001));
+    }
+
+    #[test]
+    fn tool_result_text_flattens_every_result_shape() {
+        use serde_json::json;
+        assert_eq!(tool_result_text(&json!("plain")), "plain");
+        assert_eq!(tool_result_text(&serde_json::Value::Null), "");
+        assert_eq!(
+            tool_result_text(&json!([
+                {"type": "text", "text": "one"},
+                {"type": "content", "content": {"type": "text", "text": "two"}},
+                {"type": "diff", "path": "a.rs"}
+            ])),
+            "one\ntwo\n[diff]"
+        );
+        assert_eq!(tool_result_text(&json!({"exit": 0})), r#"{"exit":0}"#);
+        assert_eq!(
+            tool_result_text(&json!({"output": "built", "metadata": {"exit": 0}})),
+            "built"
+        );
+    }
+
+    #[test]
+    fn codex_item_output_reads_commands_and_mcp_calls() {
+        use serde_json::json;
+        assert_eq!(
+            codex_item_output(&json!({"aggregatedOutput": "ok\n"})).as_deref(),
+            Some("ok\n")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"aggregated_output": "snake"})).as_deref(),
+            Some("snake")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"result": {"content": [{"type": "text", "text": "r"}]}}))
+                .as_deref(),
+            Some("r")
+        );
+        assert_eq!(
+            codex_item_output(&json!({"error": {"message": "boom"}})).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(codex_item_output(&json!({"status": "inProgress"})), None);
     }
 }

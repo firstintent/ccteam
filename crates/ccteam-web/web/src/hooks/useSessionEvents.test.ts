@@ -313,6 +313,7 @@ describe("parseSessionEvent (W2 payload shape)", () => {
           summary: "Bash(ls -la)",
           status: "started",
           item_id: "t1",
+          step_id: "n-1-t1",
         },
       }),
     );
@@ -324,6 +325,7 @@ describe("parseSessionEvent (W2 payload shape)", () => {
       summary: "Bash(ls -la)",
       status: "started",
       item_id: "t1",
+      step_id: "n-1-t1",
     });
   });
 
@@ -346,6 +348,7 @@ describe("parseSessionEvent (W2 payload shape)", () => {
       summary: "",
       status: "",
       item_id: "",
+      step_id: "",
     });
   });
 

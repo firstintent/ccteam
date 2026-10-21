@@ -493,316 +493,113 @@ pub fn migrate_legacy_skill_dirs(
     Ok(out)
 }
 
-/// V0.2.2 F44: outcome of a single project's settings.local.json hook
-/// command rewrite (legacy `… cct hook …` → `<current_exe> hook …`).
+/// Outcome of stripping ccteam's own Claude Code hooks from a project's
+/// `.claude/settings.local.json`. See [`remove_ccteam_hooks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HookCmdRewriteAction {
-    /// File absent — nothing to do.
-    NotFound,
-    /// File present, no hook command referenced an F39-era `cct`
-    /// binary path. Idempotent re-run after a successful migration
-    /// hits this branch.
-    NoChangeNeeded,
-    /// `dry_run=true` — would have rewritten N entries.
-    WouldRewrite { entries: usize },
-    /// Rewrote N hook commands and atomically wrote the file.
-    Rewrote { entries: usize },
-}
-
-/// V0.2.2 F44: report for one `~/projects/<slug>/.claude/settings.local.json`
-/// (v0.8.6 W2b — ccteam manages the local settings layer).
-#[derive(Debug, Clone)]
-pub struct HookCmdRewriteReport {
-    pub target: PathBuf,
-    pub action: HookCmdRewriteAction,
-}
-
-/// V0.2.2 F44 + V0.4.6 F89 + V0.6.1 F139: rewrite legacy hook command
-/// forms in a project's `.claude/settings.local.json` (v0.8.6 W2b — the
-/// ccteam-managed local settings layer; the caller supplies the path) so
-/// they invoke the current `~/.ccteam/hooks/hook.sh` wrapper. Idempotent
-/// — re-runs after success hit `NoChangeNeeded`.
-///
-/// Migration paths handled (oldest → newest):
-/// - F39: `…/cct hook <kind> [args]` / bare `cct hook <kind> [args]`
-/// - F89: `…/ccteam hook <kind> [args]` / bare `ccteam hook <kind> [args]`
-/// - F89: `…/ccteam internal hook <kind> [args]` / bare `ccteam internal hook <kind> [args]`
-///
-/// All of them collapse to `<new_hook_sh> <kind> [args]` — hook
-/// subcommand + event-type args (`progress-append session_start`,
-/// `chat-progress user-prompt`) are preserved verbatim so the dispatch
-/// table inside `hook.sh` / the daemon route picks them up unchanged.
-pub fn rewrite_legacy_hook_commands(
-    settings_path: &Path,
-    new_hook_sh: &Path,
-    dry_run: bool,
-) -> Result<HookCmdRewriteReport> {
-    if !settings_path.exists() {
-        return Ok(HookCmdRewriteReport {
-            target: settings_path.to_path_buf(),
-            action: HookCmdRewriteAction::NotFound,
-        });
-    }
-
-    let new_hook_str = new_hook_sh
-        .to_str()
-        .ok_or_else(|| anyhow!("hook.sh path not valid UTF-8: {}", new_hook_sh.display()))?;
-    if new_hook_str.contains('"') || new_hook_str.contains('\\') {
-        return Err(anyhow!(
-            "hook.sh path contains characters that can't be embedded in settings.json: {new_hook_str}"
-        ));
-    }
-
-    let body = std::fs::read_to_string(settings_path)
-        .with_context(|| format!("read {}", settings_path.display()))?;
-    let mut v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", settings_path.display()))?;
-
-    let mut rewritten = 0usize;
-    let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return Ok(HookCmdRewriteReport {
-            target: settings_path.to_path_buf(),
-            action: HookCmdRewriteAction::NoChangeNeeded,
-        });
-    };
-    for (_event, list) in hooks.iter_mut() {
-        let Some(arr) = list.as_array_mut() else {
-            continue;
-        };
-        for entry in arr.iter_mut() {
-            let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
-                continue;
-            };
-            for hook in inner_hooks.iter_mut() {
-                let Some(cmd_val) = hook.get_mut("command") else {
-                    continue;
-                };
-                let Some(cmd) = cmd_val.as_str() else {
-                    continue;
-                };
-                if let Some(new_cmd) = rewrite_one_hook_command(cmd, new_hook_str) {
-                    *cmd_val = serde_json::Value::String(new_cmd);
-                    rewritten += 1;
-                }
-            }
-        }
-    }
-
-    if rewritten == 0 {
-        return Ok(HookCmdRewriteReport {
-            target: settings_path.to_path_buf(),
-            action: HookCmdRewriteAction::NoChangeNeeded,
-        });
-    }
-    if dry_run {
-        return Ok(HookCmdRewriteReport {
-            target: settings_path.to_path_buf(),
-            action: HookCmdRewriteAction::WouldRewrite { entries: rewritten },
-        });
-    }
-
-    let body = serde_json::to_string_pretty(&v).context("serialize updated settings.json")?;
-    // Atomic write: write to `<path>.tmp` then rename so a crash mid-
-    // write can't leave a half-rewritten settings.json on disk.
-    let tmp = settings_path.with_extension("json.ccteam-migrate.tmp");
-    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, settings_path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
-    Ok(HookCmdRewriteReport {
-        target: settings_path.to_path_buf(),
-        action: HookCmdRewriteAction::Rewrote { entries: rewritten },
-    })
-}
-
-/// V0.4.6 F91: outcome of a single project's `cost-accumulate` hook
-/// scrub. See [`remove_cost_accumulate_hooks`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CostAccumulateScrubAction {
+pub enum CcteamHookScrubAction {
     /// `settings.local.json` absent — nothing to do.
     NotFound,
-    /// No `cost-accumulate` hook entries found. Idempotent re-run after
-    /// success hits this branch.
+    /// No ccteam hook entries found. Idempotent re-run after a successful
+    /// scrub hits this branch.
     NoChangeNeeded,
-    /// `dry_run = true` — would have removed N entries.
-    WouldRemove { entries: usize },
-    /// Removed N hook entries and atomically wrote the file.
-    Removed { entries: usize },
-}
-
-/// V0.4.6 F91: per-project report for [`remove_cost_accumulate_hooks`].
-#[derive(Debug, Clone)]
-pub struct CostAccumulateScrubReport {
-    pub target: PathBuf,
-    pub action: CostAccumulateScrubAction,
-}
-
-/// V0.4.6 F91: strip the legacy `ccteam hook cost-accumulate` hook entry
-/// from a project's `.claude/settings.local.json` (v0.8.6 W2b — the
-/// ccteam-managed local settings layer; the caller supplies the path).
-/// F91 retired the PostToolUse cost-accumulator (Claude itself reports
-/// cost on each `agent_done` event into `progress.jsonl`); existing
-/// projects need their settings cleaned so Claude Code doesn't keep
-/// firing the now-missing subcommand.
-///
-/// Detection rule: any `command` string ending with `hook cost-accumulate`
-/// (binary path prefix can be anything — `/usr/local/bin/ccteam hook
-/// cost-accumulate`, `ccteam hook cost-accumulate`, or even the legacy
-/// `cct hook cost-accumulate`). Inner hook entries matching the rule
-/// are removed; entries whose only-remaining sibling matrix collapses
-/// to empty are pruned too so the file shape stays clean.
-///
-/// Idempotent — re-runs after a successful scrub hit `NoChangeNeeded`.
-pub fn remove_cost_accumulate_hooks(
-    settings_path: &Path,
-    dry_run: bool,
-) -> Result<CostAccumulateScrubReport> {
-    if !settings_path.exists() {
-        return Ok(CostAccumulateScrubReport {
-            target: settings_path.to_path_buf(),
-            action: CostAccumulateScrubAction::NotFound,
-        });
-    }
-
-    let body = std::fs::read_to_string(settings_path)
-        .with_context(|| format!("read {}", settings_path.display()))?;
-    let mut v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", settings_path.display()))?;
-
-    let mut removed = 0usize;
-    let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return Ok(CostAccumulateScrubReport {
-            target: settings_path.to_path_buf(),
-            action: CostAccumulateScrubAction::NoChangeNeeded,
-        });
-    };
-    for (_event, list) in hooks.iter_mut() {
-        let Some(arr) = list.as_array_mut() else {
-            continue;
-        };
-        for entry in arr.iter_mut() {
-            let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
-                continue;
-            };
-            // Keep only the hook commands that aren't cost-accumulate.
-            let before = inner_hooks.len();
-            inner_hooks.retain(|hook| !hook_command_is_cost_accumulate(hook));
-            removed += before - inner_hooks.len();
-        }
-        // Drop now-empty inner hook lists so the settings.json shape
-        // stays clean (e.g. PostToolUse → [{}] with empty inner is
-        // semantically a no-op but ugly to leave behind).
-        arr.retain(|entry| {
-            entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false)
-        });
-    }
-    // Drop now-empty top-level event arrays.
-    hooks.retain(|_event, list| list.as_array().map(|a| !a.is_empty()).unwrap_or(false));
-
-    if removed == 0 {
-        return Ok(CostAccumulateScrubReport {
-            target: settings_path.to_path_buf(),
-            action: CostAccumulateScrubAction::NoChangeNeeded,
-        });
-    }
-    if dry_run {
-        return Ok(CostAccumulateScrubReport {
-            target: settings_path.to_path_buf(),
-            action: CostAccumulateScrubAction::WouldRemove { entries: removed },
-        });
-    }
-
-    let body = serde_json::to_string_pretty(&v).context("serialize updated settings.json")?;
-    let tmp = settings_path.with_extension("json.ccteam-f91-scrub.tmp");
-    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, settings_path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
-    Ok(CostAccumulateScrubReport {
-        target: settings_path.to_path_buf(),
-        action: CostAccumulateScrubAction::Removed { entries: removed },
-    })
-}
-
-/// Predicate: does this `hook` JSON entry invoke `ccteam hook
-/// cost-accumulate` (or the F39-era `cct` variant)? Matches both
-/// absolute-path and bare invocations, with or without a trailing
-/// space + args.
-fn hook_command_is_cost_accumulate(hook: &serde_json::Value) -> bool {
-    let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    let trimmed = cmd.trim();
-    trimmed.ends_with(" hook cost-accumulate") || trimmed.contains(" hook cost-accumulate ")
-}
-
-/// v0.8.6 W3: outcome of stripping ccteam's chat hooks from a project's
-/// `.claude/settings.local.json`. See [`remove_chat_hooks`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatHookScrubAction {
-    /// `settings.local.json` absent — nothing to do.
-    NotFound,
-    /// No ccteam chat-hook entries found. Idempotent re-run after a
-    /// successful scrub hits this branch.
-    NoChangeNeeded,
+    /// The path exists but could not be read (a directory, no permission …).
+    /// Left exactly as it is; the caller decides whether that is fatal
+    /// (`project rm --purge`) or a note (project create / `ccteam init`,
+    /// which must never fail on a user file).
+    Unreadable { error: String },
+    /// The file was read but is not valid JSON (empty, a trailing comma …).
+    /// Left exactly as it is; same caller policy as `Unreadable`.
+    Unparseable { error: String },
     /// `dry_run = true` — would have removed N hook command entries.
     WouldRemove { entries: usize },
     /// Removed N hook command entries; the file still holds other keys
     /// (or other hooks) so it was atomically rewritten in place.
     Removed { entries: usize },
-    /// Removed N hook command entries and the resulting JSON collapsed
-    /// to an empty object (`{}` / only an empty `hooks` map). The caller
-    /// is told so it can delete the now-vestigial file outright.
+    /// Removed N hook command entries and the resulting JSON collapsed to an
+    /// empty object, so the file — which existed only to carry ccteam's
+    /// hooks — was deleted.
     RemovedNowEmpty { entries: usize },
 }
 
-/// v0.8.6 W3: per-project report for [`remove_chat_hooks`].
+/// Per-project report for [`remove_ccteam_hooks`].
 #[derive(Debug, Clone)]
-pub struct ChatHookScrubReport {
+pub struct CcteamHookScrubReport {
     pub target: PathBuf,
-    pub action: ChatHookScrubAction,
+    pub action: CcteamHookScrubAction,
 }
 
-/// v0.8.6 W3: surgically strip the chat-mode hooks ccteam installs via
-/// `ccteam_harness::ensure_chat_hooks_installed` from a project's
-/// `.claude/settings.local.json` (the caller supplies the path). This is
-/// the inverse of that writer and the `project rm --purge` complement of
-/// [`remove_cost_accumulate_hooks`].
+/// Surgically strip ccteam's own Claude Code hooks from a project's
+/// `.claude/settings.local.json` (the caller supplies the path).
 ///
-/// **Scope (red line).** Removes ONLY entries whose `command` invokes a
-/// ccteam chat hook ([`hook_command_is_chat_hook`]):
-/// - `<hook.sh> chat-progress <event>` (the 9 SessionStart/UserPromptSubmit/
-///   Stop/SubagentStop/PostToolUse/PreToolUse/SessionEnd/PreCompact/PostCompact
-///   events)
-/// - `ccteam mux hook-emit --kind chat-progress …` (the `CCTEAM_HOOK_VIA_DAEMON`
-///   variant)
-/// - `<hook.sh> intercept-ask` (the `AskUserQuestion` PreToolUse matcher)
-/// - `<hook.sh> permission-request` (the HITL `PermissionRequest` hook;
-///   R-M4 — a hitl-spawned session installs it, so purge must clear it)
+/// docs-local issue #212: project creation no longer writes hooks — they only
+/// ever served the retired tmux/rmux terminal protocol (the default
+/// stream-json session is hookless: its events come from stdout, HITL from
+/// `can_use_tool`). Projects created before that still carry the old
+/// `hooks` block, so `ccteam init` (fresh or re-run), the web/IM create path
+/// (`bootstrap_project_at_dir`) and `project rm --purge` all run this to
+/// clean them.
 ///
-/// Every other key (`permissions`, `env`, `enabledPlugins`, …) and any
-/// operator-authored hook survives untouched. Empty inner hook lists +
-/// top-level event arrays are pruned so the file shape stays clean, and
-/// if the whole object collapses the action is `RemovedNowEmpty` so the
-/// caller can delete the file (it was created solely by ccteam).
+/// **Scope (red line).** Removes ONLY entries whose `command` is a ccteam
+/// hook ([`hook_command_is_ccteam_hook`]), plus the Telegram plugin pin an
+/// earlier ccteam wrote here (`enabledPlugins` entry exactly
+/// [`TELEGRAM_PLUGIN_PIN`]` = false`; any other value is the user's and
+/// stays — the pin now rides claude's `--settings` flag layer); every other key (`permissions`,
+/// `env`, `enabledPlugins`, `effortLevel`, …) and any operator-authored hook
+/// survives untouched. Empty inner hook lists + top-level event arrays are
+/// pruned so the file shape stays clean, and if the whole object collapses
+/// the file is deleted (`RemovedNowEmpty`).
 ///
 /// Idempotent — a re-run after a successful scrub hits `NoChangeNeeded`.
-pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHookScrubReport> {
+pub fn remove_ccteam_hooks(settings_path: &Path, dry_run: bool) -> Result<CcteamHookScrubReport> {
     if !settings_path.exists() {
-        return Ok(ChatHookScrubReport {
+        return Ok(CcteamHookScrubReport {
             target: settings_path.to_path_buf(),
-            action: ChatHookScrubAction::NotFound,
+            action: CcteamHookScrubAction::NotFound,
         });
     }
 
-    let body = std::fs::read_to_string(settings_path)
-        .with_context(|| format!("read {}", settings_path.display()))?;
-    let mut v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", settings_path.display()))?;
+    let untouched = |action| {
+        Ok(CcteamHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action,
+        })
+    };
+    let body = match std::fs::read_to_string(settings_path) {
+        Ok(body) => body,
+        Err(e) => {
+            return untouched(CcteamHookScrubAction::Unreadable {
+                error: e.to_string(),
+            })
+        }
+    };
+    let mut v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return untouched(CcteamHookScrubAction::Unparseable {
+                error: e.to_string(),
+            })
+        }
+    };
 
     let mut removed = 0usize;
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(plugins) = obj
+            .get_mut("enabledPlugins")
+            .and_then(|p| p.as_object_mut())
+        {
+            // A `false` here cannot be told apart from one the user typed by
+            // hand; stripping it re-enables Telegram for the user's own
+            // non-ccteam claude runs in this dir — accepted, since ccteam
+            // wrote this exact pin into every project it spawned in.
+            if plugins.get(TELEGRAM_PLUGIN_PIN) == Some(&serde_json::Value::Bool(false)) {
+                plugins.remove(TELEGRAM_PLUGIN_PIN);
+                removed += 1;
+                if plugins.is_empty() {
+                    obj.remove("enabledPlugins");
+                }
+            }
+        }
+    }
     if let Some(hooks) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_event, list) in hooks.iter_mut() {
             let Some(arr) = list.as_array_mut() else {
@@ -814,7 +611,7 @@ pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHook
                     continue;
                 };
                 let before = inner_hooks.len();
-                inner_hooks.retain(|hook| !hook_command_is_chat_hook(hook));
+                inner_hooks.retain(|hook| !hook_command_is_ccteam_hook(hook));
                 removed += before - inner_hooks.len();
             }
             // Drop now-empty inner hook lists (matcher entries whose hooks
@@ -832,9 +629,9 @@ pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHook
     }
 
     if removed == 0 {
-        return Ok(ChatHookScrubReport {
+        return Ok(CcteamHookScrubReport {
             target: settings_path.to_path_buf(),
-            action: ChatHookScrubAction::NoChangeNeeded,
+            action: CcteamHookScrubAction::NoChangeNeeded,
         });
     }
 
@@ -853,101 +650,78 @@ pub fn remove_chat_hooks(settings_path: &Path, dry_run: bool) -> Result<ChatHook
     let now_empty = v.as_object().map(|o| o.is_empty()).unwrap_or(false);
 
     if dry_run {
-        return Ok(ChatHookScrubReport {
+        return Ok(CcteamHookScrubReport {
             target: settings_path.to_path_buf(),
-            action: ChatHookScrubAction::WouldRemove { entries: removed },
+            action: CcteamHookScrubAction::WouldRemove { entries: removed },
+        });
+    }
+
+    if now_empty {
+        std::fs::remove_file(settings_path)
+            .with_context(|| format!("rm {}", settings_path.display()))?;
+        return Ok(CcteamHookScrubReport {
+            target: settings_path.to_path_buf(),
+            action: CcteamHookScrubAction::RemovedNowEmpty { entries: removed },
         });
     }
 
     let body = serde_json::to_string_pretty(&v).context("serialize updated settings.local.json")?;
-    let tmp = settings_path.with_extension("json.ccteam-chat-scrub.tmp");
+    let tmp = settings_path.with_extension("json.ccteam-hook-scrub.tmp");
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, settings_path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), settings_path.display()))?;
-    Ok(ChatHookScrubReport {
+    Ok(CcteamHookScrubReport {
         target: settings_path.to_path_buf(),
-        action: if now_empty {
-            ChatHookScrubAction::RemovedNowEmpty { entries: removed }
-        } else {
-            ChatHookScrubAction::Removed { entries: removed }
-        },
+        action: CcteamHookScrubAction::Removed { entries: removed },
     })
 }
 
-/// Predicate: does this `hook` JSON entry invoke one of ccteam's
-/// chat-mode hooks (the inverse target of `ensure_chat_hooks_installed`)?
-/// Matches the `chat-progress <event>` + `intercept-ask` +
-/// `permission-request` wrapper forms and the `mux hook-emit --kind
-/// chat-progress` daemon-bus variant, independent of the leading
-/// `hook.sh` / binary path.
-///
-/// v0.8.7 review-fix (R-M4): the HITL `PermissionRequest` hook
-/// (`{hook_sh} permission-request`, installed by `claude_tui` for a hitl
-/// session) is a ccteam-managed hook too, so `project rm --purge` (which
-/// scrubs these entries — purge = `init` inverse, red line) must also
-/// recognize it; otherwise a hitl-spawned project leaves a residual
-/// `PermissionRequest` hook in `settings.local.json` after purge.
-fn hook_command_is_chat_hook(hook: &serde_json::Value) -> bool {
+/// The plugin id ccteam pins off for its Claude sessions (mirror of
+/// `ccteam_harness::execution::claude_tui::TELEGRAM_PLUGIN_ID`; core sits below
+/// harness and cannot name it).
+const TELEGRAM_PLUGIN_PIN: &str = "telegram@claude-plugins-official";
+
+/// Hook kinds ccteam's `hooks/hook.sh` dispatcher has ever been invoked with
+/// from a Claude Code settings file (`ccteam_hooks::dispatch`). A `hook.sh`
+/// command only counts as ccteam's when its first argument is one of these,
+/// so an operator's own `hook.sh` survives the scrub.
+const CCTEAM_HOOK_KINDS: &[&str] = &[
+    "progress-append",
+    "load-context",
+    "intercept-ask",
+    "permission-request",
+    "chat-progress",
+];
+
+/// Predicate: does this `hook` JSON entry invoke one of ccteam's own hooks?
+/// Every shape ccteam has ever written, independent of the install path:
+/// - `<…>/hook.sh <kind> [args]` — the dispatcher (project bootstrap
+///   template + terminal-protocol chat hooks, incl. the HITL
+///   `permission-request` and the `AskUserQuestion` `intercept-ask` entries)
+/// - `<…>/ccteam [internal] hook <kind> …` / `<…>/cct hook <kind> …` — the
+///   pre-dispatcher binary forms (incl. the retired `cost-accumulate` /
+///   `parse-phase-end` kinds)
+/// - `ccteam mux hook-emit …` — the `CCTEAM_HOOK_VIA_DAEMON` variant
+fn hook_command_is_ccteam_hook(hook: &serde_json::Value) -> bool {
     let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
-    let trimmed = cmd.trim();
-    trimmed.ends_with(" chat-progress")
-        || trimmed.contains(" chat-progress ")
-        || trimmed.contains("hook-emit --kind chat-progress")
-        || trimmed.ends_with(" intercept-ask")
-        || trimmed.contains(" intercept-ask ")
-        || trimmed.ends_with(" permission-request")
-        || trimmed.contains(" permission-request ")
-}
-
-/// V0.2.2 F44 + V0.4.6 F89 + V0.6.1 F139: rewrite one hook `command`
-/// string into the `<hook.sh> <kind> [args]` shape current installs ship.
-///
-/// Returns `None` when the command already points at the supplied
-/// `new_hook_sh` (idempotency) or does not look like a ccteam-managed
-/// hook (operator-authored hooks survive untouched). Otherwise returns
-/// the rewritten string with the leading binary / wrapper-path tokens
-/// swapped to `new_hook_sh` and the `internal hook` infix dropped.
-///
-/// Migration paths handled (oldest → newest):
-/// - F44: `…/cct hook <kind> [args]` / bare `cct hook <kind> [args]`
-/// - F89: `…/ccteam hook <kind> [args]` / bare `ccteam hook <kind> [args]`
-/// - F89: `…/ccteam internal hook <kind> [args]` /
-///   bare `ccteam internal hook <kind> [args]`
-fn rewrite_one_hook_command(cmd: &str, new_hook_sh: &str) -> Option<String> {
-    // Already on the F139 form? Idempotency.
-    if cmd.trim_start().starts_with(new_hook_sh) {
-        return None;
+    let mut tokens = cmd.split_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    let rest: Vec<&str> = tokens.collect();
+    match basename {
+        "hook.sh" => rest
+            .first()
+            .is_some_and(|kind| CCTEAM_HOOK_KINDS.contains(kind)),
+        "ccteam" | "cct" => matches!(
+            rest.as_slice(),
+            ["hook", _, ..] | ["internal", "hook", _, ..] | ["mux", "hook-emit", ..]
+        ),
+        _ => false,
     }
-
-    // V0.4.6 → V0.6.1 — `…/ccteam internal hook <kind> [args]` form.
-    if let Some(idx) = cmd.find("/ccteam internal hook ") {
-        let after = &cmd[idx + "/ccteam internal hook ".len()..];
-        return Some(format!("{new_hook_sh} {after}"));
-    }
-    if let Some(rest) = cmd.strip_prefix("ccteam internal hook ") {
-        return Some(format!("{new_hook_sh} {rest}"));
-    }
-    // F89 — absolute path ending with `/ccteam hook …` (V0.4.5 form).
-    if let Some(idx) = cmd.find("/ccteam hook ") {
-        let after = &cmd[idx + "/ccteam hook ".len()..];
-        return Some(format!("{new_hook_sh} {after}"));
-    }
-    // F89 — bare `ccteam hook …` (V0.4.5 form, no path prefix).
-    if let Some(rest) = cmd.strip_prefix("ccteam hook ") {
-        return Some(format!("{new_hook_sh} {rest}"));
-    }
-    // F44 — absolute path ending with `/cct hook …` (F39 binary name).
-    if let Some(idx) = cmd.find("/cct hook ") {
-        let after = &cmd[idx + "/cct hook ".len()..];
-        return Some(format!("{new_hook_sh} {after}"));
-    }
-    // F44 — bare `cct hook …` with no path prefix (uncommon but legal).
-    if let Some(rest) = cmd.strip_prefix("cct hook ") {
-        return Some(format!("{new_hook_sh} {rest}"));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1334,219 +1108,31 @@ mod tests {
         }
     }
 
-    fn legacy_settings_json(legacy_bin: &str) -> String {
-        format!(
-            r#"{{
-  "hooks": {{
-    "SessionStart": [
-      {{"hooks": [
-        {{"type": "command", "command": "{legacy_bin} hook load-context", "timeout": 5}},
-        {{"type": "command", "command": "{legacy_bin} hook progress-append session_start", "async": true}}
-      ]}}
-    ],
-    "Stop": [
-      {{"hooks": [{{"type": "command", "command": "{legacy_bin} hook parse-phase-end"}}]}}
-    ]
-  }}
-}}"#
-        )
-    }
-
-    const HOOK_SH: &str = "/home/u/.ccteam/hooks/hook.sh";
+    // ───────────────────── remove_ccteam_hooks ─────────────────────
 
     #[test]
-    fn rewrite_legacy_hook_commands_swaps_f39_cct_path() {
-        // V0.6.1 F139: F44/F89 rewriter now lands on the hook.sh form.
+    fn remove_ccteam_hooks_not_found_when_file_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
-        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/cct")).unwrap();
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains(&format!("{HOOK_SH} load-context")),
-            "got: {body}",
-        );
-        assert!(!body.contains("/cct hook"), "F39-era path survived: {body}");
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::NotFound);
     }
 
     #[test]
-    fn rewrite_legacy_hook_commands_dry_run_does_not_write() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        let original = legacy_settings_json("/home/u/.cargo/bin/cct");
-        std::fs::write(&path, &original).unwrap();
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, true).unwrap();
-        assert_eq!(
-            rep.action,
-            HookCmdRewriteAction::WouldRewrite { entries: 3 }
-        );
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body, original);
-    }
-
-    #[test]
-    fn rewrite_legacy_hook_commands_idempotent_when_already_hook_sh() {
-        // V0.6.1 F139: a settings.local.json already pointing at the
-        // hook.sh wrapper must be a no-op the second pass.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        let already_migrated = format!(
-            r#"{{
-  "hooks": {{
-    "SessionStart": [
-      {{"hooks": [
-        {{"type": "command", "command": "{HOOK_SH} load-context"}},
-        {{"type": "command", "command": "{HOOK_SH} progress-append session_start"}}
-      ]}}
-    ],
-    "Stop": [
-      {{"hooks": [{{"type": "command", "command": "{HOOK_SH} parse-phase-end"}}]}}
-    ]
-  }}
-}}"#
-        );
-        std::fs::write(&path, already_migrated).unwrap();
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::NoChangeNeeded);
-    }
-
-    #[test]
-    fn rewrite_legacy_hook_commands_migrates_f89_internal_hook_to_hook_sh() {
-        // V0.6.1 F139: V0.4.6/V0.6.0 `<bin> internal hook ...` form
-        // rewrites to `<hook.sh> ...`. Catches user upgrades from F89.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        let v060_settings = r#"{
-  "hooks": {
-    "SessionStart": [
-      {"hooks": [
-        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook load-context"},
-        {"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook progress-append session_start"}
-      ]}
-    ],
-    "Stop": [
-      {"hooks": [{"type": "command", "command": "/home/u/.cargo/bin/ccteam internal hook progress-append Stop"}]}
-    ]
-  }
-}"#;
-        std::fs::write(&path, v060_settings).unwrap();
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains(&format!("{HOOK_SH} load-context")),
-            "got: {body}"
-        );
-        assert!(
-            !body.contains("ccteam internal hook"),
-            "V0.6.0 path must not survive: {body}",
-        );
-    }
-
-    #[test]
-    fn rewrite_legacy_hook_commands_migrates_v045_ccteam_hook_to_hook_sh() {
-        // V0.4.5 settings.local.json with `<bin> hook …` (no `internal`
-        // segment) rewrites to the F139 form too.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        std::fs::write(&path, legacy_settings_json("/home/u/.cargo/bin/ccteam")).unwrap();
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::Rewrote { entries: 3 });
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.contains(&format!("{HOOK_SH} load-context")),
-            "got: {body}"
-        );
-        assert!(
-            !body.contains("ccteam hook load-context"),
-            "V0.4.5 path must not survive: {body}",
-        );
-    }
-
-    #[test]
-    fn rewrite_legacy_hook_commands_handles_missing_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        let new_hook = PathBuf::from(HOOK_SH);
-        let rep = rewrite_legacy_hook_commands(&path, &new_hook, false).unwrap();
-        assert_eq!(rep.action, HookCmdRewriteAction::NotFound);
-    }
-
-    #[test]
-    fn rewrite_one_hook_command_handles_bare_cct_prefix() {
-        let got = rewrite_one_hook_command("cct hook progress-append PreToolUse", HOOK_SH);
-        assert_eq!(
-            got.as_deref(),
-            Some(format!("{HOOK_SH} progress-append PreToolUse").as_str()),
-        );
-    }
-
-    #[test]
-    fn rewrite_one_hook_command_handles_bare_ccteam_prefix() {
-        let got = rewrite_one_hook_command("ccteam hook progress-append PreToolUse", HOOK_SH);
-        assert_eq!(
-            got.as_deref(),
-            Some(format!("{HOOK_SH} progress-append PreToolUse").as_str()),
-        );
-    }
-
-    #[test]
-    fn rewrite_one_hook_command_handles_internal_hook_form() {
-        let got = rewrite_one_hook_command(
-            "/home/u/.cargo/bin/ccteam internal hook intercept-ask",
-            HOOK_SH,
-        );
-        assert_eq!(
-            got.as_deref(),
-            Some(format!("{HOOK_SH} intercept-ask").as_str()),
-        );
-    }
-
-    #[test]
-    fn rewrite_one_hook_command_idempotent_for_hook_sh_form() {
-        let got = rewrite_one_hook_command(&format!("{HOOK_SH} load-context"), HOOK_SH);
-        assert!(got.is_none(), "hook.sh-prefixed command must be skipped");
-    }
-
-    #[test]
-    fn rewrite_one_hook_command_returns_none_for_unrelated_commands() {
-        assert!(
-            rewrite_one_hook_command("/usr/bin/jq .progress[]", HOOK_SH).is_none(),
-            "should not touch operator-authored hooks",
-        );
-    }
-
-    // ───────────────────── v0.8.6 W3 — remove_chat_hooks ─────────────────────
-
-    #[test]
-    fn remove_chat_hooks_not_found_when_file_absent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("settings.local.json");
-        let report = remove_chat_hooks(&path, false).unwrap();
-        assert_eq!(report.action, ChatHookScrubAction::NotFound);
-    }
-
-    #[test]
-    fn remove_chat_hooks_no_change_for_operator_only_file() {
+    fn remove_ccteam_hooks_no_change_for_operator_only_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         let original = r#"{"permissions":{"allow":["Bash"]},"hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"/h/my-linter.sh"}]}]}}"#;
         std::fs::write(&path, original).unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
-        assert_eq!(report.action, ChatHookScrubAction::NoChangeNeeded);
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::NoChangeNeeded);
         // File untouched (still parses, still has the operator hook).
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("my-linter.sh"));
     }
 
     #[test]
-    fn remove_chat_hooks_strips_chat_and_ask_keeps_others() {
+    fn remove_ccteam_hooks_strips_chat_and_ask_keeps_others() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1564,9 +1150,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
         // 1 SessionStart + 1 PreToolUse chat-progress + 1 intercept-ask = 3.
-        assert_eq!(report.action, ChatHookScrubAction::Removed { entries: 3 });
+        assert_eq!(report.action, CcteamHookScrubAction::Removed { entries: 3 });
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(v.get("permissions").is_some(), "operator key kept");
@@ -1581,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_chat_hooks_reports_now_empty_when_only_ccteam_hooks() {
+    fn remove_ccteam_hooks_reports_now_empty_when_only_ccteam_hooks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1589,20 +1175,17 @@ mod tests {
             r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}],"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress stop"}]}]}}"#,
         )
         .unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
         assert_eq!(
             report.action,
-            ChatHookScrubAction::RemovedNowEmpty { entries: 2 }
+            CcteamHookScrubAction::RemovedNowEmpty { entries: 2 }
         );
-        // remove_chat_hooks rewrites in place ({}) — the CALLER deletes
-        // the file on RemovedNowEmpty; here the rewritten body is empty.
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({}));
+        // The file existed only to carry ccteam's hooks — it is deleted.
+        assert!(!path.exists(), "now-empty settings.local.json is removed");
     }
 
     #[test]
-    fn remove_chat_hooks_matches_daemon_bus_variant() {
+    fn remove_ccteam_hooks_matches_daemon_bus_variant() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1610,23 +1193,23 @@ mod tests {
             r#"{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"ccteam mux hook-emit --kind chat-progress --action stop"}]}]}}"#,
         )
         .unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
         assert_eq!(
             report.action,
-            ChatHookScrubAction::RemovedNowEmpty { entries: 1 }
+            CcteamHookScrubAction::RemovedNowEmpty { entries: 1 }
         );
     }
 
     /// v0.8.7 review-fix (R-M4) — a hitl session installs the
     /// `PermissionRequest` hook (`{hook_sh} permission-request`, see
     /// `claude_tui::ensure_chat_hooks_installed`). `project rm --purge`
-    /// (which runs `remove_chat_hooks`) is the `init` inverse and MUST clear
+    /// (which runs `remove_ccteam_hooks`) is the `init` inverse and MUST clear
     /// it; otherwise the project keeps a live HITL gate after deregistration.
     /// This pins both: the entry is counted/removed AND its now-empty
     /// `PermissionRequest` event section is pruned, while an operator hook
     /// under the same section survives.
     #[test]
-    fn remove_chat_hooks_strips_permission_request_keeps_operator() {
+    fn remove_ccteam_hooks_strips_permission_request_keeps_operator() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1642,9 +1225,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
         // 1 SessionStart chat-progress + 1 PermissionRequest ccteam hook = 2.
-        assert_eq!(report.action, ChatHookScrubAction::Removed { entries: 2 });
+        assert_eq!(report.action, CcteamHookScrubAction::Removed { entries: 2 });
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let body = serde_json::to_string(&v).unwrap();
@@ -1671,7 +1254,7 @@ mod tests {
     /// `PermissionRequest` HITL hook, no operator content) collapses to empty
     /// on purge so the caller deletes it (true `init` inverse).
     #[test]
-    fn remove_chat_hooks_now_empty_includes_permission_request() {
+    fn remove_ccteam_hooks_now_empty_includes_permission_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1679,26 +1262,24 @@ mod tests {
             r#"{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress stop"}]}],"PermissionRequest":[{"hooks":[{"type":"command","command":"/h/hook.sh permission-request"}]}]}}"#,
         )
         .unwrap();
-        let report = remove_chat_hooks(&path, false).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
         assert_eq!(
             report.action,
-            ChatHookScrubAction::RemovedNowEmpty { entries: 2 }
+            CcteamHookScrubAction::RemovedNowEmpty { entries: 2 }
         );
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({}));
+        assert!(!path.exists(), "now-empty settings.local.json is removed");
     }
 
     #[test]
-    fn remove_chat_hooks_dry_run_does_not_write() {
+    fn remove_ccteam_hooks_dry_run_does_not_write() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         let original = r#"{"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}]}}"#;
         std::fs::write(&path, original).unwrap();
-        let report = remove_chat_hooks(&path, true).unwrap();
+        let report = remove_ccteam_hooks(&path, true).unwrap();
         assert_eq!(
             report.action,
-            ChatHookScrubAction::WouldRemove { entries: 1 }
+            CcteamHookScrubAction::WouldRemove { entries: 1 }
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1708,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_chat_hooks_idempotent_after_scrub() {
+    fn remove_ccteam_hooks_idempotent_after_scrub() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("settings.local.json");
         std::fs::write(
@@ -1716,9 +1297,149 @@ mod tests {
             r#"{"permissions":{},"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"/h/hook.sh chat-progress session-start"}]}]}}"#,
         )
         .unwrap();
-        let first = remove_chat_hooks(&path, false).unwrap();
-        assert!(matches!(first.action, ChatHookScrubAction::Removed { .. }));
-        let second = remove_chat_hooks(&path, false).unwrap();
-        assert_eq!(second.action, ChatHookScrubAction::NoChangeNeeded);
+        let first = remove_ccteam_hooks(&path, false).unwrap();
+        assert!(matches!(
+            first.action,
+            CcteamHookScrubAction::Removed { .. }
+        ));
+        let second = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(second.action, CcteamHookScrubAction::NoChangeNeeded);
+    }
+
+    /// docs-local issue #212 — the exact block project bootstrap used to
+    /// write (`hooks/hook.sh progress-append|load-context|intercept-ask`) is
+    /// stripped, while the non-hook keys that file carried and a user hook in
+    /// the same event section survive.
+    #[test]
+    fn remove_ccteam_hooks_strips_bootstrap_template_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "permissions": {"defaultMode": "bypassPermissions", "deny": []},
+              "env": {"CCTEAM_HOME": "/home/u/.ccteam"},
+              "hooks": {
+                "SessionStart": [{"hooks": [
+                  {"type":"command","command":"/home/u/.ccteam/hooks/hook.sh load-context","timeout":5},
+                  {"type":"command","command":"/home/u/.ccteam/hooks/hook.sh progress-append session_start","async":true}
+                ]}],
+                "Stop": [{"hooks": [{"type":"command","command":"/home/u/.ccteam/hooks/hook.sh progress-append Stop","async":true}]}],
+                "PreToolUse": [
+                  {"hooks": [{"type":"command","command":"/home/u/.ccteam/hooks/hook.sh progress-append PreToolUse","async":true}]},
+                  {"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"/home/u/.ccteam/hooks/hook.sh intercept-ask","timeout":5}]},
+                  {"matcher":"Bash","hooks":[{"type":"command","command":"/home/u/bin/hook.sh audit"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::Removed { entries: 5 });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
+        assert_eq!(v["env"]["CCTEAM_HOME"], "/home/u/.ccteam");
+        let hooks = v["hooks"].as_object().unwrap();
+        assert_eq!(
+            hooks.keys().collect::<Vec<_>>(),
+            vec!["PreToolUse"],
+            "only the user's hook section remains"
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/home/u/bin/hook.sh audit",
+            "a user hook.sh with a non-ccteam argument is not ccteam's"
+        );
+    }
+
+    /// The pre-dispatcher binary forms (`ccteam hook …`, `ccteam internal
+    /// hook …`, `cct hook …`) incl. retired kinds are ccteam's too; an
+    /// unrelated command merely mentioning `hook` is not.
+    #[test]
+    fn hook_command_is_ccteam_hook_matches_legacy_binary_forms() {
+        let is = |cmd: &str| hook_command_is_ccteam_hook(&serde_json::json!({ "command": cmd }));
+        assert!(is("/usr/local/bin/ccteam hook cost-accumulate"));
+        assert!(is("ccteam hook parse-phase-end"));
+        assert!(is("/home/u/.cargo/bin/ccteam internal hook load-context"));
+        assert!(is("/opt/cct hook progress-append Stop"));
+        assert!(is(
+            "ccteam mux hook-emit --kind chat-progress --action stop"
+        ));
+        assert!(!is("ccteam status"));
+        assert!(!is("/usr/bin/jq .progress[]"));
+        assert!(!is("/h/hook.sh"));
+        assert!(!is("git hook run pre-commit"));
+    }
+
+    /// docs-local issue #212 — an empty / invalid file is reported, never an
+    /// error, and left byte-for-byte as it was.
+    #[test]
+    fn remove_ccteam_hooks_reports_unparseable_and_leaves_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        for body in ["", "{\"model\": \"opus\",}"] {
+            std::fs::write(&path, body).unwrap();
+            let report = remove_ccteam_hooks(&path, false).unwrap();
+            assert!(
+                matches!(report.action, CcteamHookScrubAction::Unparseable { .. }),
+                "{body:?}: {:?}",
+                report.action
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
+    }
+
+    /// A path that exists but cannot be read (here: a directory) is
+    /// `Unreadable`, not mislabelled as invalid JSON.
+    #[test]
+    fn remove_ccteam_hooks_reports_unreadable_distinct_from_unparseable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::create_dir(&path).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert!(
+            matches!(report.action, CcteamHookScrubAction::Unreadable { .. }),
+            "{:?}",
+            report.action
+        );
+        assert!(path.is_dir(), "left as it was");
+    }
+
+    /// The Telegram pin ccteam wrote (`false`) is scrubbed — pruning an
+    /// emptied `enabledPlugins` — while a user's own value survives.
+    #[test]
+    fn remove_ccteam_hooks_strips_ccteam_telegram_pin_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"opus","enabledPlugins":{"telegram@claude-plugins-official":false}}"#,
+        )
+        .unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::Removed { entries: 1 });
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"model": "opus"}));
+
+        // Pin-only file collapses and is removed.
+        std::fs::write(
+            &path,
+            r#"{"enabledPlugins":{"telegram@claude-plugins-official":false}}"#,
+        )
+        .unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(
+            report.action,
+            CcteamHookScrubAction::RemovedNowEmpty { entries: 1 }
+        );
+        assert!(!path.exists());
+
+        // A user's own `true` (and other plugins) is not ccteam's.
+        let user = r#"{"enabledPlugins":{"telegram@claude-plugins-official":true,"x@y":false}}"#;
+        std::fs::write(&path, user).unwrap();
+        let report = remove_ccteam_hooks(&path, false).unwrap();
+        assert_eq!(report.action, CcteamHookScrubAction::NoChangeNeeded);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
     }
 }

@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ThreadStatus;
+use crate::{ContextBreakdown, ThreadStatus};
 
 use super::fs_atomic::atomic_write_durable;
 
@@ -76,10 +76,67 @@ pub fn read_status_file_reporting(
     }
 }
 
+/// `<project_dir>/.ccteam/chat/<sid>/context.json` — the session's last
+/// [`ContextBreakdown`] (issue #21), beside `status.json` for the same reason:
+/// a released session must still be able to say what its window held.
+pub fn context_json_path(project_dir: &Path, sid: &str) -> PathBuf {
+    status_json_path(project_dir, sid).with_file_name("context.json")
+}
+
+/// Persist the latest breakdown atomically. Best-effort like
+/// [`write_status_file`]: a failed write only leaves the previous snapshot.
+pub fn write_context_file(project_dir: &Path, sid: &str, breakdown: &ContextBreakdown) {
+    let path = context_json_path(project_dir, sid);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(body) = serde_json::to_vec(breakdown) else {
+        return;
+    };
+    let _ = atomic_write_durable(&path, &body);
+}
+
+/// The persisted breakdown, or `None` if absent / unreadable / stale-shaped.
+pub fn read_context_file(project_dir: &Path, sid: &str) -> Option<ContextBreakdown> {
+    let body = std::fs::read(context_json_path(project_dir, sid)).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContextSource, ContextUsage};
+    use crate::{ContextCategory, ContextCategoryKind, ContextSource, ContextUsage};
+
+    #[test]
+    fn roundtrips_a_context_breakdown_beside_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_context_file(dir.path(), "s3"), None);
+        let breakdown = ContextBreakdown {
+            vendor: "claude".into(),
+            model: Some("claude-sonnet-5-5".into()),
+            captured_at: chrono::Utc::now(),
+            used_tokens: 29_198,
+            window_tokens: 1_000_000,
+            categories: vec![ContextCategory {
+                id: "memory_files".into(),
+                name: "Memory files".into(),
+                tokens: 15_169,
+                kind: ContextCategoryKind::Used,
+                items: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        write_context_file(dir.path(), "s3", &breakdown);
+        assert_eq!(
+            context_json_path(dir.path(), "s3").parent(),
+            status_json_path(dir.path(), "s3").parent()
+        );
+        assert_eq!(read_context_file(dir.path(), "s3"), Some(breakdown));
+        std::fs::write(context_json_path(dir.path(), "s3"), b"{not json").unwrap();
+        assert_eq!(read_context_file(dir.path(), "s3"), None);
+    }
 
     #[test]
     fn roundtrips_a_status_with_provenance() {

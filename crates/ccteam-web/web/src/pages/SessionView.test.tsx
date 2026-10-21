@@ -26,6 +26,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import SessionView, { BusyHeartbeat, RowTime } from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
+import { CONTEXT_PANEL_OPEN_KEY } from "../lib/contextBreakdown";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 import type { SessionEvent } from "../hooks/useSessionEvents";
 
@@ -182,6 +183,69 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(strip(local)).not.toContain("@ local");
     const remote = render({ ...SESSION, host: "dev04" });
     expect(strip(remote)).toContain("@ dev04");
+  });
+});
+
+// The context panel (right sidebar): its two entry points in the header and
+// the per-browser docked memory. The panel body itself is covered by
+// ContextPanel.test.tsx (jsdom); SSR here proves the mount-time decisions.
+describe("context panel entry points + docked memory", () => {
+  const strip = (h: string) => h.replace(/<!-- -->/g, "");
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    vi.spyOn(globalThis.localStorage, "getItem").mockReturnValue(null);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("always offers the header toggle; the panel stays closed until remembered open", () => {
+    const html = render();
+    expect(html).toMatch(/<button[^>]*data-testid="ctx-toggle"[^>]*aria-pressed="false"/);
+    expect(html).toContain('aria-label="查看上下文构成"');
+    expect(html).not.toContain('data-testid="context-panel"');
+    // The chat column is still wrapped so the panel can dock beside it.
+    expect(html).toContain('class="conv-body"');
+    expect(html).toContain('class="conv-main"');
+    // No status yet ⇒ no chip; the toggle is the way in.
+    expect(html).not.toContain('data-testid="ctx-chip"');
+  });
+
+  it("the `model · ctx N%` chip is a labelled button into the panel once a status is known", () => {
+    vi.spyOn(globalThis.localStorage, "getItem").mockImplementation((k) =>
+      k === rowsKeyFor("s9")
+        ? JSON.stringify([
+            {
+              id: "a1",
+              kind: "assistant",
+              content: "ok",
+              status: {
+                model: "claude-sonnet-5-5",
+                turn: 1,
+                context: { used_tokens: 250_000, window_tokens: 1_000_000, pct: 25 },
+              },
+            },
+          ])
+        : null,
+    );
+    const html = strip(render());
+    expect(html).toMatch(
+      /<button[^>]*class="chip chip-btn"[^>]*data-testid="ctx-chip"[^>]*aria-label="查看上下文构成 · claude-sonnet-5-5"[^>]*aria-pressed="false"/,
+    );
+    expect(html).toContain("claude-sonnet-5-5 · ctx 25%");
+    expect(html).not.toContain('title="model · context window"');
+  });
+
+  it("restores a remembered-open panel on mount (per-browser layout memory)", () => {
+    vi.spyOn(globalThis.localStorage, "getItem").mockImplementation((k) =>
+      k === CONTEXT_PANEL_OPEN_KEY ? "1" : null,
+    );
+    const html = render();
+    expect(html).toContain('data-testid="context-panel"');
+    expect(html).toContain('aria-label="上下文"');
+    // Effects don't run under SSR: the first paint is the loading state.
+    expect(html).toContain('data-testid="ctx-loading"');
+    expect(html).toMatch(/<button[^>]*data-testid="ctx-toggle"[^>]*aria-pressed="true"/);
   });
 });
 

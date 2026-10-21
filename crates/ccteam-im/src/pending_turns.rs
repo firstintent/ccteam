@@ -7,7 +7,6 @@
 //! (`submit_resolved` / event pump). No alternate turns writer.
 
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -115,13 +114,12 @@ pub fn enqueue_pending_turn(
         intent,
         request_id,
     };
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    // One `write_all` per record (see `open_jsonl_append`).
+    let mut line = serde_json::to_vec(&row)?;
+    line.push(b'\n');
+    let mut f = ccteam_harness::execution::fs_atomic::open_jsonl_append(&path)
         .with_context(|| format!("open pending_turns {}", path.display()))?;
-    serde_json::to_writer(&mut f, &row)?;
-    f.write_all(b"\n")?;
+    f.write_all(&line)?;
     f.sync_all().ok();
     Ok(())
 }
@@ -157,6 +155,77 @@ pub fn drain_pending_turns(project_dir: &Path, sid: &str) -> Result<VecDeque<Pen
     std::fs::remove_file(&path)
         .with_context(|| format!("retire pending input {}", path.display()))?;
     Ok(out)
+}
+
+/// Take back the newest queued line carrying `text` — the line a submit just
+/// enqueued and then could not deliver (its resume failed), so the caller can
+/// say "not delivered, send it again" without that line also going out later.
+/// Every other line stays, in order. `Ok(false)` when no such line is queued.
+pub fn withdraw_last_pending_turn(project_dir: &Path, sid: &str, text: &str) -> Result<bool> {
+    let path = pending_path(project_dir, sid);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read pending_turns {}", path.display()))
+        }
+    };
+    let mut lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some(index) = lines.iter().rposition(|line| {
+        serde_json::from_str::<PendingTurn>(line).is_ok_and(|turn| turn.text == text)
+    }) else {
+        return Ok(false);
+    };
+    lines.remove(index);
+    if lines.is_empty() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("retire pending input {}", path.display()))?;
+        return Ok(true);
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(true)
+}
+
+/// Take every DELEGATED line (one carrying a request id) out of the queue,
+/// keeping the rest in order; returns the request ids taken. Used when the
+/// session the lines wait for could not be brought back and their parents
+/// were told so: a parent that resends must not get the old line run too.
+pub fn withdraw_delegated_turns(project_dir: &Path, sid: &str) -> Result<Vec<String>> {
+    let path = pending_path(project_dir, sid);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read pending_turns {}", path.display()))
+        }
+    };
+    let mut taken = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<PendingTurn>(line) {
+            Ok(PendingTurn {
+                request_id: Some(id),
+                ..
+            }) => taken.push(id),
+            _ => kept.push(line),
+        }
+    }
+    if taken.is_empty() {
+        return Ok(taken);
+    }
+    if kept.is_empty() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("retire pending input {}", path.display()))?;
+    } else {
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, kept.join("\n") + "\n")
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+    }
+    Ok(taken)
 }
 
 /// Count pending turns without draining.

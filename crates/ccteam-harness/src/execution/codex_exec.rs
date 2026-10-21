@@ -779,6 +779,7 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .and_then(|v| v.as_str())
                 .unwrap_or("in_progress")
                 .to_string(),
+            output: crate::codex_item_output(item),
         },
         "file_change" => {
             let path = item
@@ -816,6 +817,7 @@ fn parse_jsonl_item(item: &Value) -> ThreadItem {
                 .unwrap_or("")
                 .to_string(),
             args: item.get("arguments").cloned().unwrap_or(Value::Null),
+            output: crate::codex_item_output(item),
         },
         "web_search" => ThreadItemDetails::WebSearch {
             query: item

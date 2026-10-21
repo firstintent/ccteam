@@ -1242,19 +1242,30 @@ pub(crate) fn spawn_binding_reaper(
     principals: Arc<ccteam_im::principals::SessionPrincipals>,
     bindings: Arc<NativeBindings>,
 ) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(BINDING_SWEEP_PERIOD);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let closed = bindings.sweep_idle(chrono::Duration::seconds(BINDING_MAX_IDLE_SECS));
-            for sid in &closed {
-                tracing::info!(
-                    %sid, idle_secs = BINDING_MAX_IDLE_SECS,
-                    "ccteam-web: reaping an idle enrolled client's ledger node"
-                );
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "binding reaper",
+        move || {
+            let (gateway, principals, bindings) = (
+                Arc::clone(&gateway),
+                Arc::clone(&principals),
+                Arc::clone(&bindings),
+            );
+            async move {
+                let mut tick = tokio::time::interval(BINDING_SWEEP_PERIOD);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let closed =
+                        bindings.sweep_idle(chrono::Duration::seconds(BINDING_MAX_IDLE_SECS));
+                    for sid in &closed {
+                        tracing::info!(
+                            %sid, idle_secs = BINDING_MAX_IDLE_SECS,
+                            "ccteam-web: reaping an idle enrolled client's ledger node"
+                        );
+                    }
+                    retire_node(Some(&gateway), Some(&principals), &closed).await;
+                }
             }
-            retire_node(Some(&gateway), Some(&principals), &closed).await;
-        }
-    });
+        },
+    ));
 }

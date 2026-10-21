@@ -36,7 +36,7 @@
 //! [`Outbound`] and returns the events it produced. The transport's
 //! `events()` task owns one translator and drives it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -185,6 +185,10 @@ pub struct StreamTranslator {
     last_text: Option<String>,
     /// Item-id counter for tool/reasoning items within a turn.
     item_seq: u64,
+    /// The active turn's tool calls still awaiting their `tool_result`, by
+    /// the vendor's `tool_use_id` → (our item id, tool name, input). The
+    /// result arrives on a later `user` line and completes the SAME item.
+    open_tools: HashMap<String, (String, String, Value)>,
     /// Canonical model id (`message.model`) of the active turn's latest
     /// assistant message — the deterministic per-turn cost source. The
     /// `result` line carries no model, so we carry it forward from the
@@ -270,15 +274,16 @@ impl StreamTranslator {
                 self.on_system(&sys);
                 Vec::new()
             }
-            // `user` replay echoes, control frames, partials: no neutral event
-            // (transcript authority + HITL handled elsewhere). A user line the
-            // vendor wrote ITSELF is not classified from its text — the turn it
-            // opens is recognised by having reserved no id (see
-            // [`TurnIdentity::open`]).
-            Outbound::User(_)
-            | Outbound::ControlRequest(_)
-            | Outbound::ControlResponse(_)
-            | Outbound::Other => Vec::new(),
+            // A `user` line completes the tool calls whose results it
+            // carries; replay echoes, control frames and partials produce no
+            // neutral event (transcript authority + HITL handled elsewhere). A
+            // user line the vendor wrote ITSELF is not classified from its
+            // text — the turn it opens is recognised by having reserved no id
+            // (see [`TurnIdentity::open`]).
+            Outbound::User(env) => self.on_tool_results(&env),
+            Outbound::ControlRequest(_) | Outbound::ControlResponse(_) | Outbound::Other => {
+                Vec::new()
+            }
         }
     }
 
@@ -304,6 +309,7 @@ impl StreamTranslator {
             self.acc_text.clear();
             self.last_text = None;
             self.item_seq = 0;
+            self.open_tools.clear();
             self.turn_model = None;
             out.push(ThreadEvent::TurnStarted {
                 turn_id: id,
@@ -402,12 +408,24 @@ impl StreamTranslator {
             // within the turn (the raw tool_use id is fine too, but this
             // keeps them grep-correlatable with the turn).
             match ev {
-                BlockItem::Tool { name, args } => {
+                BlockItem::Tool {
+                    name,
+                    args,
+                    tool_use_id,
+                } => {
                     let id = self.next_item_id();
+                    if let Some(tool_use_id) = tool_use_id {
+                        self.open_tools
+                            .insert(tool_use_id, (id.clone(), name.clone(), args.clone()));
+                    }
                     out.push(ThreadEvent::ItemStarted {
                         item: ThreadItem {
                             id,
-                            details: ThreadItemDetails::ToolCall { name, args },
+                            details: ThreadItemDetails::ToolCall {
+                                name,
+                                args,
+                                output: None,
+                            },
                         },
                     });
                 }
@@ -421,6 +439,41 @@ impl StreamTranslator {
                     });
                 }
             }
+        }
+        out
+    }
+
+    /// Complete every open tool call a `user` line answers: its
+    /// `tool_result` blocks become `ItemCompleted{ToolCall}` under the item id
+    /// the call started with, carrying the input again plus the result text.
+    /// A result for a call this turn never opened (a replay echo, a turn that
+    /// already closed) is ignored.
+    fn on_tool_results(&mut self, env: &MessageEnvelope) -> Vec<ThreadEvent> {
+        let Some(Value::Array(blocks)) = env.message.get("content") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some((id, name, args)) = self.open_tools.remove(tool_use_id) else {
+                continue;
+            };
+            let output = crate::tool_result_text(block.get("content").unwrap_or(&Value::Null));
+            out.push(ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id,
+                    details: ThreadItemDetails::ToolCall {
+                        name,
+                        args,
+                        output: Some(output),
+                    },
+                },
+            });
         }
         out
     }
@@ -533,7 +586,12 @@ pub(super) fn public_text(message: &Value) -> String {
 
 /// One non-text content block worth surfacing as a progress item.
 enum BlockItem {
-    Tool { name: String, args: Value },
+    Tool {
+        name: String,
+        args: Value,
+        /// The vendor's `tool_use` id — what its `tool_result` names.
+        tool_use_id: Option<String>,
+    },
     Reasoning(String),
 }
 
@@ -563,7 +621,13 @@ fn extract_blocks(message: &Value) -> (String, Vec<BlockItem>) {
                             .unwrap_or("tool")
                             .to_string();
                         let args = block.get("input").cloned().unwrap_or(Value::Null);
-                        items.push(BlockItem::Tool { name, args });
+                        let tool_use_id =
+                            block.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                        items.push(BlockItem::Tool {
+                            name,
+                            args,
+                            tool_use_id,
+                        });
                     }
                     "thinking" => {
                         if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
@@ -757,6 +821,57 @@ mod tests {
                 if matches!(&item.details, ThreadItemDetails::ToolCall { name, .. } if name == "Bash")
         )));
         assert_eq!(messages(&evs), vec!["running ls".to_string()]);
+    }
+
+    fn tool_results(content: Value) -> Outbound {
+        Outbound::User(MessageEnvelope {
+            message: json!({"role": "user", "content": content}),
+            session_id: "u-1".into(),
+            parent_tool_use_id: None,
+        })
+    }
+
+    /// The step inspector needs what a tool returned: the `tool_result` on the
+    /// following `user` line completes the SAME item the call opened, with the
+    /// input repeated and the result as text. A result naming no open call
+    /// (a replay echo) adds nothing.
+    #[test]
+    fn a_tool_result_completes_the_call_it_answers() {
+        let mut t = StreamTranslator::new();
+        let started = t.ingest(assistant(json!([
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}, "id": "tu-1"}
+        ])));
+        let started_id = started
+            .iter()
+            .find_map(|e| match e {
+                ThreadEvent::ItemStarted { item } => Some(item.id.clone()),
+                _ => None,
+            })
+            .expect("tool started");
+
+        let done = t.ingest(tool_results(json!([
+            {"type": "tool_result", "tool_use_id": "tu-1",
+             "content": [{"type": "text", "text": "a.txt"}, {"type": "image"}]}
+        ])));
+        assert_eq!(done.len(), 1, "{done:?}");
+        let ThreadEvent::ItemCompleted { item } = &done[0] else {
+            panic!("expected ItemCompleted, got {:?}", done[0]);
+        };
+        assert_eq!(item.id, started_id, "the result completes the started item");
+        let ThreadItemDetails::ToolCall { name, args, output } = &item.details else {
+            panic!("expected ToolCall, got {:?}", item.details);
+        };
+        assert_eq!(name, "Bash");
+        assert_eq!(args, &json!({"command": "ls"}));
+        assert_eq!(output.as_deref(), Some("a.txt\n[image]"));
+
+        let echo = t.ingest(tool_results(json!([
+            {"type": "tool_result", "tool_use_id": "tu-1", "content": "again"}
+        ])));
+        assert!(
+            echo.is_empty(),
+            "an answered call is not completed twice: {echo:?}"
+        );
     }
 
     #[test]

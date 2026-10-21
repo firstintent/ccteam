@@ -308,9 +308,10 @@ pub fn is_subagent_jsonl(path: &Path) -> bool {
 }
 
 /// In-memory carry-over for `tool_use` ↔ `tool_result` pairing across
-/// poll cycles. `tool_use_id` → tool name. Keep it small (the pending
-/// set only spans one active assistant turn).
-pub type PendingTools = HashMap<String, String>;
+/// poll cycles. `tool_use_id` → (tool name, input), so the result completes
+/// the call with both. Keep it small (the pending set only spans one active
+/// assistant turn).
+pub type PendingTools = HashMap<String, (String, Value)>;
 
 /// Result of one `read_new` pass.
 #[derive(Debug, Default)]
@@ -523,7 +524,7 @@ pub fn parse_transcript_line(row: &Value, pending: &mut PendingTools) -> Vec<Thr
                     .to_string();
                 let args = block.get("input").cloned().unwrap_or(Value::Null);
                 if !tool_use_id.is_empty() {
-                    pending.insert(tool_use_id.clone(), name.clone());
+                    pending.insert(tool_use_id.clone(), (name.clone(), args.clone()));
                 }
                 out.push(ThreadEvent::ItemStarted {
                     item: ThreadItem {
@@ -532,7 +533,11 @@ pub fn parse_transcript_line(row: &Value, pending: &mut PendingTools) -> Vec<Thr
                         } else {
                             tool_use_id
                         },
-                        details: ThreadItemDetails::ToolCall { name, args },
+                        details: ThreadItemDetails::ToolCall {
+                            name,
+                            args,
+                            output: None,
+                        },
                     },
                 });
             }
@@ -542,10 +547,10 @@ pub fn parse_transcript_line(row: &Value, pending: &mut PendingTools) -> Vec<Thr
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = pending
+                let (name, args) = pending
                     .remove(&tool_use_id)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let result_content = block.get("content").cloned().unwrap_or(Value::Null);
+                    .unwrap_or_else(|| ("unknown".to_string(), Value::Null));
+                let output = crate::tool_result_text(block.get("content").unwrap_or(&Value::Null));
                 out.push(ThreadEvent::ItemCompleted {
                     item: ThreadItem {
                         id: if tool_use_id.is_empty() {
@@ -555,7 +560,8 @@ pub fn parse_transcript_line(row: &Value, pending: &mut PendingTools) -> Vec<Thr
                         },
                         details: ThreadItemDetails::ToolCall {
                             name,
-                            args: result_content,
+                            args,
+                            output: Some(output),
                         },
                     },
                 });

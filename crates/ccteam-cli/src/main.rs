@@ -1808,16 +1808,24 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             )))
         };
 
+        // `ccteam start` reports "started" once `mcp.sock` answers, and every
+        // MCP client then dials the TCP `/mcp` that `run/mcp-url` advertises.
+        // Both listeners come up in separate tasks, so the socket waits for
+        // the web listener to be bound and published (docs-local issue #214:
+        // a client right after `start` got "connection refused").
+        let web_bound = (!web.disabled).then(|| std::sync::Arc::new(tokio::sync::Notify::new()));
         let web_handle = if web.disabled {
             None
         } else {
-            let opts = match parse_web_opts(&web) {
+            let mut opts = match parse_web_opts(&web) {
                 Ok(o) => o,
                 Err(err) => {
                     signal_task.abort();
                     return Err(err);
                 }
             };
+            opts.bound = web_bound.clone();
+            let web_exited = NotifyOnDrop(web_bound.clone());
             let mut rx = shutdown_rx.clone();
             let web_bridge = web_chat_bridge
                 .as_ref()
@@ -1848,6 +1856,16 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             let web_host_hub = host_hub.clone();
             let web_dsh_runtime = std::sync::Arc::clone(&dsh_runtime);
             Some(tokio::spawn(async move {
+                // Whatever ends this task — return, error, panic or abort — a
+                // web that never bound must not hold mcp.sock closed forever:
+                // the daemon stays up without it, as before.
+                let _web_exited = web_exited;
+                // Hidden test hook: stretch the pre-bind window so the
+                // "started ⇒ /mcp accepts" contract is tested deterministically
+                // rather than only on a host whose `/proc` sweep is slow.
+                if let Some(delay) = env_ms(WEB_PREBIND_DELAY_ENV) {
+                    tokio::time::sleep(delay).await;
+                }
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
                     move |paths, auth| {
@@ -1919,6 +1937,9 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         // session tools then report "gateway not running".
         let mcp_gateway = shared_gateway.clone();
         let mcp_handle = tokio::spawn(async move {
+            if let Some(bound) = web_bound {
+                bound.notified().await;
+            }
             serve_mcp_socket(paths, mcp_sink, mcp_pending, mcp_gateway, async move {
                 let _ = rx.changed().await;
             })
@@ -1965,9 +1986,12 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                                 _ = rx.changed() => break,
                                 maybe = sink.recv() => {
                                     let Some(event) = maybe else { break };
-                                    ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
                                     let dispatch_paths = dispatch_paths.clone();
+                                    // All per-event work runs in the blocking task, so a
+                                    // panic in it costs this event (the `Err(je)` arm), not
+                                    // the only hook-sink loop.
                                     let res = tokio::task::spawn_blocking(move || {
+                                        ccteam_harness::execution::typed_events::enrich_session_from_hook(&event);
                                         let stdin: serde_json::Value =
                                             serde_json::from_str(&event.payload_json)
                                                 .unwrap_or(serde_json::Value::Null);
@@ -1985,9 +2009,9 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                                             error = %err,
                                             "W6 hook-sink: dispatch failed; event dropped"
                                         ),
-                                        Err(je) => tracing::warn!(
+                                        Err(je) => tracing::error!(
                                             ?je,
-                                            "W6 hook-sink: dispatch task panicked"
+                                            "W6 hook-sink: dispatch task panicked; event dropped"
                                         ),
                                     }
                                 }
@@ -2320,6 +2344,29 @@ fn read_hostname() -> Option<String> {
     None
 }
 
+/// Hidden test hook (integration tests only): delay before the daemon's web
+/// listener binds, in milliseconds.
+const WEB_PREBIND_DELAY_ENV: &str = "CCTEAM_TEST_WEB_PREBIND_DELAY_MS";
+
+fn env_ms(key: &str) -> Option<Duration> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// Fires its gate when dropped, so every exit path of the task that owns it
+/// (unwinding included) releases whoever waits on the gate.
+struct NotifyOnDrop(Option<std::sync::Arc<tokio::sync::Notify>>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.notify_one();
+        }
+    }
+}
+
 fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
     let bind: std::net::SocketAddr = web
         .bind
@@ -2336,6 +2383,8 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         // This IS the daemon body (`internal daemon-run`), so it owns the
         // endpoint publication; `ccteam internal web` deliberately does not.
         publish_endpoint: true,
+        // Set by the caller, which owns the `mcp.sock` it gates.
+        bound: None,
     })
 }
 

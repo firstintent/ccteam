@@ -263,6 +263,11 @@ impl Sandbox {
             started["status"] == "started" || started["status"] == "alreadyRunning",
             "daemon did not start: {started}",
         );
+        // issue #214 regression: "started" means the advertised `/mcp` is
+        // already accepting — no retry, no sleep. The daemon once answered
+        // its readiness socket before the web listener was bound.
+        std::net::TcpStream::connect(("127.0.0.1", self.port))
+            .expect("the web /mcp listener accepts as soon as start returns");
         // issue #7 regression: the daemon must re-record run/mcp-url from
         // the address it BOUND, not the requested bind — MCP clients
         // (including `ccteam flow run`) resolve the endpoint from this file.

@@ -210,6 +210,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ### Status / 成本
 
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
+- **上下文侧栏**:在 web 控制台点会话头部的 `model · ctx` 标签(或右上角的侧栏按钮),右侧打开侧栏(切换会话时保持打开),显示上下文窗口由什么组成:system prompt、工具、memory 文件(每个 `CLAUDE.md` / 记忆文件按路径列出)、skills、MCP 工具与说明、自定义 agent,以及对话本身按工具(调用 vs 结果 token)和附件类型的拆分,外加上一次请求的缓存读 / 缓存写 / 未缓存输入。harness 延迟加载(未载入)的工具单独列出,因为它们不占窗口。数字是 harness 自己的账(Claude `/context` 的数据),不是让模型去估:在线会话每次打开和点「刷新」都现查,turn 结束时侧栏自动刷新(所以 `/compact` 后立刻看得到变化);已释放的会话显示最后一个 turn 结束时的快照并标出时间。目前只支持 Claude stream-json 会话,其他 harness 仍只显示 ctx 百分比。REST:`GET /api/v1/sessions/{sid}/context`。
 - 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
 
 ### 标准资源 API(给集成方)
@@ -442,7 +443,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)+ `.claude/settings.local.json`(ccteam 的 hook,写进本地层,**不碰**你的 `.claude/settings.json`)——**不种任何角色**,`.claude/agents/` 归你。重跑安全。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook(及 Telegram 插件钉)剥掉,其余键和你自己的 hook 原样保留;文件不是合法 JSON 时原样不动、仅在回执里注明。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
 
 ### `project`(项目生命周期)
 
@@ -456,7 +457,7 @@ ccteam project rm demo --dry-run   # 先预览会停什么、删什么
 ccteam project rm demo --purge     # 注销 + 删 ccteam 在项目里建的痕迹
 ```
 
-`rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里 ccteam 的 hook 段);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
+`rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里残留的 ccteam hook 条目);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
 
 ### `session`(会话)
 
@@ -559,7 +560,7 @@ ccteam update --now                # 跳过等待在飞 turn 的排空,立即重
 
 重启永远不会把 daemon 搬到别处:`ccteam update`(与不带 flag 的 `ccteam daemon restart` 一样)重放 launcher 记录的 flag,daemon 早于这份记录时则用它在 `/health` 上报的绑定地址。两者都拿不到 —— 既无 launcher 记录、`/health` 也不应答(用 `--no-web` 起的 daemon,或早于身份面的旧构建)—— 就只换二进制、**拒绝**重启而不是瞎猜,并在提示里写出该跑的那条重启命令:带上 daemon 正在用的 flag 执行 `ccteam stop && ccteam start --web-bind <addr> [...]`,或 `ccteam daemon restart --web-bind <addr>`。
 
-daemon 重启对活会话意味着什么 = 按 id 恢复的合同,再加一条规则 —— **一个会话一个进程**:`terminal`/tmux 会话照常跑(独立进程树);默认 `stream-json` 会话的进程是被「放手」而不是被杀 —— 空闲的自己退出,turn 进行中的跑完这个 turn。新 daemon 凭 body 记录(`<project>/.ccteam/chat/<sid>/body.json`)认出这样的幸存者,绝不为同一会话再起第二个进程:会话显示为 `detached`(web 侧栏、`agent_read activity:detached`、IM `/sessions`),发给它的消息排队、等该进程一退出就投递,`/stop` / `agent_stop` 立即结束它;它退出后 ccteam 从 Claude 自己的 transcript 里找回它这段时间给出的回答并投递(IM/web 回复、委派通知),再按 id 重建会话。ACP(grok/kimi/opencode)与 codex 进程随 daemon 一起结束;在飞的 turn 被打断,下条消息按 id 恢复上下文。`ccteam status` 与 `ccteam doctor` 显示安装渠道、运行中 vs 二进制版本、以及是否有新版本(惰性检查,最多每 ~20h 一次;`preferences.toml` 的 `check_for_update` 可关)。**卫星自己更新** —— 在每台上跑 `ccteam update`;控制台的主机页与 `ccteam status` 会标出版本落后于 daemon 的主机。
+daemon 重启对活会话意味着什么 = 按 id 恢复的合同,再加一条规则 —— **一个会话一个进程**:`terminal`/tmux 会话照常跑(独立进程树);默认 `stream-json` 会话的进程是被「放手」而不是被杀 —— 空闲的自己退出,turn 进行中的跑完这个 turn,还有后台任务在跑的(dev server、watcher)活到那个任务结束。新 daemon 凭 body 记录(`<project>/.ccteam/chat/<sid>/body.json`)认出这样的幸存者,绝不为同一会话再起第二个进程:会话显示为 `detached`(web 侧栏、`agent_read activity:detached`、IM `/sessions`),发给它的消息排队、等该进程一退出就投递。等待有上限:有消息排队、且 Claude transcript 显示最后一个 turn 已结束并静默 30 秒(或 turn 未结束但已静默 30 分钟)时,ccteam 结束这个进程 —— 只结束它本身,它启动的后台进程继续运行、无人看管,并会列给你、记进进度账本(`session_body_exited` 的 `orphans`)—— 再按原上下文恢复同一会话并投递排队消息;`/interrupt <sid>`(REST `POST /api/v1/sessions/{sid}/interrupt`)立即这样做,`/stop` / `agent_stop` 则结束会话、它当前的进程及该进程的后台进程(更早一次 `/interrupt` 或自动结束留下的后台进程属于已结束的那个进程,不受影响);它退出后 ccteam 从 Claude 自己的 transcript 里找回它这段时间给出的回答并投递(IM/web 回复、委派通知),再按 id 重建会话。ACP(grok/kimi/opencode)与 codex 进程随 daemon 一起结束;在飞的 turn 被打断,下条消息按 id 恢复上下文。`ccteam status` 与 `ccteam doctor` 显示安装渠道、运行中 vs 二进制版本、以及是否有新版本(惰性检查,最多每 ~20h 一次;`preferences.toml` 的 `check_for_update` 可关)。**卫星自己更新** —— 在每台上跑 `ccteam update`;控制台的主机页与 `ccteam status` 会标出版本落后于 daemon 的主机。
 
 ### 多机(卫星节点)
 

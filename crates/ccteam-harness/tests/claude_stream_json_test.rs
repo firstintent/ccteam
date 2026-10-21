@@ -105,7 +105,11 @@ while True:
             # maxTokens 1000000 can ONLY come from get_context_usage → it both
             # proves the source AND drives the [1m] model-id tag.
             emit({"type":"control_response","response":{"subtype":"success",
-                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":1000000,"percentage":1}}})
+                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":1000000,"percentage":1,
+                  "categories":[{"id":"memory_files","name":"Memory files","tokens":12000,"kind":"used"},
+                                {"id":"messages","name":"Messages","tokens":345,"kind":"used"},
+                                {"id":"free_space","name":"Free space","tokens":987655,"kind":"free"}],
+                  "memoryFiles":[{"path":"/p/CLAUDE.md","type":"Project","tokens":12000}]}}})
         elif os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
             emit({"type":"control_response","response":{"subtype":"error",
                   "request_id":rid,"error":"unsupported model"}})
@@ -446,6 +450,35 @@ async fn fresh_spawn_uses_session_id() {
         .expect("start_thread");
     let uuid = deterministic_session_uuid("demo", "s1");
     assert_eq!(argv_mode(tmp.path()), format!("session-id {uuid}"));
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// docs-local issue #212 — a stream-json spawn writes no project Claude
+/// settings: the Telegram pin rides `--settings`, so the project gets no
+/// `.claude/` (and certainly no `settings.local.json`) from ccteam.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn spawn_writes_no_project_claude_settings() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut spawn_ctx = ctx(tmp.path(), "demo", "s1");
+    spawn_ctx.cwd = project.clone();
+    spawn_ctx.project_dir = project.clone();
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(&AgentSpecBrief { role: "".into() }, &spawn_ctx)
+        .await
+        .expect("start_thread");
+    assert!(
+        !project.join(".claude").join("settings.local.json").exists(),
+        "spawn must not write .claude/settings.local.json"
+    );
+    assert!(
+        !project.join(".claude").exists(),
+        "spawn must not create .claude/"
+    );
     adapter.close_thread(&handle).await.unwrap();
 }
 
@@ -1774,6 +1807,51 @@ async fn stream_json_status_survives_release_via_persisted_file() {
     assert_eq!(c.window_tokens, 1_000_000);
 }
 
+/// Issue #21 — the context panel reads the live session's breakdown straight
+/// from claude (no turn needed), and the turn-end answer is kept as
+/// `context.json` so a released session still has one to show.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn context_breakdown_is_live_and_snapshotted_at_turn_end() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let live = adapter
+        .context_breakdown(&handle)
+        .await
+        .expect("a live session answers before its first turn");
+    assert_eq!((live.used_tokens, live.window_tokens), (12_345, 1_000_000));
+    assert_eq!(live.categories.len(), 3);
+    assert_eq!(live.categories[0].items[0].name, "/p/CLAUDE.md");
+
+    let snapshot_file = tmp.path().join(".ccteam/chat/s1/context.json");
+    assert!(!snapshot_file.exists(), "asking is not snapshotting");
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+    assert!(
+        snapshot_file.exists(),
+        "the snapshot lands before the turn's end is visible"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    assert_eq!(adapter.context_breakdown(&handle).await, None);
+    let snap = ccteam_harness::execution::session_status::read_context_file(tmp.path(), "s1")
+        .expect("released session keeps its last breakdown");
+    assert_eq!(snap.vendor, "claude");
+    assert_eq!(snap.categories[0].id, "memory_files");
+}
+
 /// `docs-local/issues/#14②` — claude writer family: the status tap persists a
 /// clone of the spawn-seeded shared `ThreadStatus`, so that seed carries this
 /// thread's generation and every write inherits it. A sid outlives its threads
@@ -2278,40 +2356,45 @@ async fn fault_matrix_stream_json() {
     }
 }
 
-/// E3 — the resume→fresh fallback emits a `chat_session_reset` event
-/// carrying the sid + a reason (the honest "context was lost" signal),
-/// never silently. We force the resume spawn to die (FAKE_SJ_DIE_ON_RESUME)
-/// so start_thread falls back to a fresh `--session-id` spawn + the reset.
+/// A failed local `--resume` is surfaced, never "fallen back" from: claude
+/// refuses `--session-id <uuid>` once `<uuid>.jsonl` exists, so a fresh spawn
+/// on the same uuid can never start (docs-local issue #211). The error names
+/// the resume, nothing sticks (no body record, no reset event, the transcript
+/// untouched), and the next attempt resumes the same conversation.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn resume_failure_emits_reset_event_with_sid_and_reason() {
+async fn local_resume_failure_is_surfaced_and_retryable() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
-    // Pre-create the transcript so start_thread chooses --resume first.
+    // Pre-create the transcript so start_thread chooses --resume.
     let uuid = deterministic_session_uuid("demo", "s1");
     let dir = anthropic_project_dir(tmp.path()).expect("anthropic dir");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
-    // Resume spawn dies; fresh spawn lives.
+    let transcript = dir.join(format!("{uuid}.jsonl"));
+    std::fs::write(&transcript, "{}\n").unwrap();
     std::env::set_var("FAKE_SJ_DIE_ON_RESUME", "1");
     std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "1200");
 
     let adapter = ClaudeStreamJsonAdapter::new();
-    let h = adapter
+    let err = adapter
         .start_thread(
             &AgentSpecBrief { role: "a".into() },
             &ctx(tmp.path(), "demo", "s1"),
         )
         .await
-        .expect("start_thread should fall back to fresh after resume death");
-    // The fresh fallback ran (the recorded mode is session-id, not resume).
-    assert_eq!(argv_mode(tmp.path()), format!("session-id {uuid}"));
-
-    // The reset event landed in the progress jsonl with sid + reason.
-    // The path is `<ccteam root>/state/progress/<slug>.jsonl` — this test read
-    // it WITHOUT the `state/` segment, so it asserted on an always-empty file
-    // and failed deterministically wherever the emit path was correct. (The
-    // sibling `claude_tui_resume_test` spells the same path right.)
+        .expect_err("a failed resume is an error, not a fresh session");
+    assert!(
+        err.to_string().contains(&format!("--resume {uuid} failed")),
+        "the error names the resume: {err}"
+    );
+    // The last (only) spawn was the resume — no `--session-id` on that uuid.
+    assert_eq!(argv_mode(tmp.path()), format!("resume {uuid}"));
+    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "{}\n");
+    assert_eq!(
+        ccteam_harness::execution::session_body::probe(tmp.path(), "s1"),
+        ccteam_harness::execution::session_body::BodyProbe::Absent,
+        "the killed handshake child leaves no body record"
+    );
     let progress = tmp
         .path()
         .join(".ccteam")
@@ -2320,11 +2403,20 @@ async fn resume_failure_emits_reset_event_with_sid_and_reason() {
         .join("demo.jsonl");
     let body = std::fs::read_to_string(&progress).unwrap_or_default();
     assert!(
-        body.contains("\"s1\"") && body.contains("resume_failed_fallback_to_fresh"),
-        "reset event must carry sid + reason; got: {body}"
+        !body.contains("resume_failed_fallback_to_fresh"),
+        "no context-reset claim for a session whose context is intact: {body}"
     );
 
+    // The cause clears; the very next attempt resumes the same conversation.
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief { role: "a".into() },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("retry resumes");
+    assert_eq!(argv_mode(tmp.path()), format!("resume {uuid}"));
     std::env::remove_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS");
     adapter.close_thread(&h).await.unwrap();
 }
@@ -2358,6 +2450,22 @@ async fn body_record_follows_spawn_close_and_detach() {
         .unwrap();
     let body = session_body::read(tmp.path(), "s41").expect("body.json written at spawn");
     assert_eq!(body.adapter, "claude-stream-json");
+    // The body leads its own process group, so ending it can end the
+    // background processes it starts (and a signal to the daemon's group
+    // never reaches it).
+    if cfg!(target_os = "linux") {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", body.pid)).unwrap();
+        let pgrp: u32 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(pgrp, body.pid, "the body is its own process group leader");
+    }
     assert!(matches!(
         session_body::probe(tmp.path(), "s41"),
         BodyProbe::Alive(_)

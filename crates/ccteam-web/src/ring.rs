@@ -32,7 +32,7 @@
 //! `PendingInteractions`, not from ring contents.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ccteam_im::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use tokio::sync::broadcast;
@@ -40,6 +40,13 @@ use tokio::sync::broadcast;
 /// Bounded per-sid history: enough to ride out a typical reconnect blip
 /// without growing unbounded memory for a long-lived chatty session.
 pub(crate) const RING_CAPACITY: usize = 64;
+
+/// Sessions whose backlog is kept. A daemon outlives thousands of sessions,
+/// and every one that ever emitted an event used to keep its 64 frames
+/// (answers, progress, attachments) for the life of the process (issue #213).
+/// Past this, the backlog of the session that recorded least recently is
+/// dropped — its `next_seq` is kept, so seqs still never restart.
+const MAX_BUFFERED_SESSIONS: usize = 128;
 
 /// Fan-out channel capacity for the ring's live tap. Generous relative to
 /// how often ANY one session emits events, so an idle-ish per-connection
@@ -59,21 +66,32 @@ pub(crate) struct RingEntry {
 struct RingState {
     next_seq: u64,
     buf: VecDeque<RingEntry>,
+    /// [`SessionEventRing`]'s record clock at this ring's last record.
+    last_record: u64,
 }
 
 /// Shared per-sid replay ring + live tap. Cheap to clone via `Arc`; the
 /// internal bookkeeping mutex is a plain `std::sync::Mutex` since every
 /// operation is O(capacity) and never holds across an `.await`.
 pub(crate) struct SessionEventRing {
-    rings: Mutex<HashMap<String, RingState>>,
+    rings: Mutex<Rings>,
     tap: broadcast::Sender<RingEntry>,
+}
+
+#[derive(Default)]
+struct Rings {
+    by_sid: HashMap<String, RingState>,
+    /// Monotonic record counter — the LRU clock for [`MAX_BUFFERED_SESSIONS`].
+    clock: u64,
+    /// How many `by_sid` entries hold a non-empty `buf`.
+    buffered: usize,
 }
 
 impl SessionEventRing {
     pub(crate) fn new() -> Self {
         let (tap, _rx) = broadcast::channel(TAP_CAPACITY);
         Self {
-            rings: Mutex::new(HashMap::new()),
+            rings: Mutex::new(Rings::default()),
             tap,
         }
     }
@@ -93,16 +111,35 @@ impl SessionEventRing {
     /// itself is still the durable side of this record.
     pub(crate) fn record(&self, sid: &str, event: GatewayEvent) -> u64 {
         let seq = {
-            let mut guard = self.rings.lock().unwrap();
-            let state = guard.entry(sid.to_string()).or_default();
+            let mut guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
+            let rings = &mut *guard;
+            rings.clock += 1;
+            let state = rings.by_sid.entry(sid.to_string()).or_default();
             state.next_seq += 1;
+            state.last_record = rings.clock;
             let seq = state.next_seq;
+            let newly_buffered = state.buf.is_empty();
             state.buf.push_back(RingEntry {
                 seq,
                 event: event.clone(),
             });
             while state.buf.len() > RING_CAPACITY {
                 state.buf.pop_front();
+            }
+            if newly_buffered {
+                rings.buffered += 1;
+                if rings.buffered > MAX_BUFFERED_SESSIONS {
+                    if let Some(oldest) = rings
+                        .by_sid
+                        .values_mut()
+                        .filter(|state| !state.buf.is_empty())
+                        .min_by_key(|state| state.last_record)
+                    {
+                        // Frees the frames; `next_seq` stays (8 bytes/sid).
+                        oldest.buf = VecDeque::new();
+                        rings.buffered -= 1;
+                    }
+                }
             }
             seq
         };
@@ -115,8 +152,9 @@ impl SessionEventRing {
     /// (the gap outran the ring's capacity), this simply returns everything
     /// left — the closest available approximation of "what you missed".
     pub(crate) fn replay_since(&self, sid: &str, since: u64) -> Vec<RingEntry> {
-        let guard = self.rings.lock().unwrap();
+        let guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
         guard
+            .by_sid
             .get(sid)
             .map(|s| s.buf.iter().filter(|e| e.seq > since).cloned().collect())
             .unwrap_or_default()
@@ -169,7 +207,7 @@ impl GlobalEventRing {
     /// Returns the assigned seq.
     pub(crate) fn record(&self, event: GatewayEvent) -> u64 {
         let seq = {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             guard.next_seq += 1;
             let seq = guard.next_seq;
             guard.buf.push_back(RingEntry {
@@ -188,7 +226,7 @@ impl GlobalEventRing {
     /// Every buffered entry with `seq > since`, oldest first — the same
     /// best-effort catch-up contract as [`SessionEventRing::replay_since`].
     pub(crate) fn replay_since(&self, since: u64) -> Vec<RingEntry> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         guard
             .buf
             .iter()
@@ -206,21 +244,30 @@ pub(crate) fn spawn_global_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<GlobalEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving the ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "global ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            ring.record(ev);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    ring.record(ev);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 /// Spawn the ONE persistent ring-feeder task for this gateway — called once
@@ -237,23 +284,32 @@ pub(crate) fn spawn_ring_feeder(
     gateway: Arc<tokio::sync::Mutex<Gateway>>,
     ring: Arc<SessionEventRing>,
 ) {
-    tokio::spawn(async move {
-        let mut rx = gateway.lock().await.subscribe_events();
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if is_im_only_event(&ev) {
-                        continue;
-                    }
-                    if let Some(sid) = ev.sid.clone() {
-                        ring.record(&sid, ev);
+    // The one feeder: supervised, so a panic re-subscribes instead of
+    // leaving every session's replay ring silently empty for the daemon's life.
+    tokio::spawn(ccteam_im::supervise::supervise_loop(
+        "session ring feeder",
+        move || {
+            let gateway = Arc::clone(&gateway);
+            let ring = Arc::clone(&ring);
+            async move {
+                let mut rx = gateway.lock().await.subscribe_events();
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if is_im_only_event(&ev) {
+                                continue;
+                            }
+                            if let Some(sid) = ev.sid.clone() {
+                                ring.record(&sid, ev);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        },
+    ));
 }
 
 #[cfg(test)]
@@ -275,6 +331,29 @@ mod tests {
             sid: Some(sid.to_string()),
             slug: None,
         }
+    }
+
+    /// One panic while a ring lock is held must not turn every later record
+    /// and replay into a panic too (the feeders run for the daemon's life).
+    #[test]
+    fn rings_keep_working_after_a_panic_poisoned_their_lock() {
+        let session = Arc::new(SessionEventRing::new());
+        let global = Arc::new(GlobalEventRing::new());
+        session.record("s1", ev("a", "s1"));
+        global.record(ev("a", "s1"));
+        let (s, g) = (Arc::clone(&session), Arc::clone(&global));
+        let _ = std::thread::spawn(move || {
+            let _rings = s.rings.lock().unwrap();
+            let _state = g.state.lock().unwrap();
+            panic!("poison both ring locks");
+        })
+        .join();
+        assert!(session.rings.is_poisoned() && global.state.is_poisoned());
+
+        assert_eq!(session.record("s1", ev("b", "s1")), 2);
+        assert_eq!(session.replay_since("s1", 0).len(), 2);
+        assert_eq!(global.record(ev("b", "s1")), 2);
+        assert_eq!(global.replay_since(0).len(), 2);
     }
 
     #[test]
@@ -318,6 +397,26 @@ mod tests {
         assert_eq!(replayed.len(), RING_CAPACITY, "capped at RING_CAPACITY");
         // The oldest surviving entry is #10 (0..10 evicted).
         assert_eq!(replayed[0].event.id, "e10");
+    }
+
+    /// Issue #213: only the most recently active sessions keep a backlog,
+    /// and a session whose backlog was dropped keeps counting seqs from where
+    /// it was (a reconnect's `Last-Event-ID` is never confused by a restart).
+    #[test]
+    fn only_recent_sessions_keep_a_backlog_and_seqs_never_restart() {
+        let ring = SessionEventRing::new();
+        ring.record("s0", ev("first", "s0"));
+        for i in 1..=MAX_BUFFERED_SESSIONS {
+            let sid = format!("s{i}");
+            ring.record(&sid, ev("x", &sid));
+        }
+        assert!(
+            ring.replay_since("s0", 0).is_empty(),
+            "least recent dropped"
+        );
+        assert_eq!(ring.replay_since("s1", 0).len(), 1);
+        assert_eq!(ring.rings.lock().unwrap().buffered, MAX_BUFFERED_SESSIONS);
+        assert_eq!(ring.record("s0", ev("second", "s0")), 2);
     }
 
     #[test]

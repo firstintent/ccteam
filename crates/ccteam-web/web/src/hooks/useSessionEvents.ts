@@ -40,7 +40,8 @@ export interface SessionEventOption {
  *  `web_search` / `tool_result`); `name` is the tool/category name (empty
  *  for thinking); `summary` is the one-line preview; `status` is the
  *  lifecycle phase (`started` / `completed` / `update`); `item_id` lets the
- *  UI dedup/merge a start↔complete pair. Mirrors the Rust `SessionActivity`
+ *  UI dedup/merge a start↔complete pair; `step_id` names its full record.
+ *  Mirrors the Rust `SessionActivity`
  *  serde shape. */
 export interface SessionActivity {
   kind: string;
@@ -48,6 +49,11 @@ export interface SessionActivity {
   summary: string;
   status: string;
   item_id: string;
+  /** The step's id in the session's step log — what the step inspector
+   *  fetches the full input / output / reasoning by
+   *  (`GET /api/v1/sessions/{sid}/steps/{step_id}`). Empty from an older
+   *  daemon. */
+  step_id: string;
 }
 
 /** One event line off the per-session SSE stream (the W2 payload shape).
@@ -262,6 +268,7 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
       summary: typeof a.summary === "string" ? a.summary : "",
       status: typeof a.status === "string" ? a.status : "",
       item_id: typeof a.item_id === "string" ? a.item_id : "",
+      step_id: typeof a.step_id === "string" ? a.step_id : "",
     };
   }
   const options = parseEventOptions(obj.options);

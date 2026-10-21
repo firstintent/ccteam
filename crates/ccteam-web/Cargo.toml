@@ -114,7 +114,12 @@ libc = "0.2"
 # V0.3.2 F53 — embed the vite-built SPA bundle (`web/dist/`) into the
 # binary so `ccteam web` ships the React UI without a separate static
 # files step. Asset routes live in `routes/assets.rs`.
-rust-embed = "8"
+# `debug-embed`: without it a debug build does NOT embed — it reads
+# `<build worktree>/web/dist/` from disk on every request, so a debug binary
+# copied out of a worktree serves the SPA only until that worktree is removed,
+# then every `/app/*` 500s (#215). Embedding in every profile keeps any built
+# binary self-contained.
+rust-embed = { version = "8", features = ["debug-embed"] }
 mime_guess = "2"
 
 # v0.8.7 W5 (Item E) — OpenAPI auto-docs. `utoipa` derive +
