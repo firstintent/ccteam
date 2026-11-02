@@ -219,6 +219,8 @@ The session's top-right toolbar groups **Files** and **Context** in one right wo
 
 Files offers path search, keyboard navigation, file icons, and Git status. Click for a temporary preview; double-click or pin to keep a tab. Switching to Context and back preserves open files and reading positions. Local file links in chat open source at the referenced line. Refresh reloads the directory, source, and preview; turn completion also refreshes them.
 
+Markdown (`.md` / `.markdown`) opens as a formatted document with heading anchors, tables, task lists, quotes, code blocks, relative images, and same-directory document links. Switch to Source or open the rendered document in a new tab. Standard Markdown paragraph rules apply; raw HTML is shown as text and scripts do not run. Previews use the same project permissions and one-hour directory-scoped links as HTML. Markdown input must be UTF-8 and no larger than 2 MiB.
+
 HTML/HTM files open as interactive previews, with Source and Open in new tab controls. Relative CSS, JavaScript/ES modules, images, and fonts are served from the HTML file's directory and its descendants. Preview links expire after one hour; refresh to renew. Browser sandboxes isolate previews from the console DOM, login, and storage. They cannot call console APIs or start React/Vite builds or development servers. File browsing currently supports local projects; remote projects report that it is unsupported. Internal state, dependency directories, and common secret files are excluded. Limits: 20,000 tree entries, 2 MiB source files, and 16 MiB per preview asset.
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.

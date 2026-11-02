@@ -528,7 +528,10 @@ test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts re
   await expect(page.getByTestId("status-view")).toBeVisible();
   await expect(page.getByTestId("hosts-view")).toBeVisible();
   await expect(page.getByText(/1 .*live/).first()).toBeVisible();
-  await expect(page.getByTestId("ops-view")).toHaveCSS("flex-direction", "column");
+  await expect(page.getByTestId("ops-view")).toHaveCSS(
+    "flex-direction",
+    "column",
+  );
 
   // Both legacy settings and flat routes canonicalize to the merged tab.
   await page.goto("/app/settings/hosts");
@@ -539,8 +542,17 @@ test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts re
   await expect(page).toHaveURL(/\/app\/settings\/ops$/);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByTestId("ops-view")).toHaveCSS("flex-direction", "column");
-  await expect.poll(() => page.getByTestId("ops-view").evaluate((node) => node.getBoundingClientRect().right)).toBeLessThanOrEqual(391);
+  await expect(page.getByTestId("ops-view")).toHaveCSS(
+    "flex-direction",
+    "column",
+  );
+  await expect
+    .poll(() =>
+      page
+        .getByTestId("ops-view")
+        .evaluate((node) => node.getBoundingClientRect().right),
+    )
+    .toBeLessThanOrEqual(391);
 });
 
 test("mobile ≤820px: sidebar is a drawer behind the hamburger with a backdrop", async ({
@@ -697,6 +709,7 @@ test("file workspace preserves Context, refreshes paths, and previews HTML", asy
     .getByTestId("project-file-tree")
     .getByRole("treeitem", { name: "README.md", exact: true })
     .dblclick();
+  await page.getByRole("button", { name: /^(源码|Source)$/ }).click();
   await expect(page.locator(".cm-content")).toContainText("Read me");
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("file-workspace")).not.toBeVisible();
@@ -712,7 +725,7 @@ test("mobile Files drawer accepts clicks above its backdrop", async ({
     route.fulfill({
       json: {
         root: "/repo",
-        paths: ["README.md"],
+        paths: ["mobile.txt"],
         git_status: {},
         truncated: false,
       },
@@ -721,7 +734,7 @@ test("mobile Files drawer accepts clicks above its backdrop", async ({
   await page.route("**/api/v1/projects/dev-team/file?*", (route) =>
     route.fulfill({
       json: {
-        path: "README.md",
+        path: "mobile.txt",
         content: "Mobile source",
         size: 13,
         binary: false,
@@ -732,7 +745,7 @@ test("mobile Files drawer accepts clicks above its backdrop", async ({
   await page.getByTestId("files-toggle").click();
   await page
     .getByTestId("project-file-tree")
-    .getByRole("treeitem", { name: "README.md", exact: true })
+    .getByRole("treeitem", { name: "mobile.txt", exact: true })
     .click();
   await expect(page.locator(".cm-content")).toContainText("Mobile source");
   await page
@@ -826,4 +839,72 @@ test("file workspace follows repeated line links into the same file", async ({
   await expect
     .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
     .toBeLessThan(readingPosition + 5);
+});
+
+test("file workspace previews Markdown and opens the rendered document in a new page", async ({
+  page,
+}) => {
+  await mockCcteamApi(page);
+  await page.route("**/api/v1/projects/dev-team/files", (route) =>
+    route.fulfill({
+      json: {
+        root: "/repo",
+        paths: ["README.md"],
+        git_status: {},
+        truncated: false,
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/file?*", (route) =>
+    route.fulfill({
+      json: {
+        path: "README.md",
+        content: "# Markdown document\n\n| Name | Value |",
+        size: 44,
+        binary: false,
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/files/preview", (route) =>
+    route.fulfill({
+      json: {
+        url: "/api/v1/projects/dev-team/files/preview/markdown/README.md",
+        expires_in: 3600,
+      },
+    }),
+  );
+  const markdownResponse = {
+    contentType: "text/html",
+    headers: { "content-security-policy": "sandbox" },
+    body: "<!doctype html><title>README.md</title><h1>Markdown document</h1><table><tr><td>world</td></tr></table>",
+  };
+  await page.route("**/files/preview/markdown/README.md", (route) => route.fulfill(markdownResponse));
+  // A popup's initial navigation belongs to the context, before its Page
+  // exists. Page-scoped mocks only cover the parent iframe request.
+  await page.context().route("**/files/preview/markdown/README.md", (route) => route.fulfill(markdownResponse));
+  await page.goto("/app/chat/s/s1");
+  await page.getByTestId("files-toggle").click();
+  await page
+    .getByTestId("project-file-tree")
+    .getByRole("treeitem", { name: "README.md", exact: true })
+    .click();
+  await expect(
+    page
+      .frameLocator("iframe.files-preview")
+      .getByRole("heading", { name: "Markdown document" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: /^(源码|Source)$/ }).click();
+  await expect(page.locator(".cm-content")).toContainText(
+    "# Markdown document",
+  );
+  await page.getByRole("button", { name: /^(预览|Preview)$/ }).click();
+  const popup = page.waitForEvent("popup");
+  await page
+    .getByRole("link", { name: /新标签页打开|Open in new tab/ })
+    .click();
+  const standalone = await popup;
+  await expect(
+    standalone.getByRole("heading", { name: "Markdown document" }),
+  ).toBeVisible();
+  await expect(standalone).toHaveTitle("README.md");
 });

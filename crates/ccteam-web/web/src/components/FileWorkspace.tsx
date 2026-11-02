@@ -26,6 +26,7 @@ import {
   getProjectFile,
   getProjectFiles,
   mintFilePreview,
+  supportsFilePreview,
   openFileTab,
   projectRelativePath,
   type FileTab,
@@ -220,7 +221,7 @@ export default function FileWorkspace({
   const scrollCleanup = useRef<(() => void) | null>(null);
   const appliedNavigation = useRef<FileTarget | null>(null);
   const scrollPositions = useRef(new Map<string, number>());
-  const isHtml = /\.html?$/i.test(active ?? "");
+  const canPreview = supportsFilePreview(active ?? "");
   const readerExtensions = useMemo(
     () => [...extensions, READER_THEME],
     [extensions],
@@ -231,7 +232,7 @@ export default function FileWorkspace({
       setTabs((old) => openFileTab(old, path, pin));
       setActive(path);
       if (active !== path)
-        setMode(/\.html?$/i.test(path) ? "preview" : "source");
+        setMode(supportsFilePreview(path) ? "preview" : "source");
     },
     [active],
   );
@@ -260,7 +261,7 @@ export default function FileWorkspace({
       setTabs((old) => openFileTab(old, relative, true));
       setActive(relative);
       setMode(
-        !target.line && /\.html?$/i.test(relative) ? "preview" : "source",
+        !target.line && supportsFilePreview(relative) ? "preview" : "source",
       );
     }
   }
@@ -295,7 +296,12 @@ export default function FileWorkspace({
   }, [project, active, revision, refreshKey]);
 
   useEffect(() => {
-    if (!visible || !active || !/\.html?$/i.test(active) || mode !== "preview")
+    if (
+      !visible ||
+      !active ||
+      !supportsFilePreview(active) ||
+      mode !== "preview"
+    )
       return;
     const controller = new AbortController();
     mintFilePreview(project, active, controller.signal)
@@ -356,7 +362,7 @@ export default function FileWorkspace({
     if (active === path) {
       const last = next.at(-1);
       setActive(last?.path ?? null);
-      setMode(/\.html?$/i.test(last?.path ?? "") ? "preview" : "source");
+      setMode(supportsFilePreview(last?.path ?? "") ? "preview" : "source");
     }
   };
   const freshPreview = preview?.path === active ? preview.url : null;
@@ -515,7 +521,7 @@ export default function FileWorkspace({
                       <Pin />
                     </button>
                   </div>
-                  {isHtml ? (
+                  {canPreview ? (
                     <div className="files-modes">
                       <button
                         className={`tab${mode === "preview" ? " active" : ""}`}
@@ -543,7 +549,7 @@ export default function FileWorkspace({
                       ) : null}
                     </div>
                   ) : null}
-                  {mode === "preview" && isHtml ? (
+                  {mode === "preview" && canPreview ? (
                     previewError ? (
                       <div role="alert" className="files-error">
                         {previewError}

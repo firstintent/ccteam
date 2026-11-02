@@ -8,6 +8,60 @@ use tempfile::TempDir;
 const TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
 #[tokio::test]
+async fn markdown_preview_renders_documents_and_links_without_executing_html() {
+    let (_tmp, paths, addr, client) = fixture().await;
+    std::fs::write(paths.project_dir("demo").join("web/README.md"), "# Markdown document\n\n| Name | Value |\n| --- | --- |\n| hello | world |\n\n- [x] finished\n\n```rust\nfn main() {}\n```\n\n![dot](assets/dot.svg)\n\n[Next](next.markdown)\n\n<script>parent.document.body.textContent='unsafe'</script>\n\n[bad](javascript:alert(1))").unwrap();
+    std::fs::write(
+        paths.project_dir("demo").join("web/next.markdown"),
+        "# Next document",
+    )
+    .unwrap();
+    let response = client
+        .post(format!("http://{addr}/api/v1/projects/demo/files/preview"))
+        .bearer_auth(format!("ccteam:{TOKEN}"))
+        .json(&json!({"path":"web/README.md"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "Markdown must share the preview flow"
+    );
+    let link: Value = response.json().await.unwrap();
+    let url = link["url"].as_str().unwrap();
+    let response = client
+        .get(format!("http://{addr}{url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(!response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("allow-scripts"));
+    let html = response.text().await.unwrap();
+    assert!(html.contains("<h1") && html.contains("Markdown document"));
+    assert!(html.contains("<table>") && html.contains("type=\"checkbox\""));
+    assert!(html.contains("language-rust") && html.contains("assets/dot.svg"));
+    assert!(!html.contains("<script>") && !html.contains("href=\"javascript:"));
+    let next = client
+        .get(format!(
+            "http://{addr}{}",
+            url.replace("README.md", "next.markdown")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(next.status(), 200);
+    assert!(next.text().await.unwrap().contains("Next document"));
+}
+
+#[tokio::test]
 async fn ownership_changes_revoke_previews_and_remote_projects_never_read_local_files() {
     use ccteam_core::{
         config::{self, CcteamConfig, ProjectEntry},
@@ -114,6 +168,8 @@ async fn fixture() -> (TempDir, CcteamPaths, SocketAddr, reqwest::Client) {
     std::fs::write(root.join("node_modules/huge.js"), "ignored").unwrap();
     std::fs::write(root.join("binary.bin"), b"a\0b").unwrap();
     std::fs::write(root.join("web/private.rs"), "server-only source").unwrap();
+    std::fs::write(root.join("web/README.md"), "# Markdown document\n\n[Section](#details)\n\n| Name | Value |\n| --- | --- |\n| hello | world |\n\n- [x] finished\n\n```rust\nfn main() {}\n```\n\n![dot](assets/dot.svg)\n\n[Next](next.markdown)\n\n## Details\n\n<script>parent.document.body.textContent='unsafe'</script>").unwrap();
+    std::fs::write(root.join("web/next.markdown"), "# Next document").unwrap();
     std::fs::write(root.join("outside.html"), "outside preview directory").unwrap();
     std::fs::write(root.join("large.txt"), vec![b'a'; 2 * 1024 * 1024 + 1]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -239,10 +295,21 @@ async fn preview_runs_relative_modules_and_css_inside_an_opaque_browser_sandbox(
         .unwrap();
     let script =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/tests/file-preview-browser.mjs");
+    let markdown: Value = client
+        .post(format!("http://{addr}/api/v1/projects/demo/files/preview"))
+        .bearer_auth(format!("ccteam:{TOKEN}"))
+        .json(&json!({"path":"web/README.md"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let status = tokio::process::Command::new("node")
         .arg(script)
         .arg(format!("http://{addr}"))
         .arg(link["url"].as_str().unwrap())
+        .arg(markdown["url"].as_str().unwrap())
         .status()
         .await
         .unwrap();
@@ -307,6 +374,7 @@ async fn preview_capability_loads_relative_assets_without_login_and_cannot_cross
     for path in [
         url.replace("web/index.html", "outside.html"),
         url.replace("index.html", "private.rs"),
+        url.replace("index.html", "README.md"),
     ] {
         assert_eq!(
             client

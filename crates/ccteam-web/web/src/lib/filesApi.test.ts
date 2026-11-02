@@ -1,7 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { fileLinkTarget, openFileTab, projectRelativePath } from "./filesApi";
+import {
+  fileLinkTarget,
+  openFileTab,
+  projectRelativePath,
+  supportsFilePreview,
+} from "./filesApi";
 
 describe("project file navigation", () => {
+  it("shares preview controls between HTML and Markdown documents", () => {
+    for (const path of [
+      "README.md",
+      "docs/guide.markdown",
+      "README.MD",
+      "index.html",
+      "INDEX.HTM",
+    ])
+      expect(supportsFilePreview(path)).toBe(true);
+    for (const path of ["lib.rs", "app.mdx", "image.png"])
+      expect(supportsFilePreview(path)).toBe(false);
+  });
   it("recognizes bare filenames with numeric line suffixes", () => {
     expect(fileLinkTarget("Cargo.toml:12")).toEqual({
       path: "Cargo.toml",

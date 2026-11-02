@@ -19,6 +19,10 @@ export interface FileTarget {
   path: string;
   line?: number;
 }
+
+export function supportsFilePreview(path: string): boolean {
+  return /\.(?:html?|md|markdown)$/i.test(path);
+}
 const projectUrl = (slug: string) =>
   `/api/v1/projects/${encodeURIComponent(slug)}`;
 

@@ -3,7 +3,7 @@
 //! cookieless requests from an opaque sandbox pass the ordinary project ACL.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Read,
     path::{Component, Path as FsPath, PathBuf},
     sync::Mutex,
@@ -28,9 +28,26 @@ const MAX_ASSET: u64 = 16 * 1024 * 1024;
 const PREVIEW_TTL: Duration = Duration::from_secs(3600);
 const PREVIEW_CSP: &str = "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' http: https: data: blob:; style-src 'unsafe-inline' http: https: data:; img-src http: https: data: blob:; font-src http: https: data:; media-src http: https: data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
+const MARKDOWN_CSP: &str = "sandbox; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src http: https:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewKind {
+    Html,
+    Markdown,
+}
+
+fn preview_kind(path: &FsPath) -> Option<PreviewKind> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "html" | "htm" => Some(PreviewKind::Html),
+        "md" | "markdown" => Some(PreviewKind::Markdown),
+        _ => None,
+    }
+}
+
 struct PreviewGrant {
     slug: String,
     directory: PathBuf,
+    kind: PreviewKind,
     identity: Identity,
     expires: Instant,
 }
@@ -44,6 +61,7 @@ impl PreviewRegistry {
         slug: String,
         identity: Identity,
         directory: PathBuf,
+        kind: PreviewKind,
     ) -> Result<String, StatusCode> {
         let mut grants = self.0.lock().unwrap_or_else(|e| e.into_inner());
         grants.retain(|_, grant| grant.expires > Instant::now());
@@ -58,6 +76,7 @@ impl PreviewRegistry {
             PreviewGrant {
                 slug,
                 directory,
+                kind,
                 identity,
                 expires: Instant::now() + PREVIEW_TTL,
             },
@@ -71,10 +90,11 @@ impl PreviewRegistry {
         (grant.slug == slug && grant.expires > Instant::now()).then(|| grant.identity.clone())
     }
 
-    fn directory(&self, slug: &str, token: &str) -> Option<PathBuf> {
+    fn scope(&self, slug: &str, token: &str) -> Option<(PathBuf, PreviewKind)> {
         let grants = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let grant = grants.get(token)?;
-        (grant.slug == slug && grant.expires > Instant::now()).then(|| grant.directory.clone())
+        (grant.slug == slug && grant.expires > Instant::now())
+            .then(|| (grant.directory.clone(), grant.kind))
     }
 }
 
@@ -422,22 +442,15 @@ pub(crate) async fn handle_mint_preview(
         Err((s, message)) => return error(s, message),
     };
     let path = match resolve(&root, &body.path) {
-        Ok(path)
-            if path.is_file()
-                && matches!(
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .map(str::to_ascii_lowercase)
-                        .as_deref(),
-                    Some("html" | "htm")
-                ) =>
-        {
-            path
-        }
-        _ => return error(StatusCode::NOT_FOUND, "HTML preview file not found"),
+        Ok(path) if path.is_file() && preview_kind(&path).is_some() => path,
+        _ => return error(StatusCode::NOT_FOUND, "Preview document not found"),
     };
+    let kind = preview_kind(&path).expect("preview kind checked above");
     let directory = path.parent().unwrap_or(&root).to_path_buf();
-    let ticket = match app.file_previews.mint(slug.clone(), identity, directory) {
+    let ticket = match app
+        .file_previews
+        .mint(slug.clone(), identity, directory, kind)
+    {
         Ok(t) => t,
         Err(s) => return error(s, "Too many open previews"),
     };
@@ -481,66 +494,93 @@ pub(crate) async fn handle_preview(
         Ok(p) => p,
         Err(s) => return error(s, "Preview resource unavailable"),
     };
-    let Some(directory) = app.file_previews.directory(&slug, &ticket) else {
+    let Some((directory, grant_kind)) = app.file_previews.scope(&slug, &ticket) else {
         return error(StatusCode::UNAUTHORIZED, "Preview expired");
     };
     // A page (and any third-party script it includes) can read its ticket.
     // It grants only web assets below that page's directory, never arbitrary
-    // Rust, Markdown, configuration or other project source.
+    // Rust, configuration or other project source. Markdown grants additionally
+    // allow rendered Markdown links; HTML grants retain their web-assets scope.
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let markdown = preview_kind(&path) == Some(PreviewKind::Markdown);
     if !path.starts_with(directory)
-        || !matches!(
-            extension.as_str(),
-            "html"
-                | "htm"
-                | "css"
-                | "js"
-                | "mjs"
-                | "json"
-                | "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "svg"
-                | "ico"
-                | "woff"
-                | "woff2"
-                | "ttf"
-                | "otf"
-                | "wasm"
-                | "mp4"
-                | "webm"
-                | "mp3"
-                | "ogg"
-        )
+        || (markdown && grant_kind != PreviewKind::Markdown)
+        || !(markdown
+            || matches!(
+                extension.as_str(),
+                "html"
+                    | "htm"
+                    | "css"
+                    | "js"
+                    | "mjs"
+                    | "json"
+                    | "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "svg"
+                    | "ico"
+                    | "woff"
+                    | "woff2"
+                    | "ttf"
+                    | "otf"
+                    | "wasm"
+                    | "mp4"
+                    | "webm"
+                    | "mp3"
+                    | "ogg"
+            ))
     {
         return error(
             StatusCode::FORBIDDEN,
-            "Resource is outside this HTML preview's asset scope",
+            "Resource is outside this document preview's asset scope",
         );
     }
-    let mime = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
-    let result = tokio::task::spawn_blocking(move || read_bounded(&path, MAX_ASSET)).await;
+    let mime = if markdown {
+        "text/html".to_string()
+    } else {
+        mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string()
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let bytes = read_bounded(&path, if markdown { MAX_TEXT } else { MAX_ASSET })?;
+        if !markdown {
+            return Ok(bytes);
+        }
+        let source = std::str::from_utf8(&bytes).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+        Ok(render_markdown_document(
+            source,
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+        )
+        .into_bytes())
+    })
+    .await;
     let mut response = match result {
         Ok(Ok(bytes)) => (
             [(header::CONTENT_TYPE, format!("{mime}; charset=utf-8"))],
             bytes,
         )
             .into_response(),
-        Ok(Err(s)) => error(s, "Preview resource unavailable or exceeds 16 MiB"),
+        Ok(Err(s)) => error(
+            s,
+            if markdown {
+                "Markdown preview unavailable: expected UTF-8 text up to 2 MiB"
+            } else {
+                "Preview resource unavailable or exceeds 16 MiB"
+            },
+        ),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Could not read preview"),
     };
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(PREVIEW_CSP),
+        HeaderValue::from_static(if markdown { MARKDOWN_CSP } else { PREVIEW_CSP }),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -560,9 +600,147 @@ pub(crate) async fn handle_preview(
     response
 }
 
+fn markdown_url_is_safe(url: &str) -> bool {
+    let normalized: String = url
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect();
+    if normalized.contains('\\') {
+        return false;
+    }
+    let first_segment = normalized.split(['/', '#', '?']).next().unwrap_or_default();
+    match first_segment.split_once(':') {
+        Some((scheme, _)) => matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "mailto" | "tel"
+        ),
+        None => true,
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Filter Markdown parser events before rendering: raw HTML stays visible as
+/// text, links retain a small protocol set, and no scripts are enabled. The
+/// response-level sandbox also holds when the document is opened separately.
+fn render_markdown_document(source: &str, title: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM;
+    let mut events: Vec<_> = Parser::new_ext(source, options)
+        .map(|event| match event {
+            Event::Html(html) | Event::InlineHtml(html) => Event::Text(html),
+            Event::Start(mut tag) => {
+                if let Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } = &mut tag {
+                    if !markdown_url_is_safe(dest_url) {
+                        *dest_url = "#".into();
+                    }
+                }
+                Event::Start(tag)
+            }
+            other => other,
+        })
+        .collect();
+    let mut heading_counts = HashMap::<String, usize>::new();
+    let mut used_heading_ids = HashSet::new();
+    for index in 0..events.len() {
+        if !matches!(events[index], Event::Start(Tag::Heading { .. })) {
+            continue;
+        }
+        let text: String = events[index + 1..]
+            .iter()
+            .take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_))))
+            .filter_map(|e| match e {
+                Event::Text(s) | Event::Code(s) => Some(s.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let slug: String = text
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter_map(|c| {
+                if c.is_alphanumeric() || matches!(c, '-' | '_') {
+                    Some(c)
+                } else if c.is_whitespace() {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let base = if slug.trim_matches('-').is_empty() {
+            "section"
+        } else {
+            slug.trim_matches('-')
+        };
+        let count = heading_counts.entry(base.to_string()).or_default();
+        let mut id = if *count == 0 {
+            base.to_string()
+        } else {
+            format!("{base}-{count}")
+        };
+        while !used_heading_ids.insert(id.clone()) {
+            *count += 1;
+            id = format!("{base}-{count}");
+        }
+        *count += 1;
+        if let Event::Start(Tag::Heading { id: heading_id, .. }) = &mut events[index] {
+            *heading_id = Some(id.into());
+        }
+    }
+    let mut body = String::new();
+    html::push_html(&mut body, events.into_iter());
+    format!("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><title>{}</title><style>{MARKDOWN_STYLE}</style></head><body><main>{body}</main></body></html>", escape_html(title))
+}
+
+const MARKDOWN_STYLE: &str = r#"
+:root{color-scheme:light dark;--bg:#fff;--fg:#24292f;--muted:#57606a;--border:#d0d7de;--soft:#f6f8fa;--link:#0969da}
+@media(prefers-color-scheme:dark){:root{--bg:#111318;--fg:#e6edf3;--muted:#9da7b3;--border:#30363d;--soft:#1c2129;--link:#79b8ff}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.75 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}
+main{max-width:960px;margin:auto;padding:clamp(20px,4vw,48px)}h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.5em 0 .65em;scroll-margin-top:20px}h1{font-size:2em}h2{font-size:1.5em;border-bottom:1px solid var(--border);padding-bottom:.3em}main>:first-child{margin-top:0}
+p,ul,ol,pre,blockquote,table{margin:0 0 1em}li>p{margin:.3em 0}a{color:var(--link);text-underline-offset:3px}a:hover{text-decoration-thickness:2px}img{max-width:100%;height:auto}blockquote{margin-left:0;border-left:3px solid var(--border);padding:0 1em;color:var(--muted)}
+code{font: .88em/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--soft);padding:.15em .35em;border-radius:4px}pre{overflow:auto;padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--soft)}pre code{padding:0;background:none;white-space:pre}
+table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}th,td{padding:7px 12px;border:1px solid var(--border)}th{background:var(--soft);text-align:left}input[type=checkbox]{margin-right:.5em;accent-color:var(--link)}hr{border:0;border-top:1px solid var(--border);margin:1.5em 0}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_escapes_html_titles_and_unsafe_urls_and_assigns_unique_anchors() {
+        let html = render_markdown_document("# Same\n\n# Same\n\n# Same-1\n\n[x](jav&#x61;script:alert%281%29)\n\n<svg onload=alert(1)>\n", "<&>.md");
+        assert!(html.contains("<title>&lt;&amp;&gt;.md</title>"));
+        for id in ["same", "same-1", "same-1-1"] {
+            assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1);
+        }
+        assert!(!html.contains("<svg") && !html.contains("href=\"javascript:"));
+        for url in [
+            "javascript:alert(1)",
+            "java\nscript:alert(1)",
+            "data:text/html,evil",
+            "file:///etc/passwd",
+        ] {
+            assert!(!markdown_url_is_safe(url));
+        }
+        for url in [
+            "next.md",
+            "assets/a.svg",
+            "#details",
+            "https://example.com/docs",
+        ] {
+            assert!(markdown_url_is_safe(url));
+        }
+    }
 
     #[test]
     fn paths_reject_private_and_traversal_including_symlink_targets() {
@@ -598,6 +776,7 @@ mod tests {
                 "one".into(),
                 Identity::admin(),
                 PathBuf::from("/project/web"),
+                PreviewKind::Html,
             )
             .unwrap();
         assert!(registry.principal("one", &token).is_some());
