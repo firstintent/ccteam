@@ -3,8 +3,8 @@
 // on every switch, so all per-sid state resets atomically; the v0.8.9
 // structural guarantee is unchanged).
 //
-// Skin = prototype: conv-head (status dot · title · meta chips · Chat|终端
-// tabs · cost pill) + chat-scroll message stream (user right-aligned soft
+// Chrome: status/title/model + a shared right-panel toolbar; session details
+// live in Context. The chat stream uses user right-aligned soft
 // bubble 14/14/4/14, agent left with NO fill + full Markdown rendering,
 // streaming cursor while a turn is in flight) + the same composer as Home
 // (sans ctx-bar).
@@ -12,9 +12,7 @@
 // Data spine unchanged (红线 §1.6-7): localStorage seed → getHistory mirror →
 // live SSE fold; drafts persist per-sid; IME composition guard; Stop
 // interrupts the running turn (session kept); HITL approvals resolve through
-// the gateway pending machinery (never a fake turn). The terminal tab renders
-// ONLY for a claude session that owns a pane (protocol ≠ stream-json) — the
-// byte-exact `ccteam-pty.v1` relay via TerminalView.
+// the gateway pending machinery (never a fake turn).
 
 import {
   lazy,
@@ -30,6 +28,8 @@ import { Group, Panel, Separator, type Layout } from "react-resizable-panels";
 import {
   ArrowDown,
   Clock,
+  Check,
+  Copy,
   FolderTree,
   PanelRightClose,
   PanelRightOpen,
@@ -41,12 +41,10 @@ import { ContextPanel } from "../components/ContextPanel";
 import type { FileTarget } from "../lib/filesApi";
 import "../components/fileWorkspace.css";
 import { InlineRename } from "../components/InlineRename";
+import { copyText } from "../lib/clipboard";
 import type { TurnAttachment } from "../lib/attachmentsApi";
-import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { StepInspector } from "../components/StepInspector";
-import { TerminalView } from "../components/TerminalView";
-import { VendorChip } from "../components/VendorChip";
 import {
   foldSessionLiveness,
   isTurnBoundary,
@@ -89,7 +87,6 @@ import {
   stepIcon,
   type TranscriptRow,
 } from "./chatTranscript";
-import { railSessionLabel } from "./railHelpers";
 import { contextPct, formatElapsed, formatTurnStatus } from "../lib/statusLine";
 import {
   isNarrowViewport,
@@ -194,6 +191,25 @@ export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
   );
 }
 
+export function ReplyCopyButton({ content, lang }: { content: string; lang: Lang }) {
+  const t = makeT(lang);
+  const [result, setResult] = useState<"idle" | "copied" | "failed">("idle");
+  useEffect(() => {
+    if (result !== "copied") return;
+    const timer = window.setTimeout(() => setResult("idle"), 2000);
+    return () => window.clearTimeout(timer);
+  }, [result]);
+  if (!content) return null;
+  const label = result === "copied" ? t("replyCopied") : t("replyCopyMarkdown");
+  return <>
+    <button type="button" className="icon-btn sm reply-copy" data-testid="reply-copy" title={label} aria-label={label}
+      onClick={() => { void copyText(content).then((ok) => setResult(ok ? "copied" : "failed")); }}>
+      {result === "copied" ? <Check /> : <Copy />}
+    </button>
+    <span className="reply-copy-feedback" role="status">{result === "copied" ? t("replyCopied") : result === "failed" ? t("copyFailed") : ""}</span>
+  </>;
+}
+
 function OutboundAttachments({
   project,
   attachments,
@@ -247,7 +263,6 @@ export default function SessionView({
   onRename?: (sid: string, title: string) => void | Promise<void>;
 }) {
   const t = makeT(lang);
-  const [view, setView] = useState<"chat" | "terminal">("chat");
   // Inline title edit in the header. `pendingTitle` is the optimistic value
   // shown only WHILE the shell's rename is in flight — without it the header
   // visibly snaps back to the old title for a beat after Enter. It is cleared
@@ -292,6 +307,7 @@ export default function SessionView({
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
+  const [contextRefreshEpoch, setContextRefreshEpoch] = useState(0);
 
   // ---- context panel (the right sidebar) ------------------------------------
   // Docked/closed is a per-browser LAYOUT preference: it survives this
@@ -401,6 +417,9 @@ export default function SessionView({
   const latestTurnEndId = [...events]
     .reverse()
     .find((event) => isTurnBoundary(event))?.id;
+  const latestContextChangeId = [...events].reverse().find((event) =>
+    isTurnBoundary(event) || event.kind === "session_lifecycle" || !!event.options?.length,
+  )?.id;
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
   // view of its current length so an authoritative history reseed can install
@@ -578,7 +597,7 @@ export default function SessionView({
     .reverse()
     .find((event) => event.kind === "answer" && event.status)?.status;
   const displayStatusModel =
-    latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel;
+    latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel ?? session?.model;
   const displayCtxPct = latestEventStatus
     ? contextPct(latestEventStatus.context)
     : latestTurnStatus
@@ -691,7 +710,9 @@ export default function SessionView({
         current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)),
       );
       pushRow({ kind: "user", content: `→ ${option.label}` });
-      apiResolveApproval(sid, row.token, option.id).catch((e) => {
+      apiResolveApproval(sid, row.token, option.id).then(() => {
+        setContextRefreshEpoch((epoch) => epoch + 1);
+      }).catch((e) => {
         setRows((current) =>
           current.map((r) => (r.id === row.id ? { ...r, resolved: false } : r)),
         );
@@ -718,12 +739,6 @@ export default function SessionView({
       });
   }, [sid, pushRow]);
 
-  // Terminal tab: only a claude session that owns a pane (protocol ≠
-  // stream-json). A stream-json session has NO pane → the tab does not exist.
-  const isStreamJson = session?.protocol === "stream-json";
-  const canTerminal = session?.vendor === "claude" && !isStreamJson;
-  const showTerminal = view === "terminal" && canTerminal;
-
   // Auto-scroll only when already near the bottom; 「回到最新」 appears when
   // the reader scrolled up (a streaming reply never yanks them down).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -744,10 +759,10 @@ export default function SessionView({
     setShowJump(false);
   }, []);
   useLayoutEffect(() => {
-    if (!showTerminal && atBottomRef.current && scrollRef.current) {
+    if (atBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [rows, showTerminal]);
+  }, [rows]);
 
   // conv-head status dot: busy amber › SESSION RESIDENCY. The base is the
   // rail's REST `session.residency`; this sid's live `session_lifecycle`
@@ -769,7 +784,7 @@ export default function SessionView({
   // red connection dot next to the status dot.
   const connLost = gatewayUnavailable || lastError !== null;
 
-  const serverTitle = session ? railSessionLabel(session) : sid;
+  const serverTitle = session?.title || session?.role || sid;
   const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
 
@@ -842,60 +857,10 @@ export default function SessionView({
             <Pencil />
           </button>
         ) : null}
-        <div className="meta">
-          <span className="chip sid">{sid}</span>
-          {session ? <span className="chip">{session.project}</span> : null}
-          {session ? (
-            <span className="chip" data-testid="session-role">
-              {session.role || t("noRole")}
-            </span>
-          ) : null}
-          <VendorChip vendor={vendor} />
-          {session?.host && session.host !== "local" ? (
-            <span className="chip">@ {session.host}</span>
-          ) : null}
-          {displayStatusModel ? (
-            // The `model · ctx N%` chip IS the entry point into the context
-            // panel — the affordance sits on the number it explains.
-            <button
-              type="button"
-              className="chip chip-btn"
-              data-testid="ctx-chip"
-              title={t("ctxOpen")}
-              aria-label={`${t("ctxOpen")} · ${displayStatusModel}`}
-              aria-pressed={ctxOpen}
-              onClick={toggleContext}
-            >
-              {displayStatusModel}
-              {displayCtxPct !== null
-                ? ` · ctx ${Math.round(displayCtxPct)}%`
-                : ""}
-            </button>
-          ) : null}
-        </div>
-        <div className="tabs">
-          <button
-            type="button"
-            className={`tab ${!showTerminal ? "active" : ""}`}
-            onClick={() => setView("chat")}
-          >
-            {t("chatTab")}
-          </button>
-          {canTerminal ? (
-            <button
-              type="button"
-              className={`tab ${showTerminal ? "active" : ""}`}
-              onClick={() => setView("terminal")}
-              data-testid="terminal-tab"
-            >
-              {t("terminal")}
-            </button>
-          ) : null}
-        </div>
-        <CostPill />
-        {/* Always-present toggle (the chip above needs a reported status; this
-            one is the way in before the first turn and for every harness —
-            the panel itself explains when there is nothing to show). */}
+        {session?.role ? <span className="chip session-role" data-testid="session-role" title={session.role}>{session.role}</span> : null}
+        <span className="session-model" data-testid="session-model" title={displayStatusModel ?? vendor}>
+          {displayStatusModel ?? vendor}
+        </span>
         <div
           className="right-panel-tools"
           role="toolbar"
@@ -915,6 +880,7 @@ export default function SessionView({
             }
           >
             <FolderTree />
+            <span>{t("filesTitle")}</span>
           </button>
           <button
             ref={ctxToggleRef}
@@ -927,6 +893,8 @@ export default function SessionView({
             onClick={toggleContext}
           >
             {ctxOpen ? <PanelRightClose /> : <PanelRightOpen />}
+            <span>{t("ctxPanelTitle")}</span>
+            {displayCtxPct != null ? <span className="panel-context-pct">{Math.round(displayCtxPct)}%</span> : null}
           </button>
         </div>
       </div>
@@ -952,15 +920,6 @@ export default function SessionView({
         }}
       >
         <Panel id="session-chat" className="conv-main" minSize="280px">
-          {showTerminal && session?.project ? (
-            <div className="term-wrap">
-              <TerminalView
-                slug={session.project}
-                sid={sid}
-                className="flex-1 min-h-0"
-              />
-            </div>
-          ) : (
             <>
               <div
                 style={{
@@ -1185,12 +1144,13 @@ export default function SessionView({
                               .filter((part): part is string => !!part)
                               .join(" · ");
                             return (
-                              <span
-                                className={`turn-status${footer?.warn ? " warn" : ""}`}
-                              >
+                              <div className="reply-footer">
+                                <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
                                 <RowTime ts={row.ts} lang={lang} />
                                 {row.ts ? ` · ${tail}` : tail}
-                              </span>
+                                </span>
+                                <ReplyCopyButton content={row.content} lang={lang} />
+                              </div>
                             );
                           })()}
                         </div>
@@ -1305,7 +1265,6 @@ export default function SessionView({
                 </div>
               </div>
             </>
-          )}
         </Panel>
         {activePanel || filesVisited ? (
           <>
@@ -1319,9 +1278,10 @@ export default function SessionView({
               {ctxOpen ? (
                 <ContextPanel
                   sid={sid}
+                  model={displayStatusModel}
                   lang={lang}
                   onClose={closeContext}
-                  refreshKey={latestTurnEndId}
+                  refreshKey={`${latestContextChangeId ?? ""}:${busy}:${session?.waiting_approval ?? false}:${contextRefreshEpoch}`}
                   focusOnMount={ctxOpenedByUser}
                 />
               ) : null}

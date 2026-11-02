@@ -842,7 +842,7 @@ pub(crate) async fn handle_session_status(
     tag = "sessions",
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     responses(
-        (status = 200, description = "`{sid, live, breakdown}`; `breakdown` = `{vendor, model, captured_at, used_tokens, window_tokens, auto_compact_threshold, categories:[{id, name, tokens, kind: used|deferred|buffer|free, items:[{name, source, detail, tokens, loaded}]}], messages:{tool_call_tokens, tool_result_tokens, attachment_tokens, assistant_tokens, user_tokens, other_tokens, tools:[{name, call_tokens, result_tokens}], attachments:[{name, tokens}]}, last_request:{input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens}}` or null", body = serde_json::Value),
+        (status = 200, description = "`{sid, live, session, breakdown}`; session contains current per-sid activity, residency, harness/model/host, parent/depth, cumulative cost/tokens and last activity, including released/stopped sessions. Breakdown is vendor-reported `{vendor, model, captured_at, used_tokens, window_tokens, auto_compact_threshold, categories, messages, last_request}` or null. Claude supplies detailed categories/messages; Codex supplies used/free totals and last-request input/cache/output/reasoning accounting (reasoning is a subset of output), without estimated tool/memory categories or compaction threshold.", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
@@ -868,24 +868,78 @@ pub(crate) async fn handle_session_context(
     let Some(resolved) = resolved else {
         return unknown_session(&sid);
     };
-    let fresh = match resident {
-        Some((adapter, thread)) => adapter.context_breakdown(&thread).await,
+    let fresh = match resident.as_ref() {
+        Some((adapter, thread)) => adapter.context_breakdown(thread).await,
+        None => None,
+    };
+    let reported_model = match resident.as_ref() {
+        Some((adapter, thread)) => adapter
+            .thread_status(thread)
+            .await
+            .ok()
+            .and_then(|s| s.model),
         None => None,
     };
     let live = fresh.is_some();
-    let breakdown = match fresh {
-        Some(b) => Some(b),
+    let (breakdown, persisted_model) = match fresh {
+        Some(b) => (Some(b), None),
         None => {
             let (dir, snapshot_sid) = (resolved.project_dir, sid.clone());
             tokio::task::spawn_blocking(move || {
-                ccteam_harness::execution::session_status::read_context_file(&dir, &snapshot_sid)
+                (
+                    ccteam_harness::execution::session_status::read_context_file(
+                        &dir,
+                        &snapshot_sid,
+                    ),
+                    ccteam_harness::execution::session_status::read_status_file(
+                        &dir,
+                        &snapshot_sid,
+                    )
+                    .and_then(|s| s.model),
+                )
             })
             .await
-            .ok()
-            .flatten()
+            .unwrap_or_default()
         }
     };
-    Json(json!({ "sid": sid, "live": live, "breakdown": breakdown })).into_response()
+    // Read one sid after the usage query: ordinary turns update these durable
+    // counters even when the shell's rail has not reconciled yet. Reuse the
+    // shared activity/residency resolvers; never synthesize a historical
+    // session as local/root, and never read the whole team graph.
+    let (meta, residency, live_turn, pending) = {
+        let guard = gw.lock().await;
+        (
+            guard.session_meta_snapshot(&sid),
+            guard.session_residency(&sid),
+            guard.live_turn_for(&sid),
+            guard.pending_handle(),
+        )
+    };
+    let waiting_approval = pending.lock().await.pending_for_sid(&sid).is_some();
+    let session = meta.map(|m| {
+        let status = if residency == Some("detached") {
+            "detached".to_string()
+        } else {
+            ProjectActivity::new(&app.progress_projection, &m.slug)
+                .resolve(&sid, live_turn)
+                .status
+                .activity
+                .to_string()
+        };
+        json!({
+            "sid":m.sid,"project":m.slug,"role":m.role,"vendor":m.vendor,
+            "permission_mode":m.permission_mode,"protocol":m.protocol,
+            "host":if m.host.is_empty() {"local"} else {&m.host},
+            "current":false,"status":status,"residency":residency,
+            "model":reported_model.or(persisted_model).or(m.observed_model).or(m.model),"parent_sid":m.parent_sid,
+            "delegation_depth":m.delegation_depth,"cost_usd":m.cost_usd,
+            "tokens_total":m.tokens_total,"last_active":m.last_active,
+            "created_at":m.created_at,"title":m.title,"turn_count":m.turn_count,
+            "waiting_approval":waiting_approval,
+        })
+    });
+    Json(json!({ "sid": sid, "live": live, "breakdown": breakdown, "session":session }))
+        .into_response()
 }
 
 /// POST body for a turn submission — `text` (required unless `attachments`

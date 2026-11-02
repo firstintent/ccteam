@@ -13813,6 +13813,12 @@ impl Gateway {
         Some(residency_of_meta(&meta))
     }
 
+    /// Durable facts for one sid, using the same catalog as session listings.
+    /// Read-only detail surfaces need neither a fleet listing nor a disk scan.
+    pub fn session_meta_snapshot(&self, sid: &str) -> Option<SessionMeta> {
+        self.find_meta_for_sid(sid).ok().map(|(_, _, meta)| meta)
+    }
+
     /// Every RELEASED session of the given projects — real, resumable, and
     /// simply not holding a process right now. `slugs = None` means every
     /// project the gateway has loaded.
@@ -14864,8 +14870,8 @@ impl Gateway {
     // The policy is a two-level ladder, in this order of importance:
     //   1. IDLE RELEASE (primary) — a session nobody has spoken to for its
     //      harness's `sessions.idle_release_secs` window is released. The
-    //      default window is the vendor's prompt-cache TTL, so a process is
-    //      held exactly as long as holding it can still save a cache re-read.
+    //      default window is 250 minutes; explicit per-harness overrides can
+    //      tune the balance between continuity and resident memory.
     //   2. CAPACITY (secondary) — `sessions.max_live` still caps the burst
     //      case, evicting the least-recently-active eligible session at
     //      admission time.

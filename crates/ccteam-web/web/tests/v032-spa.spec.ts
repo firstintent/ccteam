@@ -49,6 +49,71 @@ const sessionHistory = {
   ],
 };
 
+for (const width of [1360, 390, 320]) {
+  test(`compact header, current context and Markdown reply copy at ${width}px`, async ({ page }, testInfo) => {
+    await mockCcteamApi(page);
+    await page.setViewportSize({ width, height: 1000 });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+        writeText: async (value: string) => { (window as typeof window & { copiedReply?: string }).copiedReply = value; },
+      } });
+    });
+    const raw = "## Answer\n\n**Keep Markdown** and [the link](https://example.com).\n\n```ts\nconst answer = 42;\n```\n\n| A | B |\n| - | - |\n| 1 | 2 |";
+    const facts = { ...sessionRows[0], role: "", vendor: "codex", title: "一个很长的会话标题用于验证窄屏省略与工具栏布局", model: "gpt-test", host: "satellite-1", residency: "released", status: "idle", parent_sid: "s1497", delegation_depth: 2, cost_usd: 716.425, tokens_total: 9000000, last_active: "2026-11-01T22:00:00Z" };
+    // The shell is deliberately stale/wrong: Context must use its own sid
+    // response, including for the history-only path after a release.
+    await page.route("**/api/v1/projects/dev-team/sessions", route => route.fulfill({ json: [] }));
+    await page.route("**/api/v1/projects/dev-team/sessions/history", route => route.fulfill({ json: [{...facts,slug:"dev-team",host:"local",parent_sid:null,delegation_depth:0}] }));
+    await page.route("**/api/v1/sessions/s1", route => route.fulfill({ json: { sid:"s1",events:[
+      {turn_id:"t1",ts:"2026-11-02T01:00:00Z",role:"",user:"first",assistant:raw},
+      {turn_id:"t2",ts:"2026-11-02T02:00:00Z",role:"",user:"second",assistant:"Second **response**"},
+    ] } }));
+    await page.route("**/api/v1/sessions/s1/status", route => route.fulfill({ json: {sid:"s1",model:"gpt-test",context:{used_tokens:8000,window_tokens:100000,pct:8},status_line:null} }));
+    let refreshes = 0;
+    await page.route("**/api/v1/sessions/s1/context", route => {
+      refreshes += 1;
+      return route.fulfill({ json: {sid:"s1",live:false,session:{...facts,cost_usd:716.425+refreshes-1},breakdown:{vendor:"codex",model:"gpt-test",captured_at:"2026-11-02T01:00:00Z",used_tokens:8000,window_tokens:100000,categories:[{id:"context_total",name:"Used context",tokens:8000,kind:"used"},{id:"free_space",name:"Free space",tokens:92000,kind:"free"}],last_request:{input_tokens:6000,cache_read_tokens:1000,cache_creation_tokens:0,output_tokens:1000,reasoning_output_tokens:200}}} });
+    });
+    await page.goto("/app/chat/s/s1");
+    const head = page.locator(".conv-head");
+    await expect(head.locator(".tabs")).toHaveCount(0);
+    await expect(head.locator(".cost-pill")).toHaveCount(0);
+    await expect(head.getByTestId("session-role")).toHaveCount(0);
+    await expect(head).not.toContainText("无 role");
+    await expect(page.getByTestId("ctx-toggle")).toContainText("8%");
+    await expect(page.getByTestId("files-toggle")).toBeVisible();
+    await expect(page.getByTestId("ctx-toggle")).toBeVisible();
+    expect(await head.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    expect(await page.getByTestId("ctx-toggle").evaluate(node => node.getBoundingClientRect().height)).toBeLessThanOrEqual(44);
+    expect(await page.locator(".right-panel-tools").evaluate(node => node.getBoundingClientRect().width)).toBeGreaterThan(150);
+    const copies = page.getByTestId("reply-copy");
+    await expect(copies).toHaveCount(2);
+    await copies.first().click();
+    expect(await page.evaluate(() => (window as typeof window & { copiedReply?: string }).copiedReply)).toBe(raw);
+    await expect(page.locator(".reply-copy-feedback").first()).toHaveText(/已复制|Copied/);
+    await copies.last().click();
+    expect(await page.evaluate(() => (window as typeof window & { copiedReply?: string }).copiedReply)).toBe("Second **response**");
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {configurable:true,value:{writeText:async()=>{throw Error("denied");}}});
+      document.execCommand = () => false;
+    });
+    await copies.last().click();
+    await expect(page.locator(".reply-copy-feedback").last()).toHaveText(/复制失败|Copy failed/);
+    await page.getByTestId("ctx-toggle").click();
+    const status = page.getByTestId("ctx-session-status");
+    await expect(status).toContainText("satellite-1");
+    await expect(status).toContainText("s1497");
+    await expect(status).toContainText("$716.4250");
+    await expect(page.getByTestId("ctx-codex-scope")).toBeVisible();
+    await expect(page.getByTestId("ctx-last-request")).toContainText("200");
+    await page.getByTestId("ctx-refresh").click();
+    await expect(status).toContainText("$717.4250");
+    await page.screenshot({path:testInfo.outputPath(`context-${width}.png`),fullPage:true});
+    await page.getByTestId("ctx-close").click();
+    await expect(page.getByTestId("ctx-toggle")).toBeFocused();
+  });
+}
+
 const statusSnapshot = {
   daemon_healthy: true,
   sessions_live: 1,

@@ -93,12 +93,8 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     // The prototype conv chrome is present…
     expect(html).toContain('data-testid="conversation-view"');
     expect(html).toContain("Enter 发送"); // conv composer placeholder
-    expect(html).toContain(">s9<"); // sid chip
-    expect(html).toContain(">demo<"); // project chip
-    // Vendor chip is an icon-only mark (no text label) with data-vendor.
-    expect(html).toContain('class="chip claude vendor-chip"');
-    expect(html).toContain('data-vendor="claude"');
-    expect(html).toContain('aria-label="claude"');
+    expect(html).not.toContain('class="chip sid"');
+    expect(html).toContain('data-testid="session-model"');
     // …but there are NO transcript bubbles: rows seeded empty and the
     // SSE/history seeds can't run under SSR.
     expect(html).not.toContain('class="msg user');
@@ -145,11 +141,13 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(html).not.toContain('src="blob:');
   });
 
-  it("hides the terminal tab for a stream-json session (no pane) and shows it for claude terminal", () => {
+  it("never offers the retired chat/terminal switch for any protocol", () => {
     const streamJson = render({ ...SESSION, protocol: "stream-json" });
     expect(streamJson).not.toContain('data-testid="terminal-tab"');
     const terminal = render({ ...SESSION, protocol: "terminal" });
-    expect(terminal).toContain('data-testid="terminal-tab"');
+    expect(terminal).not.toContain('data-testid="terminal-tab"');
+    expect(terminal).not.toContain('class="tabs"');
+    expect(terminal).not.toContain('class="cost-pill"');
     // codex never gets a terminal tab.
     const codex = render({ ...SESSION, vendor: "codex", protocol: "stream-json" });
     expect(codex).not.toContain('data-testid="terminal-tab"');
@@ -171,18 +169,22 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
       permission_mode: "hitl",
       protocol: "stream-json",
     });
-    expect(html).toContain('data-vendor="pi"');
+    expect(html).toContain('data-testid="session-model"');
+    expect(html).toContain('title="pi"');
     expect(html).toContain('data-testid="session-role"');
     expect(html).toContain("reviewer");
     expect(html).toContain('data-testid="pi-hitl-tradeoff"');
   });
 
-  it("shows the @host chip only for a remote session", () => {
+  it("keeps host and identity details out of the header, and omits an empty role", () => {
     const strip = (h: string) => h.replace(/<!-- -->/g, "");
     const local = render({ ...SESSION, host: "local" });
     expect(strip(local)).not.toContain("@ local");
     const remote = render({ ...SESSION, host: "dev04" });
-    expect(strip(remote)).toContain("@ dev04");
+    expect(strip(remote)).not.toContain("@ dev04");
+    const roleless = render({ ...SESSION, role: "" });
+    expect(roleless).not.toContain('data-testid="session-role"');
+    expect(roleless.split('class="conv-head"')[1]?.split('class="conv-body')[0]).not.toContain("无 role");
   });
 });
 
@@ -211,7 +213,7 @@ describe("context panel entry points + docked memory", () => {
     expect(html).not.toContain('data-testid="ctx-chip"');
   });
 
-  it("the `model · ctx N%` chip is a labelled button into the panel once a status is known", () => {
+  it("renders a passive model and puts context percent on the single context toggle", () => {
     vi.spyOn(globalThis.localStorage, "getItem").mockImplementation((k) =>
       k === rowsKeyFor("s9")
         ? JSON.stringify([
@@ -229,11 +231,9 @@ describe("context panel entry points + docked memory", () => {
         : null,
     );
     const html = strip(render());
-    expect(html).toMatch(
-      /<button[^>]*class="chip chip-btn"[^>]*data-testid="ctx-chip"[^>]*aria-label="查看上下文构成 · claude-sonnet-5-5"[^>]*aria-pressed="false"/,
-    );
-    expect(html).toContain("claude-sonnet-5-5 · ctx 25%");
-    expect(html).not.toContain('title="model · context window"');
+    expect(html).toMatch(/<span[^>]*data-testid="session-model"[^>]*>claude-sonnet-5-5<\/span>/);
+    expect(html).not.toContain('data-testid="ctx-chip"');
+    expect(html).toMatch(/data-testid="ctx-toggle"[^>]*>[\s\S]*?<span>上下文<\/span><span class="panel-context-pct">25%<\/span>/);
   });
 
   it("restores a remembered-open panel on mount (per-browser layout memory)", () => {
@@ -334,7 +334,10 @@ function collectElementText(value: unknown): string[] {
   if (!value || typeof value !== "object") return [];
   const props = (value as { props?: Record<string, unknown> }).props;
   if (!props) return [];
-  const ownContent = typeof props.content === "string" ? [props.content] : [];
+  // Only Markdown renders its content prop. A clipboard action also receives
+  // that source, but must not count as another visible copy of the response.
+  const type = (value as { type?: { name?: string } }).type;
+  const ownContent = type?.name === "Markdown" && typeof props.content === "string" ? [props.content] : [];
   return [...ownContent, ...collectElementText(props.children)];
 }
 

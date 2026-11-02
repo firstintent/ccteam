@@ -6,7 +6,7 @@
 // cost. The gateway asks the harness when the session is resident (`live:
 // true`); otherwise it serves the snapshot persisted at the end of the last
 // turn (`live: false`, dated by `captured_at`). `breakdown: null` = this
-// harness offers no breakdown and no snapshot exists (non-Claude harnesses,
+// harness offers no breakdown and no snapshot exists (unsupported harnesses,
 // terminal-protocol or remote-host sessions, or a session that has not
 // finished a turn since the feature shipped) — a fact to explain, not an
 // error.
@@ -16,6 +16,7 @@
 
 import { httpError } from "./httpError";
 import { sessionUrl } from "./sessionsApi";
+import type { SessionView } from "./sessionsApi";
 
 /** `used` occupies the window; `deferred` = tool schemas NOT loaded (never
  *  counted — list them apart, muted); `buffer` = reserved for auto-compaction;
@@ -70,6 +71,8 @@ export interface ContextLastRequest {
   output_tokens?: number | null;
   cache_creation_tokens?: number | null;
   cache_read_tokens?: number | null;
+  /** Codex: a subset of output_tokens, never added to the total again. */
+  reasoning_output_tokens?: number | null;
 }
 
 export interface ContextBreakdown {
@@ -90,6 +93,8 @@ export interface SessionContextResponse {
   sid: string;
   live: boolean;
   breakdown: ContextBreakdown | null;
+  /** Current per-sid facts; includes released/stopped sessions. */
+  session?: SessionView | null;
 }
 
 export function sessionContextUrl(sid: string): string {

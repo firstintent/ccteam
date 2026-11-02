@@ -1526,6 +1526,9 @@ pub struct ContextRequestUsage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Codex reports this as a subset of output, not an additional total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex

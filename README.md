@@ -62,11 +62,11 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 </p>
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
-- a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input; a turn's folded activity row opens into its steps, and each step into its full thinking text or tool input and output
-- a context sidebar per session: what its context window is made of — system prompt, tools, each memory file by path, skills, MCP tools, agents, the conversation split by tool and attachment, last-request cache use — taken from the harness's own accounting, refreshed when a turn ends (Claude sessions)
+- a chat per session with a compact title/model header and unified Files / Context toolbar, including a clock on the composer to queue delayed user turns above the input; a turn's folded activity row opens into its steps, and each step into its full thinking text or tool input and output
+- a context sidebar per session: session status, harness/model/host, delegation parent, cumulative cost and last activity, followed by the harness's own context accounting — detailed categories for Claude; window totals and last-request input/cache/output/reasoning usage for Codex — refreshed when a turn ends, with dated snapshots after release
 - a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place, and a Runs tab listing every ccteam Flow run with the sessions it hired
 - a DSH page that opens DeepSeek Harness Web inside ccteam: the daemon authenticates the request, starts or attaches the right local DSH web instance, and gives each logged-in user a separate DSH home
-- a cost pill with daily budget caps
+- a Status page with per-session cost and daily budget caps
 - a per-project ⋯ menu in the sidebar: start a session there, copy its path, or take the project out of ccteam (deregister + stop its live sessions — your directory and code are never touched)
 - marketplace and settings
 
@@ -234,7 +234,7 @@ ccteam adds a team to your repo without taking it over:
 
 - **Roleless by default** — the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism; ccteam never rewrites project knowledge.
 - **Small footprint** — exactly `.ccteam/` (state), `.claude/agents/` (personas you install), and in `.claude/settings.local.json` only the keys you ask for (a hub plugin you enable, an `/effort` you pin) — never your `settings.json`, and no hooks (unless you pick the frozen terminal protocol, which installs its own).
-- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. A session you are not talking to releases its harness process after an idle window (default one hour, matching the prompt-cache TTL) and comes straight back on your next message, on the same id and the same conversation — so a fleet of thirty sessions costs thirty transcripts, not thirty resident processes. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
+- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. A session you are not talking to releases its harness process after an idle window (default 250 minutes) and comes straight back on your next message, on the same id and the same conversation — so a fleet of thirty sessions costs thirty transcripts, not thirty resident processes. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
 
 ## Extras
 

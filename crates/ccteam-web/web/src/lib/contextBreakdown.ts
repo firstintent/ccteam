@@ -85,6 +85,7 @@ const CATEGORY_LABEL_ZH: Record<string, string> = {
   messages: "消息",
   autocompact_buffer: "自动压缩预留",
   free_space: "剩余空间",
+  context_total: "已用上下文",
 };
 
 export function categoryLabel(category: Pick<ContextCategory, "id" | "name">, lang: Lang): string {

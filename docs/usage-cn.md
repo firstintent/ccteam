@@ -209,7 +209,9 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### Status / 成本
 
-会话右上角的工具栏统一排列「文件」和「上下文」，点击切换右侧工作区；原有 `model · ctx` 入口仍可直接打开上下文。桌面可拖动聊天与工作区之间的分隔线调整宽度，手机以抽屉展示，Esc 关闭并返回入口。
+会话顶部显示状态、标题、非空 role 和模型文字；右上角统一排列「文件」和「上下文」，上下文按钮附带窗口使用百分比，点击切换右侧工作区。双击标题或点重命名按钮可改名。桌面可拖动聊天与工作区之间的分隔线调整宽度，手机以抽屉展示，Esc 关闭并返回入口。
+
+每条助手文本回复的 footer 都有复制按钮，复制该条回复的原始 Markdown（保留代码块、表格和链接，不含状态 footer 或工具过程），并显示成功或失败反馈。
 
 「文件」支持目录搜索、键盘导航、文件图标和 Git 状态。单击临时预览，双击或点固定按钮保留标签；切换到上下文再回来仍保留已打开文件与阅读位置。聊天中的本地文件链接可直接打开源码并定位行号。点刷新可重新读取目录、源码与预览，turn 结束也会刷新。
 
@@ -217,8 +219,9 @@ Markdown (`.md` / `.markdown`) 默认显示排版预览，支持标题锚点、�
 
 HTML/HTM 默认打开交互预览，可切换「源码」或在新标签页打开。预览支持 HTML 所在目录及子目录中的相对 CSS、JS/ES module、图片和字体；资源链接一小时有效，过期后刷新。预览沙箱与控制台的 DOM、登录状态和存储隔离，不能调用控制台 API，也不会启动 React/Vite 构建或开发服务器。目前仅支持本地主机项目，远程项目明确显示未支持。内部状态、依赖目录和常见密钥文件不列出；目录最多 20,000 项，源码最多 2 MiB，单个预览资源最多 16 MiB。
 
-- **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
-- **上下文侧栏**:在 web 控制台点会话头部的 `model · ctx` 标签(或右上角的侧栏按钮),右侧打开侧栏(切换会话时保持打开),显示上下文窗口由什么组成:system prompt、工具、memory 文件(每个 `CLAUDE.md` / 记忆文件按路径列出)、skills、MCP 工具与说明、自定义 agent,以及对话本身按工具(调用 vs 结果 token)和附件类型的拆分,外加上一次请求的缓存读 / 缓存写 / 未缓存输入。harness 延迟加载(未载入)的工具单独列出,因为它们不占窗口。数字是 harness 自己的账(Claude `/context` 的数据),不是让模型去估:在线会话每次打开和点「刷新」都现查,turn 结束时侧栏自动刷新(所以 `/compact` 后立刻看得到变化);已释放的会话显示最后一个 turn 结束时的快照并标出时间。目前只支持 Claude stream-json 会话,其他 harness 仍只显示 ctx 百分比。REST:`GET /api/v1/sessions/{sid}/context`。
+- **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算。
+- **上下文侧栏**:顶部整理当前会话的活动与运行状态、ID/项目、harness/模型/主机、父会话和委派深度、本会话累计成本、累计 tokens、最后活动时间。尚未计价与 $0 区分显示，累计 tokens 不等于窗口占用。即使 harness 不提供上下文分析，也可查看会话状态。
+- **厂商上下文分析**:Claude stream-json 显示 system prompt、工具、memory 文件(按路径)、skills、MCP 工具与说明、自定义 agent，以及消息按工具调用/结果和附件类型的拆分；延迟加载工具单独列出，不计入窗口。Codex app-server 显示已用/剩余窗口、最近一次请求的输入、缓存命中、输出及其中推理 tokens；Codex 未提供分类明细和压缩阈值，面板不会补估。数字来自 harness 官方接口，不调用模型估算。每次打开、手动刷新和 turn 结束时更新；Codex 读取最近的用量事件，采集时间不会因打开面板而改变。释放后显示最后一次 turn 结束的快照及时间。REST:`GET /api/v1/sessions/{sid}/context`。
 - 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
 
 ### 标准资源 API(给集成方)
@@ -594,7 +597,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 - **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
 - **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
 
-远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 3600 秒 = 一小时,对齐 Claude 的 prompt-cache TTL —— 进程只握到「再握也省不下缓存」为止;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 15000 秒 = 250 分钟;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
 
 ---
 

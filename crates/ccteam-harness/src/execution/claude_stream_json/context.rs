@@ -189,6 +189,7 @@ fn parse_request_usage(v: &Value) -> Option<ContextRequestUsage> {
         output_tokens: n("output_tokens"),
         cache_creation_tokens: n("cache_creation_input_tokens"),
         cache_read_tokens: n("cache_read_input_tokens"),
+        reasoning_output_tokens: None,
     })
 }
 

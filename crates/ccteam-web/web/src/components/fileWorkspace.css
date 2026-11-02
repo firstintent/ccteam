@@ -3,10 +3,12 @@
   display: flex;
   align-items: center;
   gap: 3px;
-  margin-left: 4px;
-  padding-left: 8px;
-  border-left: 1px solid var(--border-soft);
+  margin-left: auto;
+  flex: none;
 }
+.right-panel-tools .icon-btn.sm { width: auto; height: 32px; min-height: 32px; gap: 6px; padding: 6px 8px; font-size: 12px; white-space: nowrap; }
+.right-panel-tools .panel-context-pct { font: 11px var(--font-mono); color: var(--text-muted); }
+@media (pointer: coarse) { .right-panel-tools .icon-btn.sm { height: 44px; min-height: 44px; } }
 .right-panel-tools .on {
   color: var(--text);
   background: var(--bg-soft);

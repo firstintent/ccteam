@@ -250,7 +250,7 @@ to it, and the details sheet slides over the conversation.
   parent. The dot is the daemon’s activity verdict first (animated = working,
   green = idle, amber = stale, red = stuck); a settled session then shows its
   residency — a hollow ring means the daemon released its process after the
-  harness’s prompt-cache TTL and it resumes by sid on the next message, a
+  configured idle window (250 minutes by default) and it resumes by sid on the next message, a
   dimmed disc (with a “stopped” caption) means you stopped it. Hovering a
   row explains the state. Project headers fold and show the project’s total
   cost; hovering one reveals **⋯** (new session, copy slug, expand only this
