@@ -1,4 +1,7 @@
 /* #219: a shared right workspace, with Files and Context in the same tool rail. */
+[data-testid="conversation-view"] {
+  container: session-view / inline-size;
+}
 .right-panel-tools {
   display: flex;
   align-items: center;
@@ -222,7 +225,10 @@
 .files-reader .cm-editor {
   height: 100%;
 }
-@media (max-width: 820px) {
+/* Size against the conversation, not the whole viewport: a portrait tablet
+   can still have the left sidebar open. Keep drawers below the shared toolbar
+   and give normal/expanded files the same layer above their local backdrop. */
+@container session-view (max-width: 820px) {
   #session-right-workspace {
     position: absolute !important;
     inset: 0 !important;
@@ -239,16 +245,35 @@
     width: 100%;
   }
   .files-workspace {
-    position: fixed;
-    inset: 0;
-    z-index: 110;
+    position: absolute;
+    inset: 0 0 0 auto;
+    width: min(96%, 640px);
+    z-index: 2;
     box-shadow: -8px 0 30px #0002;
+  }
+  .files-workspace.files-expanded {
+    width: 100%;
+    z-index: 2;
+  }
+  .right-workspace-panel .ctx-panel {
+    position: absolute;
+    inset: 0 0 0 auto;
+    width: min(92%, 380px);
+    height: 100%;
+    z-index: 2;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-menu);
   }
   .outer-separator {
     display: none;
   }
-  .files-backdrop {
+  #session-right-workspace .ctx-backdrop {
     display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    border: none;
+    background: rgba(0, 0, 0, .28);
     pointer-events: auto;
   }
   .files-head {

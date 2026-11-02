@@ -908,7 +908,10 @@ export default function SessionView({
         id="session-workspace"
         defaultLayout={workspaceLayout}
         onLayoutChanged={(layout) => {
-          if (!activePanel || isNarrowViewport(window)) return;
+          // Match the drawer's container query, including tablets whose left
+          // sidebar leaves less room than the viewport width suggests.
+          const width = document.getElementById("session-workspace")?.clientWidth;
+          if (!activePanel || width == null || width <= 820) return;
           try {
             localStorage.setItem(
               "ccteam.workspace.layout",

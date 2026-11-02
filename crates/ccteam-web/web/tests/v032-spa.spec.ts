@@ -781,6 +781,107 @@ test("file workspace preserves Context, refreshes paths, and previews HTML", asy
   await expect(page.getByTestId("files-toggle")).toBeFocused();
 });
 
+test.describe("touch workspace", () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  async function openWorkspace(page: Page, width: number, height: number) {
+    await mockCcteamApi(page);
+    await page.setViewportSize({ width, height });
+    await page.route("**/api/v1/projects/dev-team/files", route => route.fulfill({json:{root:"/repo",paths:["mobile.txt"],git_status:{},truncated:false}}));
+    await page.route("**/api/v1/projects/dev-team/file?*", route => route.fulfill({json:{path:"mobile.txt",content:"Keep this reading position",size:26,binary:false}}));
+    await page.route("**/api/v1/sessions/s1/context", route => route.fulfill({json:{sid:"s1",live:false,breakdown:null}}));
+    await page.goto("/app/chat/s/s1");
+    await page.getByTestId("files-toggle").tap();
+    await expect(page.getByTestId("file-workspace")).toBeVisible();
+  }
+
+  async function expectToolbarClickable(page: Page) {
+    for (const id of ["files-toggle", "ctx-toggle"]) {
+      await expect(page.getByTestId(id)).toBeInViewport();
+      expect(await page.getByTestId(id).evaluate(element => {
+        const bounds = element.getBoundingClientRect();
+        return document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)?.closest("button") === element;
+      })).toBe(true);
+    }
+  }
+
+  for (const [width, height] of [[320,720],[390,844],[768,1024],[820,1180],[834,1194],[1024,768],[1180,820],[1440,900]]) {
+    test(`single taps open, close and switch panels at ${width}x${height}`, async ({ page }, testInfo) => {
+      await openWorkspace(page, width, height);
+      await expectToolbarClickable(page);
+      await page.getByTestId("files-toggle").tap();
+      await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+      await page.getByTestId("files-toggle").tap();
+      await expect(page.getByTestId("file-workspace")).toBeVisible();
+      await page.getByTestId("project-file-tree").getByRole("treeitem", {name:"mobile.txt",exact:true}).tap();
+      await expect(page.locator(".cm-content")).toContainText("Keep this reading position");
+      const before = await page.getByTestId("file-workspace").boundingBox();
+      await page.getByRole("button", {name:/放大工作区|Expand workspace/}).tap();
+      const expanded = await page.getByTestId("file-workspace").boundingBox();
+      const body = await page.locator(".conv-body").boundingBox();
+      expect(expanded!.width).toBeGreaterThan(before!.width + 2);
+      expect(Math.abs(expanded!.width - body!.width)).toBeLessThan(2);
+      await expectToolbarClickable(page);
+      await page.screenshot({path:testInfo.outputPath(`files-expanded-${width}x${height}.png`)});
+      await page.getByRole("button", {name:/恢复并排布局|Restore split view/}).tap();
+      await page.getByTestId("ctx-toggle").tap();
+      await expect(page.getByTestId("context-panel")).toBeVisible();
+      await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+      await expectToolbarClickable(page);
+      await page.screenshot({path:testInfo.outputPath(`workspace-${width}x${height}.png`)});
+      await page.getByTestId("ctx-toggle").tap();
+      await expect(page.getByTestId("context-panel")).not.toBeVisible();
+      await page.getByTestId("files-toggle").tap();
+      await expect(page.locator(".cm-content")).toContainText("Keep this reading position");
+      await page.getByRole("button", {name:/关闭文件面板|Close file panel/}).last().tap();
+      await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+      await expect(page.getByTestId("files-toggle")).toBeFocused();
+    });
+  }
+
+  test("expanded tablet workspace stays operable through rotation", async ({page}) => {
+    await openWorkspace(page, 1180, 820);
+    await page.getByRole("button", {name:/放大工作区|Expand workspace/}).tap();
+    await page.setViewportSize({width:820,height:1180});
+    await expectToolbarClickable(page);
+    await page.getByRole("button", {name:/恢复并排布局|Restore split view/}).tap();
+    await page.getByTestId("ctx-toggle").tap();
+    await expect(page.getByTestId("context-panel")).toBeVisible();
+    await page.setViewportSize({width:1180,height:820});
+    await expectToolbarClickable(page);
+    await page.getByTestId("files-toggle").tap();
+    await expect(page.getByTestId("file-workspace")).toBeVisible();
+  });
+
+  test("saved desktop layout survives narrow drawers, backdrop taps and rotation", async ({page}) => {
+    const layout = JSON.stringify({"session-chat":60,"session-right-workspace":40});
+    await page.addInitScript(value => {
+      localStorage.setItem("ccteam.workspace.layout", value);
+      localStorage.setItem("ccteam.files.open", "1");
+    }, layout);
+    // A remembered desktop panel must still open on the first phone tap.
+    await openWorkspace(page, 390, 844);
+    const savedLayout = () => page.evaluate(() => localStorage.getItem("ccteam.workspace.layout"));
+    expect(await savedLayout()).toBe(layout);
+    await page.locator(".files-backdrop").tap({position:{x:1,y:100}});
+    await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+    await expect(page.getByTestId("files-toggle")).toBeFocused();
+    await page.getByTestId("ctx-toggle").tap();
+    await page.getByTestId("ctx-backdrop").tap({position:{x:1,y:100}});
+    await expect(page.getByTestId("context-panel")).not.toBeVisible();
+    await expect(page.getByTestId("ctx-toggle")).toBeFocused();
+    await page.getByTestId("files-toggle").tap();
+    await page.setViewportSize({width:834,height:1194});
+    await expectToolbarClickable(page);
+    expect(await savedLayout()).toBe(layout);
+    await page.setViewportSize({width:390,height:844});
+    await expectToolbarClickable(page);
+    await page.getByTestId("files-toggle").tap();
+    await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+    expect(await savedLayout()).toBe(layout);
+  });
+});
+
 test("mobile Files drawer accepts clicks above its backdrop", async ({
   page,
 }) => {

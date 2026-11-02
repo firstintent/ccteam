@@ -217,6 +217,8 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 
 The session header shows status, title, a nonempty role and plain model text. The top-right toolbar groups **Files** and **Context**, with window usage on Context. Double-click the title or use its rename button to rename. Drag the divider to resize the desktop workspace. On phones it opens as a drawer; Escape closes it and returns focus to its toolbar button.
 
+When a tablet or phone has limited conversation space, drawers cover only the chat body. Files / Context remain reachable: tap once to open, again to close, or tap the other button to switch. Files can expand across the chat body and restore; the close button or exposed backdrop also dismisses the drawer. Rotation preserves open files, and drawer widths do not overwrite desktop split preferences.
+
 Each assistant text reply has a footer copy button. It copies that reply's original Markdown, preserving code fences, tables and links without metadata or tool activity, and shows success or failure feedback.
 
 Files offers path search, keyboard navigation, file icons, and Git status. Click for a temporary preview; double-click or pin to keep a tab. Switching to Context and back preserves open files and reading positions. Local file links in chat open source at the referenced line. Refresh reloads the directory, source, and preview; turn completion also refreshes them.

@@ -33,5 +33,10 @@ export default defineConfig({
       name: "chromium",
       use: { browserName: "chromium" },
     },
+    {
+      name: "webkit-touch",
+      grep: /touch workspace/,
+      use: { browserName: "webkit" },
+    },
   ],
 });
