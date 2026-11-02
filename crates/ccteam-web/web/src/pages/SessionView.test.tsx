@@ -205,7 +205,7 @@ describe("context panel entry points + docked memory", () => {
     expect(html).toContain('aria-label="查看上下文构成"');
     expect(html).not.toContain('data-testid="context-panel"');
     // The chat column is still wrapped so the panel can dock beside it.
-    expect(html).toContain('class="conv-body"');
+    expect(html).toContain('class="conv-body workspace-closed"');
     expect(html).toContain('class="conv-main"');
     // No status yet ⇒ no chip; the toggle is the way in.
     expect(html).not.toContain('data-testid="ctx-chip"');

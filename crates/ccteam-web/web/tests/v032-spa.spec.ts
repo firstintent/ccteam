@@ -161,7 +161,10 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
     route.fulfill({ status: 200, json: { wire_token: null } }),
   );
   await page.route("**/api/v1/me", (route) =>
-    route.fulfill({ status: 200, json: { id: "admin", handle: "owner", is_admin: true } }),
+    route.fulfill({
+      status: 200,
+      json: { id: "admin", handle: "owner", is_admin: true },
+    }),
   );
   await page.route("**/api/v1/status", (route) =>
     route.fulfill({ status: 200, json: statusSnapshot }),
@@ -171,7 +174,13 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
       status: 200,
       json: {
         hosts: [
-          { host: "local", hostname: "dev01", is_local: true, agent_count: 5, agents_ready: 5 },
+          {
+            host: "local",
+            hostname: "dev01",
+            is_local: true,
+            agent_count: 5,
+            agents_ready: 5,
+          },
         ],
       },
     }),
@@ -181,7 +190,8 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
       status: 200,
       json: {
         token: "e2e-join-token",
-        command: "ccteam host join --daemon <daemon-url> --token e2e-join-token",
+        command:
+          "ccteam host join --daemon <daemon-url> --token e2e-join-token",
       },
     }),
   );
@@ -285,12 +295,18 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
   );
   await page.route("**/api/v1/projects", (route) => {
     if (route.request().method() === "POST") {
-      return route.fulfill({ status: 201, json: { slug: "new-proj", path: "/tmp/new-proj" } });
+      return route.fulfill({
+        status: 201,
+        json: { slug: "new-proj", path: "/tmp/new-proj" },
+      });
     }
     return route.fulfill({ status: 200, json: dashboardRows });
   });
   await page.route("**/api/v1/projects/dev-team/roles", (route) =>
-    route.fulfill({ status: 200, json: [{ role: "cto", description: "默认管家", model: "" }] }),
+    route.fulfill({
+      status: 200,
+      json: [{ role: "cto", description: "默认管家", model: "" }],
+    }),
   );
   await page.route("**/api/v1/projects/dev-team/sessions", (route) => {
     if (route.request().method() === "POST") {
@@ -315,12 +331,20 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
   await page.route("**/api/v1/sessions/*/status", (route) =>
     route.fulfill({
       status: 200,
-      json: { sid: "s1", model: null, effort: null, context: null, status_line: null },
+      json: {
+        sid: "s1",
+        model: null,
+        effort: null,
+        context: null,
+        status_line: null,
+      },
     }),
   );
 
   async function captureJson(
-    route: Parameters<Page["route"]>[1] extends (route: infer R) => unknown ? R : never,
+    route: Parameters<Page["route"]>[1] extends (route: infer R) => unknown
+      ? R
+      : never,
   ) {
     const req = route.request();
     captured.push({
@@ -363,21 +387,29 @@ test("desktop shell: sidebar groups sessions by project and opens a sid conversa
   await expect(page.getByText("hi from history")).toBeVisible();
 });
 
-test("conversation posts a turn; sidebar hover-stop stops the session", async ({ page }) => {
+test("conversation posts a turn; sidebar hover-stop stops the session", async ({
+  page,
+}) => {
   const captured = await mockCcteamApi(page);
   await page.goto("/app/chat/s/s1");
 
   await page.getByTestId("composer-textarea").fill("ship gate note");
   await page.getByTestId("composer-send").click();
   await expect
-    .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/turn")))
+    .poll(() =>
+      captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/turn")),
+    )
     .toBe(true);
 
   // The sidebar row's hover stop (prototype `.srow .stop`) → POST /stop.
   await page.getByText("评审登录页").first().hover();
-  await page.getByRole("button", { name: "停止(状态保留,可 resume) s1", exact: true }).click();
+  await page
+    .getByRole("button", { name: "停止(状态保留,可 resume) s1", exact: true })
+    .click();
   await expect
-    .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/stop")))
+    .poll(() =>
+      captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/stop")),
+    )
     .toBe(true);
 
   expect(captured).toEqual(
@@ -409,11 +441,15 @@ test("home lazy-create: first message POSTs session without a host override, the
   await expect
     .poll(() =>
       captured.some(
-        (r) => r.url.endsWith("/api/v1/projects/dev-team/sessions") && r.method === "POST",
+        (r) =>
+          r.url.endsWith("/api/v1/projects/dev-team/sessions") &&
+          r.method === "POST",
       ),
     )
     .toBe(true);
-  const create = captured.find((r) => r.url.endsWith("/projects/dev-team/sessions"));
+  const create = captured.find((r) =>
+    r.url.endsWith("/projects/dev-team/sessions"),
+  );
   expect(create?.body).toMatchObject({
     vendor: "claude",
     protocol: "stream-json",
@@ -423,7 +459,9 @@ test("home lazy-create: first message POSTs session without a host override, the
 
   // The first message rides as the new session's first turn → Conversation.
   await expect
-    .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s2/turn")))
+    .poll(() =>
+      captured.some((r) => r.url.endsWith("/api/v1/sessions/s2/turn")),
+    )
     .toBe(true);
   const turn = captured.find((r) => r.url.endsWith("/api/v1/sessions/s2/turn"));
   expect(turn?.body).toEqual({ text: "修复登录页布局" });
@@ -440,19 +478,30 @@ test("Pi picker keeps role, uses provider/model-id, and exposes strict-HITL trad
   await page.getByRole("button", { name: /cto/ }).click();
 
   await page.getByTestId("model-btn").click();
-  await page.getByRole("button", { name: /anthropic\/claude-opus-4-6/ }).click();
-  await expect(page.getByTestId("model-btn")).toContainText("Pi · anthropic/claude-opus-4-6");
+  await page
+    .getByRole("button", { name: /anthropic\/claude-opus-4-6/ })
+    .click();
+  await expect(page.getByTestId("model-btn")).toContainText(
+    "Pi · anthropic/claude-opus-4-6",
+  );
   await page.getByTestId("model-btn").click();
   await page.getByRole("button", { name: "xhigh", exact: true }).click();
 
   await page.getByTestId("hitl-toggle").click();
   await expect(page.getByTestId("pi-hitl-tradeoff")).toContainText("用户扩展");
-  await expect(page.getByTestId("pi-hitl-tradeoff")).toContainText("技能、上下文文件和提示词模板不受影响");
+  await expect(page.getByTestId("pi-hitl-tradeoff")).toContainText(
+    "技能、上下文文件和提示词模板不受影响",
+  );
 
   await page.getByTestId("composer-textarea").fill("验证 Pi 配方");
   await page.getByTestId("home-send").click();
   await expect
-    .poll(() => captured.find((request) => request.url.endsWith("/projects/dev-team/sessions"))?.body)
+    .poll(
+      () =>
+        captured.find((request) =>
+          request.url.endsWith("/projects/dev-team/sessions"),
+        )?.body,
+    )
     .toMatchObject({
       role: "cto",
       vendor: "pi",
@@ -479,13 +528,7 @@ test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts re
   await expect(page.getByTestId("status-view")).toBeVisible();
   await expect(page.getByTestId("hosts-view")).toBeVisible();
   await expect(page.getByText(/1 .*live/).first()).toBeVisible();
-  await expect
-    .poll(() =>
-      page
-        .getByTestId("ops-view")
-        .evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(" ").length),
-    )
-    .toBe(2);
+  await expect(page.getByTestId("ops-view")).toHaveCSS("flex-direction", "column");
 
   // Both legacy settings and flat routes canonicalize to the merged tab.
   await page.goto("/app/settings/hosts");
@@ -496,13 +539,8 @@ test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts re
   await expect(page).toHaveURL(/\/app\/settings\/ops$/);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect
-    .poll(() =>
-      page
-        .getByTestId("ops-view")
-        .evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(" ").length),
-    )
-    .toBe(1);
+  await expect(page.getByTestId("ops-view")).toHaveCSS("flex-direction", "column");
+  await expect.poll(() => page.getByTestId("ops-view").evaluate((node) => node.getBoundingClientRect().right)).toBeLessThanOrEqual(391);
 });
 
 test("mobile ≤820px: sidebar is a drawer behind the hamburger with a backdrop", async ({
@@ -523,11 +561,15 @@ test("mobile ≤820px: sidebar is a drawer behind the hamburger with a backdrop"
   await expect(page.getByTestId("side-backdrop")).toBeVisible();
 
   // Backdrop click closes it again.
-  await page.getByTestId("side-backdrop").click({ position: { x: 350, y: 400 } });
+  await page
+    .getByTestId("side-backdrop")
+    .click({ position: { x: 350, y: 400 } });
   await expect(sidebar).not.toBeInViewport();
 });
 
-test("401 after auth-required bootstrap shows the token entry flow", async ({ page }) => {
+test("401 after auth-required bootstrap shows the token entry flow", async ({
+  page,
+}) => {
   await page.route("**/api/v1/auth/token", (route) =>
     route.fulfill({ status: 200, json: { wire_token: "ccteam:deadbeef" } }),
   );
@@ -537,12 +579,14 @@ test("401 after auth-required bootstrap shows the token entry flow", async ({ pa
   await page.route("**/api/v1/me", (route) =>
     route.fulfill({ status: 401, json: { error: "auth required" } }),
   );
-  await page.route("**/sse/**", (route) => route.fulfill({ status: 200, body: "\n" }));
+  await page.route("**/sse/**", (route) =>
+    route.fulfill({ status: 200, body: "\n" }),
+  );
 
   await page.goto("/app/");
-  await expect(page.getByLabel("Token or URL")).toBeVisible();
-  await page.getByLabel("Token or URL").fill("abc123");
-  await page.getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByLabel("访问令牌")).toBeVisible();
+  await page.getByLabel("访问令牌").fill("abc123");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page).toHaveURL(/\/\?token=ccteam%3Aabc123$/);
 });
 
@@ -557,8 +601,229 @@ test("fresh unauthenticated load surfaces the token entry page, not a wedged she
   await page.route("**/api/**", (route) =>
     route.fulfill({ status: 401, body: "auth required" }),
   );
-  await page.route("**/sse/**", (route) => route.fulfill({ status: 200, body: "\n" }));
+  await page.route("**/sse/**", (route) =>
+    route.fulfill({ status: 200, body: "\n" }),
+  );
 
   await page.goto("/app/");
-  await expect(page.getByLabel("Token or URL")).toBeVisible();
+  await expect(page.getByLabel("访问令牌")).toBeVisible();
+});
+
+test("file workspace preserves Context, refreshes paths, and previews HTML", async ({
+  page,
+}) => {
+  await mockCcteamApi(page);
+  const paths = ["index.html", "README.md", "src/", "src/lib.rs"];
+  await page.route("**/api/v1/projects/dev-team/files", (route) =>
+    route.fulfill({
+      json: {
+        root: "/repo",
+        paths,
+        git_status: { "README.md": "modified" },
+        truncated: false,
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/file?*", (route) => {
+    const path = new URL(route.request().url()).searchParams.get("path");
+    return route.fulfill({
+      json: {
+        path,
+        content:
+          path === "README.md"
+            ? "# Project\nRead me"
+            : "<h1>Hello preview</h1>",
+        size: 30,
+        binary: false,
+      },
+    });
+  });
+  await page.route("**/api/v1/projects/dev-team/files/preview", (route) =>
+    route.fulfill({
+      json: {
+        url: "/api/v1/projects/dev-team/files/preview/test/index.html",
+        expires_in: 3600,
+      },
+    }),
+  );
+  await page.route("**/files/preview/test/index.html", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      headers: { "content-security-policy": "sandbox allow-scripts" },
+      body: "<h1>Hello preview</h1><button onclick=\"this.textContent='Clicked'\">Click me</button>",
+    }),
+  );
+  await page.route("**/api/v1/sessions/s1/context", (route) =>
+    route.fulfill({ json: { sid: "s1", live: false, breakdown: null } }),
+  );
+  await page.goto("/app/chat/s/s1");
+  await page.getByTestId("files-toggle").click();
+  await expect(page.getByTestId("ctx-toggle")).toBeVisible();
+  await page
+    .getByTestId("project-file-tree")
+    .getByRole("treeitem", { name: "index.html", exact: true })
+    .click();
+  await expect(
+    page
+      .frameLocator("iframe.files-preview")
+      .getByRole("heading", { name: "Hello preview" }),
+  ).toBeVisible();
+  await page
+    .frameLocator("iframe.files-preview")
+    .getByRole("button", { name: "Click me" })
+    .click();
+  await expect(
+    page
+      .frameLocator("iframe.files-preview")
+      .getByRole("button", { name: "Clicked" }),
+  ).toBeVisible();
+  await page.getByTestId("ctx-toggle").click();
+  await expect(page.getByTestId("context-panel")).toBeVisible();
+  await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+  await page.getByTestId("files-toggle").click();
+  await expect(page.getByRole("tab", { name: "index.html" })).toBeVisible();
+  await page.getByRole("button", { name: /^(源码|Source)$/ }).click();
+  await expect(page.locator(".cm-content")).toContainText("Hello preview");
+  paths.push("new.txt");
+  await page.getByRole("button", { name: /刷新文件|Refresh files/ }).click();
+  await expect(
+    page
+      .getByTestId("project-file-tree")
+      .getByRole("treeitem", { name: "new.txt", exact: true }),
+  ).toBeVisible();
+  await expect(page.locator("iframe.files-preview")).toHaveCount(0);
+  await expect(page.locator(".cm-content")).toContainText("Hello preview");
+  await page
+    .getByTestId("project-file-tree")
+    .getByRole("treeitem", { name: "README.md", exact: true })
+    .dblclick();
+  await expect(page.locator(".cm-content")).toContainText("Read me");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+  await expect(page.getByTestId("files-toggle")).toBeFocused();
+});
+
+test("mobile Files drawer accepts clicks above its backdrop", async ({
+  page,
+}) => {
+  await mockCcteamApi(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/v1/projects/dev-team/files", (route) =>
+    route.fulfill({
+      json: {
+        root: "/repo",
+        paths: ["README.md"],
+        git_status: {},
+        truncated: false,
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/file?*", (route) =>
+    route.fulfill({
+      json: {
+        path: "README.md",
+        content: "Mobile source",
+        size: 13,
+        binary: false,
+      },
+    }),
+  );
+  await page.goto("/app/chat/s/s1");
+  await page.getByTestId("files-toggle").click();
+  await page
+    .getByTestId("project-file-tree")
+    .getByRole("treeitem", { name: "README.md", exact: true })
+    .click();
+  await expect(page.locator(".cm-content")).toContainText("Mobile source");
+  await page
+    .getByRole("button", { name: /关闭文件面板|Close file panel/ })
+    .last()
+    .click();
+  await expect(page.getByTestId("file-workspace")).not.toBeVisible();
+});
+
+test("file workspace follows repeated line links into the same file", async ({
+  page,
+}) => {
+  await mockCcteamApi(page);
+  await page.route("**/api/v1/sessions/s1", (route) =>
+    route.fulfill({
+      json: {
+        sid: "s1",
+        events: [
+          {
+            turn_id: "links",
+            role: "reviewer",
+            user: "inspect",
+            assistant:
+              "[Lower](/repo/src/lib.rs:130) [Upper](/repo/src/lib.rs:10)",
+          },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/files", (route) =>
+    route.fulfill({
+      json: {
+        root: "/repo",
+        paths: ["other.txt", "src/", "src/lib.rs"],
+        git_status: {},
+        truncated: false,
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects/dev-team/file?*", (route) => {
+    const path = new URL(route.request().url()).searchParams.get("path");
+    return route.fulfill({
+      json: {
+        path,
+        content:
+          path === "other.txt"
+            ? "Other file"
+            : Array.from({ length: 160 }, (_, i) => `// line ${i + 1}`).join(
+                "\n",
+              ),
+        size: 2000,
+        binary: false,
+      },
+    });
+  });
+  await page.goto("/app/chat/s/s1");
+  await page.getByRole("link", { name: "Lower", exact: true }).click();
+  await expect(page.locator(".cm-content")).toBeVisible();
+  await expect(
+    page
+      .getByTestId("project-file-tree")
+      .getByRole("treeitem", { name: "lib.rs", exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
+    .toBeGreaterThan(1000);
+  await page.getByRole("link", { name: "Upper", exact: true }).click();
+  await expect
+    .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
+    .toBeLessThan(500);
+  await expect(
+    page.getByRole("tab", { name: "lib.rs", exact: true }),
+  ).toHaveCount(1);
+  await page.locator(".cm-scroller").hover();
+  await page.mouse.wheel(0, 64);
+  await expect
+    .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
+    .toBeGreaterThan(20);
+  const readingPosition = await page
+    .locator(".cm-scroller")
+    .evaluate((el) => el.scrollTop);
+  await page
+    .getByTestId("project-file-tree")
+    .getByRole("treeitem", { name: "other.txt", exact: true })
+    .click();
+  await expect(page.locator(".cm-content")).toContainText("Other file");
+  await page.getByRole("tab", { name: "lib.rs", exact: true }).click();
+  await expect
+    .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
+    .toBeGreaterThan(readingPosition - 5);
+  await expect
+    .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
+    .toBeLessThan(readingPosition + 5);
 });

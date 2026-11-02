@@ -609,6 +609,19 @@ pub async fn auth_layer(
     next: Next,
 ) -> Response {
     let auth = app.auth.clone();
+    if let Some(identity) =
+        crate::routes::files::preview_identity(&app, req.method(), req.uri().path())
+    {
+        let Some(identity) = identity else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Preview expired; reopen it from Files",
+            )
+                .into_response();
+        };
+        req.extensions_mut().insert(identity);
+        return next.run(req).await;
+    }
     if !auth.enabled {
         // Loopback / --no-auth: the local operator IS the owner → admin identity.
         req.extensions_mut().insert(Identity::admin());

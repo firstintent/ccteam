@@ -1,5 +1,8 @@
 import { defineConfig } from "@playwright/test";
 
+// Parallel checkouts must never silently test another checkout's server.
+const previewPort = Number(process.env.CCTEAM_WEB_TEST_PORT ?? 4173);
+
 export default defineConfig({
   testDir: "./tests",
   // V0.3.2 F59 keeps only ccteam-owned SPA smoke in the default
@@ -11,7 +14,7 @@ export default defineConfig({
   timeout: 30000,
   retries: process.env.CI ? 1 : 0,
   use: {
-    baseURL: "http://localhost:4173",
+    baseURL: `http://127.0.0.1:${previewPort}`,
     headless: true,
     screenshot: "only-on-failure",
   },
@@ -20,8 +23,8 @@ export default defineConfig({
     // `npx` on PATH (only `node`/`npm`; observed in this wave's sandbox) since
     // `vite` is already a devDependency, so `node_modules/.bin/vite` always
     // resolves post-install without depending on the npx shim at all.
-    command: "node_modules/.bin/vite preview --port 4173",
-    port: 4173,
+    command: `node_modules/.bin/vite preview --host 127.0.0.1 --port ${previewPort} --strictPort`,
+    port: previewPort,
     reuseExistingServer: !process.env.CI,
   },
   reporter: process.env.CI ? [["html", { open: "never" }], ["github"]] : "list",

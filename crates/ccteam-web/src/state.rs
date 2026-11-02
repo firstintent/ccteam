@@ -132,6 +132,7 @@ pub struct AppState {
     /// Coalesces concurrent daemon-wide status aggregations. The completed
     /// result is never retained after its in-flight computation finishes.
     pub(crate) status_singleflight: crate::routes::status::StatusSingleflight,
+    pub(crate) file_previews: Arc<crate::routes::files::PreviewRegistry>,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -208,6 +209,7 @@ impl AppState {
             ),
             vendor_quotas: Arc::new(crate::routes::vendor_quota::VendorQuotaService::default()),
             status_singleflight: crate::routes::status::StatusSingleflight::default(),
+            file_previews: Arc::new(crate::routes::files::PreviewRegistry::default()),
         }
     }
 

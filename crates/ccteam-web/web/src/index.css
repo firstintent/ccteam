@@ -1493,7 +1493,7 @@ html.dark {
   --ctx-5: #d55181; --ctx-6: #008300; --ctx-7: #9085e9; --ctx-8: #e66767;
 }
 .conv-body { flex: 1; min-height: 0; display: flex; flex-direction: row; position: relative; }
-.conv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.conv-main { flex: 1; min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; }
 .ctx-panel {
   width: 360px; flex: none; min-height: 0; display: flex; flex-direction: column;
   border-left: 1px solid var(--border-soft); background: var(--bg-side); outline: none;

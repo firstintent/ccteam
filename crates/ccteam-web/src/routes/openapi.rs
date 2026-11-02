@@ -278,6 +278,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_context))
         .routes(routes!(super::sessions_api::handle_session_turn))
+        .routes(routes!(super::files::handle_files))
+        .routes(routes!(super::files::handle_file))
+        .routes(routes!(super::files::handle_mint_preview))
+        .routes(routes!(super::files::handle_preview))
         .routes(routes!(super::sessions_api::handle_session_step))
         .routes(routes!(
             super::sessions_api::handle_list_scheduled,

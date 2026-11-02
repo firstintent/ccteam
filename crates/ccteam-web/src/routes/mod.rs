@@ -40,6 +40,7 @@ pub mod enroll;
 pub mod evolution;
 // 2026-09-01 — `GET /api/v1/projects/{slug}/flow-runs`: the run-level envelope
 // of `ccteam flow run`, folded back out of the project ledger.
+pub mod files;
 pub mod flow_runs;
 pub mod health;
 pub mod hosts;

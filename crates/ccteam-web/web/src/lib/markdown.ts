@@ -10,6 +10,7 @@
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import type { UponSanitizeAttributeHook } from "dompurify";
+import { fileLinkTarget } from "./filesApi";
 
 /** Chat links may use ordinary relative URLs or a small set of explicit
  * schemes. `data:`/`blob:` and script-like schemes never qualify. */
@@ -46,7 +47,10 @@ const stripUnsafeUri: UponSanitizeAttributeHook = (_node, hook) => {
   // DOMPurify's default DATA_URI_TAGS separately permits data: on `<img>`
   // even when ALLOWED_URI_REGEXP rejects it. The hook closes that explicit
   // exception while the config below governs every ordinary URI.
-  if (normalized.toLowerCase().includes("data:") || !CHAT_ALLOWED_URI_REGEXP.test(normalized)) {
+  if (
+    normalized.toLowerCase().includes("data:") ||
+    !CHAT_ALLOWED_URI_REGEXP.test(normalized)
+  ) {
     hook.keepAttr = false;
   }
 };
@@ -81,11 +85,27 @@ function wrapTables(html: string): string {
 /** Render chat Markdown → sanitized HTML (synchronous). Safe to feed to
  *  dangerouslySetInnerHTML. */
 export function renderMarkdown(md: string): string {
-  const html = marked.parse(md ?? "", { async: false, gfm: true, breaks: true }) as string;
+  const html = marked.parse(md ?? "", {
+    async: false,
+    gfm: true,
+    breaks: true,
+    walkTokens(token) {
+      // A bare filename:line looks like a URI scheme to the sanitizer. Only
+      // recognized local references get an explicit relative-path prefix.
+      if (
+        token.type === "link" &&
+        fileLinkTarget(token.href) &&
+        /^[^/]+:\d+(?::\d+)?$/.test(token.href)
+      )
+        token.href = `./${token.href}`;
+    },
+  }) as string;
   if (typeof DOMPurify.sanitize !== "function") return escapeHtml(md ?? "");
   DOMPurify.addHook("uponSanitizeAttribute", stripUnsafeUri);
   try {
-    return wrapTables(DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP: CHAT_ALLOWED_URI_REGEXP }));
+    return wrapTables(
+      DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP: CHAT_ALLOWED_URI_REGEXP }),
+    );
   } finally {
     DOMPurify.removeHook("uponSanitizeAttribute", stripUnsafeUri);
   }
