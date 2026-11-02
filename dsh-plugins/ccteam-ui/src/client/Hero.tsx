@@ -8,11 +8,11 @@
  */
 import { useState } from 'react'
 import {
-  IconAgentPresetOutline16,
-  IconBranchOutline16,
-  IconFolderOpen16,
-  IconSparkle16,
-  IconUserOutline16,
+  IconAgentPresetOutlineRegular,
+  IconBranchOutlineRegular,
+  IconFolderOpenRegular,
+  IconSparkleRegular,
+  IconUserOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelsCatalog, ProjectInfo, SpawnRequest, VendorAvailability } from '../shared/contract.js'
 import { titleFromTask } from './format.js'
@@ -112,13 +112,13 @@ export function Hero(props: HeroProps) {
     <div className={css.hero}>
       <div className={css.heroInner}>
         <div className={css.heroMark}>
-          <IconBranchOutline16 size={26} />
+          <IconBranchOutlineRegular size={26} />
           <span>{t('hero.title')}</span>
         </div>
         <div className={css.heroSubtitle}>{noProjects ? t('hero.noProjects.body') : t('hero.subtitle')}</div>
         <div className={css.pickerRow}>
           <Picker
-            icon={<IconFolderOpen16 size={14} />}
+            icon={<IconFolderOpenRegular size={14} />}
             label={t('spawn.project')}
             value={draft.project}
             placeholder={noProjects ? t('hero.noProjects.title') : '…'}
@@ -129,7 +129,7 @@ export function Hero(props: HeroProps) {
             }}
           />
           <Picker
-            icon={<IconSparkle16 size={14} />}
+            icon={<IconSparkleRegular size={14} />}
             label={t('spawn.vendor')}
             value={draft.vendor}
             placeholder="…"
@@ -140,7 +140,7 @@ export function Hero(props: HeroProps) {
             }}
           />
           <Picker
-            icon={<IconUserOutline16 size={14} />}
+            icon={<IconUserOutlineRegular size={14} />}
             label={t('spawn.role')}
             value={draft.role}
             placeholder={t('spawn.role.none')}
@@ -168,7 +168,7 @@ export function Hero(props: HeroProps) {
           trailing={(
             <>
               <Picker
-                icon={<IconAgentPresetOutline16 size={14} />}
+                icon={<IconAgentPresetOutlineRegular size={14} />}
                 label={t('spawn.model')}
                 value={draft.model}
                 placeholder={t('spawn.model.default')}

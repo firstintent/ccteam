@@ -11,7 +11,10 @@
  * `useCard` selector hook. Nothing here touches React or the wire directly;
  * the bound `SettingsScope` is the transport.
  */
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ConfigForm, SettingsDescribeFace } from '@deepseek-ai/dsh-client-ui-settings/client'
+
+/** Only the operations this staged form consumes; upstream owns sync and persistence. */
+type SettingsScope<T> = Pick<ConfigForm<T>, 'getSnapshot' | 'subscribe' | 'mutate'>
 import type { CcteamLocaleKey } from '../locales.js'
 
 /** One control of a card. */
@@ -140,6 +143,8 @@ export class SettingsCardController {
   private saving = false
   private failed = false
   private snapshot: CardState
+  private readonly disposers: Array<() => void>
+  private baseline: number | undefined
 
   /**
    * @param scope - the bound settings scope for this card's namespace.
@@ -148,11 +153,20 @@ export class SettingsCardController {
   constructor(
     private readonly scope: SettingsScope<Section>,
     readonly spec: CardSpec,
+    private readonly described: Pick<SettingsDescribeFace, 'getSnapshot' | 'subscribe'>,
   ) {
     this.snapshot = this.project()
-    scope.subscribe(() => {
-      this.publish()
-    })
+    this.disposers = [scope.subscribe(() => this.publish()), described.subscribe(() => this.publish())]
+  }
+
+  /** Release subscriptions when the plugin unloads. */
+  dispose(): void { for (const dispose of this.disposers) dispose() }
+
+  private stage(field: string, text: string): void {
+    if (this.staged.size === 0) this.baseline = this.scope.getSnapshot().revision
+    this.staged.set(field, text)
+    this.failed = false
+    this.publish()
   }
 
   /** @returns the current card state (stable reference until the next change). */
@@ -181,14 +195,10 @@ export class SettingsCardController {
       hooks: { card: this },
       spec: this.spec,
       edit: (field, text) => {
-        this.staged.set(field, text)
-        this.failed = false
-        this.publish()
+        this.stage(field, text)
       },
       reset: (field) => {
-        this.staged.set(field, '')
-        this.failed = false
-        this.publish()
+        this.stage(field, '')
       },
       save: () => {
         void this.save()
@@ -218,13 +228,13 @@ export class SettingsCardController {
     this.saving = true
     this.failed = false
     this.publish()
-    let threw = false
+    const before = this.scope.getSnapshot().revision
     try {
-      await this.scope.set(field, value)
+      this.failed = !await this.scope.mutate([{ op: 'set', path: [field], value }])
+      if (!this.failed && this.baseline === before) this.baseline = this.scope.getSnapshot().revision
     } catch {
-      threw = true
+      this.failed = true
     }
-    this.failed = threw || booleanAt(this.scope.getSnapshot().value, field) !== value
     this.saving = false
     this.publish()
   }
@@ -239,25 +249,15 @@ export class SettingsCardController {
     const plan = [...this.staged.entries()].map(([field, text]) => ({ field, text: text.trim(), kind: this.kindOf(field) }))
     this.saving = true
     this.publish()
-    let threw = false
-    for (const item of plan) {
-      if (item.kind === 'secret' && item.text === '') continue
-      try {
-        if (item.text === '') await this.scope.unset(item.field)
-        else await this.scope.set(item.field, item.text)
-      } catch {
-        // The scope's own contract is to reload Host state on a failed
-        // write; the read-back below is what decides whether this save landed.
-        threw = true
-      }
+    const ops = plan.filter(item => item.kind !== 'secret' || item.text !== '').map(item =>
+      item.text === ''
+        ? { op: 'unset' as const, path: [item.field] }
+        : { op: 'set' as const, path: [item.field], value: item.text })
+    try {
+      this.failed = ops.length > 0 && !await this.scope.mutate(ops, this.baseline)
+    } catch {
+      this.failed = true
     }
-    const after = this.scope.getSnapshot()
-    const landed = plan.every((item) => {
-      if (item.kind === 'secret') return item.text === '' || stringAt(after.value, item.field) !== ''
-      if (item.text === '') return !hasOwn(after.user, item.field)
-      return stringAt(after.value, item.field) === item.text
-    })
-    this.failed = threw || !landed
     if (!this.failed) this.staged.clear()
     this.saving = false
     this.publish()
@@ -284,7 +284,8 @@ export class SettingsCardController {
       const staged = this.staged.get(spec.field)
       const current = stringAt(snapshot.value, spec.field)
       if (spec.kind === 'secret') {
-        fields[spec.field] = { text: staged ?? '', overridden: false, configured: current !== '' }
+        const secrets = this.described.getSnapshot().view?.namespaces.find(row => row.ns === this.spec.namespace)?.secrets ?? []
+        fields[spec.field] = { text: staged ?? '', overridden: false, configured: secrets.some(secret => secret.path.length === 1 && secret.path[0] === spec.field && secret.set) }
         continue
       }
       fields[spec.field] = {

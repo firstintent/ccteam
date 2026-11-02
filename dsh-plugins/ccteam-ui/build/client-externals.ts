@@ -1,11 +1,9 @@
 /**
  * The DSH client-bundle module table — build-time only, never shipped.
  *
- * Verbatim from references/deepseek-harness/packages/client/web/src/platform.ts
- * (`PLATFORM_MODULES` lines 8-12 + `PRELOADED_CLIENT_EXTERNALS` lines 15-17).
- * These are the only specifiers the browser loader's injected `require` can
- * answer; everything else must be bundled inline or it throws at
- * materialization (system.ts:174-187).
+ * Only shared platform libraries this bundle actually imports are external.
+ * Cross-plugin services are accessed through Cordis and imported as types,
+ * so adding vendor plugins never requires another loader-table entry here.
  *
  * MATCHING IS EXACT STRING EQUALITY, never prefix. `react` being external does
  * not make `react/jsx-runtime` external — it is listed separately because it
@@ -21,8 +19,6 @@ export const CLIENT_EXTERNALS: ReadonlySet<string> = new Set([
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
   '@deepseek-ai/dsh-client-ui-primitives',
-  // The `/client` subpath is part of the specifier; the loader strips it to key the row.
-  '@deepseek-ai/dsh-client-runtime/client',
 ])
 
 /** Vendored libraries carry no shared identity, so inlining them is correct. */

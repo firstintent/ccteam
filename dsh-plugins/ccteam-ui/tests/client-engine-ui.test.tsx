@@ -23,18 +23,18 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
     Input: (props: Record<string, unknown>) => h('input', props),
     Pill: ({ children }: { children: unknown }) => h('span', null, children as never),
     writeClipboard: () => {},
-    IconBranchOutline16: icon,
-    IconCheckOutline14: icon,
-    IconCloseOutline16: icon,
-    IconCodeOutline16: icon,
-    IconCopyOutline16: icon,
-    IconFolderOpen16: icon,
-    IconLoadingOutline16: icon,
-    IconPlayOutline16: icon,
-    IconRightUpOutline14: icon,
-    IconSettingsOutline14: icon,
-    IconWarningOutline16: icon,
-    IconChevronDownOutline14: icon,
+    IconBranchOutlineRegular: icon,
+    IconCheckOutlineRegular: icon,
+    IconCloseOutlineRegular: icon,
+    IconCodeOutlineRegular: icon,
+    IconCopyOutlineRegular: icon,
+    IconFolderOpenRegular: icon,
+    IconLoadingOutlineRegular: icon,
+    IconPlayOutlineRegular: icon,
+    IconRightUpOutlineRegular: icon,
+    IconSettingsOutlineRegular: icon,
+    IconWarningOutlineRegular: icon,
+    IconChevronDownOutlineRegular: icon,
   }
 })
 
@@ -205,7 +205,7 @@ describe('first-run engine panel', () => {
     // The host sentence repeats the reason in other words: hidden.
     expect(html).not.toContain('the daemon is not running.')
     expect(button(html, '启动引擎').disabled).toBe(false)
-    expect(html).toContain('插件配置 → ccteam-ui')
+    expect(html).toContain('DSH 设置 → ccteam-ui')
   })
 
   it('installing / starting: a spinner title and no start button', () => {

@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cli"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-core"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cost"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "chrono",
  "serde",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-flow"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "ccteam-harness",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-harness"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-hooks"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-im"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-web"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "askama",
@@ -592,6 +592,7 @@ dependencies = [
  "nix 0.29.0",
  "notify",
  "portable-pty",
+ "pulldown-cmark",
  "rand 0.8.6",
  "reqwest",
  "rust-embed",
@@ -2252,6 +2253,24 @@ dependencies = [
  "idna",
  "psl-types",
 ]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.11.1",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "quinn"

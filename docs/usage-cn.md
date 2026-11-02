@@ -19,7 +19,7 @@
 - **session** = 一个独立的 agent 会话(像 Claude Code 原生会话一样自带上下文),属于某个项目。一个项目可同时开多个会话、互不串台,每个有持久句柄 `s<N>`(扛重启、不复用)。
 - **role** = 会话启动时**可选**绑定的角色(`.claude/agents/<role>.md` 里的 persona + 工具)。默认 **roleless**:裸 vendor 自读项目的 `CLAUDE.md`/`AGENTS.md`。persona 从插件市场装或自建,ccteam 不内置任何角色。
 
-> **ccteam 只管自己的东西。** 它从不修改你的业务代码、`.git/`、`.env`,也不改写你的 `CLAUDE.md` / `AGENTS.md` —— 这些都归项目自己,Claude 和 Codex 原生读取。
+> **ccteam 只管自己的东西。** 它从不修改你的业务代码、`.git/`、`.env`,也不改写已有的 `CLAUDE.md` / `AGENTS.md`。两文件都不存在时,创建项目只种一个供你补充的 `AGENTS.md` 占位文件。项目指引归项目自己,由 vendor 原生读取。
 
 ---
 
@@ -145,7 +145,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### DSH Web
 
-**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
+**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走同源 `/dsh/` 反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
 一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`agent {vendor:"dsh"}`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
 
@@ -154,11 +154,11 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。同身份的所有 DSH 会话——你在这页打开的和在 ccteam 里雇出来的——都跑在同一个运行时、用同一份配置,改一次全体生效。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
 - **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;同一条规则在雇出来的会话里同样成立——你从 DSH 侧直接输入的 turn 是 vendor 原生 turn,ccteam 的 transcript 与账本只记 ccteam 路由的部分,完整对话以 DSH 家为准。从 DSH 通过 ccteam 插件委派出去的工作照常入账。
 - **局域网明文 HTTP**:DSH Web 是按 loopback 源写的,浏览器只在安全上下文里给它 `crypto.randomUUID` 等 API;把 UI 搬离 loopback 的是 ccteam,所以伴生监听会在它下发的 HTML 里补回这一个 API(真 `crypto.getRandomValues` 生成的 UUID v4),浏览器自带时则不介入。走 HTTPS 或在 daemon 本机打开都不需要这些。
-- **局域网浏览器改设置**:DSH 把设置文档(所有 Settings 页,含「插件配置」)当作「操作者本机」才可触及的特权面,而且由客户端按页面地址判断——原生 `dsh web` 从局域网地址打开时,「插件配置」页一片空白、设置只读。经伴生监听访问时这个「本机」就是你的 ccteam 身份:实例只属于你,页面已经过 ccteam 鉴权,所以伴生监听用 DSH 自己的传输钩子(`__DSH_TRANSPORT__.ownsHost`)声明「本页拥有其 Host」,任何浏览器都能改设置。DSH 从 0.1.1-rc.2 之后的版本才原生读这个钩子(已在 DSH main 上);对 rc.2 及更早版本(客户端只按页面主机名判断),伴生监听把这一处读取回填进它下发的 client-connection bundle(精确到行的改写,其它版本上零操作),所以 rc.2 上同样任何浏览器都能改设置。一个连带后果:DSH 的产出文件动作会作用在 daemon 所在机器(即工作区机器)上。
+- **局域网浏览器改设置**:通过 ccteam 鉴权的伴生页面使用 DSH 官方 `__DSH_TRANSPORT__.ownsHost` 钩子声明拥有该身份的 Host。设置由 DSH 原生配置表单处理，厂商 JavaScript 原样转发；文件动作作用在 daemon 所在的工作区机器上。
 - **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 
-如果 ccteam 前面有 HTTPS 反代,**伴生端口也必须一起反代**。DSH Web 没有 base-path 支持,所以用第二个 HTTPS 端口或子域;只反代 `:7331` 会让 iframe 继续加载明文 HTTP,浏览器按 mixed-content 拒绝。
+DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、RPC 和 WebSocket,自动沿用浏览器的协议与端口。直接访问主 Web 端口、通过 80/443 的 HTTP/HTTPS 反代均可用;反代只需覆盖主 Web 监听并支持 WebSocket upgrade,不用额外开放公网端口或子域。独立伴生入口(通常是 `:7332/`)仍可访问,它本身是明文 HTTP,需要 HTTPS 时由反代提供 TLS。
 
 ### 创建项目
 
@@ -209,8 +209,21 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### Status / 成本
 
-- **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
-- **上下文侧栏**:在 web 控制台点会话头部的 `model · ctx` 标签(或右上角的侧栏按钮),右侧打开侧栏(切换会话时保持打开),显示上下文窗口由什么组成:system prompt、工具、memory 文件(每个 `CLAUDE.md` / 记忆文件按路径列出)、skills、MCP 工具与说明、自定义 agent,以及对话本身按工具(调用 vs 结果 token)和附件类型的拆分,外加上一次请求的缓存读 / 缓存写 / 未缓存输入。harness 延迟加载(未载入)的工具单独列出,因为它们不占窗口。数字是 harness 自己的账(Claude `/context` 的数据),不是让模型去估:在线会话每次打开和点「刷新」都现查,turn 结束时侧栏自动刷新(所以 `/compact` 后立刻看得到变化);已释放的会话显示最后一个 turn 结束时的快照并标出时间。目前只支持 Claude stream-json 会话,其他 harness 仍只显示 ctx 百分比。REST:`GET /api/v1/sessions/{sid}/context`。
+会话顶部显示状态、标题、非空 role 和模型文字；右上角统一排列「文件」和「上下文」，上下文按钮附带窗口使用百分比，点击切换右侧工作区。双击标题或点重命名按钮可改名。桌面可拖动聊天与工作区之间的分隔线调整宽度，手机以抽屉展示，Esc 关闭并返回入口。
+
+平板和手机空间不足时，抽屉只覆盖聊天区，顶部「文件／上下文」始终可点：单击打开，再次单击关闭，点击另一个入口直接切换。文件可放大到整个聊天区并还原；也可点关闭按钮或露出的遮罩关闭。横竖屏切换保留已打开文件，抽屉宽度不会覆盖桌面的分栏偏好。
+
+每条助手文本回复的 footer 都有复制按钮，复制该条回复的原始 Markdown（保留代码块、表格和链接，不含状态 footer 或工具过程），并显示成功或失败反馈。
+
+「文件」支持目录搜索、键盘导航、文件图标和 Git 状态。单击临时预览，双击或点固定按钮保留标签；切换到上下文再回来仍保留已打开文件与阅读位置。聊天中的本地文件链接可直接打开源码并定位行号。点刷新可重新读取目录、源码与预览，turn 结束也会刷新。
+
+Markdown (`.md` / `.markdown`) 默认显示排版预览，支持标题锚点、表格、任务列表、引用、代码块、相对图片和同目录文档链接；可切换「源码」或在新标签页独立阅读。文档按标准 Markdown 换行排版，原始 HTML 显示为文本，脚本不执行。使用与 HTML 相同的项目权限和一小时目录受限链接；Markdown 输入需为 UTF-8，最多 2 MiB。
+
+HTML/HTM 默认打开交互预览，可切换「源码」或在新标签页打开。预览支持 HTML 所在目录及子目录中的相对 CSS、JS/ES module、图片和字体；资源链接一小时有效，过期后刷新。预览沙箱与控制台的 DOM、登录状态和存储隔离，不能调用控制台 API，也不会启动 React/Vite 构建或开发服务器。目前仅支持本地主机项目，远程项目明确显示未支持。内部状态、依赖目录和常见密钥文件不列出；目录最多 20,000 项，源码最多 2 MiB，单个预览资源最多 16 MiB。
+
+- **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算。
+- **上下文侧栏**:顶部整理当前会话的活动与运行状态、ID/项目、harness/模型/主机、父会话和委派深度、本会话累计成本、累计 tokens、最后活动时间。尚未计价与 $0 区分显示，累计 tokens 不等于窗口占用。即使 harness 不提供上下文分析，也可查看会话状态。
+- **厂商上下文分析**:Claude stream-json 显示 system prompt、工具、memory 文件(按路径)、skills、MCP 工具与说明、自定义 agent，以及消息按工具调用/结果和附件类型的拆分；延迟加载工具单独列出，不计入窗口。Codex app-server 显示已用/剩余窗口、最近一次请求的输入、缓存命中、输出及其中推理 tokens；Codex 未提供分类明细和压缩阈值，面板不会补估。数字来自 harness 官方接口，不调用模型估算。每次打开、手动刷新和 turn 结束时更新；Codex 读取最近的用量事件，采集时间不会因打开面板而改变。释放后显示最后一次 turn 结束的快照及时间。REST:`GET /api/v1/sessions/{sid}/context`。
 - 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
 
 ### 标准资源 API(给集成方)
@@ -443,7 +456,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook(及 Telegram 插件钉)剥掉,其余键和你自己的 hook 原样保留;文件不是合法 JSON 时原样不动、仅在回执里注明。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
 
 ### `project`(项目生命周期)
 
@@ -586,7 +599,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 - **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
 - **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
 
-远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 3600 秒 = 一小时,对齐 Claude 的 prompt-cache TTL —— 进程只握到「再握也省不下缓存」为止;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 15000 秒 = 250 分钟;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
 
 ---
 

@@ -148,6 +148,7 @@ futures-util = "0.3"
 # `fs` is required for `nix::sys::stat::Mode` + `nix::unistd::mkfifo`
 # (F56 uses these to create the FIFO under `~/.ccteam/pty/`).
 nix = { version = "0.29", default-features = false, features = ["signal", "fs"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 tempfile = "3"

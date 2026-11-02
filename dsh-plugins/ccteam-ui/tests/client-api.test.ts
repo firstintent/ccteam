@@ -1,9 +1,10 @@
 /** BFF client: method→URL mapping, JSON wire shape, events URL, frame parsing. */
 import { describe, expect, it } from 'vitest'
-import { API_PREFIX } from '../src/shared/contract.js'
+import { API_RELATIVE_PREFIX } from '../src/shared/contract.js'
 import { createApi, eventsUrl } from '../src/client/api.js'
 import type { EventSourceLike } from '../src/client/api.js'
 import type { PanelEvent } from '../src/shared/contract.js'
+import { attachmentRefs } from '../src/bff.js'
 
 interface RecordedRequest {
   url: string
@@ -42,7 +43,7 @@ describe('api.call', () => {
     expect(result).toEqual({ connected: true })
     expect(requests).toHaveLength(1)
     const request = requests[0]!
-    expect(request.url).toBe(`${API_PREFIX}/status`)
+    expect(request.url).toBe(`${API_RELATIVE_PREFIX}/status`)
     expect(request.init?.method).toBe('POST')
     expect(request.init?.headers).toEqual({ 'content-type': 'application/json' })
     expect(JSON.parse(String(request.init?.body))).toEqual({})
@@ -56,10 +57,10 @@ describe('api.call', () => {
     await api.call('session.send', { sid: 's7', text: 'hi' })
     await api.call('session.spawn', { vendor: 'claude' })
     expect(requests.map(r => r.url)).toEqual([
-      `${API_PREFIX}/team.graph`,
-      `${API_PREFIX}/session.history`,
-      `${API_PREFIX}/session.send`,
-      `${API_PREFIX}/session.spawn`,
+      `${API_RELATIVE_PREFIX}/team.graph`,
+      `${API_RELATIVE_PREFIX}/session.history`,
+      `${API_RELATIVE_PREFIX}/session.send`,
+      `${API_RELATIVE_PREFIX}/session.spawn`,
     ])
     expect(JSON.parse(String(requests[1]!.init?.body))).toEqual({ sid: 's7' })
   })
@@ -85,9 +86,9 @@ describe('api.events', () => {
     api.events({ onEvent: () => {} }, 's12')
     api.events({ onEvent: () => {} }, 's 9')
     expect(sources.map(s => s.url)).toEqual([
-      `${API_PREFIX}/events`,
-      `${API_PREFIX}/events?sid=s12`,
-      `${API_PREFIX}/events?sid=s%209`,
+      `${API_RELATIVE_PREFIX}/events`,
+      `${API_RELATIVE_PREFIX}/events?sid=s12`,
+      `${API_RELATIVE_PREFIX}/events?sid=s%209`,
     ])
   })
 
@@ -142,4 +143,27 @@ describe('eventsUrl', () => {
     expect(eventsUrl('/x', undefined)).toBe('/x/events')
     expect(eventsUrl('/x', 's1')).toBe('/x/events?sid=s1')
   })
+})
+
+describe('DSH mount paths', () => {
+  it.each(['http://localhost:7332/', 'https://example.com/dsh/'])(
+    'keeps RPC, events and attachments inside %s', async (base) => {
+      const { requests, fetchFn } = fakeFetch({ connected: true })
+      const sources: FakeEventSource[] = []
+      const api = createApi({ fetchFn, createEventSource: url => {
+        const source = new FakeEventSource(url)
+        sources.push(source)
+        return source
+      } })
+      await api.call('status', {})
+      await api.upload('p', { name: 'report.txt', body: new Uint8Array([1]) })
+      api.events({ onEvent: () => {} })
+      const history = attachmentRefs([{ kind: 'file', path: '/tmp/report.pdf' }], 's1')!
+      for (const path of [...requests.map(r => r.url), sources[0]!.url, api.attachmentUrl('p', 'report.pdf'), history[0]!.url!]) {
+        const url = new URL(path, base)
+        expect(url.origin).toBe(new URL(base).origin)
+        expect(url.pathname.startsWith(`${new URL(base).pathname}ccteam/api/`)).toBe(true)
+      }
+    },
+  )
 })

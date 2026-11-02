@@ -93,6 +93,7 @@ export function makeFakeCtx(options?: {
     // Mirrors the vendor roster: resolve(undefined) falls back to the default id.
     resolve: vi.fn(async (id?: string) => ({ id: id ?? 'standard' })),
     mount: vi.fn(async (_agentCtx: unknown, _id?: string) => undefined),
+    presetForSession: vi.fn((_session: unknown) => 'cordis'),
   }
   const persistenceInspect = vi.fn(async (_sessionId: string) => options?.persistence ?? {})
   const permissionPresets = { set: vi.fn((_session: unknown, _name: string) => undefined) }
@@ -212,7 +213,13 @@ export function makeFakeCtx(options?: {
     emit('session/event', { id: sessionId }, { type, seq: 1, time: new Date().toISOString(), data })
   }
 
+  const assistantStream = (sessionId: string, data: { turn: number; step?: number; chunk: unknown }) => {
+    const agent = agents.get(sessionId)
+    emit('agent/assistant-stream', { agent, frame: { type: 'start', attemptId: 'attempt-1', revision: 1, turn: data.turn, step: 0 } })
+    emit('agent/assistant-stream', { agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 0, chunk: data.chunk } })
+  }
   return {
+    assistantStream,
     ctx,
     inject,
     tools,

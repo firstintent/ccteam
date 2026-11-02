@@ -37,6 +37,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   API_PREFIX,
+  API_RELATIVE_PREFIX,
   ATTACHMENT_PATH,
   EVENTS_PATH,
   UPLOAD_PATH,
@@ -142,13 +143,7 @@ export interface BffOptions {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }
 
-export interface WebServerLike {
-  register(route: {
-    kind: 'exact' | 'prefix'
-    path: string
-    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
-  }): () => void
-}
+export type WebServerLike = Pick<import('@deepseek-ai/dsh-host-webserver').WebServer, 'register'>
 
 export interface BffContext {
   webServer: WebServerLike
@@ -958,11 +953,11 @@ function residencyOf(residency: string | undefined): Residency | undefined {
 }
 
 function attachmentUrlFor(project: string, name: string): string {
-  return `${API_PREFIX}${ATTACHMENT_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
+  return `${API_RELATIVE_PREFIX}${ATTACHMENT_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
 }
 
 function attachmentUrlForSid(sid: string, name: string): string {
-  return `${API_PREFIX}${ATTACHMENT_PATH}?sid=${encodeURIComponent(sid)}&name=${encodeURIComponent(name)}`
+  return `${API_RELATIVE_PREFIX}${ATTACHMENT_PATH}?sid=${encodeURIComponent(sid)}&name=${encodeURIComponent(name)}`
 }
 
 /**

@@ -6,8 +6,17 @@
 
 import { useEffect, useMemo, useRef } from "react";
 import { renderMarkdown } from "../lib/markdown";
+import { fileLinkTarget, type FileTarget } from "../lib/filesApi";
 
-export function Markdown({ content, className }: { content: string; className?: string }) {
+export function Markdown({
+  content,
+  className,
+  onFileOpen,
+}: {
+  content: string;
+  className?: string;
+  onFileOpen?: (target: FileTarget) => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const html = useMemo(() => renderMarkdown(content), [content]);
 
@@ -22,7 +31,8 @@ export function Markdown({ content, className }: { content: string; className?: 
       btn.className = "code-copy";
       btn.textContent = "复制";
       btn.addEventListener("click", () => {
-        const code = pre.querySelector("code")?.textContent ?? pre.textContent ?? "";
+        const code =
+          pre.querySelector("code")?.textContent ?? pre.textContent ?? "";
         void navigator.clipboard?.writeText(code);
         btn.textContent = "已复制";
         window.setTimeout(() => {
@@ -37,6 +47,24 @@ export function Markdown({ content, className }: { content: string; className?: 
     <div
       ref={ref}
       className={`cockpit-markdown ${className ?? ""}`}
+      onClick={(event) => {
+        if (
+          !onFileOpen ||
+          event.ctrlKey ||
+          event.metaKey ||
+          event.shiftKey ||
+          event.altKey
+        )
+          return;
+        const link = (event.target as Element).closest("a[href]");
+        const target = link
+          ? fileLinkTarget(link.getAttribute("href") ?? "")
+          : null;
+        if (target) {
+          event.preventDefault();
+          onFileOpen(target);
+        }
+      }}
       // html is renderMarkdown() output = marked + DOMPurify.sanitize.
       dangerouslySetInnerHTML={{ __html: html }}
     />

@@ -13,7 +13,7 @@
  */
 import { useEffect, useId, useState } from 'react'
 import clsx from 'clsx'
-import { Button, IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconChevronDownOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsCardProps } from '../slots.js'
 import type { T } from '../slots.js'
 import { EngineSection } from './EngineSection.js'
@@ -114,7 +114,7 @@ export function SettingsCard({ spec, useCard, useConsole, dispatch, api, edit, r
           <span className={css.description}>{t(spec.descriptionKey)}</span>
         </span>
         {state.dirty && <span className={css.pending}>{t('settings.unsaved')}</span>}
-        <IconChevronDownOutline14 className={clsx(css.chevron, open && css.chevronOpen)} />
+        <IconChevronDownOutlineRegular className={clsx(css.chevron, open && css.chevronOpen)} />
       </button>
       {open && (
         <div className={css.body}>

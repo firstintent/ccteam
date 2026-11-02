@@ -8,17 +8,18 @@
  * runtime edge (the client bundle purity gate only ever sees value imports).
  */
 import type { InjectFace, PropsLocale, PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 // ctx.locale (register / bind).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // 'shell.overlay' — the frame-wide floating layer (declared by ui-layout's root entry).
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 // 'sidebar.footer.action' — the seat beside Settings at the sidebar foot (declared by ui-sidebar).
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-// ctx.settingsScope — the per-namespace settings scope binder.
+// Native configuration forms and settings section slots.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-// 'settings.plugin.item' — one card per settings namespace (declared by ui-settings-plugins' configurable tab).
-import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+// 'settings.section' — one card per settings namespace (declared by ui-settings-plugins' configurable tab).
 import type { CcteamLocaleKey } from './locales.js'
 import type { ApiClient } from './api.js'
 import type { Action, ConsoleStore } from './store.js'
@@ -66,11 +67,11 @@ export type EntryButtonProps = PropsRuntime<'sidebar.footer.action'> & InjectFac
 /** Composed props of the `shell.overlay` entry: face + `t` (the layer passes no owner props). */
 export type WorkbenchProps = PropsRuntime<'shell.overlay'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
 
-/** Composed props of one `settings.plugin.item` card: the card face + `t`. */
-export type SettingsCardProps = PropsRuntime<'settings.plugin.item'> & InjectFace<SettingsSeatFace> & PropsLocale<'ccteam'>
+/** Composed props of one `settings.section` card: the card face + `t`. */
+export type SettingsCardProps = PropsRuntime<'settings.section'> & InjectFace<SettingsSeatFace> & PropsLocale<'ccteam'>
 
 /** DSH's own workspace list, as the framework's global seat hands it to every slot component. */
 export type UseWorkspaces = WorkbenchProps['useWorkspaces']
 
-/** The client context as this plugin sees it (locale + settingsScope merges pulled above). */
+/** The client context as this plugin sees it (locale + configForms merges pulled above). */
 export type CcteamClientContext = ClientContext

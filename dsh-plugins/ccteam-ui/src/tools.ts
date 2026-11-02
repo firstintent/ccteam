@@ -1,3 +1,6 @@
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ToolsService, ToolDefinition, ToolRunContext as NativeToolRunContext } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm/message'
 import { randomUUID } from 'node:crypto'
 import type { SessionCredentialStore } from './credentials.js'
 
@@ -270,37 +273,21 @@ export function sessionIdOfAgent(agent: DshAgent | undefined): string | undefine
   return typeof sessionId === 'string' && sessionId !== '' ? sessionId : undefined
 }
 
-export interface ToolRunContext {
-  agent?: DshAgent
-  signal?: AbortSignal
-  [key: string]: unknown
-}
+export type ToolRunContext = Partial<Pick<NativeToolRunContext, 'signal'>> & { agent?: DshAgent }
 
-export interface DshAgent {
+/** Narrow the native live handle to the capabilities this bridge consumes. */
+export type DshAgent = Partial<Pick<Agent, 'followup' | 'whenIdle' | 'cancel'>> & {
   id?: string
-  session?: { id?: string; events?: unknown[] }
+  session?: { id?: string }
   inbox?: { remove?(messageId: string): boolean }
-  followup?(message: unknown): void
-  whenIdle?(): Promise<void>
-  cancel?(cause: { kind: string }, options?: { keepInbox?: boolean }): void
-  [key: string]: unknown
 }
 
 export interface ToolRegistryContext {
-  tools: {
-    register(definition: DshToolDefinition): () => void
-  }
+  tools: Pick<ToolsService, 'register'>
   effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void
 }
 
-export interface DshToolDefinition {
-  name: string
-  description: string
-  parameters: unknown
-  output: {
-    schema: Record<string, unknown>
-    render(args: unknown, value: McpToolResult): ContentBlock[]
-  }
+export type DshToolDefinition = Omit<ToolDefinition, 'execute'> & {
   execute(args: unknown, exec: ToolRunContext): Promise<McpToolResult>
 }
 
@@ -314,7 +301,7 @@ export type McpClientForExec = (exec: ToolRunContext) => CcteamMcpClient
 interface McpToolDefinition {
   name: string
   description: string
-  inputSchema: unknown
+  inputSchema: Record<string, unknown>
 }
 
 export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
@@ -378,7 +365,7 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
           enum: ['full', 'read', 'none'],
           description: 'New session\'s ccteam tool face (default full).',
         },
-        mode: { type: 'string', description: 'Vendor session mode. DSH only: standard|ptc|minimal|creator.' },
+        mode: { type: 'string', description: 'Native DSH agent-preset id; omitted uses the DSH default. creator selects cordis.' },
         permission_mode: {
           type: 'string',
           enum: ['skip', 'hitl'],
@@ -444,7 +431,10 @@ function toDshTool(definition: McpToolDefinition, clientFor: McpClientForExec, n
     output: {
       schema: {},
       render(_args, value) {
-        return value.content
+        return (isRecord(value) && Array.isArray(value.content) ? value.content : [value]).map(block => ({
+          type: 'text' as const,
+          text: isRecord(block) && typeof block.text === 'string' ? block.text : JSON.stringify(block),
+        }))
       },
     },
     async execute(args, exec) {
@@ -511,21 +501,9 @@ export class CcteamCompletionNotifier implements DelegationNotifier {
   }
 }
 
-/** A ccteam-minted user turn; its `id` is what turn attribution binds on. */
-export interface UserTextMessage {
-  readonly id: string
-  readonly role: 'user'
-  readonly content: readonly [{ readonly type: 'text'; readonly text: string }]
-  readonly source: { readonly kind: 'user' }
-}
-
-export function createUserTextMessage(text: string): UserTextMessage {
-  return Object.freeze({
-    id: randomUUID(),
-    role: 'user',
-    content: Object.freeze([Object.freeze({ type: 'text', text })]),
-    source: Object.freeze({ kind: 'user' }),
-  }) as UserTextMessage
+/** Construct user turns through DSH's public immutable-message factory. */
+export function createUserTextMessage(text: string) {
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
 }
 
 function extractDelegatedSid(args: unknown, result: McpToolResult): string | undefined {

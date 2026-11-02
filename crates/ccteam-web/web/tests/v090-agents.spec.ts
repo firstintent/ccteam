@@ -43,38 +43,19 @@ const agentsGraph = {
 
 async function mockAgentsApi(page: Page): Promise<void> {
   await page.addInitScript(() => {
-    class MockEventSource extends EventTarget {
-      static CONNECTING = 0;
-      static OPEN = 1;
-      static CLOSED = 2;
-
-      readonly url: string;
-      readonly withCredentials = false;
-      readyState = MockEventSource.CONNECTING;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-
-      constructor(url: string | URL) {
-        super();
-        this.url = String(url);
-        const bag = (window as unknown as { __agentsEventSources: MockEventSource[] });
-        bag.__agentsEventSources = bag.__agentsEventSources || [];
-        bag.__agentsEventSources.push(this);
-        queueMicrotask(() => {
-          this.readyState = MockEventSource.OPEN;
-          const event = new Event("open");
-          this.onopen?.(event);
-          this.dispatchEvent(event);
-        });
-      }
-
-      close() {
-        this.readyState = MockEventSource.CLOSED;
-      }
-    }
-    (window as unknown as { EventSource: typeof EventSource }).EventSource =
-      MockEventSource as unknown as typeof EventSource;
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes("/api/v1/agents/events")) return originalFetch(input, init);
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const bag = window as unknown as { __pushAgentsEvent?: (payload: Record<string, unknown>) => void };
+          bag.__pushAgentsEvent = (payload) => controller.enqueue(new TextEncoder().encode(`event: delegation\ndata: ${JSON.stringify(payload)}\n\n`));
+          init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
+        },
+      });
+      return Promise.resolve(new Response(body, { headers: { "content-type": "text/event-stream" } }));
+    };
   });
 
   await page.route("**/api/**", (route) =>
@@ -92,15 +73,11 @@ async function mockAgentsApi(page: Page): Promise<void> {
   );
 }
 
-/** Dispatch a named SSE frame into the `/api/v1/agents/events` mock
- *  EventSource instance the page created (there is exactly one — AgentsView
- *  opens it once on mount). */
+/** Exercise the actual fetch-backed SSE reader, after its stream is ready. */
 async function pushAgentsEvent(page: Page, payload: Record<string, unknown>): Promise<void> {
+  await expect.poll(() => page.evaluate(() => typeof (window as unknown as { __pushAgentsEvent?: unknown }).__pushAgentsEvent)).toBe("function");
   await page.evaluate((p) => {
-    const bag = window as unknown as { __agentsEventSources?: EventTarget[] };
-    const sources = bag.__agentsEventSources ?? [];
-    const es = sources.find((s) => (s as unknown as { url: string }).url.includes("/agents/events"));
-    es?.dispatchEvent(new MessageEvent("delegation", { data: JSON.stringify(p) }));
+    (window as unknown as { __pushAgentsEvent: (payload: Record<string, unknown>) => void }).__pushAgentsEvent(p);
   }, payload);
 }
 

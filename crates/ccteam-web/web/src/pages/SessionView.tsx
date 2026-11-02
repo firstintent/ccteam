@@ -3,8 +3,8 @@
 // on every switch, so all per-sid state resets atomically; the v0.8.9
 // structural guarantee is unchanged).
 //
-// Skin = prototype: conv-head (status dot · title · meta chips · Chat|终端
-// tabs · cost pill) + chat-scroll message stream (user right-aligned soft
+// Chrome: status/title/model + a shared right-panel toolbar; session details
+// live in Context. The chat stream uses user right-aligned soft
 // bubble 14/14/4/14, agent left with NO fill + full Markdown rendering,
 // streaming cursor while a turn is in flight) + the same composer as Home
 // (sans ctx-bar).
@@ -12,21 +12,39 @@
 // Data spine unchanged (红线 §1.6-7): localStorage seed → getHistory mirror →
 // live SSE fold; drafts persist per-sid; IME composition guard; Stop
 // interrupts the running turn (session kept); HITL approvals resolve through
-// the gateway pending machinery (never a fake turn). The terminal tab renders
-// ONLY for a claude session that owns a pane (protocol ≠ stream-json) — the
-// byte-exact `ccteam-pty.v1` relay via TerminalView.
+// the gateway pending machinery (never a fake turn).
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Clock, PanelRightClose, PanelRightOpen, Pencil, X } from "lucide-react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Group, Panel, Separator, type Layout } from "react-resizable-panels";
+import {
+  ArrowDown,
+  Clock,
+  Check,
+  Copy,
+  FolderTree,
+  PanelRightClose,
+  PanelRightOpen,
+  Pencil,
+  X,
+} from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import { ContextPanel } from "../components/ContextPanel";
+import type { FileTarget } from "../lib/filesApi";
+import "../components/fileWorkspace.css";
 import { InlineRename } from "../components/InlineRename";
+import { copyText } from "../lib/clipboard";
 import type { TurnAttachment } from "../lib/attachmentsApi";
-import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { StepInspector } from "../components/StepInspector";
-import { TerminalView } from "../components/TerminalView";
-import { VendorChip } from "../components/VendorChip";
 import {
   foldSessionLiveness,
   isTurnBoundary,
@@ -35,7 +53,12 @@ import {
   type TurnMark,
 } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
-import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
+import {
+  defaultDraft,
+  normalizeDraft,
+  vendorSpec,
+  type ComposerDraft,
+} from "../lib/vendors";
 import {
   getHistory,
   getDaemonTimezone,
@@ -64,13 +87,16 @@ import {
   stepIcon,
   type TranscriptRow,
 } from "./chatTranscript";
-import { railSessionLabel } from "./railHelpers";
 import { contextPct, formatElapsed, formatTurnStatus } from "../lib/statusLine";
 import {
   isNarrowViewport,
   readContextPanelOpen,
   writeContextPanelOpen,
 } from "../lib/contextBreakdown";
+
+const FileWorkspace = lazy(() => import("../components/FileWorkspace"));
+type RightPanel = "files" | "context";
+const FILES_PANEL_OPEN_KEY = "ccteam.files.open";
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -84,7 +110,10 @@ function formatAttachmentSize(size: number): string {
  *  Sits on its own line under the bubble, so it never squeezes the bubble on
  *  narrow viewports. Absent/unparseable `ts` (old daemons, rows persisted
  *  before this field) renders nothing. */
-function rowTimeParts(ts: string, now: Date): { date: boolean; year: boolean } | null {
+function rowTimeParts(
+  ts: string,
+  now: Date,
+): { date: boolean; year: boolean } | null {
   const when = new Date(ts);
   if (Number.isNaN(when.getTime())) return null;
   return {
@@ -115,10 +144,13 @@ export function BusyHeartbeat({
   const last = lastEventTs ? new Date(lastEventTs) : null;
   const lastText =
     last && !Number.isNaN(last.getTime())
-      ? last.toLocaleTimeString(lang === "en" ? "en-US" : "zh-CN", { hour12: false })
+      ? last.toLocaleTimeString(lang === "en" ? "en-US" : "zh-CN", {
+          hour12: false,
+        })
       : null;
   const parts: string[] = [];
-  if (since !== null) parts.push(`${t("busyElapsed")} ${formatElapsed(now - since)}`);
+  if (since !== null)
+    parts.push(`${t("busyElapsed")} ${formatElapsed(now - since)}`);
   if (lastText) parts.push(`${t("busyLastEvent")} ${lastText}`);
   if (parts.length === 0) return null;
   return (
@@ -137,7 +169,11 @@ export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
   const text = when.toLocaleString(locale, {
     ...(parts.date
       ? parts.year
-        ? { year: "numeric" as const, month: "2-digit" as const, day: "2-digit" as const }
+        ? {
+            year: "numeric" as const,
+            month: "2-digit" as const,
+            day: "2-digit" as const,
+          }
         : { month: "2-digit" as const, day: "2-digit" as const }
       : {}),
     hour: "2-digit",
@@ -145,10 +181,33 @@ export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
     hour12: false,
   });
   return (
-    <time className="msg-time" dateTime={ts} title={when.toLocaleString(locale)}>
+    <time
+      className="msg-time"
+      dateTime={ts}
+      title={when.toLocaleString(locale)}
+    >
       {text}
     </time>
   );
+}
+
+export function ReplyCopyButton({ content, lang }: { content: string; lang: Lang }) {
+  const t = makeT(lang);
+  const [result, setResult] = useState<"idle" | "copied" | "failed">("idle");
+  useEffect(() => {
+    if (result !== "copied") return;
+    const timer = window.setTimeout(() => setResult("idle"), 2000);
+    return () => window.clearTimeout(timer);
+  }, [result]);
+  if (!content) return null;
+  const label = result === "copied" ? t("replyCopied") : t("replyCopyMarkdown");
+  return <>
+    <button type="button" className="icon-btn sm reply-copy" data-testid="reply-copy" title={label} aria-label={label}
+      onClick={() => { void copyText(content).then((ok) => setResult(ok ? "copied" : "failed")); }}>
+      {result === "copied" ? <Check /> : <Copy />}
+    </button>
+    <span className="reply-copy-feedback" role="status">{result === "copied" ? t("replyCopied") : result === "failed" ? t("copyFailed") : ""}</span>
+  </>;
 }
 
 function OutboundAttachments({
@@ -204,7 +263,6 @@ export default function SessionView({
   onRename?: (sid: string, title: string) => void | Promise<void>;
 }) {
   const t = makeT(lang);
-  const [view, setView] = useState<"chat" | "terminal">("chat");
   // Inline title edit in the header. `pendingTitle` is the optimistic value
   // shown only WHILE the shell's rename is in flight — without it the header
   // visibly snaps back to the old title for a beat after Enter. It is cleared
@@ -223,12 +281,19 @@ export default function SessionView({
   // and which step the inspector shows (looked up live in `rows`, so a running
   // step flips to done — and its record loads — while the panel is open).
   // Per-sid by construction: the shell remounts this view on a sid change.
-  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
-  const [inspected, setInspected] = useState<{ rowId: string; itemId: string } | null>(null);
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [inspected, setInspected] = useState<{
+    rowId: string;
+    itemId: string;
+  } | null>(null);
   const inspectedStep = useMemo(() => {
     if (!inspected) return null;
     const row = rows.find((r) => r.id === inspected.rowId);
-    return row?.fold?.steps?.find((st) => st.item_id === inspected.itemId) ?? null;
+    return (
+      row?.fold?.steps?.find((st) => st.item_id === inspected.itemId) ?? null
+    );
   }, [inspected, rows]);
   const closeInspector = useCallback(() => setInspected(null), []);
   const toggleFold = useCallback((rowId: string) => {
@@ -242,6 +307,7 @@ export default function SessionView({
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
+  const [contextRefreshEpoch, setContextRefreshEpoch] = useState(0);
 
   // ---- context panel (the right sidebar) ------------------------------------
   // Docked/closed is a per-browser LAYOUT preference: it survives this
@@ -249,18 +315,89 @@ export default function SessionView({
   // never auto-restores it (the panel is a chat-covering overlay there — the
   // user re-opens it). `ctxOpenedByUser` tells the panel whether to take
   // focus: yes after a click, no when the docked state was merely restored.
-  const [ctxOpen, setCtxOpen] = useState(
-    () =>
-      readContextPanelOpen(typeof localStorage === "undefined" ? null : localStorage) &&
-      !isNarrowViewport(typeof window === "undefined" ? undefined : window),
+  const [activePanel, setActivePanel] = useState<RightPanel | null>(() =>
+    !isNarrowViewport(typeof window === "undefined" ? undefined : window)
+      ? (() => {
+          try {
+            if (
+              typeof localStorage !== "undefined" &&
+              localStorage.getItem(FILES_PANEL_OPEN_KEY) === "1"
+            )
+              return "files";
+          } catch {
+            /* layout storage is optional */
+          }
+          return readContextPanelOpen(
+            typeof localStorage === "undefined" ? null : localStorage,
+          )
+            ? "context"
+            : null;
+        })()
+      : null,
   );
+  const ctxOpen = activePanel === "context";
+  const [filesVisited, setFilesVisited] = useState(activePanel === "files");
+  const [workspaceLayout] = useState<Layout | undefined>(() => {
+    try {
+      const saved: unknown = JSON.parse(
+        localStorage.getItem("ccteam.workspace.layout") ?? "null",
+      );
+      if (
+        saved &&
+        typeof saved === "object" &&
+        !Array.isArray(saved) &&
+        Object.values(saved).every(
+          (n) =>
+            typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100,
+        )
+      )
+        return saved as Layout;
+    } catch {
+      /* layout storage is optional */
+    }
+    return undefined;
+  });
+  const [fileTarget, setFileTarget] = useState<FileTarget | null>(null);
   const [ctxOpenedByUser, setCtxOpenedByUser] = useState(false);
   const ctxToggleRef = useRef<HTMLButtonElement>(null);
-  const setContextOpen = useCallback((next: boolean, byUser: boolean) => {
-    setCtxOpen(next);
-    setCtxOpenedByUser(byUser);
-    writeContextPanelOpen(typeof localStorage === "undefined" ? null : localStorage, next);
-  }, []);
+  const filesToggleRef = useRef<HTMLButtonElement>(null);
+  const setRightPanel = useCallback(
+    (next: RightPanel | null, byUser: boolean) => {
+      if (next === "files") setFilesVisited(true);
+      setActivePanel(next);
+      setCtxOpenedByUser(byUser);
+      writeContextPanelOpen(
+        typeof localStorage === "undefined" ? null : localStorage,
+        next === "context",
+      );
+      try {
+        localStorage.setItem(
+          FILES_PANEL_OPEN_KEY,
+          next === "files" ? "1" : "0",
+        );
+      } catch {
+        /* optional */
+      }
+    },
+    [],
+  );
+  const setContextOpen = useCallback(
+    (next: boolean, byUser: boolean) => {
+      setRightPanel(next ? "context" : null, byUser);
+    },
+    [setRightPanel],
+  );
+  const openFile = useCallback(
+    (target: FileTarget) => {
+      setFileTarget(target);
+      setRightPanel("files", true);
+    },
+    [setRightPanel],
+  );
+  const closeFiles = useCallback(() => {
+    setRightPanel(null, false);
+    filesToggleRef.current?.focus();
+  }, [setRightPanel]);
   const toggleContext = useCallback(
     () => setContextOpen(!ctxOpen, true),
     [ctxOpen, setContextOpen],
@@ -277,7 +414,12 @@ export default function SessionView({
   // A turn ending is the moment the window changes, so the panel re-fetches
   // on the newest boundary frame's id (identity, not a count: the ring drops
   // its oldest frames once full, so a count could stand still).
-  const latestTurnEndId = [...events].reverse().find((event) => isTurnBoundary(event))?.id;
+  const latestTurnEndId = [...events]
+    .reverse()
+    .find((event) => isTurnBoundary(event))?.id;
+  const latestContextChangeId = [...events].reverse().find((event) =>
+    isTurnBoundary(event) || event.kind === "session_lifecycle" || !!event.options?.length,
+  )?.id;
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
   // view of its current length so an authoritative history reseed can install
@@ -318,12 +460,16 @@ export default function SessionView({
           const seeded = historyToRows(h.events);
           const events = eventsRef.current;
           if (seeded.length > 0 || replaceEmpty) {
-            setRows((current) => mergeHistory(current, seeded, events, barrier));
+            setRows((current) =>
+              mergeHistory(current, seeded, events, barrier),
+            );
             foldedRef.current = events.length;
           }
           // Newest turn status in the page — a status-only closing row counts
           // even when it had no reply of its own to footer (#209).
-          const latest = [...h.events].reverse().find((ev) => ev.status)?.status;
+          const latest = [...h.events]
+            .reverse()
+            .find((ev) => ev.status)?.status;
           if (latest) {
             setStatusModel(latest.model ?? null);
             setCtxPct(contextPct(latest.context));
@@ -338,7 +484,9 @@ export default function SessionView({
         })
         .catch((error) => {
           if (request !== historyRequestRef.current) return;
-          setHistoryError(error instanceof Error ? error.message : String(error));
+          setHistoryError(
+            error instanceof Error ? error.message : String(error),
+          );
         });
     },
     [sid],
@@ -359,7 +507,12 @@ export default function SessionView({
   }, [seedHistory, connectionEpoch]);
 
   const loadEarlier = useCallback(() => {
-    if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
+    if (
+      !historyPage.hasMore ||
+      !historyPage.nextBefore ||
+      historyPage.loadingEarlier
+    )
+      return;
     const before = historyPage.nextBefore;
     const request = historyRequestRef.current;
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
@@ -414,7 +567,8 @@ export default function SessionView({
   }
 
   // ---- per-session status (model + effort + ctx%) --------------------------
-  const lastEventTs = events.length > 0 ? events[events.length - 1]?.ts : undefined;
+  const lastEventTs =
+    events.length > 0 ? events[events.length - 1]?.ts : undefined;
   useEffect(() => {
     let cancelled = false;
     getSessionStatus(sid)
@@ -442,7 +596,8 @@ export default function SessionView({
   const latestEventStatus = [...events]
     .reverse()
     .find((event) => event.kind === "answer" && event.status)?.status;
-  const displayStatusModel = latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel;
+  const displayStatusModel =
+    latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel ?? session?.model;
   const displayCtxPct = latestEventStatus
     ? contextPct(latestEventStatus.context)
     : latestTurnStatus
@@ -450,7 +605,9 @@ export default function SessionView({
       : ctxPct;
 
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
-    setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
+    setRows((current) =>
+      appendRow(current, { ...row, id: nextRowId(row.kind) }),
+    );
   }, []);
 
   // ---- delayed user-message queue ------------------------------------------
@@ -471,7 +628,9 @@ export default function SessionView({
     reloadScheduled();
   }, [reloadScheduled, scheduledRevision]);
   useEffect(() => {
-    getDaemonTimezone().then(setDaemonTimezone).catch(() => setDaemonTimezone("local"));
+    getDaemonTimezone()
+      .then(setDaemonTimezone)
+      .catch(() => setDaemonTimezone("local"));
   }, []);
 
   const scheduleText = useCallback(
@@ -508,9 +667,12 @@ export default function SessionView({
       // Optimistic transcript row: show the text plus a compact attachment
       // note (the server-side turn text carries the full attachment lines).
       const names = attachments
-        .map((a) => (a.kind === "skill" ? `skill:${a.name}` : (a.name ?? a.path ?? "")))
+        .map((a) =>
+          a.kind === "skill" ? `skill:${a.name}` : (a.name ?? a.path ?? ""),
+        )
         .filter(Boolean);
-      const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
+      const shown =
+        names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
       pushRow({ kind: "user", content: shown });
       // The frames this tree RENDERED, not `eventsRef` — that ref catches up
       // in an effect, and a send landing between a commit and its effects
@@ -523,7 +685,9 @@ export default function SessionView({
         const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
           kind: "system",
-          content: detail.startsWith("发送失败") ? detail : `发送失败: ${detail}`,
+          content: detail.startsWith("发送失败")
+            ? detail
+            : `发送失败: ${detail}`,
         });
       });
     },
@@ -537,13 +701,18 @@ export default function SessionView({
       if (!row.token || !option?.id) {
         pushRow({
           kind: "system",
-          content: "无法批准: 该提示缺少 token/选项 id(请在 IM 批准,或重开会话)",
+          content:
+            "无法批准: 该提示缺少 token/选项 id(请在 IM 批准,或重开会话)",
         });
         return;
       }
-      setRows((current) => current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)));
+      setRows((current) =>
+        current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)),
+      );
       pushRow({ kind: "user", content: `→ ${option.label}` });
-      apiResolveApproval(sid, row.token, option.id).catch((e) => {
+      apiResolveApproval(sid, row.token, option.id).then(() => {
+        setContextRefreshEpoch((epoch) => epoch + 1);
+      }).catch((e) => {
         setRows((current) =>
           current.map((r) => (r.id === row.id ? { ...r, resolved: false } : r)),
         );
@@ -570,12 +739,6 @@ export default function SessionView({
       });
   }, [sid, pushRow]);
 
-  // Terminal tab: only a claude session that owns a pane (protocol ≠
-  // stream-json). A stream-json session has NO pane → the tab does not exist.
-  const isStreamJson = session?.protocol === "stream-json";
-  const canTerminal = session?.vendor === "claude" && !isStreamJson;
-  const showTerminal = view === "terminal" && canTerminal;
-
   // Auto-scroll only when already near the bottom; 「回到最新」 appears when
   // the reader scrolled up (a streaming reply never yanks them down).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -596,10 +759,10 @@ export default function SessionView({
     setShowJump(false);
   }, []);
   useLayoutEffect(() => {
-    if (!showTerminal && atBottomRef.current && scrollRef.current) {
+    if (atBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [rows, showTerminal]);
+  }, [rows]);
 
   // conv-head status dot: busy amber › SESSION RESIDENCY. The base is the
   // rail's REST `session.residency`; this sid's live `session_lifecycle`
@@ -612,13 +775,16 @@ export default function SessionView({
   // (`working|idle|stale|stuck`) the list endpoint resolves, so the old
   // `status === "live"` test could never be true and the dot was permanently
   // grey until a lifecycle frame happened to arrive.
-  const sessionLive = foldSessionLiveness(session?.residency === "resident", events);
+  const sessionLive = foldSessionLiveness(
+    session?.residency === "resident",
+    events,
+  );
   const headDot = busy ? "dot busy" : sessionLive ? "dot on" : "dot off";
   // A broken stream (retries exhausted / no gateway) stays visible as its own
   // red connection dot next to the status dot.
   const connLost = gatewayUnavailable || lastError !== null;
 
-  const serverTitle = session ? railSessionLabel(session) : sid;
+  const serverTitle = session?.title || session?.role || sid;
   const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
 
@@ -645,7 +811,11 @@ export default function SessionView({
       <div className="conv-head">
         <span className={headDot} data-testid="conv-dot" />
         {connLost ? (
-          <span className="dot err" data-testid="conn-dot" title={t("connLost")} />
+          <span
+            className="dot err"
+            data-testid="conn-dot"
+            title={t("connLost")}
+          />
         ) : null}
         {editingTitle && onRename ? (
           <InlineRename
@@ -655,7 +825,9 @@ export default function SessionView({
             onSubmit={(next) => {
               setEditingTitle(false);
               setPendingTitle(next);
-              void Promise.resolve(onRename(sid, next)).finally(() => setPendingTitle(null));
+              void Promise.resolve(onRename(sid, next)).finally(() =>
+                setPendingTitle(null),
+              );
             }}
             onCancel={() => setEditingTitle(false)}
           />
@@ -663,7 +835,9 @@ export default function SessionView({
           <span
             className="title"
             data-testid="conv-title"
-            title={onRename ? `${t("renameTip")} · ${t("renameHint")}` : undefined}
+            title={
+              onRename ? `${t("renameTip")} · ${t("renameHint")}` : undefined
+            }
             onDoubleClick={() => {
               if (onRename) setEditingTitle(true);
             }}
@@ -683,84 +857,81 @@ export default function SessionView({
             <Pencil />
           </button>
         ) : null}
-        <div className="meta">
-          <span className="chip sid">{sid}</span>
-          {session ? <span className="chip">{session.project}</span> : null}
-          {session ? (
-            <span className="chip" data-testid="session-role">
-              {session.role || t("noRole")}
-            </span>
-          ) : null}
-          <VendorChip vendor={vendor} />
-          {session?.host && session.host !== "local" ? (
-            <span className="chip">@ {session.host}</span>
-          ) : null}
-          {displayStatusModel ? (
-            // The `model · ctx N%` chip IS the entry point into the context
-            // panel — the affordance sits on the number it explains.
-            <button
-              type="button"
-              className="chip chip-btn"
-              data-testid="ctx-chip"
-              title={t("ctxOpen")}
-              aria-label={`${t("ctxOpen")} · ${displayStatusModel}`}
-              aria-pressed={ctxOpen}
-              onClick={toggleContext}
-            >
-              {displayStatusModel}
-              {displayCtxPct !== null ? ` · ctx ${Math.round(displayCtxPct)}%` : ""}
-            </button>
-          ) : null}
-        </div>
-        <div className="tabs">
-          <button
-            type="button"
-            className={`tab ${!showTerminal ? "active" : ""}`}
-            onClick={() => setView("chat")}
-          >
-            {t("chatTab")}
-          </button>
-          {canTerminal ? (
-            <button
-              type="button"
-              className={`tab ${showTerminal ? "active" : ""}`}
-              onClick={() => setView("terminal")}
-              data-testid="terminal-tab"
-            >
-              {t("terminal")}
-            </button>
-          ) : null}
-        </div>
-        <CostPill />
-        {/* Always-present toggle (the chip above needs a reported status; this
-            one is the way in before the first turn and for every harness —
-            the panel itself explains when there is nothing to show). */}
-        <button
-          ref={ctxToggleRef}
-          type="button"
-          className={`icon-btn sm ctx-toggle${ctxOpen ? " on" : ""}`}
-          data-testid="ctx-toggle"
-          title={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
-          aria-label={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
-          aria-pressed={ctxOpen}
-          onClick={toggleContext}
+        {session?.role ? <span className="chip session-role" data-testid="session-role" title={session.role}>{session.role}</span> : null}
+        <span className="session-model" data-testid="session-model" title={displayStatusModel ?? vendor}>
+          {displayStatusModel ?? vendor}
+        </span>
+        <div
+          className="right-panel-tools"
+          role="toolbar"
+          aria-label={t("rightPanelTools")}
         >
-          {ctxOpen ? <PanelRightClose /> : <PanelRightOpen />}
-        </button>
+          <button
+            ref={filesToggleRef}
+            type="button"
+            className={`icon-btn sm panel-toggle${activePanel === "files" ? " on" : ""}`}
+            data-testid="files-toggle"
+            title={t("filesTitle")}
+            aria-label={t("filesTitle")}
+            aria-pressed={activePanel === "files"}
+            disabled={!session?.project}
+            onClick={() =>
+              setRightPanel(activePanel === "files" ? null : "files", true)
+            }
+          >
+            <FolderTree />
+            <span>{t("filesTitle")}</span>
+          </button>
+          <button
+            ref={ctxToggleRef}
+            type="button"
+            className={`icon-btn sm ctx-toggle${ctxOpen ? " on" : ""}`}
+            data-testid="ctx-toggle"
+            title={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
+            aria-label={ctxOpen ? t("ctxClosePanel") : t("ctxOpen")}
+            aria-pressed={ctxOpen}
+            onClick={toggleContext}
+          >
+            {ctxOpen ? <PanelRightClose /> : <PanelRightOpen />}
+            <span>{t("ctxPanelTitle")}</span>
+            {displayCtxPct != null ? <span className="panel-context-pct">{Math.round(displayCtxPct)}%</span> : null}
+          </button>
+        </div>
       </div>
 
       {/* [chat column | context panel] — the panel is a docked right
           sidebar beside the chat (an overlay drawer ≤820px, see index.css),
           mounted only while open so mount = fetch. */}
-      <div className="conv-body">
-        <div className="conv-main">
-          {showTerminal && session?.project ? (
-            <div className="term-wrap">
-              <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
-            </div>
-          ) : (
+      <Group
+        orientation="horizontal"
+        className={`conv-body${activePanel ? "" : " workspace-closed"}`}
+        id="session-workspace"
+        defaultLayout={workspaceLayout}
+        onLayoutChanged={(layout) => {
+          // Match the drawer's container query, including tablets whose left
+          // sidebar leaves less room than the viewport width suggests.
+          const width = document.getElementById("session-workspace")?.clientWidth;
+          if (!activePanel || width == null || width <= 820) return;
+          try {
+            localStorage.setItem(
+              "ccteam.workspace.layout",
+              JSON.stringify(layout),
+            );
+          } catch {
+            /* optional */
+          }
+        }}
+      >
+        <Panel id="session-chat" className="conv-main" minSize="280px">
             <>
-              <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex" }}>
+              <div
+                style={{
+                  position: "relative",
+                  flex: 1,
+                  minHeight: 0,
+                  display: "flex",
+                }}
+              >
                 <div
                   ref={scrollRef}
                   onScroll={onTranscriptScroll}
@@ -769,7 +940,11 @@ export default function SessionView({
                 >
                   <div className="chat-inner">
                     {historyError ? (
-                      <div className="msg system" data-testid="history-error" role="alert">
+                      <div
+                        className="msg system"
+                        data-testid="history-error"
+                        role="alert"
+                      >
                         <div className="bubble">
                           {t("historyLoadFailed")}: {historyError}{" "}
                           <button
@@ -807,14 +982,25 @@ export default function SessionView({
                             <span className="who">{t("approve")}</span>
                             <div className="bubble">
                               {row.content}
-                              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  gap: 8,
+                                  flexWrap: "wrap",
+                                  marginTop: 10,
+                                }}
+                              >
                                 {(row.options ?? []).map((opt, i) => (
                                   <button
                                     key={`${row.id}-${i}`}
                                     type="button"
                                     className="btn primary mini"
                                     disabled={row.resolved}
-                                    style={row.resolved ? { opacity: 0.45 } : undefined}
+                                    style={
+                                      row.resolved
+                                        ? { opacity: 0.45 }
+                                        : undefined
+                                    }
                                     onClick={() => resolveApproval(row, i)}
                                   >
                                     {opt.label}
@@ -822,7 +1008,13 @@ export default function SessionView({
                                 ))}
                               </div>
                               {row.resolved ? (
-                                <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-faint)" }}>
+                                <div
+                                  style={{
+                                    marginTop: 6,
+                                    fontSize: 11,
+                                    color: "var(--text-faint)",
+                                  }}
+                                >
                                   已回应
                                 </div>
                               ) : null}
@@ -866,10 +1058,14 @@ export default function SessionView({
                               {row.content}
                             </button>
                             {open ? (
-                              <ol className="fold-steps" data-testid="fold-steps">
+                              <ol
+                                className="fold-steps"
+                                data-testid="fold-steps"
+                              >
                                 {steps.map((step) => {
                                   const selected =
-                                    inspected?.rowId === row.id && inspected.itemId === step.item_id;
+                                    inspected?.rowId === row.id &&
+                                    inspected.itemId === step.item_id;
                                   return (
                                     <li key={step.item_id || step.step_id}>
                                       <button
@@ -877,12 +1073,22 @@ export default function SessionView({
                                         className={`fold-step${step.kind === "thinking" ? " thinking" : ""}${selected ? " selected" : ""}`}
                                         data-testid="fold-step"
                                         onClick={() =>
-                                          setInspected({ rowId: row.id, itemId: step.item_id })
+                                          setInspected({
+                                            rowId: row.id,
+                                            itemId: step.item_id,
+                                          })
                                         }
                                       >
-                                        <span aria-hidden>{stepIcon(step)}</span>
-                                        <span className="fold-step-summary">{step.summary}</span>
-                                        <span className="fold-step-state" aria-hidden>
+                                        <span aria-hidden>
+                                          {stepIcon(step)}
+                                        </span>
+                                        <span className="fold-step-summary">
+                                          {step.summary}
+                                        </span>
+                                        <span
+                                          className="fold-step-state"
+                                          aria-hidden
+                                        >
                                           {step.done ? "✓" : "…"}
                                         </span>
                                       </button>
@@ -916,7 +1122,12 @@ export default function SessionView({
                       return (
                         <div key={row.id} className="msg agent fade-in">
                           <div className="bubble md">
-                            {row.content ? <Markdown content={row.content} /> : null}
+                            {row.content ? (
+                              <Markdown
+                                content={row.content}
+                                onFileOpen={openFile}
+                              />
+                            ) : null}
                             <OutboundAttachments
                               project={session?.project}
                               attachments={row.attachments}
@@ -930,66 +1141,99 @@ export default function SessionView({
                             // surfaces read the same. The ledger lives on the
                             // session pages.
                             const footer = formatTurnStatus(row.status);
-                            const model = row.status?.model || displayStatusModel;
+                            const model =
+                              row.status?.model || displayStatusModel;
                             const tail = [vendor, sid, model, footer?.text]
                               .filter((part): part is string => !!part)
                               .join(" · ");
                             return (
-                              <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                              <div className="reply-footer">
+                                <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
                                 <RowTime ts={row.ts} lang={lang} />
                                 {row.ts ? ` · ${tail}` : tail}
-                              </span>
+                                </span>
+                                <ReplyCopyButton content={row.content} lang={lang} />
+                              </div>
                             );
                           })()}
                         </div>
                       );
                     })}
                     {busy ? (
-                      <div className="msg agent" aria-label="生成中" data-testid="streaming-cursor">
+                      <div
+                        className="msg agent"
+                        aria-label="生成中"
+                        data-testid="streaming-cursor"
+                      >
                         <div className="bubble">
                           <span className="cursor" />
-                          <BusyHeartbeat since={busySince} lastEventTs={lastEventTs} lang={lang} />
+                          <BusyHeartbeat
+                            since={busySince}
+                            lastEventTs={lastEventTs}
+                            lang={lang}
+                          />
                         </div>
                       </div>
                     ) : null}
                   </div>
                 </div>
                 {showJump ? (
-                  <button type="button" className="jump-latest" onClick={jumpToBottom}>
+                  <button
+                    type="button"
+                    className="jump-latest"
+                    onClick={jumpToBottom}
+                  >
                     <ArrowDown /> 回到最新
                   </button>
                 ) : null}
                 {inspectedStep ? (
-                  <StepInspector sid={sid} step={inspectedStep} lang={lang} onClose={closeInspector} />
+                  <StepInspector
+                    sid={sid}
+                    step={inspectedStep}
+                    lang={lang}
+                    onClose={closeInspector}
+                  />
                 ) : null}
               </div>
 
               <div className="conv-composer-wrap">
                 <div className="composer-group">
                   {scheduled.length > 0 ? (
-                    <div className="scheduled-queue" data-testid="scheduled-queue">
+                    <div
+                      className="scheduled-queue"
+                      data-testid="scheduled-queue"
+                    >
                       <div className="scheduled-head">
                         <Clock />
                         <span>{t("scheduleQueue")}</span>
                       </div>
                       {scheduled.map((item) => (
-                        <div key={item.id} className={`scheduled-row ${item.status}`}>
+                        <div
+                          key={item.id}
+                          className={`scheduled-row ${item.status}`}
+                        >
                           <time
                             dateTime={item.send_at}
                             title={`${t("scheduleLocalTime")}: ${item.send_at}`}
                           >
-                            {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
-                              month: "2-digit",
-                              day: "2-digit",
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
+                            {new Date(item.send_at).toLocaleString(
+                              lang === "en" ? "en-US" : "zh-CN",
+                              {
+                                month: "2-digit",
+                                day: "2-digit",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              },
+                            )}
                           </time>
                           <span className="scheduled-preview" title={item.text}>
                             {item.text.replace(/\s+/g, " ").trim().slice(0, 80)}
                           </span>
                           {item.status === "failed" ? (
-                            <span className="scheduled-error" title={item.fail_reason ?? ""}>
+                            <span
+                              className="scheduled-error"
+                              title={item.fail_reason ?? ""}
+                            >
                               {t("scheduleFailed")}
                             </span>
                           ) : null}
@@ -1024,18 +1268,50 @@ export default function SessionView({
                 </div>
               </div>
             </>
-          )}
-        </div>
-        {ctxOpen ? (
-          <ContextPanel
-            sid={sid}
-            lang={lang}
-            onClose={closeContext}
-            refreshKey={latestTurnEndId}
-            focusOnMount={ctxOpenedByUser}
-          />
+        </Panel>
+        {activePanel || filesVisited ? (
+          <>
+            <Separator className="workspace-separator outer-separator" />
+            <Panel
+              id="session-right-workspace"
+              className="right-workspace-panel"
+              minSize="320px"
+              defaultSize={activePanel === "files" ? "55%" : "360px"}
+            >
+              {ctxOpen ? (
+                <ContextPanel
+                  sid={sid}
+                  model={displayStatusModel}
+                  lang={lang}
+                  onClose={closeContext}
+                  refreshKey={`${latestContextChangeId ?? ""}:${busy}:${session?.waiting_approval ?? false}:${contextRefreshEpoch}`}
+                  focusOnMount={ctxOpenedByUser}
+                />
+              ) : null}
+              {filesVisited && session?.project ? (
+                <div className="files-mount" hidden={activePanel !== "files"}>
+                  <Suspense
+                    fallback={
+                      <div className="files-empty">{t("filesLoading")}</div>
+                    }
+                  >
+                    <FileWorkspace
+                      key={session.project}
+                      project={session.project}
+                      lang={lang}
+                      onClose={closeFiles}
+                      target={fileTarget}
+                      refreshKey={latestTurnEndId}
+                      focusOnMount={ctxOpenedByUser}
+                      visible={activePanel === "files"}
+                    />
+                  </Suspense>
+                </div>
+              ) : null}
+            </Panel>
+          </>
         ) : null}
-      </div>
+      </Group>
     </section>
   );
 }

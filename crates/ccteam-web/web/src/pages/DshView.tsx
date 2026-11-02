@@ -1,6 +1,6 @@
 // v0.9.15 — DSH (DeepSeek Harness) as a first-class ccteam-web page. The shell
 // route `/dsh` mounts this; it embeds the identity's `dsh web` instance through
-// the daemon's DSH companion port (same ccteam auth, per-tenant isolation via
+// the daemon's same-origin /dsh/ proxy (same ccteam auth, per-tenant isolation via
 // DSH_HOME — the SPA never reaches `dsh web` directly, redline §四). The page
 // is a thin lifecycle skin over `GET/POST /api/v1/dsh/*`: a status head
 // (state dot · meta chips · start/stop/restart · operator "open native ↗")

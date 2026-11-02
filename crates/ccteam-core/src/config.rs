@@ -154,10 +154,9 @@ impl DaemonConfig {
 /// - [`Self::idle_release_secs`] is the PRIMARY policy: a session nobody has
 ///   spoken to for that long has its vendor process released (the session
 ///   itself is untouched — it resumes by sid on the next message). The default
-///   tracks the longest prompt-cache TTL a vendor offers (Claude: 1h), so the
-///   process is held exactly as long as keeping it alive can still save a
-///   cache re-read, and no longer. A 10–30 session fleet at ~300 MB per
-///   resident claude is the case this exists for.
+///   is 250 minutes, balancing continuity across work breaks with resident
+///   process memory. A 10–30 session fleet at ~300 MB per resident claude is
+///   the case this exists for.
 /// - [`Self::max_live`] is the SECONDARY ceiling: a hard cap for the burst
 ///   case (many sessions active inside one TTL window), enforced by evicting
 ///   the least-recently-active eligible session at admission time.
@@ -184,11 +183,9 @@ pub fn default_sessions_max_live() -> u32 {
     50
 }
 
-/// One hour — Claude's prompt-cache TTL, the longest window in which holding
-/// the process open can still save the model a cache re-read. Past it, a
-/// resident process buys nothing but RAM.
+/// Owner-selected 250-minute idle window (docs-local/issues/#226).
 pub fn default_sessions_idle_release_secs() -> u64 {
-    3600
+    250 * 60
 }
 
 impl Default for SessionsConfig {
@@ -595,7 +592,7 @@ mod tests {
         let cfg = CcteamConfig::default();
         assert_eq!(cfg.daemon.workers, 4);
         assert_eq!(cfg.sessions.max_live, 50);
-        assert_eq!(cfg.sessions.idle_release_secs, 3600);
+        assert_eq!(cfg.sessions.idle_release_secs, 15_000);
         assert!(cfg.sessions.idle_release_by_vendor.is_empty());
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);

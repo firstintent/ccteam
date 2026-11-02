@@ -174,9 +174,14 @@ pub fn router_with_state(state: AppState) -> Router {
     // spawn came out rootless (the v0.9.2 "delegation parent lost over HTTP"
     // fix). The web token is not a credential HERE at all: it names a browser
     // session and authenticates `/api/v1/**`, never the MCP data plane.
+    // Use the same authenticated proxy as the dedicated companion listener.
+    // A relative iframe URL survives TLS termination and external port mapping;
+    // the vendor's assets, RPC and WebSockets all stay under this mount.
+    let dsh = dsh_web::companion_router().with_state(state.clone());
     let mcp = routes::mcp::router().with_state(state);
     Router::new()
         .merge(routes::stateless_router(health))
+        .nest("/dsh/", dsh)
         .merge(mcp)
         .merge(stateful)
         .layer(CompressionLayer::new().gzip(true).br(true))

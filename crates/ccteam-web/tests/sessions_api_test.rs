@@ -721,6 +721,8 @@ async fn session_context_is_live_then_falls_back_to_the_snapshot() {
     assert_eq!(live["live"], true);
     assert_eq!(live["breakdown"]["used_tokens"], 42);
     assert_eq!(live["breakdown"]["categories"][0]["kind"], "used");
+    assert_eq!(live["session"]["sid"], sid.as_str());
+    assert_eq!(live["session"]["residency"], "resident");
 
     let stopped = client
         .post(format!("{base}/sessions/{sid}/stop"))
@@ -731,6 +733,7 @@ async fn session_context_is_live_then_falls_back_to_the_snapshot() {
     let (code, gone) = context(sid.clone()).await;
     assert_eq!(code, 200, "a stopped session is still readable: {gone}");
     assert_eq!(gone["live"], false);
+    assert_eq!(gone["session"]["residency"], "stopped");
     assert!(gone["breakdown"].is_null(), "no snapshot yet: {gone}");
 
     ccteam_harness::execution::session_status::write_context_file(
@@ -741,6 +744,40 @@ async fn session_context_is_live_then_falls_back_to_the_snapshot() {
     let (_, snap) = context(sid.clone()).await;
     assert_eq!(snap["live"], false);
     assert_eq!(snap["breakdown"]["used_tokens"], 7);
+
+    // A cold historical remote child must not inherit the shell's local/root
+    // defaults. This sid is never loaded into the gateway's live session map.
+    let mut remote =
+        ccteam_harness::execution::session_meta::read_session_meta(&project_dir, &sid).unwrap();
+    remote.sid = "s987".into();
+    remote.host = "satellite-1".into();
+    remote.parent_sid = Some("s1497".into());
+    remote.delegation_depth = 2;
+    remote.stopped_at = None;
+    remote.cost_usd = Some(716.425);
+    remote.tokens_total = Some(12345);
+    ccteam_harness::execution::session_meta::write_session_meta(&project_dir, &remote).unwrap();
+    let (code, historical) = context("s987".into()).await;
+    assert_eq!(code, 200, "{historical}");
+    assert_eq!(historical["session"]["host"], "satellite-1");
+    assert_eq!(historical["session"]["parent_sid"], "s1497");
+    assert_eq!(historical["session"]["delegation_depth"], 2);
+    assert_eq!(historical["session"]["residency"], "released");
+    assert_eq!(historical["session"]["cost_usd"], 716.425);
+    assert_eq!(historical["session"]["tokens_total"], 12345);
+    ccteam_harness::execution::session_status::write_status_file(
+        &project_dir,
+        "s987",
+        &ccteam_harness::ThreadStatus {
+            model: Some("current-observed-model".into()),
+            ..Default::default()
+        },
+    );
+    let (_, refreshed) = context("s987".into()).await;
+    assert_eq!(
+        refreshed["session"]["model"], "current-observed-model",
+        "model changes survive release and Context refresh"
+    );
 
     let codex = create("codex").await;
     let (code, none) = context(codex).await;

@@ -50,11 +50,13 @@ import {
   type MessageSplitKey,
 } from "../lib/contextBreakdown";
 import { makeT, type Lang } from "../lib/i18n";
+import type { SessionView } from "../lib/sessionsApi";
 
 type T = (key: string) => string;
 
 export interface ContextPanelProps {
   sid: string;
+  model?: string | null;
   lang: Lang;
   onClose: () => void;
   /** Identity of the newest turn-ending frame on this session; every change
@@ -65,7 +67,7 @@ export interface ContextPanelProps {
   focusOnMount?: boolean;
 }
 
-export function ContextPanel({ sid, lang, onClose, refreshKey, focusOnMount = false }: ContextPanelProps) {
+export function ContextPanel({ sid, model, lang, onClose, refreshKey, focusOnMount = false }: ContextPanelProps) {
   const t = makeT(lang);
   const [data, setData] = useState<SessionContextResponse | null>(null);
   // Mount = a fetch is already in flight, so the first paint is the loading
@@ -176,6 +178,7 @@ export function ContextPanel({ sid, lang, onClose, refreshKey, focusOnMount = fa
           </button>
         </div>
         <div className="ctx-body">
+          {data?.session ? <SessionFacts session={data.session} model={model} lang={lang} /> : null}
           {error ? (
             <div className="ctx-error" role="alert" data-testid="ctx-error">
               <span>
@@ -215,6 +218,41 @@ export function ContextPanel({ sid, lang, onClose, refreshKey, focusOnMount = fa
   );
 }
 
+/** The context response includes authoritative per-sid facts, even after
+ *  release. The shell's capped history rows are not a session detail source. */
+export function SessionFacts({ session, model, lang }: { session: SessionView; model?: string | null; lang: Lang }) {
+  const t = makeT(lang);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const activity: Record<string, string> = { working: t("ctxWorking"), idle: t("ctxIdle"), stale: t("ctxStale"), stuck: t("ctxStuck"), detached: t("ctxDetached") };
+  const residency: Record<string, string> = { resident: t("ctxResident"), released: t("ctxReleased"), stopped: t("ctxStopped"), detached: t("ctxDetached"), external: t("ctxExternal") };
+  const lastActive = session.last_active ? new Date(session.last_active) : null;
+  const validDate = lastActive && Number.isFinite(lastActive.getTime());
+  return (
+    <section className="ctx-sec ctx-session" data-testid="ctx-session-status">
+      <h4>{t("ctxSessionStatus")}</h4>
+      <dl className="ctx-facts">
+        <dt>{t("ctxSessionId")}</dt><dd className="mono">{session.sid}</dd>
+        <dt>{t("project")}</dt><dd>{session.project}</dd>
+        <dt>{t("ctxActivity")}</dt><dd>{session.waiting_approval ? t("ctxWaitingApproval") : activity[session.status] ?? session.status}</dd>
+        {session.residency ? <><dt>{t("ctxResidency")}</dt><dd>{residency[session.residency] ?? session.residency}</dd></> : null}
+        <dt>Harness</dt><dd>{session.vendor}</dd>
+        <dt>{t("model")}</dt><dd>{session.model || model || "—"}</dd>
+        <dt>{t("host")}</dt><dd>{session.host || "local"}</dd>
+        {session.role ? <><dt>Role</dt><dd>{session.role}</dd></> : null}
+        <dt>{t("parentSession")}</dt><dd className="mono">{session.parent_sid || t("noParent")}</dd>
+        <dt>{t("depth")}</dt><dd>{session.delegation_depth ?? "—"}</dd>
+        <dt>{t("ctxSessionCost")}</dt><dd className="mono">{session.cost_usd != null ? `$${session.cost_usd.toFixed(4)}` : t("ctxUnpriced")}</dd>
+        {session.tokens_total != null ? <><dt>{t("ctxTotalTokens")}</dt><dd className="mono">{formatTokensExact(session.tokens_total)}</dd></> : null}
+        <dt>{t("ctxLastActive")}</dt><dd>{validDate ? <time dateTime={session.last_active} title={lastActive.toLocaleString(lang === "en" ? "en-US" : "zh-CN")}>{relativeTime(session.last_active, now, lang)}</time> : "—"}</dd>
+      </dl>
+    </section>
+  );
+}
+
 function Breakdown({
   breakdown,
   live,
@@ -238,6 +276,7 @@ function Breakdown({
     <>
       <Header breakdown={breakdown} live={live} fetchedAt={fetchedAt} lang={lang} t={t} />
       <WindowBar breakdown={breakdown} lang={lang} t={t} />
+      {breakdown.vendor === "codex" ? <p className="ctx-note" data-testid="ctx-codex-scope">{t("ctxCodexScope")}</p> : null}
       {rows.length > 0 ? (
         <section className="ctx-sec">
           <h4>{t("ctxCategories")}</h4>
@@ -270,7 +309,7 @@ function Breakdown({
         </section>
       ) : null}
       {breakdown.messages ? <MessagesSection messages={breakdown.messages} t={t} /> : null}
-      {breakdown.last_request ? <LastRequest last={breakdown.last_request} t={t} /> : null}
+      {breakdown.last_request ? <LastRequest last={breakdown.last_request} vendor={breakdown.vendor} t={t} /> : null}
     </>
   );
 }
@@ -293,7 +332,7 @@ function Header({
   const captured = breakdown.captured_at ? new Date(breakdown.captured_at) : null;
   const capturedText =
     captured && !Number.isNaN(captured.getTime()) ? captured.toLocaleString(locale) : null;
-  const age = live ? null : relativeTime(breakdown.captured_at, fetchedAt, lang);
+  const age = live && breakdown.vendor !== "codex" ? null : relativeTime(breakdown.captured_at, fetchedAt, lang);
   return (
     <div className="ctx-meta" data-testid="ctx-meta">
       {breakdown.model ? (
@@ -310,8 +349,8 @@ function Header({
         {pct !== null ? ` · ${formatPct(pct)}` : ""}
       </span>
       {live ? (
-        <span className="ctx-badge live" data-testid="ctx-live">
-          {t("ctxLive")}
+        <span className="ctx-badge live" data-testid="ctx-live" title={capturedText ? `${t("ctxCapturedAt")} ${capturedText}` : undefined}>
+          {t(breakdown.vendor === "codex" ? "ctxReported" : "ctxLive")}{age ? ` · ${age}` : ""}
         </span>
       ) : (
         <span
@@ -616,8 +655,22 @@ function MessagesSection({ messages, t }: { messages: ContextMessages; t: T }) {
   );
 }
 
-function LastRequest({ last, t }: { last: ContextLastRequest; t: T }) {
+function LastRequest({ last, vendor, t }: { last: ContextLastRequest; vendor?: string | null; t: T }) {
   const ratio = cacheHitRatio(last);
+  if (vendor === "codex") {
+    const input = last.input_tokens == null || last.cache_read_tokens == null || last.cache_creation_tokens == null ? null : last.input_tokens + last.cache_read_tokens + last.cache_creation_tokens;
+    return <section className="ctx-sec" data-testid="ctx-last-request">
+      <h4>{t("ctxLastRequest")}</h4>
+      <dl className="ctx-facts">
+        <dt>{t("ctxInputTotal")}</dt><dd>{formatTokensExact(input)}</dd>
+        <dt>{t("ctxCachedSubset")}</dt><dd>{formatTokensExact(last.cache_read_tokens)}</dd>
+        {(last.cache_creation_tokens ?? 0) > 0 ? <><dt>{t("ctxCacheWrite")}</dt><dd>{formatTokensExact(last.cache_creation_tokens)}</dd></> : null}
+        <dt>{t("ctxOutput")}</dt><dd>{formatTokensExact(last.output_tokens)}</dd>
+        {last.reasoning_output_tokens != null ? <><dt>{t("ctxReasoningSubset")}</dt><dd>{formatTokensExact(last.reasoning_output_tokens)}</dd></> : null}
+        {ratio !== null ? <><dt>{t("ctxCacheHit")}</dt><dd data-testid="ctx-cache-hit">{formatPct(ratio * 100)}</dd></> : null}
+      </dl>
+    </section>;
+  }
   return (
     <section className="ctx-sec" data-testid="ctx-last-request">
       <h4>{t("ctxLastRequest")}</h4>

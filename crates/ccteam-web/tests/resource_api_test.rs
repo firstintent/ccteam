@@ -396,6 +396,10 @@ async fn post_project_creates_and_registers() {
 
     // Side effects: state.json on disk + registered in config.yaml.
     assert!(target.join(".ccteam/state.json").exists());
+    assert!(target.join("AGENTS.md").is_file());
+    assert!(target.join(".gitignore").is_file());
+    assert!(!target.join("CLAUDE.md").exists());
+    assert!(!target.join(".ccteam/workflow.yaml").exists());
     let entry = ccteam_core::lookup_project_in_config(&root, "myapp")
         .unwrap()
         .expect("myapp registered");
@@ -416,6 +420,41 @@ async fn post_project_rejects_bad_slug() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn post_project_refresh_preserves_team_unless_explicit() {
+    disable_tool_surface_bootstrap_for_tests();
+    for (team, expected) in [(None, "ops"), (Some("design"), "design")] {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let root = paths.root.clone();
+        let target = tmp.path().join("existing-repo");
+        let state_path = CcteamPaths::project_state_in(&target);
+        ccteam_core::ProjectState::initial_for_team("old".into(), "ops".into())
+            .save(&state_path)
+            .unwrap();
+        let addr = spawn(AppState::new(paths)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/projects"))
+            .json(&serde_json::json!({
+                "slug": "adopted", "path": target, "team": team,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let state = ccteam_core::ProjectState::load(&state_path).unwrap();
+        assert_eq!(state.team, expected);
+        assert_eq!(state.owner.as_deref(), Some("user:web-api"));
+        assert_eq!(
+            ccteam_core::lookup_project_in_config(&root, "adopted")
+                .unwrap()
+                .unwrap()
+                .team,
+            expected
+        );
+    }
 }
 
 #[tokio::test]

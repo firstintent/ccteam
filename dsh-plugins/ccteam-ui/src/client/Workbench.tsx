@@ -22,14 +22,14 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Button,
-  IconBranchOutline16,
-  IconChevronLeftOutline14,
-  IconCloseOutline16,
-  IconFullscreenOutline16,
-  IconInspectOutline12,
-  IconPanelLeftOutline16,
-  IconPlusOutline16,
-  IconWarningOutline16,
+  IconBranchOutlineRegular,
+  IconChevronLeftOutlineRegular,
+  IconCloseOutlineRegular,
+  IconFullscreenOutlineRegular,
+  IconInspectOutlineRegular,
+  IconPanelLeftOutlineRegular,
+  IconPlusOutlineRegular,
+  IconWarningOutlineRegular,
   StateDot,
   Tooltip,
   writeClipboard,
@@ -131,7 +131,7 @@ function StateScreen({ state, dispatch, api, t }: { state: ConsoleState; dispatc
   if (phase === 'unconfigured') {
     return (
       <div className={css.state}>
-        <IconWarningOutline16 className={css.stateIcon} size={24} />
+        <IconWarningOutlineRegular className={css.stateIcon} size={24} />
         <div className={css.stateTitle}>{t('states.unconfigured.title')}</div>
         <ol className={css.stateSteps}>
           <li>{t('states.unconfigured.step1')}</li>
@@ -153,7 +153,7 @@ function StateScreen({ state, dispatch, api, t }: { state: ConsoleState; dispatc
   }
   return (
     <div className={css.state}>
-      <IconWarningOutline16 className={css.stateIcon} size={24} />
+      <IconWarningOutlineRegular className={css.stateIcon} size={24} />
       <div className={css.stateTitle}>{t('states.unreachable.title')}</div>
       <div className={css.stateBody}>{t('states.unreachable.body')}</div>
       <CopyChip text="ccteam start" t={t} />
@@ -647,7 +647,7 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                     dispatch({ type: 'clear_selection' })
                   }}
                 >
-                  <IconChevronLeftOutline14 size={14} />
+                  <IconChevronLeftOutlineRegular size={14} />
                 </button>
               </Tooltip>
             )
@@ -663,12 +663,12 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                     dispatch({ type: 'toggle_team' })
                   }}
                 >
-                  <IconPanelLeftOutline16 size={16} />
+                  <IconPanelLeftOutlineRegular size={16} />
                 </button>
               </Tooltip>
             )}
         <span className={css.brand}>
-          <IconBranchOutline16 size={16} />
+          <IconBranchOutlineRegular size={16} />
           {t('panel.title')}
           <Tooltip label={connected ? t('panel.connected') : t('panel.disconnected')} delayMs={300}>
             <span className={css.brandDot}>
@@ -728,7 +728,7 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                 dispatch({ type: 'select_new' })
               }}
             >
-              <IconPlusOutline16 size={16} />
+              <IconPlusOutlineRegular size={16} />
             </button>
           </Tooltip>
           <Tooltip label={t('panel.details')} delayMs={400}>
@@ -741,7 +741,7 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                 dispatch({ type: 'toggle_details' })
               }}
             >
-              <IconInspectOutline12 size={14} />
+              <IconInspectOutlineRegular size={14} />
             </button>
           </Tooltip>
           <Tooltip label={full ? t('panel.dock') : t('panel.expand')} delayMs={400}>
@@ -754,7 +754,7 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                 dispatch({ type: 'toggle_mode' })
               }}
             >
-              <IconFullscreenOutline16 size={16} />
+              <IconFullscreenOutlineRegular size={16} />
             </button>
           </Tooltip>
           <Tooltip label={`${t('panel.close')} · Esc`} delayMs={400}>
@@ -766,7 +766,7 @@ export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: Workb
                 dispatch({ type: 'close_panel' })
               }}
             >
-              <IconCloseOutline16 size={16} />
+              <IconCloseOutlineRegular size={16} />
             </button>
           </Tooltip>
         </div>

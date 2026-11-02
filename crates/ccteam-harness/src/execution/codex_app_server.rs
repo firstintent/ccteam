@@ -64,7 +64,7 @@ use crate::execution::progress_bridge::{
     CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 use crate::execution::session_meta::read_session_meta;
-use crate::execution::session_status::write_status_file;
+use crate::execution::session_status::{write_context_file, write_status_file};
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
     SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
@@ -161,6 +161,9 @@ pub struct ThreadLive {
     /// Latest context usage (total tokens + model context window) from
     /// `thread/tokenUsage/updated`.
     pub usage: Option<ContextUsage>,
+    /// The last vendor usage observation. No category RPC exists in Codex:
+    /// retain totals/request accounting, never estimate tools or memory files.
+    context: Option<crate::ContextBreakdown>,
     /// The in-flight turn id, if any. Drives steer-vs-start (D2.2) and
     /// `/interrupt`'s `expectedTurnId`.
     pub active_turn: Option<String>,
@@ -249,6 +252,12 @@ impl ThreadLive {
 fn persist_status(pending: Option<(StatusPersist, ThreadStatus)>) {
     if let Some((persist, status)) = pending {
         write_status_file(&persist.project_dir, &persist.sid, &status);
+    }
+}
+
+fn persist_context(pending: Option<(StatusPersist, crate::ContextBreakdown)>) {
+    if let Some((persist, context)) = pending {
+        write_context_file(&persist.project_dir, &persist.sid, &context);
     }
 }
 
@@ -2662,6 +2671,18 @@ impl HarnessAdapter for CodexAppServerAdapter {
         Ok(live.status())
     }
 
+    async fn context_breakdown(&self, h: &ThreadHandle) -> Option<crate::ContextBreakdown> {
+        // Read the existing dispatcher-owned snapshot; no extra subscription,
+        // model turn or RPC, and its timestamp remains the observation time.
+        self.tracker
+            .lock()
+            .await
+            .threads
+            .get(&h.identity)?
+            .context
+            .clone()
+    }
+
     /// What this thread's in-flight turn has said so far — `None` when no turn
     /// is open (GitHub #197 E/G).
     ///
@@ -4237,22 +4258,32 @@ async fn apply_notification_to_tracker(
             tracker.lock().await.entry(&tid).active_turn = Some(turn_id);
         }
         "turn/completed" => {
-            let pending = {
+            let (pending, context) = {
                 let mut tracker = tracker.lock().await;
                 let entry = tracker.entry(&tid);
                 entry.active_turn = None;
-                entry.pending_write()
+                (
+                    entry.pending_write(),
+                    entry.persist.clone().zip(entry.context.clone()),
+                )
             };
             // Turn boundary: the same moment every other adapter's status tap
             // writes, so context usage lands with the model it ran under.
             persist_status(pending);
+            persist_context(context);
         }
         "error" => {
             // Terminal failures (willRetry=false) clear the active turn;
             // retryable ones do not (the turn lives on until completion).
             let will_retry = pluck_bool(&notif.params, "will_retry", "willRetry").unwrap_or(false);
             if !will_retry {
-                tracker.lock().await.entry(&tid).active_turn = None;
+                let context = {
+                    let mut tracker = tracker.lock().await;
+                    let entry = tracker.entry(&tid);
+                    entry.active_turn = None;
+                    entry.persist.clone().zip(entry.context.clone())
+                };
+                persist_context(context);
             }
         }
         "thread/tokenUsage/updated" => {
@@ -4267,17 +4298,25 @@ async fn apply_notification_to_tracker(
             let used = usage
                 .get("last")
                 .and_then(|t| t.get("total_tokens").or_else(|| t.get("totalTokens")))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                .max(0) as u64;
+                .and_then(|v| v.as_u64());
             let window = usage
                 .get("modelContextWindow")
                 .or_else(|| usage.get("model_context_window"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
                 .max(0) as u64;
-            tracker.lock().await.entry(&tid).usage =
-                Some(ContextUsage::known(used, window, ContextSource::Reported));
+            let mut tracker = tracker.lock().await;
+            let entry = tracker.entry(&tid);
+            entry.usage = Some(ContextUsage {
+                used_tokens: used,
+                window_tokens: window,
+                source: if used.is_some() {
+                    ContextSource::Reported
+                } else {
+                    ContextSource::Unknown
+                },
+            });
+            entry.context = codex_context_usage(&usage, entry.model.clone());
         }
         _ => {}
     }
@@ -4461,6 +4500,66 @@ fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
         .cloned()
         .or_else(|| v.get("turn").and_then(|t| t.get("usage")).cloned())?;
     serde_json::from_value(raw).ok()
+}
+
+/// Codex exposes usage observations, not Claude's category-analysis RPC.
+/// `last.totalTokens` is also what its TUI uses for tokens-in-context; `total`
+/// counts re-sent history many times. Keep unknown windows out of this shape
+/// rather than claiming zero capacity. Cache/reasoning are nested wire fields.
+fn codex_context_usage(usage: &Value, model: Option<String>) -> Option<crate::ContextBreakdown> {
+    let last = usage.get("last")?;
+    let used_tokens = last.get("totalTokens")?.as_u64()?;
+    let window_tokens = usage
+        .get("modelContextWindow")?
+        .as_u64()
+        .filter(|w| *w > 0)?;
+    let last_request = serde_json::from_value::<CodexUsageBucket>(last.clone())
+        .ok()
+        .and_then(|bucket| {
+            let written = last
+                .get("cacheWriteInputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let uncached = bucket
+                .input_tokens
+                .checked_sub(bucket.cached_input_tokens)?
+                .checked_sub(written)?;
+            (bucket.reasoning_output_tokens <= bucket.output_tokens).then_some(
+                crate::ContextRequestUsage {
+                    input_tokens: uncached,
+                    cache_read_tokens: bucket.cached_input_tokens,
+                    cache_creation_tokens: written,
+                    output_tokens: bucket.output_tokens,
+                    reasoning_output_tokens: Some(bucket.reasoning_output_tokens),
+                },
+            )
+        });
+    Some(crate::ContextBreakdown {
+        vendor: "codex".into(),
+        model,
+        captured_at: Utc::now(),
+        used_tokens,
+        window_tokens,
+        // Only two totals, with no invented prompt/tool/memory attribution.
+        categories: vec![
+            crate::ContextCategory {
+                id: "context_total".into(),
+                name: "Used context".into(),
+                tokens: used_tokens,
+                kind: crate::ContextCategoryKind::Used,
+                items: Vec::new(),
+            },
+            crate::ContextCategory {
+                id: "free_space".into(),
+                name: "Free space".into(),
+                tokens: window_tokens.saturating_sub(used_tokens),
+                kind: crate::ContextCategoryKind::Free,
+                items: Vec::new(),
+            },
+        ],
+        last_request,
+        ..Default::default()
+    })
 }
 
 /// One Codex usage bucket (`tokenUsage.last` / `tokenUsage.total`) exactly as
@@ -5725,6 +5824,103 @@ mod tests {
         assert_eq!(line["event"], CODEX_TOKEN_USAGE);
         assert_eq!(line["total"]["total_tokens"], 5);
         assert_eq!(line["model_context_window"], 128000);
+    }
+
+    #[tokio::test]
+    async fn context_panel_uses_latest_request_and_persists_at_turn_end() {
+        let adapter = CodexAppServerAdapter::new();
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut tracker = adapter.tracker.lock().await;
+            let entry = tracker.entry("t-context");
+            entry.model = Some("gpt-test".into());
+            entry.persist = Some(StatusPersist {
+                project_dir: tmp.path().to_path_buf(),
+                sid: "s12".into(),
+                generation: Some(1),
+            });
+        }
+        let handle = ThreadHandle {
+            vendor: AgentVendor::Codex,
+            mode: ExecutionMode::Chat,
+            identity: "t-context".into(),
+            started_at: Utc::now(),
+            raw_extras: json!({}),
+        };
+        assert!(adapter.context_breakdown(&handle).await.is_none());
+        for used in [15_765, 8_000] {
+            apply_notification_to_tracker(&adapter.tracker, &Notification {
+                method: "thread/tokenUsage/updated".into(),
+                params: json!({"threadId":"t-context","turnId":"turn-1","tokenUsage":{
+                    "total":{"totalTokens":9_000_000},"modelContextWindow":258_400,
+                    "last":{"inputTokens":used-302,"cachedInputTokens":1_000,"outputTokens":302,"reasoningOutputTokens":110,"totalTokens":used,"cacheWriteInputTokens":0}
+                }}),
+            }).await;
+            let b = adapter
+                .context_breakdown(&handle)
+                .await
+                .expect("Codex usage must reach the panel");
+            assert_eq!(b.used_tokens, used);
+            assert_eq!(b.window_tokens, 258_400);
+            assert_eq!(b.model.as_deref(), Some("gpt-test"));
+            assert_eq!(b.categories[0].tokens, used);
+            assert_eq!(b.categories[1].tokens, 258_400 - used);
+            assert!(b.messages.is_none(), "no invented per-tool accounting");
+            let last = b.last_request.unwrap();
+            assert_eq!(last.input_tokens, used - 302 - 1_000);
+            assert_eq!(last.cache_read_tokens, 1_000);
+            assert_eq!(
+                last.output_tokens, 302,
+                "reasoning is a subset, not an extra bucket"
+            );
+        }
+        let other = ThreadHandle {
+            identity: "other-thread".into(),
+            ..handle.clone()
+        };
+        assert!(adapter.context_breakdown(&other).await.is_none());
+        apply_notification_to_tracker(
+            &adapter.tracker,
+            &Notification {
+                method: "turn/completed".into(),
+                params: json!({"threadId":"t-context","turn":{"id":"turn-1"}}),
+            },
+        )
+        .await;
+        let saved = crate::execution::session_status::read_context_file(tmp.path(), "s12")
+            .expect("turn end persists context");
+        assert_eq!(saved.used_tokens, 8_000);
+        assert_eq!(
+            adapter
+                .context_breakdown(&handle)
+                .await
+                .unwrap()
+                .captured_at,
+            saved.captured_at,
+            "reading the panel does not refresh the observation time"
+        );
+    }
+
+    #[test]
+    fn context_panel_never_turns_missing_or_invalid_usage_into_zero() {
+        for usage in [
+            json!({}),
+            json!({"last":{"totalTokens":1},"modelContextWindow":null}),
+            json!({"last":{},"modelContextWindow":100}),
+            json!({"last":{"totalTokens":-1},"modelContextWindow":100}),
+        ] {
+            assert!(codex_context_usage(&usage, None).is_none());
+        }
+        let partial = codex_context_usage(
+            &json!({"last":{"totalTokens":10},"modelContextWindow":100}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(partial.used_tokens, 10);
+        assert!(
+            partial.last_request.is_none(),
+            "missing request buckets are not zero"
+        );
     }
 
     #[test]

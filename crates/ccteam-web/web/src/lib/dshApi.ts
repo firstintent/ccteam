@@ -1,8 +1,8 @@
 // v0.9.15 — DSH web first-class page. `GET /api/v1/dsh/status` reports this
 // identity's DSH web instance (operator = the real ~/.dsh; tenant = an
 // isolated per-tenant DSH_HOME), and `start`/`stop` drive its lifecycle. The
-// page itself embeds the instance through the daemon's companion port
-// (`companion_port`), which reuses the same ccteam auth — the SPA never talks
+// page itself embeds the instance through the same-origin /dsh/ proxy,
+// which reuses the same ccteam auth — the SPA never talks
 // to `dsh web` directly. Backend SoT: routes/dsh.rs.
 
 import { httpError } from "./httpError";
@@ -16,7 +16,7 @@ export interface DshStatus {
   state: DshState;
   /** The `dsh web` listen port (ephemeral) once running; absent otherwise. */
   port?: number | null;
-  /** The daemon's DSH companion listener port — the iframe's real origin.
+  /** The daemon's optional dedicated DSH companion listener port.
    *  Absent when the companion listener is off (`state:"disabled"`). */
   companion_port?: number | null;
   /** `own` = the operator's real ~/.dsh; `managed` = a ccteam-owned tenant home. */
@@ -57,14 +57,12 @@ export function isDisabled(status: DshStatus | null): boolean {
   return !!status && (status.state === "disabled" || status.disabled === true);
 }
 
-/** The embed origin: same scheme + hostname as the SPA, on the daemon's DSH
- *  companion port. Empty until the instance is serving. */
+/** Keep the browser's external origin (including TLS and any mapped port).
+ *  Internal listener ports cannot describe an HTTPS reverse proxy's address. */
 export function embedSrc(status: DshStatus | null): string | null {
   if (!status || (status.state !== "running" && status.state !== "attached")) return null;
   if (status.companion_port == null) return null;
-  if (typeof window === "undefined") return null;
-  const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:${status.companion_port}/`;
+  return "/dsh/";
 }
 
 /** Whether a hostname is loopback — the only place a DSH-loopback-bound URL is

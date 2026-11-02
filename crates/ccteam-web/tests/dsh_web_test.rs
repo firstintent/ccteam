@@ -145,7 +145,10 @@ async fn spawn_fake_dsh_origin() -> SocketAddr {
             }),
         )
         .route("/api/events.mux", get(echo_websocket))
-        .route("/api/events.host", get(echo_websocket));
+        .route("/api/events.host", get(echo_websocket))
+        .fallback(|uri: axum::http::Uri| async move {
+            (StatusCode::NOT_FOUND, format!("unexpected upstream URI: {uri}"))
+        });
     spawn_app(app).await
 }
 
@@ -208,6 +211,74 @@ async fn companion_compresses_assets_after_splicing_html() {
     let decoded_html = gunzip(&html.bytes().await.unwrap());
     assert!(decoded_html.contains("randomUUID"));
     assert!(decoded_html.contains("<body>dsh web</body>"));
+}
+
+#[tokio::test]
+async fn main_origin_dsh_mount_proxies_html_assets_and_websockets_with_auth() {
+    let origin = spawn_fake_dsh_origin().await;
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let supervisor = supervisor_for(&paths.root, Some(format!("http://{origin}")));
+    let state =
+        AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into())).with_dsh_web(supervisor);
+    let addr = spawn_app(router_with_state(state)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    for path in ["/dsh/", "/dsh/client.js", "/dsh/api/events.mux"] {
+        assert_eq!(
+            client
+                .get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+    for (path, marker) in [
+        ("/dsh/", "<body>dsh web</body>"),
+        ("/dsh/client.js", "window.__DSH_ASSET__"),
+    ] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .header(header::COOKIE, format!("ccteam_token={TOKEN_HEX}"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{path}: {body}");
+        assert!(body.contains(marker));
+    }
+    let request = Request::builder()
+        .uri(format!("ws://{addr}/dsh/api/events.mux"))
+        .header(header::HOST, addr.to_string())
+        .header(header::COOKIE, format!("ccteam_token={TOKEN_HEX}"))
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "mounted".into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+        "mounted"
+    );
+    socket.close(None).await.unwrap();
 }
 
 #[tokio::test]

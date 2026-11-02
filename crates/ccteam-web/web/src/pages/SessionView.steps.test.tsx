@@ -45,6 +45,12 @@ describe("SessionView step view", () => {
   let fetched: string[];
 
   beforeEach(() => {
+    // Layout observers are browser APIs; jsdom does not implement them.
+    vi.stubGlobal("ResizeObserver", class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
     fetched = [];
     let rows: TranscriptRow[] = [];
     rows = appendEvent(rows, activity({ summary: "Bash(ls)", status: "started", item_id: "t1" }));
@@ -85,6 +91,7 @@ describe("SessionView step view", () => {
     host.remove();
     localStorage.clear();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   const q = (id: string) => host.querySelector(`[data-testid="${id}"]`);

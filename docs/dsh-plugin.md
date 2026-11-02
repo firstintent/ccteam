@@ -144,7 +144,7 @@ same OS user all share one home and one daemon. The rules:
 
 ## 4. The Engine section, the first screen and the banner
 
-**Settings card.** DSH **Settings → Plugins → Plugin configuration →
+**Settings card.** DSH **Settings →
 ccteam-ui** opens with the **Engine** section:
 
 - **State** — a dot and one of: *Reading engine state…* · **Running**
@@ -187,7 +187,7 @@ engine is not on this machine; there is nothing here to start or stop.*
 **Inside the workbench.** The header carries an **Engine: <state>** dot;
 clicking it opens the same engine panel inside the workbench (DSH gives a
 plugin no way to jump to its settings page, so the panel ends with *Engine
-settings: DSH Settings → Plugins → Plugin configuration → ccteam-ui*); **Esc**
+settings: DSH Settings → ccteam-ui*); **Esc**
 closes it. On first use the workbench is gated on the engine:
 
 - **The ccteam engine is not running** — with the reason (*The engine is
@@ -211,12 +211,10 @@ closes it. On first use the workbench is gated on the engine:
 
 ## 5. Configure the faces
 
-The same card holds the connection settings. DSH shows this tab only to a
-browser it considers the operator's own machine: open a hand-started
-`dsh web` from `127.0.0.1`, or go through ccteam's DSH page, which declares
-the page owns its Host (see usage.md → DSH Web; on 0.1.1-rc.2 and earlier
-ccteam back-ports that read into the served client bundle); a native
-`dsh web` opened over a LAN address leaves the tab empty.
+The same card holds the connection settings. DSH persists live preferences
+in the profile's native configuration. Credentials remain write-only; the
+card reads only the Host's configured-state metadata. Registering the plugin
+again preserves preferences and credentials already saved in that profile.
 
 | Field | What it is | When you fill it |
 |---|---|---|
@@ -250,7 +248,7 @@ to it, and the details sheet slides over the conversation.
   parent. The dot is the daemon’s activity verdict first (animated = working,
   green = idle, amber = stale, red = stuck); a settled session then shows its
   residency — a hollow ring means the daemon released its process after the
-  harness’s prompt-cache TTL and it resumes by sid on the next message, a
+  configured idle window (250 minutes by default) and it resumes by sid on the next message, a
   dimmed disc (with a “stopped” caption) means you stopped it. Hovering a
   row explains the state. Project headers fold and show the project’s total
   cost; hovering one reveals **⋯** (new session, copy slug, expand only this
@@ -308,7 +306,7 @@ completion count for turns finished since the last open; opening it clears
 the badge.
 
 The workbench needs the native sidebar-footer and overlay seats DSH ships
-since 0.1.0-rc.7.
+through its public plugin slots.
 
 ## 7. Troubleshooting
 
@@ -323,13 +321,16 @@ since 0.1.0-rc.7.
 | **`duplicate loader entry id` at boot** | The plugin was inserted twice (for example, registry plus bundle patch, or a hand-edited `cordis.patch.yml`). Keep exactly one entry and remove the duplicate. ccteam's own registration never adds a second entry next to one you installed. |
 | **`cordis.patch.yml` came back reformatted or without its comments** | The first time ccteam registers into a profile you manage by hand, it re-serializes the patch file: formatting is normalized and YAML comments are not preserved (`serde_yaml` has no comment-preserving round-trip). After that ccteam never rewrites the file unless its content changes — a repeated registration is byte-identical — and every write is atomic (temp file + rename, mode 0600). Keep notes outside the patch file. |
 | **`ccteam doctor` warns `plugin_version_mismatch`** | Your own `dsh plugin add` copy differs from the version this ccteam embeds. ccteam leaves it alone; run `dsh plugin --profile web update @ccteam/ccteam-ui`. |
-| **No ccteam button in the sidebar** | The plugin needs DSH 0.1.0-rc.7 or newer (the native sidebar footer and overlay seats). Update DSH; then check Settings → Plugins → Plugin list shows `ccteam-ui` as Enabled. |
+| **No ccteam button in the sidebar** | The plugin needs DSH 0.2.2-alpha.2 or newer (the native sidebar footer and overlay seats). Update DSH; then check Settings → Plugins → Plugin list shows `ccteam-ui` as Enabled. |
 | **Plain-HTTP LAN problems** | See [usage.md](usage.md) → “Access and security” for the DSH Web security-context note. |
 | **Human DSH turns missing from ccteam** | Expected: turns typed in DSH’s own UI remain harness-native. ccteam’s ledger and transcript contain only turns ccteam routed; DSH keeps the complete conversation. |
 
 ## 8. Versions and updates
 
-Use **DSH 0.1.0-rc.7 or newer**.
+The plugin uses the native Config/forms and public slots provided by
+**DSH 0.2.2-alpha.2**. DSH and ccteam versions are independent: DSH resolves
+its own presets and default, so adding a preset needs no ccteam update.
+Breaking changes to DSH's plugin APIs still require adapting those APIs.
 
 **Version lockstep.** Each plugin release pins the engine version it was
 published with (`ccteam.engine` in its `package.json`, equal to the

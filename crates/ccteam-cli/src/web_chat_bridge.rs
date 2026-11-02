@@ -198,7 +198,7 @@ mod tests {
         }
     }
 
-    /// `/newproject` scaffolds through `bootstrap_project_at_dir`, whose
+    /// `/newproject` scaffolds through `create_project`, whose
     /// `pre_trust_project` step writes a trust entry into `~/.claude.json` —
     /// the ONE path in this stack that resolves off `$HOME` rather than off
     /// the injected root. Switch it off process-wide, once, exactly as
@@ -855,6 +855,9 @@ mod tests {
 
         // `/newproject <slug> <path>` scaffolds at the path and registers it.
         let proj_dir = home.path().join("code").join("demo");
+        ccteam_core::ProjectState::initial_for_team("old".into(), "ops".into())
+            .save(&CcteamPaths::project_state_in(&proj_dir))
+            .unwrap();
         send_text(
             &mut socket,
             "newproject",
@@ -864,8 +867,13 @@ mod tests {
         recv_reply_contains(&mut socket, "已创建并切换到 demo").await;
 
         assert!(proj_dir.join(".ccteam").join("state.json").exists());
+        assert!(proj_dir.join("AGENTS.md").is_file());
+        assert!(proj_dir.join(".gitignore").is_file());
+        assert!(!proj_dir.join("CLAUDE.md").exists());
+        assert!(!proj_dir.join(".ccteam/workflow.yaml").exists());
         let state = ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&proj_dir))
             .expect("chat-created project state");
+        assert_eq!(state.team, "ops");
         assert_eq!(
             state.owner.as_deref(),
             Some("user:web-api"),

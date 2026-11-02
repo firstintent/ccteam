@@ -536,7 +536,7 @@ pub struct CcteamHookScrubReport {
 /// stream-json session is hookless: its events come from stdout, HITL from
 /// `can_use_tool`). Projects created before that still carry the old
 /// `hooks` block, so `ccteam init` (fresh or re-run), the web/IM create path
-/// (`bootstrap_project_at_dir`) and `project rm --purge` all run this to
+/// (`create_project`) and `project rm --purge` all run this to
 /// clean them.
 ///
 /// **Scope (red line).** Removes ONLY entries whose `command` is a ccteam

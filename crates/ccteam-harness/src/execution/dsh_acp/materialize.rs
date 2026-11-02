@@ -1134,7 +1134,13 @@ fn merged_profile_patch_yaml(
     // inserted the row, and an empty override would say nothing.
     let mut ours: Vec<(&PluginAsset, serde_yaml::Mapping)> = Vec::new();
     if !spec.config.is_empty() {
-        ours.push((&UI_PLUGIN, flat_config(spec.config.entries())));
+        let mut config = flat_config(spec.config.entries());
+        // Engine ownership is explicit; credentials can also be entered by a human.
+        config.insert(
+            serde_yaml::Value::String("engineManaged".into()),
+            serde_yaml::Value::Bool(true),
+        );
+        ours.push((&UI_PLUGIN, config));
     }
     // Rows naming a former ccteam package ccteam itself wrote are pruned
     // whatever their id; every other row survives byte-for-byte.
@@ -1185,10 +1191,22 @@ fn merged_profile_patch_yaml(
                     serde_yaml::Value::String("name".to_string()),
                     serde_yaml::Value::String(plugin.bundle.to_string()),
                 );
-                row.insert(
-                    serde_yaml::Value::String("config".to_string()),
-                    serde_yaml::Value::Mapping(config),
-                );
+                // Native live settings share this row with our wiring. Preserve
+                // preferences and credentials this registration did not supply.
+                let key = serde_yaml::Value::String("config".to_string());
+                let mut merged = match row.get(&key) {
+                    None | Some(serde_yaml::Value::Null) => Mapping::new(),
+                    Some(serde_yaml::Value::Mapping(existing)) => existing.clone(),
+                    Some(_) => {
+                        return Err(HarnessError::SpawnFailed(format!(
+                            "DSH profile patch {} row `{}` config must be a mapping",
+                            path.display(),
+                            plugin.row_id
+                        )))
+                    }
+                };
+                merged.extend(config);
+                row.insert(key, serde_yaml::Value::Mapping(merged));
             }
             None => {
                 let mut row = serde_yaml::Mapping::new();
@@ -1657,6 +1675,54 @@ mod tests {
             EMPTY_PATCH_YAML,
             "no config of ours to install => an empty patch list"
         );
+    }
+
+    #[test]
+    fn registration_preserves_native_live_settings_for_owned_and_operator_profiles() {
+        for policy in [ManifestPolicy::Owned, ManifestPolicy::MergeOnly] {
+            let root = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let mut spec = wired_web();
+            spec.manifest = policy;
+            let out = materialize_profile_in(root.path(), home.path(), spec).unwrap();
+            let path = out.profile_dir.join("cordis.patch.yml");
+            let mut patch = read_patch(&out.profile_dir);
+            let config = patch.as_sequence_mut().unwrap()[0]["config"]
+                .as_mapping_mut()
+                .unwrap();
+            for (key, value) in [
+                ("autoStart", serde_yaml::Value::Bool(false)),
+                (
+                    "enginePath",
+                    serde_yaml::Value::String("/opt/ccteam".into()),
+                ),
+                (
+                    "defaultProject",
+                    serde_yaml::Value::String("my-project".into()),
+                ),
+                (
+                    "enrollment",
+                    serde_yaml::Value::String("ccteam-enroll:saved:secret".into()),
+                ),
+            ] {
+                config.insert(serde_yaml::Value::String(key.into()), value);
+            }
+            fs::write(&path, serde_yaml::to_string(&patch).unwrap()).unwrap();
+            spec.config.enrollment = None;
+            spec.config.daemon_url = Some("http://127.0.0.1:9999");
+            materialize_profile_in(root.path(), home.path(), spec).unwrap();
+            let patch = read_patch(&out.profile_dir);
+            let config = &ccteam_row(&patch)["config"];
+            assert_eq!(config["autoStart"], serde_yaml::Value::Bool(false));
+            assert_eq!(config["enginePath"].as_str(), Some("/opt/ccteam"));
+            assert_eq!(config["defaultProject"].as_str(), Some("my-project"));
+            assert_eq!(
+                config["enrollment"].as_str(),
+                Some("ccteam-enroll:saved:secret")
+            );
+            assert_eq!(config["daemonUrl"].as_str(), Some("http://127.0.0.1:9999"));
+            assert_eq!(config["engineManaged"], serde_yaml::Value::Bool(true));
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@
  * Seats:
  *   1. `sidebar.footer.action` — the entry button beside DSH's Settings trigger
  *   2. `shell.overlay`         — the workbench (team tree / conversation / details)
- *   3. `settings.plugin.item`  — the ccteam settings card
+ *   3. `settings.section`  — the ccteam settings card
  *
  * All network traffic goes through the host BFF (src/shared/contract.ts).
  */
@@ -38,7 +38,7 @@ import { CCTEAM_CARD, SettingsCardController } from './settings/form.js'
 export const name = 'ccteam-ui'
 
 /** Services required by this plugin (cordis fiber inject). */
-export const inject = ['slots', 'locale', 'settingsScope']
+export const inject = ['slots', 'locale']
 
 function browserStorage(): StorageLike | undefined {
   try {
@@ -52,7 +52,7 @@ function browserStorage(): StorageLike | undefined {
 
 /**
  * Plugin body: wire the store/api/stream and contribute the three seats.
- * @param ctx - client cordis context (slots + locale + settingsScope services injected).
+ * @param ctx - client cordis context (slots and locale).
  */
 export function apply(ctx: CcteamClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ccteam-ui: dictionaries')
@@ -137,21 +137,20 @@ export function apply(ctx: CcteamClientContext): void {
     inject: face,
   }, Workbench))
 
-  // One card for the one ccteam settings namespace — every face of this plugin
-  // is configured from it. The configurable-plugins tab dispatches by namespace
-  // and renders nothing for one the Host does not serve, so the card is inert
-  // wherever the host half did not load.
-  const card = new SettingsCardController(
-    ctx.settingsScope.bind({ namespace: CCTEAM_CARD.namespace }),
-    CCTEAM_CARD,
-  )
-  ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-    name: 'settings.plugin.item',
-    key: card.spec.namespace,
-    locale: NS,
-    // The card face plus the workbench store (its engine slice), the write
-    // path, and the BFF client — the 「引擎」 section is one seat of the same
-    // state the workbench header and first-run panel read.
-    inject: () => ({ ...card.inject(), hooks: { card, console: store }, dispatch: store.dispatch, api }),
-  }, SettingsCard))
+  // Optional settings follow the native served-namespace and slot lifetimes.
+  ctx.inject(['configForms'], ctx => {
+    const card = new SettingsCardController(
+      ctx.configForms.get(CCTEAM_CARD.namespace), CCTEAM_CARD, ctx.configForms.describe(),
+    )
+    ctx.effect(() => () => card.dispose(), 'ccteam-ui: settings form')
+    ctx.effect(() => ctx.configForms.whileServed([CCTEAM_CARD.namespace], () =>
+      ctx.slots.inject('settings.section', () => ctx.slots.register({
+        name: 'settings.section',
+        id: card.spec.namespace,
+        label: () => ctx.locale.bind(NS)('settings.card.title'),
+        locale: NS,
+        inject: () => ({ ...card.inject(), hooks: { card, console: store }, dispatch: store.dispatch, api }),
+      }, SettingsCard)),
+    ), 'ccteam-ui: settings section')
+  })
 }

@@ -13,8 +13,14 @@
     "test:unit": "vitest run"
   },
   "dependencies": {
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
+    "@pierre/trees": "1.0.0-beta.6",
     "@tailwindcss/vite": "^4.2.2",
     "@tanstack/react-table": "^8.21.3",
+    "@uiw/react-codemirror": "4.25.12",
     "@wterm/core": "^0.1.8",
     "@wterm/dom": "^0.1.8",
     "@wterm/react": "^0.1.8",
@@ -27,6 +33,7 @@
     "react": "^19.2.4",
     "react-diff-viewer-continued": "^4.2.2",
     "react-dom": "^19.2.4",
+    "react-resizable-panels": "4.16.1",
     "react-router-dom": "^7.14.2",
     "remark-gfm": "^4.0.1",
     "shiki": "^4.0.2",

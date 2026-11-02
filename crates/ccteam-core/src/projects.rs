@@ -1,6 +1,7 @@
-//! Project bootstrap helpers used by `ccteam project new` (and reusable by the
-//! M3+ inbox triage path). Pure: no tmux side effects, just file
-//! creation under `~/projects/<slug>/`.
+//! Project creation. [`create_project`] is the one path every entry (`ccteam
+//! init`, web `POST /projects`, IM `/newproject`, the satellite project binding)
+//! goes through; the rest are slug and path helpers around it. Pure: no tmux
+//! side effects, just file creation in the project working tree.
 
 use std::path::{Path, PathBuf};
 
@@ -212,28 +213,89 @@ fn pick_unused_with_prefixed(paths: &CcteamPaths, prefixed: &str) -> Result<Stri
     unreachable!("integer accumulation always finds a free slug")
 }
 
-/// Write the bootstrap files for a fresh project:
-/// - `<project>/.ccteam/state.json` ← `ProjectState::initial_for_team(slug, team)`
-/// - `<project>/.claude/settings.local.json` ← managed hooks + base
-/// - `<project>/.claude/agents/cto.md` ← default IM/chat persona
+/// What a project creation is made from. See [`create_project`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewProject<'a> {
+    pub slug: &'a str,
+    /// The working tree. Created when absent; files already in it are left alone.
+    pub dir: &'a Path,
+    /// `None` = `dev` for a fresh project, keep the recorded team on a refresh.
+    pub team: Option<&'a str>,
+    /// `ProjectState.owner` to stamp. `None` = leave unowned (fresh) / keep the
+    /// existing owner (refresh).
+    pub owner: Option<&'a str>,
+}
+
+/// What [`create_project`] did, for the callers' receipts.
+#[derive(Debug, Clone)]
+pub struct NewProjectReport {
+    pub dir: PathBuf,
+    /// `false` = `.ccteam/state.json` already existed and was refreshed.
+    pub fresh: bool,
+    /// The team now recorded in `state.json` and the registry.
+    pub team: String,
+    /// The owner now recorded in `state.json`.
+    pub owner: Option<String>,
+    /// A placeholder `AGENTS.md` was written (the project had neither
+    /// `CLAUDE.md` nor `AGENTS.md`).
+    pub agents_md_scaffolded: bool,
+    /// What happened to old ccteam hooks in `.claude/settings.local.json`;
+    /// `None` when that file could not be inspected at all.
+    pub settings_scrub: Option<crate::tool_surface::CcteamHookScrubReport>,
+}
+
+/// The one way a project comes into being — `ccteam init`, web
+/// `POST /projects`, IM `/newproject` and the satellite project binding all
+/// call this, so every entry leaves the same files behind:
 ///
-/// v0.8.6: ccteam no longer generates a project `CLAUDE.md` /
-/// `AGENTS.md` (project knowledge is vendor-native, owned by the
-/// project) nor a `.ccteam/spec.md`; `.ccteam/` keeps only `state.json`
-/// (+ `workflow.yaml`, written elsewhere). `request` is retained for
-/// API stability but no longer persisted.
+/// - `<project>/.ccteam/state.json` (created, or refreshed when present);
+/// - `<project>/AGENTS.md` — a placeholder, only when the project has neither
+///   `CLAUDE.md` nor `AGENTS.md`;
+/// - `.ccteam/` appended to `<project>/.gitignore`;
+/// - the global `~/.ccteam/` home, a trust entry in `~/.claude.json`, and the
+///   `config.yaml` registry entry.
 ///
-/// `team` lands in state.json so downstream routing can pick the
-/// matching workflow.
-///
-/// Returns the full project directory path.
+/// It writes no role (`.claude/agents/` stays the project's), no Claude
+/// settings (and strips the hooks an older ccteam wrote there), no
+/// `workflow.yaml`, and never overwrites an existing project file.
+pub fn create_project(paths: &CcteamPaths, new: &NewProject<'_>) -> Result<NewProjectReport> {
+    let report = scaffold_project(paths, new)?;
+    crate::config::upsert_project(
+        &paths.root,
+        crate::config::ProjectEntry {
+            slug: new.slug.to_string(),
+            path: new.dir.to_path_buf(),
+            host: crate::host_registry::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
+            team: report.team.clone(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .context("register project in ~/.ccteam/config.yaml")?;
+    Ok(report)
+}
+
+/// Test-fixture shorthand: scaffold `<projects_root>/<slug>/` WITHOUT touching
+/// the `config.yaml` registry (the layout `CcteamPaths::project_dir` falls back
+/// to). Production creates go through [`create_project`]. `request` is unused.
 pub fn bootstrap_project(
     paths: &CcteamPaths,
     slug: &str,
-    request: &str,
+    _request: &str,
     team: &str,
 ) -> Result<PathBuf> {
-    bootstrap_project_at_dir(paths, &paths.project_dir(slug), slug, request, team)
+    let dir = paths.project_dir(slug);
+    scaffold_project(
+        paths,
+        &NewProject {
+            slug,
+            dir: &dir,
+            team: Some(team),
+            owner: None,
+        },
+    )?;
+    Ok(dir)
 }
 
 /// Materialize the daemon-side state home for a remote project without
@@ -260,22 +322,13 @@ pub fn ensure_project_data_home(
     Ok(data_home.to_path_buf())
 }
 
-/// V0.4.2 F72: `bootstrap_project` generalized to install at an
-/// arbitrary `target_dir`. Used by `ccteam init` to bring an existing
-/// repo under management without moving files. Side effects (trust-marking)
-/// still use `paths.root` / `paths.projects_root`, since those are global
-/// concerns.
-///
-/// `target_dir` is created if it doesn't exist. Existing files inside
-/// it are left alone — this is the **fresh-install** path. Idempotent
-/// refresh of an already-installed project lives in `ccteam init`'s
-/// refresh helpers; this function assumes the caller already decided
-/// "this is a new install".
 /// v0.8.9 (owner decision) — scaffold body for an EMPTY project's `AGENTS.md`.
 /// It tells a bare / roleless agent the project is uninitialized so it asks the
 /// user to set it up instead of spinning on an under-specified task. Written
 /// ONLY when the project has neither `CLAUDE.md` nor `AGENTS.md` (see
-/// [`bootstrap_project_at_dir`]); never overwrites existing content.
+/// [`create_project`]); never overwrites existing content. It is the only
+/// knowledge file ccteam writes: Claude Code reads `AGENTS.md` itself when a
+/// project has no `CLAUDE.md`, and Codex and the ACP harnesses read it natively.
 const EMPTY_PROJECT_AGENTS_MD: &str = "\
 # Project guide
 
@@ -294,80 +347,57 @@ Until this file is filled in, keep replies short, ask clarifying questions, and
 do **not** guess at the task or start open-ended exploration.
 ";
 
-const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
-# Edit this file to declare your project's agent topology. Each agent
-# is a role (filename of .claude/agents/<role>.md) with a trigger that
-# decides when ccteam spawns a session for it.
-#
-# Trigger grammar:
-#   manual                        # explicit `ccteam spawn <slug> <role>` only
-#   schedule                      # periodic; needs `schedule:` 5-field cron
-#   gate                          # waits for `trigger_gate` MCP / CLI call
-#   watch:.ccteam/issues/         # spawn one session per new file under the path
-name: default-workflow
-description: |
-  Minimal starter workflow. Edit me — declare your own agents below.
-  (v0.9.0: ccteam seeds no default role; sessions are roleless unless
-  you author `.claude/agents/<role>.md` or install one from the hub.)
-
-agents: {}
-"#;
-
-/// Write the standard `.ccteam/workflow.yaml` project scaffold. Existing
-/// content is preserved unless `force` is true.
-pub fn scaffold_workflow_yaml(target: &Path, force: bool) -> Result<()> {
-    let ccteam_dir = target.join(".ccteam");
-    std::fs::create_dir_all(&ccteam_dir)
-        .with_context(|| format!("create {}", ccteam_dir.display()))?;
-    let path = ccteam_dir.join("workflow.yaml");
-    if path.exists() && !force {
-        return Ok(());
-    }
-    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-pub fn bootstrap_project_at_dir(
-    // `paths` is the global `~/.ccteam/` root. It feeds the
-    // home-ensure below (`ensure_ccteam_home`).
-    paths: &CcteamPaths,
-    target_dir: &Path,
-    slug: &str,
-    // v0.8.6: `request` is no longer persisted (no `.ccteam/spec.md`,
-    // no generated `CLAUDE.md`); kept in the signature for API
-    // stability so existing callers don't churn.
-    _request: &str,
-    team: &str,
-) -> Result<PathBuf> {
+/// The disk half of [`create_project`] (no registry write). Everything here is
+/// idempotent: a re-run refreshes `state.json` and adds nothing twice.
+fn scaffold_project(paths: &CcteamPaths, new: &NewProject<'_>) -> Result<NewProjectReport> {
+    let slug = new.slug;
     // Materialize the global `~/.ccteam/` home (canonical dirs + the
-    // `hooks/hook.sh` dispatcher) so every create path — `ccteam init`, web
-    // `POST /projects`, IM/web chat create — leaves the same complete home.
-    // Idempotent (cheap no-op when the home is already complete).
+    // `hooks/hook.sh` dispatcher) so every create path leaves the same
+    // complete home. Idempotent (cheap no-op when the home is already complete).
     crate::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home")?;
 
-    let project_dir = target_dir.to_path_buf();
+    let project_dir = new.dir.to_path_buf();
     let ccteam_dir = project_dir.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
         .with_context(|| format!("create {}", ccteam_dir.display()))?;
 
-    let state = ProjectState::initial_for_team(slug.to_string(), team.to_string());
-    state.save(&CcteamPaths::project_state_in(&project_dir))?;
+    let state_path = CcteamPaths::project_state_in(&project_dir);
+    let fresh = !state_path.exists();
+    let mut state = if fresh {
+        match new.team {
+            Some(team) => ProjectState::initial_for_team(slug.to_string(), team.to_string()),
+            None => ProjectState::initial(slug.to_string()),
+        }
+    } else {
+        // A re-create never resets what the project has accumulated.
+        let mut state = ProjectState::load(&state_path)
+            .with_context(|| format!("load existing {}", state_path.display()))?;
+        state.slug = slug.to_string();
+        state.tmux_session = format!("ccteam-{slug}");
+        if let Some(team) = new.team {
+            state.team = team.to_string();
+        }
+        state
+    };
+    if let Some(owner) = new.owner {
+        state.owner = Some(owner.to_string());
+    }
+    state.save(&state_path)?;
 
     // docs-local issue #212 — ccteam writes NO Claude settings for a project.
     // The `.claude/settings.local.json` hooks block it used to lay down only
     // served the retired tmux/rmux terminal protocol (the default stream-json
     // session is hookless), and creating that file for ccteam alone is
     // exactly what the owner ruled out. A directory that already carries
-    // ccteam's old hooks (a re-bootstrap over an earlier project) gets them
+    // ccteam's old hooks (a re-create over an earlier project) gets them
     // stripped instead; every other key and any user hook survive.
     // Best-effort: a user file that is unreadable or not valid JSON (empty,
     // trailing comma) is left untouched and never fails project creation.
     let settings_local = project_dir.join(".claude").join("settings.local.json");
-    match crate::tool_surface::remove_ccteam_hooks(&settings_local, false) {
+    let settings_scrub = match crate::tool_surface::remove_ccteam_hooks(&settings_local, false) {
         Ok(report) => {
             use crate::tool_surface::CcteamHookScrubAction as A;
-            match report.action {
+            match &report.action {
                 A::Unreadable { error } => tracing::warn!(
                     path = %settings_local.display(),
                     %error,
@@ -380,13 +410,17 @@ pub fn bootstrap_project_at_dir(
                 ),
                 _ => {}
             }
+            Some(report)
         }
-        Err(err) => tracing::warn!(
-            path = %settings_local.display(),
-            error = %err,
-            "could not strip old ccteam hooks from .claude/settings.local.json",
-        ),
-    }
+        Err(err) => {
+            tracing::warn!(
+                path = %settings_local.display(),
+                error = %err,
+                "could not strip old ccteam hooks from .claude/settings.local.json",
+            );
+            None
+        }
+    };
     // v0.8.6 (review-fix #3): no longer stamp `~/.ccteam/templates/`.
     // `HELPER_TEMPLATES` has been empty since V0.5.0 F101, so the writer
     // only ever created an empty `templates/` dir that is *not* in
@@ -405,8 +439,8 @@ pub fn bootstrap_project_at_dir(
 
     // v0.9.0 W2 (F6.1) — engine neutralization: ccteam seeds NO role. A fresh
     // project's `.claude/agents/` is left untouched (not even created); the
-    // default session is roleless (bare vendor reads the project CLAUDE.md /
-    // AGENTS.md). Orchestration personas live 100% in user space / the hub.
+    // default session is roleless (bare vendor reads the project's
+    // AGENTS.md / CLAUDE.md). Orchestration personas live 100% in user space / the hub.
 
     // v0.8.9 (owner decision) — scaffold a minimal project brain for an EMPTY
     // project so a roleless / bare-claude session asks the user to initialize
@@ -414,16 +448,14 @@ pub fn bootstrap_project_at_dir(
     // has NEITHER CLAUDE.md NOR AGENTS.md (either present ⇒ a real project —
     // never touch it). This deliberately relaxes the earlier "ccteam never
     // generates the project knowledge layer" red-line, scoped to the
-    // empty-project bootstrap and never overwriting existing content.
-    let claude_md = project_dir.join("CLAUDE.md");
+    // empty-project bootstrap and never overwriting existing content. Only
+    // `AGENTS.md` is written (issue #222): a second `CLAUDE.md` that just
+    // `@import`s it added nothing.
     let agents_md = project_dir.join("AGENTS.md");
-    if !claude_md.exists() && !agents_md.exists() {
+    let agents_md_scaffolded = !project_dir.join("CLAUDE.md").exists() && !agents_md.exists();
+    if agents_md_scaffolded {
         std::fs::write(&agents_md, EMPTY_PROJECT_AGENTS_MD)
             .with_context(|| format!("write {}", agents_md.display()))?;
-        // CLAUDE.md reuses AGENTS.md as the single source of truth via Claude
-        // Code's `@import` (Codex reads AGENTS.md directly).
-        std::fs::write(&claude_md, "@AGENTS.md\n")
-            .with_context(|| format!("write {}", claude_md.display()))?;
     }
 
     // v0.8.9 (owner request) — keep `.ccteam/` out of git: add a `.ccteam/`
@@ -452,7 +484,14 @@ pub fn bootstrap_project_at_dir(
         }
     }
 
-    Ok(project_dir)
+    Ok(NewProjectReport {
+        dir: project_dir,
+        fresh,
+        team: state.team,
+        owner: state.owner,
+        agents_md_scaffolded,
+        settings_scrub,
+    })
 }
 
 /// Pre-mark `project_dir` as trusted in `~/.claude.json` so the first
@@ -1168,6 +1207,34 @@ mod tests {
         );
     }
 
+    /// `create_project` with the defaults the web / IM / satellite entries pass.
+    fn create_demo(paths: &CcteamPaths, dir: &Path) -> NewProjectReport {
+        create_project(
+            paths,
+            &NewProject {
+                slug: "demo",
+                dir,
+                team: Some("dev"),
+                owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Every regular file under `root`, recursively.
+    fn walk(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     #[test]
     fn bootstrap_project_does_not_create_templates_dir() {
         // v0.8.6 (review-fix #3): `HELPER_TEMPLATES` has been empty since
@@ -1219,7 +1286,7 @@ mod tests {
     /// the hooks an earlier ccteam wrote strips exactly those: user keys, a
     /// user hook in the same event section and `settings.json` survive.
     #[test]
-    fn bootstrap_project_at_dir_strips_old_ccteam_hooks() {
+    fn create_project_strips_old_ccteam_hooks() {
         ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1257,7 +1324,7 @@ mod tests {
         );
         std::fs::write(&committed, &committed_body).unwrap();
 
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(re-create)", "dev").unwrap();
+        create_demo(&paths, &project_dir);
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
         assert_eq!(v["model"], "opus", "user key kept");
@@ -1281,7 +1348,7 @@ mod tests {
     /// docs-local issue #212 — an empty or invalid user settings.local.json
     /// never fails project creation and is left exactly as it was.
     #[test]
-    fn bootstrap_project_at_dir_tolerates_unparseable_settings_local() {
+    fn create_project_tolerates_unparseable_settings_local() {
         ensure_isolation();
         for (name, body) in [("empty", ""), ("comma", "{\"model\": \"opus\",}")] {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -1294,18 +1361,26 @@ mod tests {
             std::fs::create_dir_all(local.parent().unwrap()).unwrap();
             std::fs::write(&local, body).unwrap();
 
-            bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev")
-                .unwrap_or_else(|e| panic!("{name}: bootstrap must not fail: {e:#}"));
+            create_project(
+                &paths,
+                &NewProject {
+                    slug: "demo",
+                    dir: &project_dir,
+                    team: Some("dev"),
+                    owner: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: create must not fail: {e:#}"));
             assert!(CcteamPaths::project_state_in(&project_dir).exists());
             assert_eq!(std::fs::read_to_string(&local).unwrap(), body, "{name}");
         }
     }
 
     /// Every create path (web / IM / daemon all flow through
-    /// `bootstrap_project_at_dir`) leaves a complete ccteam home:
+    /// `create_project`) leaves a complete ccteam home:
     /// `ensure_ccteam_home` runs up front, so hook.sh lands + is exec.
     #[test]
-    fn bootstrap_project_at_dir_materializes_hook_sh() {
+    fn create_project_materializes_hook_sh() {
         ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1314,13 +1389,12 @@ mod tests {
         };
         let project_dir = tmp.path().join("workspace").join("my-repo");
 
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
-            .unwrap();
+        create_demo(&paths, &project_dir);
 
         let hook_sh = paths.hooks_script();
         assert!(
             hook_sh.exists(),
-            "bootstrap_project_at_dir must materialize {}",
+            "create_project must materialize {}",
             hook_sh.display(),
         );
         let body = std::fs::read_to_string(&hook_sh).unwrap();
@@ -1353,7 +1427,7 @@ mod tests {
     /// re-run must succeed and leave hook.sh in place (it underpins the
     /// daemon-start + every create path, all of which may run repeatedly).
     #[test]
-    fn bootstrap_empty_project_scaffolds_claude_and_agents_md() {
+    fn create_empty_project_scaffolds_only_agents_md() {
         ensure_isolation();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1362,30 +1436,138 @@ mod tests {
         };
         let project_dir = tmp.path().join("workspace").join("empty-repo");
 
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
-            .unwrap();
+        let report = create_demo(&paths, &project_dir);
 
-        let agents_md = project_dir.join("AGENTS.md");
-        let claude_md = project_dir.join("CLAUDE.md");
+        assert!(report.agents_md_scaffolded);
         assert!(
-            agents_md.exists(),
-            "an empty project must get a scaffolded AGENTS.md"
-        );
-        assert!(
-            claude_md.exists(),
-            "an empty project must get a scaffolded CLAUDE.md"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&claude_md).unwrap(),
-            "@AGENTS.md\n",
-            "CLAUDE.md must @-import AGENTS.md (single source of truth)"
-        );
-        assert!(
-            std::fs::read_to_string(&agents_md)
+            std::fs::read_to_string(project_dir.join("AGENTS.md"))
                 .unwrap()
                 .contains("has not been initialized"),
             "scaffolded AGENTS.md must prompt the user to initialize the project"
         );
+        assert!(
+            !project_dir.join("CLAUDE.md").exists(),
+            "issue #222: no CLAUDE.md alongside the AGENTS.md placeholder"
+        );
+        assert!(
+            !project_dir.join(".ccteam").join("workflow.yaml").exists()
+                && !project_dir.join("workflow.yaml").exists(),
+            "issue #222: creation seeds no workflow.yaml"
+        );
+    }
+
+    /// Issue #222 — the whole footprint of a creation, pinned in one place: every
+    /// entry point goes through `create_project`, so this is what each of them
+    /// leaves behind.
+    #[test]
+    fn create_project_footprint_is_state_agents_md_gitignore_and_registry() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("repo");
+
+        let report = create_project(
+            &paths,
+            &NewProject {
+                slug: "demo",
+                dir: &project_dir,
+                team: None,
+                owner: Some("user:alice"),
+            },
+        )
+        .unwrap();
+
+        assert!(report.fresh);
+        assert_eq!(report.team, "dev", "no team given → the default");
+        assert_eq!(report.owner.as_deref(), Some("user:alice"));
+
+        let mut files: Vec<String> = Vec::new();
+        for entry in walk(&project_dir) {
+            files.push(
+                entry
+                    .strip_prefix(&project_dir)
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            );
+        }
+        files.sort();
+        assert_eq!(
+            files,
+            [".ccteam/state.json", ".gitignore", "AGENTS.md"],
+            "a creation writes exactly these files into the project"
+        );
+
+        let state = ProjectState::load(&CcteamPaths::project_state_in(&project_dir)).unwrap();
+        assert_eq!(state.slug, "demo");
+        assert_eq!(state.owner.as_deref(), Some("user:alice"));
+
+        let entry = crate::config::load(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .find(|p| p.slug == "demo")
+            .expect("create_project registers the project in config.yaml");
+        assert_eq!(entry.path, project_dir);
+        assert_eq!(entry.team, "dev");
+    }
+
+    /// Re-creating over a project that already has a `state.json` refreshes it:
+    /// what the project accumulated (team, owner) survives unless a value is given.
+    #[test]
+    fn create_project_refreshes_existing_state_instead_of_resetting_it() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("repo");
+        let first = create_project(
+            &paths,
+            &NewProject {
+                slug: "demo",
+                dir: &project_dir,
+                team: Some("ops"),
+                owner: Some("user:alice"),
+            },
+        )
+        .unwrap();
+        assert!(first.fresh);
+
+        let again = create_project(
+            &paths,
+            &NewProject {
+                slug: "demo",
+                dir: &project_dir,
+                team: None,
+                owner: None,
+            },
+        )
+        .unwrap();
+        assert!(!again.fresh);
+        assert_eq!(again.team, "ops", "no team given → keep the recorded one");
+        assert_eq!(again.owner.as_deref(), Some("user:alice"));
+        assert!(
+            !again.agents_md_scaffolded,
+            "the AGENTS.md from the first creation is already there"
+        );
+
+        let taken = create_project(
+            &paths,
+            &NewProject {
+                slug: "demo",
+                dir: &project_dir,
+                team: Some("dev"),
+                owner: Some("user:bob"),
+            },
+        )
+        .unwrap();
+        assert_eq!(taken.team, "dev");
+        assert_eq!(taken.owner.as_deref(), Some("user:bob"));
     }
 
     #[test]
@@ -1406,8 +1588,7 @@ mod tests {
         )
         .unwrap();
 
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
-            .unwrap();
+        create_demo(&paths, &project_dir);
 
         assert_eq!(
             std::fs::read_to_string(project_dir.join("CLAUDE.md")).unwrap(),
@@ -1434,7 +1615,7 @@ mod tests {
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join(".gitignore"), "target\nnode_modules").unwrap();
 
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev").unwrap();
+        create_demo(&paths, &project_dir);
         let body = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert!(
             body.contains("target") && body.contains("node_modules"),
@@ -1449,7 +1630,7 @@ mod tests {
         );
 
         // Re-bootstrap (idempotent / re-create) must NOT add a duplicate line.
-        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev").unwrap();
+        create_demo(&paths, &project_dir);
         let body2 = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert_eq!(
             body2

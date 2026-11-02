@@ -21,7 +21,7 @@
 //!
 //! `ccteam-core` depends on `ccteam-harness` (tmux_ops moved here in W1), so
 //! mux MUST NOT depend on core — that would cycle. The FIFO directory
-//! (`~/.ccteam/pty`, honoring `CCTEAM_HOME`) is therefore resolved by a
+//! (`~/.ccteam/state/pty`, honoring `CCTEAM_HOME`) is therefore resolved by a
 //! small local helper that mirrors `CcteamPaths::pty_dir` rather than
 //! importing it.
 //!
@@ -48,7 +48,7 @@ use crate::MuxSessionId;
 /// this surfaces as a `MuxEvent::OutputDropped` on the stream.
 pub const BROADCAST_CAPACITY: usize = 256;
 
-/// Resolve `~/.ccteam/pty` honoring `CCTEAM_HOME`, mirroring
+/// Resolve `~/.ccteam/state/pty` honoring `CCTEAM_HOME`, mirroring
 /// `ccteam_core::CcteamPaths::pty_dir` without taking the dependency
 /// (which would create a cargo cycle). Falls back to `$TMPDIR` / `/tmp`
 /// when neither `CCTEAM_HOME` nor `$HOME` is set (tests / sandboxes).
@@ -62,7 +62,9 @@ fn pty_dir() -> PathBuf {
     } else {
         PathBuf::from("/tmp").join(".ccteam")
     };
-    root.join("pty")
+    // Keep the leaf-crate resolver aligned with CcteamPaths::pty_dir.
+    // The canonical home stores runtime FIFOs under state/, not at root.
+    root.join("state").join("pty")
 }
 
 /// Registry of live `tmux pipe-pane` relays keyed by `MuxSessionId`.

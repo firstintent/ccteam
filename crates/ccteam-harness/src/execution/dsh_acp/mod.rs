@@ -75,27 +75,13 @@ struct LiveSession {
     _dispatcher: tokio::task::JoinHandle<()>,
 }
 
-/// Resolve the ccteam `mode` axis to a DSH agent-preset id. The vendor's
-/// shipped presets are `standard` | `code` (displayed "PTC") | `minimal` |
-/// `cordis` (displayed "creator"); ccteam accepts both spellings and an unset
-/// mode defaults a hire to `standard` (owner decree, matching DSH's own web
-/// default). Presets pick the TOOLSET: a session created without one has no
-/// bash/read/write at all in the web runtime.
-pub fn mode_agent_preset(mode: Option<&str>) -> Result<String, HarnessError> {
-    let token = mode
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .unwrap_or("standard");
-    match token.to_ascii_lowercase().as_str() {
-        "ptc" | "code" => Ok("code".to_string()),
-        "standard" => Ok("standard".to_string()),
-        "minimal" => Ok("minimal".to_string()),
-        "creator" | "cordis" => Ok("cordis".to_string()),
-        other => Err(HarnessError::SpawnFailed(format!(
-            "unknown DSH session mode `{other}`: accepts standard | ptc (code) | minimal | \
-             creator (cordis); omit it for the ccteam default (standard)"
-        ))),
-    }
+/// Pass native preset ids through so new DSH presets need no engine release.
+/// An absent mode leaves the vendor's configured default authoritative.
+/// `creator` is ccteam's product label for DSH's `cordis` preset.
+pub fn mode_agent_preset(mode: Option<&str>) -> Option<String> {
+    mode.map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(|mode| if mode == "creator" { "cordis" } else { mode }.to_string())
 }
 
 /// Per-process singleton holding live DSH ACP sessions keyed by DSH session id.
@@ -438,29 +424,18 @@ impl HarnessAdapter for DshAcpAdapter {
                 "DSH sessions are roleless-only; ccteam does not inject role prompts".into(),
             ));
         }
-        if let Some(effort) = ctx
-            .effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-        {
-            return Err(crate::execution::acp::spawn_pick_refused(
-                "effort",
-                effort,
-                "DSH ACP has no reasoning-effort axis",
-            ));
-        }
-
         let mcp = Self::session_mcp_endpoint(ctx)?;
         let cwd = project_cwd(ctx)?;
         let inbound = Self::inbound_policy(ctx.permission_mode);
-        let agent_options = DshAgentOptions::new(ctx.model_id.as_deref());
+        let agent_options = DshAgentOptions::new(ctx.model_id.as_deref())
+            .with_reasoning_effort(ctx.effort.as_deref());
         // `session/load` carries the identity WITHOUT a preset (the stored one
         // is authoritative); `session/new` — fresh or as the failed-load
-        // fallback — carries the resolved mode, ccteam-defaulting to PTC.
-        let agent_preset = mode_agent_preset(ctx.mode.as_deref())?;
+        // fallback — carries an explicitly requested native preset.
+        let agent_preset = mode_agent_preset(ctx.mode.as_deref());
         let meta = CcteamSessionMeta::new(&ctx.sid, &mcp, ctx.permission_mode);
-        let new_meta = meta.clone().with_agent_preset(agent_preset);
+        let mut new_meta = meta.clone();
+        new_meta.agent_preset = agent_preset;
 
         // The runtime is per identity, so the socket and the DSH home are too.
         // `CCTEAM_DSH_SOCKET` (test-only) names a socket a fake already serves
@@ -743,18 +718,18 @@ mod tests {
     }
 
     #[test]
-    fn mode_tokens_resolve_to_vendor_preset_ids() {
-        assert_eq!(mode_agent_preset(None).unwrap(), "standard");
-        assert_eq!(mode_agent_preset(Some("")).unwrap(), "standard");
-        assert_eq!(mode_agent_preset(Some("ptc")).unwrap(), "code");
-        assert_eq!(mode_agent_preset(Some("PTC")).unwrap(), "code");
-        assert_eq!(mode_agent_preset(Some("code")).unwrap(), "code");
-        assert_eq!(mode_agent_preset(Some("standard")).unwrap(), "standard");
-        assert_eq!(mode_agent_preset(Some("minimal")).unwrap(), "minimal");
-        assert_eq!(mode_agent_preset(Some("creator")).unwrap(), "cordis");
-        assert_eq!(mode_agent_preset(Some("cordis")).unwrap(), "cordis");
-        let err = mode_agent_preset(Some("turbo")).unwrap_err().to_string();
-        assert!(err.contains("turbo") && err.contains("standard"), "{err}");
+    fn mode_tokens_defer_defaults_and_native_preset_validation_to_dsh() {
+        assert_eq!(mode_agent_preset(None), None);
+        assert_eq!(mode_agent_preset(Some("  ")), None);
+        assert_eq!(mode_agent_preset(Some(" ptc ")).as_deref(), Some("ptc"));
+        assert_eq!(
+            mode_agent_preset(Some("creator")).as_deref(),
+            Some("cordis")
+        );
+        assert_eq!(
+            mode_agent_preset(Some("custom-preset")).as_deref(),
+            Some("custom-preset")
+        );
     }
 
     #[test]

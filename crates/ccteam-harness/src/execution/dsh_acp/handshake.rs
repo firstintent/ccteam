@@ -29,8 +29,7 @@ pub struct CcteamSessionMeta {
     pub bearer: String,
     pub mcp_url: String,
     pub approval_mode: &'static str,
-    /// DSH agent-preset id for `session/new` ONLY (`standard` | `code` |
-    /// `minimal` | `cordis`). Never sent on `session/load`: the stored preset
+    /// DSH agent-preset id for `session/new` ONLY (a native preset id). Never sent on `session/load`: the stored preset
     /// in the vendor's own session data is authoritative on resume.
     pub agent_preset: Option<String>,
 }
@@ -74,6 +73,7 @@ impl CcteamSessionMeta {
 pub struct DshAgentOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl DshAgentOptions {
@@ -82,6 +82,7 @@ impl DshAgentOptions {
             return Self {
                 provider: None,
                 model: None,
+                reasoning_effort: None,
             };
         };
         if let Some((provider, model)) = model.split_once('/') {
@@ -91,17 +92,27 @@ impl DshAgentOptions {
                 return Self {
                     provider: Some(provider.to_string()),
                     model: Some(model.to_string()),
+                    reasoning_effort: None,
                 };
             }
         }
         Self {
             provider: None,
             model: Some(model.to_string()),
+            reasoning_effort: None,
         }
     }
 
+    pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort = effort
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self
+    }
+
     fn to_json(&self) -> Option<Value> {
-        if self.provider.is_none() && self.model.is_none() {
+        if self.provider.is_none() && self.model.is_none() && self.reasoning_effort.is_none() {
             return None;
         }
         let mut out = serde_json::Map::new();
@@ -110,6 +121,9 @@ impl DshAgentOptions {
         }
         if let Some(model) = &self.model {
             out.insert("model".to_string(), json!(model));
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            out.insert("reasoningEffort".to_string(), json!(effort));
         }
         Some(Value::Object(out))
     }

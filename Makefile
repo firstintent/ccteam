@@ -53,7 +53,7 @@ WIPE_DIRS    := state run cache
 DAEMON_LOG   := $(CCTEAM_HOME)/daemon.log
 
 .DEFAULT_GOAL := help
-.PHONY: help build release clean fmt fmt-check clippy check test test-web perf-gate \
+.PHONY: help build release clean fmt fmt-check clippy check test test-web test-files-browser perf-gate \
         web web-deps web-check gate \
         install install-binary next-steps uninstall reinstall require-cli require-node \
         config init start stop status doctor \
@@ -181,6 +181,11 @@ test-baseline: require-node
 
 test-web: require-node
 	cargo test -p ccteam-web
+
+# #219 — real browser verification against the tempdir-backed file API.
+test-files-browser: require-node
+	cargo test -p ccteam-web --test files_test preview_runs_relative_modules_and_css_inside_an_opaque_browser_sandbox -- --ignored
+	cd $(WEB_DIR) && npm test -- --grep 'file workspace|mobile Files'
 
 # Explicit, release-profile performance contract. The integration target
 # returns immediately unless CCTEAM_PERF_GATE=1, so ordinary test targets never

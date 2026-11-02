@@ -105,7 +105,7 @@ describe("DSH keep-alive across navigation (WEB-DSH-1)", () => {
     await act(async () => navigate("/dsh"));
     const frame = container.querySelector('[data-testid="dsh-frame"]') as HTMLIFrameElement | null;
     expect(frame).not.toBeNull();
-    expect(frame?.getAttribute("src")).toBe("http://localhost:7332/");
+    expect(frame?.getAttribute("src")).toBe("/dsh/");
     const host = container.querySelector('[data-testid="dsh-frame-host"]');
     expect(host).not.toBeNull();
     expect((host as HTMLDivElement).hidden).toBe(false);
@@ -122,7 +122,7 @@ describe("DSH keep-alive across navigation (WEB-DSH-1)", () => {
     expect(hostHidden).not.toBeNull();
     expect(hostHidden.hidden).toBe(true);
     expect(container.querySelector('[data-testid="dsh-frame"]')).toBe(frame);
-    expect(frame?.getAttribute("src")).toBe("http://localhost:7332/");
+    expect(frame?.getAttribute("src")).toBe("/dsh/");
 
     // Navigate back: still the SAME iframe node (a remount would have created
     // a new element and re-fetched the DSH SPA).

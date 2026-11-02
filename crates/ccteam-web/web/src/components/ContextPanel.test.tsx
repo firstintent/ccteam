@@ -146,6 +146,32 @@ describe("ContextPanel", () => {
     expect($('[data-testid="ctx-loading"]')).toBeNull();
   });
 
+  it("shows session facts even without context data and distinguishes cost from tokens", async () => {
+    const session = {sid:"s12",project:"demo",role:"",vendor:"codex",model:"gpt-test",permission_mode:"skip",current:true,status:"idle",residency:"released",host:"local",parent_sid:"s1497",delegation_depth:2,cost_usd:716.425,tokens_total:12345,last_active:"2026-10-20T08:00:00Z"};
+    globalThis.fetch = fetchAnswering({sid:"s12",live:false,breakdown:null,session});
+    await mount(panel({model:"stale-transcript-model"}));
+    const facts=text('[data-testid="ctx-session-status"]');
+    for(const value of ["s12","demo","codex","gpt-test","local","s1497","2","$716.4250","12,345","Released; resumes on next message","Last active"]) expect(facts).toContain(value);
+    expect(facts).not.toContain("Role");
+    expect(facts).not.toContain("stale-transcript-model");
+    expect($('[data-testid="ctx-none"]')).not.toBeNull();
+    globalThis.fetch = fetchAnswering({sid:"s12",live:false,breakdown:null,session:{...session,cost_usd:null,waiting_approval:true}});
+    await mount(panel({model:"gpt-test",refreshKey:1}));
+    expect(text('[data-testid="ctx-session-status"]')).toContain("Not priced yet");
+    expect(text('[data-testid="ctx-session-status"]')).toContain("Waiting for approval");
+    expect(text('[data-testid="ctx-session-status"]')).not.toContain("$0.0000");
+  });
+
+  it("shows Codex totals and cache usage without fabricating category detail", async () => {
+    globalThis.fetch=fetchAnswering({sid:"s12",live:true,breakdown:{vendor:"codex",used_tokens:8000,window_tokens:100000,categories:[{id:"context_total",name:"Used context",tokens:8000,kind:"used"},{id:"free_space",name:"Free space",tokens:92000,kind:"free"}],last_request:{input_tokens:6000,cache_read_tokens:1000,cache_creation_tokens:0,output_tokens:1000}}});
+    await mount(panel());
+    expect(text('[data-testid="ctx-usage"]')).toContain("8k / 100k · 8%");
+    expect(text('[data-testid="ctx-codex-scope"]')).toContain("without per-tool, skill or memory-file categories");
+    expect(text('[data-testid="ctx-cache-hit"]')).toContain("14.3%");
+    expect($('[data-testid="ctx-messages"]')).toBeNull();
+    expect($('[data-testid="ctx-threshold"]')).toBeNull();
+  });
+
   it("stacks used (desc) → buffer → free in the bar; deferred is NOT a segment", async () => {
     globalThis.fetch = fetchAnswering(BREAKDOWN);
     await mount(panel());
@@ -294,7 +320,7 @@ describe("ContextPanel", () => {
     globalThis.fetch = fetchAnswering({ sid: "s12", live: false, breakdown: null });
     await mount(panel());
     expect(text('[data-testid="ctx-none"]')).toContain("No context breakdown for this session yet.");
-    expect(text('[data-testid="ctx-none"]')).toContain("Only Claude stream-json sessions on this host");
+    expect(text('[data-testid="ctx-none"]')).toContain("Codex app-server reports window totals and request usage");
     expect($('[data-testid="ctx-meter"]')).toBeNull();
     expect($('[data-testid="ctx-error"]')).toBeNull();
     expect($('[data-testid="ctx-meta"]')).toBeNull();

@@ -1,0 +1,282 @@
+/* #219: a shared right workspace, with Files and Context in the same tool rail. */
+[data-testid="conversation-view"] {
+  container: session-view / inline-size;
+}
+.right-panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  flex: none;
+}
+.right-panel-tools .icon-btn.sm { width: auto; height: 32px; min-height: 32px; gap: 6px; padding: 6px 8px; font-size: 12px; white-space: nowrap; }
+.right-panel-tools .panel-context-pct { font: 11px var(--font-mono); color: var(--text-muted); }
+@media (pointer: coarse) { .right-panel-tools .icon-btn.sm { height: 44px; min-height: 44px; } }
+.right-panel-tools .on {
+  color: var(--text);
+  background: var(--bg-soft);
+}
+.right-workspace-panel {
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+.files-mount {
+  height: 100%;
+}
+.files-mount[hidden] {
+  display: none;
+}
+.workspace-closed #session-right-workspace,
+.workspace-closed .outer-separator {
+  display: none !important;
+}
+.right-workspace-panel .ctx-panel {
+  width: 100%;
+  height: 100%;
+  border-left: 0;
+}
+.workspace-separator {
+  flex: none;
+  width: 5px;
+  background: var(--border-soft);
+  cursor: col-resize;
+  transition: background 0.15s;
+}
+.workspace-separator:hover,
+.workspace-separator:focus-visible,
+.workspace-separator[data-separator="active"] {
+  background: var(--accent);
+  outline: none;
+}
+.files-workspace {
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-side);
+  color: var(--text);
+  outline: none;
+}
+.files-workspace.files-expanded {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+}
+.files-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border-soft);
+  flex: none;
+  font-size: 13px;
+}
+.files-head .files-project {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files-body {
+  flex: 1;
+  min-height: 0;
+}
+.files-tree {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.files-reader {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.files-tabs {
+  display: flex;
+  overflow-x: auto;
+  flex: none;
+  min-height: 33px;
+  border-bottom: 1px solid var(--border-soft);
+  scrollbar-width: thin;
+}
+.files-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 3px;
+  border-right: 1px solid var(--border-soft);
+  border-top: 2px solid transparent;
+  padding: 0 5px;
+  color: var(--text-muted);
+}
+.files-tab.active {
+  color: var(--text);
+  background: var(--bg-soft);
+  border-top-color: var(--accent);
+}
+.files-tab button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 6px 4px;
+}
+.files-tab:not(.pinned) > button:first-child {
+  font-style: italic;
+}
+.files-tab button:focus-visible {
+  outline: 1px solid var(--accent);
+}
+.files-tab-action {
+  display: flex;
+  align-items: center;
+}
+.files-filebar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 7px;
+  border-bottom: 1px solid var(--border-soft);
+  flex: none;
+}
+.files-filebar > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10px var(--font-mono);
+  color: var(--text-muted);
+}
+.files-modes {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.files-modes .tab {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.files-open-external {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.files-preview {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: white;
+}
+.files-empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.files-empty small {
+  font-size: 10px;
+}
+.files-error,
+.files-notice {
+  padding: 12px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.files-error {
+  color: var(--danger, #c53c3c);
+}
+.files-error button {
+  margin-left: 8px;
+}
+.files-notice {
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-soft);
+}
+.files-reader > [class^="cm-theme"] {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.files-reader .cm-editor {
+  height: 100%;
+}
+/* Size against the conversation, not the whole viewport: a portrait tablet
+   can still have the left sidebar open. Keep drawers below the shared toolbar
+   and give normal/expanded files the same layer above their local backdrop. */
+@container session-view (max-width: 820px) {
+  #session-right-workspace {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    pointer-events: none;
+    z-index: 30;
+  }
+  .right-workspace-panel,
+  .right-workspace-panel .ctx-panel,
+  .files-workspace {
+    pointer-events: auto;
+  }
+  .right-workspace-panel {
+    width: 100%;
+  }
+  .files-workspace {
+    position: absolute;
+    inset: 0 0 0 auto;
+    width: min(96%, 640px);
+    z-index: 2;
+    box-shadow: -8px 0 30px #0002;
+  }
+  .files-workspace.files-expanded {
+    width: 100%;
+    z-index: 2;
+  }
+  .right-workspace-panel .ctx-panel {
+    position: absolute;
+    inset: 0 0 0 auto;
+    width: min(92%, 380px);
+    height: 100%;
+    z-index: 2;
+    background: var(--bg-card);
+    box-shadow: var(--shadow-menu);
+  }
+  .outer-separator {
+    display: none;
+  }
+  #session-right-workspace .ctx-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    border: none;
+    background: rgba(0, 0, 0, .28);
+    pointer-events: auto;
+  }
+  .files-head {
+    min-height: 44px;
+  }
+}
