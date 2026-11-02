@@ -61,12 +61,12 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | **session 调度门 = daemon 校验 per-session principal `(sid,secret)`(best-effort,非硬边界)** | 3 个 `agent*` 工具由 daemon 按 principal 校验:spawn 时 mint per-session secret,受管会话走 HTTP bearer `ccteam-sid:<sid>:<secret>`;`verify_session_principal` 常数时比对;caller 的 project 服务端覆写(只能操作自己 project),授权只认 principal;`agent`/`agent_stop` 是显式调度,stop 限后代 + depth/children/delegated/cycle/预算护栏。手起会话 = enrolled client:凭 vendor 全局配置里的 enrollment 凭据(`ccteam-enroll:<id>:<secret>`)在 `initialize` 领 `Mcp-Session-Id`,daemon 铸 ledger 节点 + principal 并 promote(同一条 Ambient 路);节点 `managed_by: external` 不进 gateway live map,`agent`/`agent_stop` 对它一律拒绝;凭据没钉 project 时 caller 必须自己点名 workspace(首次点名即终身绑定),cwd / peer / 最近项目等推断一律不做。ACP 面无 `--strict-mcp-config` 同类物 → `/mcp` 按进程血缘(adapter 握手前登记子 pid + `/proc` 上溯)绑回 principal,两条路都没到才发 `identity_degraded`(只广播)。诚实范围:单 OS-uid 全信任模型下 agent 间无硬边界,secret 只抬门槛;真隔离 = per-agent OS user/sandbox(deferred) |
 | **委派语义 = 路由,非新引擎;完成通知非注入** | `agent{task,sid}` 与 IM `@handle` 同路;完成通知 = gateway 生成的一条普通 user-role turn 投给 parent(live = vendor steer / dead = pending FIFO + resume),与人转告同构;通知单位 = 任务(vendor turn 边界),中途叙述只进账本;child turns 按 child sid 落 `turns.jsonl`,委派关系写 `progress.jsonl`,不伪造进对方 transcript。可靠性合同:幂等 `agent`(`idempotency_key`)· at-least-once 通知扛重启(`delegation.json` 落盘 + 启动 reconcile)· append→notify 顺序 · 原子写;单 daemon 无 HA,是协议语义可靠 |
 | **跨机 = host 是 project 属性,session 继承;网络方向 = 卫星拨入** | host 住 project catalog(`~/.ccteam/config.yaml`,条目含 `host` + `remote_slug`;slug 相同 ≠ 同一项目);spawn 面无 host 参数(传入即硬错 `HOST_SPAWN_PARAM_REMOVED`);记账一律 catalog slug;远程项目进入 = web 选主机新建或 `POST /projects/import` 接入卫星已上报项目(绝不自动接入;撞名累加、幂等);卫星零监听面:`ccteam start` 进程内嵌卫星客户端出站长连 daemon,卫星自己解析 binary + cwd,主侧永不下发路径;terminal 永不上多机;rebuild 一律 re-gate project 绑定(host 不符或卫星 offline → 可读错误,绝不本地重生);远程 verdict 钉 claude,其余 vendor 远程 = 显式 NotImplemented |
-| **不改写已有项目 `CLAUDE.md`/`AGENTS.md`** | 项目知识层归 vendor 原生 + 项目自己;唯一放宽:对真空项目(两文件都不存在)scaffold `AGENTS.md` + `CLAUDE.md` = `@AGENTS.md`,绝不覆盖已有内容;`.ccteam/` 幂等加进项目 `.gitignore` |
-| **vendor 配置足迹 = 只写自家 MCP 注册** | 对 vendor 全局配置(`~/.claude.json`、`~/.codex/config.toml`、grok/opencode/kimi 对称面)的唯一写入 = 幂等注册/修复自己的 MCP server 条目;项目侧只写 `.claude/settings.local.json` 自己的段(绝不碰用户 `.claude/settings.json`);pi 不写任何配置 |
+| **不改写已有项目 `CLAUDE.md`/`AGENTS.md`** | 项目知识层归 vendor 原生 + 项目自己;唯一放宽:对真空项目(两文件都不存在)只 scaffold `AGENTS.md`,不写 `CLAUDE.md`,绝不覆盖已有内容;`.ccteam/` 幂等加进项目 `.gitignore` |
+| **vendor 配置足迹 = 只写自家注册与显式设置** | vendor 全局配置只幂等注册/修复自己的 MCP server 条目,另在 `~/.claude.json` 标记项目 trust;创建项目不写 Claude 设置,仅清理旧 ccteam hook/Telegram 插件钉;显式插件/effort 设置只动 `.claude/settings.local.json` 自己的键,绝不碰用户 `.claude/settings.json`;pi 不写任何配置 |
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
 | **repo 零提示词类型内容(零例外)** | agent/persona/skill/workflow 的内容一律不进 ccteam repo;住 ccteam-hub 或用户空间,ccteam 只读 index、按 sha 取内容;用户项目里既有 `.claude/agents/*.md` 是用户文件,不删不改 |
 | **跨项目记忆走官方接口** | Claude `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex `~/.codex/AGENTS.md` —— ccteam 只读 |
-| **init 布局** | 项目 `.ccteam/` 只种 `state.json` + `workflow.yaml`(`routing.md` 用户可选自建,`status` 原文透传);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor 查 home-drift) |
+| **init 布局** | CLI/Web/IM/卫星统一走 `create_project`:项目 `.ccteam/` 只种 `state.json`,不种 `workflow.yaml`(`workflow.yaml`/`routing.md` 用户可选自建,读侧照用);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor 查 home-drift) |
 | **新建项目 slug = `slugify(目录名)` + 撞名数字累加** | `ccteam init` 可在任意现有目录就地初始化;`--slug` 显式覆盖 |
 
 **vendor 红线**:不 vendor Claude / Codex 二进制(`references/` 仅协议参考;spawn 走 `$PATH` + `CCTEAM_{CLAUDE,CODEX}_BIN` override);`AgentVendor` 无 default,spawn 必须显式。
@@ -98,7 +98,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 ## 五、易踩的坑(实战累积)
 
 - **不要给 ccteam 自己加 ccteam 风格的 hook/orchestrator** —— 循环引用排错地狱;本仓用 Claude Code 默认行为开发,只产出项目挂 ccteam hook。
-- **ccteam 的 hook 写 `.claude/settings.local.json`**(gitignored、Claude 照读、与用户 `settings.json` 合并);`.claude/settings*.json` 的 `bypassPermissions` 是开发态便利,产品形态走 `--dangerously-skip-permissions`。
+- **创建项目不装 hook、不写 Claude 设置**;重跑 init 仅清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉;冻结的 terminal 协议仍按需装自己的 hook。`.claude/settings*.json` 的 `bypassPermissions` 是开发态便利,产品形态走 `--dangerously-skip-permissions`。
 - **测试 `bootstrap_project` / `bootstrap_meta_project` 前必先 `disable_tool_surface_bootstrap_for_tests()`**,否则向真实 `~/.claude.json` 写垃圾,破坏 claude 登录。
 - **env-mutating 测试**(`set_var/remove_var HOME/CCTEAM_HOME/CLAUDE_CONFIG_HOME` …)只放 `crates/*/tests/*.rs` integration(独立进程),不放 lib `#[cfg(test)]`(全 workspace 有禁 env 写守卫);新状态面优先 `_in(root)` 注入式 API 而非 home 派生全局函数。
 - **测试绝不写真实生产状态**:只把 `HOME` 指到 tempdir 不够 —— `CCTEAM_HOME` 优先级更高(实锤:fixture bot 注册写进真实 registry → telegram 静默失联数小时);隔离必须同时 pin `HOME` + `CCTEAM_HOME`。

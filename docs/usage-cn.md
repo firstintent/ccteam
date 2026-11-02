@@ -19,7 +19,7 @@
 - **session** = 一个独立的 agent 会话(像 Claude Code 原生会话一样自带上下文),属于某个项目。一个项目可同时开多个会话、互不串台,每个有持久句柄 `s<N>`(扛重启、不复用)。
 - **role** = 会话启动时**可选**绑定的角色(`.claude/agents/<role>.md` 里的 persona + 工具)。默认 **roleless**:裸 vendor 自读项目的 `CLAUDE.md`/`AGENTS.md`。persona 从插件市场装或自建,ccteam 不内置任何角色。
 
-> **ccteam 只管自己的东西。** 它从不修改你的业务代码、`.git/`、`.env`,也不改写你的 `CLAUDE.md` / `AGENTS.md` —— 这些都归项目自己,Claude 和 Codex 原生读取。
+> **ccteam 只管自己的东西。** 它从不修改你的业务代码、`.git/`、`.env`,也不改写已有的 `CLAUDE.md` / `AGENTS.md`。两文件都不存在时,创建项目只种一个供你补充的 `AGENTS.md` 占位文件。项目指引归项目自己,由 vendor 原生读取。
 
 ---
 
@@ -454,7 +454,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)——**不种任何角色**,`.claude/agents/` 归你;也不写任何 Claude 设置(不建 `.claude/settings.local.json`、不装 hook),**不碰**你的 `.claude/settings.json`。重跑安全;对旧版 ccteam 初始化过的项目,重跑会把旧版写进 `.claude/settings.local.json` 的 Claude Code hook(及 Telegram 插件钉)剥掉,其余键和你自己的 hook 原样保留;文件不是合法 JSON 时原样不动、仅在回执里注明。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
 
 ### `project`(项目生命周期)
 

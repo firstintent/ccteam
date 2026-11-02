@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
-use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
+use ccteam_core::config::CcteamConfig;
+use ccteam_core::projects::{create_project, validate_slug_format, NewProject};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::usage_catalog::VendorAccountUsage;
@@ -7232,7 +7232,7 @@ impl Gateway {
     /// `config.yaml`, and make it addressable by `/cd <slug>` in this
     /// running daemon. `raw_path` may be `~`-relative; it must resolve to
     /// an absolute directory (existing repos are adopted in place, empty
-    /// dirs are created — `bootstrap_project_at_dir` leaves user files
+    /// dirs are created — `create_project` leaves user files
     /// alone). Requires [`Gateway::enable_project_creation`].
     fn create_project(
         &mut self,
@@ -7253,39 +7253,19 @@ impl Gateway {
             return Err(anyhow!("project already exists: {slug}"));
         }
         let abs = expand_project_path(raw_path)?;
-        bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
-            .with_context(|| format!("scaffold project {slug} at {}", abs.display()))?;
-        // v0.8.18 柱2 — record the creating chat as owner (explicit field; NOT
-        // path-derived). Use the known project dir: the config upsert happens
-        // below, so `paths.project_state(slug)` would still resolve the fallback
-        // projects-root path and miss an arbitrary-path project's real state.
-        if let Some(owner) = owner {
-            let state_path = ccteam_core::CcteamPaths::project_state_in(&abs);
-            match ccteam_core::ProjectState::load(&state_path) {
-                Ok(mut state) => {
-                    state.owner = Some(owner.to_string());
-                    if let Err(err) = state.save(&state_path) {
-                        tracing::warn!(%slug, error = %err, "set project owner failed");
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(%slug, error = %err, "load state to set owner failed")
-                }
-            }
-        }
-        upsert_project(
-            &paths.root,
-            ProjectEntry {
-                slug: slug.clone(),
-                path: abs.clone(),
-                host: ccteam_core::LOCAL_HOST.to_string(),
-                remote_slug: None,
-                remote_path: None,
-                team: "dev".to_string(),
-                installed_at: chrono::Utc::now(),
+        // v0.8.18 柱2 — the creating chat is recorded as owner (explicit field;
+        // NOT path-derived). One shared creation path (issue #222): scaffold,
+        // owner stamp and config.yaml registration happen together.
+        create_project(
+            &paths,
+            &NewProject {
+                slug: &slug,
+                dir: &abs,
+                team: None,
+                owner,
             },
         )
-        .with_context(|| format!("register project {slug} in config.yaml"))?;
+        .with_context(|| format!("create project {slug} at {}", abs.display()))?;
         self.register_project(slug.clone(), abs.clone());
         // Switch the creating chat INTO the new project (mirror `/cd`): point its
         // `current_project` at the fresh slug and clear the active session — a

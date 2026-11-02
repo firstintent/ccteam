@@ -142,7 +142,7 @@ enum Command {
         /// Registered project name (default: install-dir basename); does not move the install.
         #[arg(long, value_name = "NAME")]
         slug: Option<String>,
-        /// Overwrite ccteam-managed files (state.json, workflow.yaml); never touches `.claude/agents/`.
+        /// Re-stamp the team on a refresh and step past the install-target guards (ccteam repo, $HOME, a slug registered elsewhere).
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Project owner identity (e.g. `user:alice`; a bare name maps to `user:<name>`).

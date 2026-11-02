@@ -2311,7 +2311,16 @@ async fn real_ws_dual_harness_smoke() {
     )
     .unwrap();
     let paths = ccteam_core::CcteamPaths::from_env().unwrap();
-    ccteam_core::bootstrap_project_at_dir(&paths, project.path(), &slug, "", "real-ws").unwrap();
+    ccteam_core::create_project(
+        &paths,
+        &ccteam_core::NewProject {
+            slug: &slug,
+            dir: project.path(),
+            team: Some("real-ws"),
+            owner: None,
+        },
+    )
+    .unwrap();
     ccteam_core::install_hooks(&paths).unwrap();
     seed_role(project.path(), "api");
     seed_role(project.path(), "reviewer");

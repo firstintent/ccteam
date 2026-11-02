@@ -145,43 +145,27 @@ pub(crate) async fn handle_create_project(
     let paths = app.paths.clone();
     let slug_for_blocking = slug.clone();
     let abs_for_blocking = abs.clone();
-    let team_for_blocking = team.clone();
+    let team_for_blocking = form
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|team| !team.is_empty())
+        .map(str::to_owned);
     // v0.8.18 档1 — bind the new project to its creating web user
     // (`user:<id>`; admin → the shared `web-api` pool). Project is the unit of
     // ownership; its sessions inherit it.
     let owner_for_blocking = identity.owner_tag();
     let scaffold = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        ccteam_core::bootstrap_project_at_dir(
+        // Scaffold + owner stamp (binds the project to its creator so the
+        // tenant can see its own project) + config.yaml registration, as one
+        // shared creation path (issue #222).
+        ccteam_core::create_project(
             &paths,
-            &abs_for_blocking,
-            &slug_for_blocking,
-            "(created from web resource API)",
-            &team_for_blocking,
-        )?;
-        // Owner stamp — bind the project to its creator so the tenant can see
-        // its own project. Use the KNOWN project path (`abs`), NOT
-        // `paths.project_state(slug)`: that resolves the dir through the config
-        // registry, which does not yet contain this project (the upsert is
-        // below) → it would fall back to the wrong path, the load would miss,
-        // and the owner would never persist → the creating tenant could not see
-        // its own project (404). `abs` IS the project working tree.
-        let state_path = ccteam_core::CcteamPaths::project_state_in(&abs_for_blocking);
-        if let Ok(mut state) = ccteam_core::ProjectState::load(&state_path) {
-            state.owner = Some(owner_for_blocking.clone());
-            if let Err(err) = state.save(&state_path) {
-                tracing::warn!(slug = %slug_for_blocking, error = %err, "set project owner failed");
-            }
-        }
-        ccteam_core::upsert_project_in_config(
-            &paths.root,
-            ProjectEntry {
-                slug: slug_for_blocking.clone(),
-                path: abs_for_blocking.clone(),
-                host: ccteam_core::LOCAL_HOST.to_string(),
-                remote_slug: None,
-                remote_path: None,
-                team: team_for_blocking.clone(),
-                installed_at: chrono::Utc::now(),
+            &ccteam_core::NewProject {
+                slug: &slug_for_blocking,
+                dir: &abs_for_blocking,
+                team: team_for_blocking.as_deref(),
+                owner: Some(&owner_for_blocking),
             },
         )?;
         Ok(())

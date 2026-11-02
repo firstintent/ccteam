@@ -19,7 +19,7 @@ Install once, start one resident process, then do daily work from three surfaces
 - **session** = one independent agent conversation with its own context, like a native Claude Code session. A project can have many sessions running side by side. Each session has a durable handle `s<N>` that survives restarts and is never reused.
 - **role** = an optional persona bound at session start, loaded from `.claude/agents/<role>.md`. The default is **roleless**: the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`. Personas are installed from the marketplace or written by you; ccteam seeds none.
 
-> **ccteam only manages its own footprint.** It never edits your product code, `.git/`, `.env`, `CLAUDE.md`, or `AGENTS.md`. Project instructions stay owned by the project and are read natively by Claude and Codex.
+> **ccteam only manages its own footprint.** It never edits your product code, `.git/`, `.env`, or existing `CLAUDE.md` / `AGENTS.md`. When neither instruction file exists, creation seeds only an `AGENTS.md` placeholder for you to fill in. Project instructions stay owned by the project and are read natively by the vendor.
 
 ---
 
@@ -473,7 +473,7 @@ ccteam status                  # Daemon heartbeat, projects, sessions, web link,
 ccteam doctor                  # Install/dependency checks; --verify-mcp checks MCP surface.
 ```
 
-`ccteam init` only writes ccteam-owned files: project `.ccteam/` (it seeds no roles — `.claude/agents/` stays yours, and it writes no Claude settings: no `.claude/settings.local.json`, no hooks). It does **not** touch your `.claude/settings.json`. Re-running is safe, and on a project an older ccteam initialized it strips the Claude Code hooks (and the Telegram plugin pin) that version wrote into `.claude/settings.local.json`, leaving every other key and your own hooks in place; a file that is not valid JSON is left untouched and noted. Preferences live in `~/.ccteam/preferences.toml`; currently `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
+`ccteam init`, Web creation, IM `/newproject`, and satellite project creation share one creation path: write `.ccteam/state.json`, add `.ccteam/` to `.gitignore`, seed an `AGENTS.md` placeholder only when neither `AGENTS.md` nor `CLAUDE.md` exists, ensure the global `~/.ccteam/` home, mark the project trusted in `~/.claude.json`, and register it in `~/.ccteam/config.yaml`. Creation writes no `CLAUDE.md`, `workflow.yaml`, roles, or Claude settings; `.claude/agents/` and `.claude/settings.json` stay yours. You can create `.ccteam/workflow.yaml` yourself for budget settings. Re-running refreshes state while preserving the recorded team and owner unless explicitly supplied (`--force` re-stamps the default team), and preserves existing project instructions and workflows. It also strips old ccteam hooks and the Telegram plugin pin from `.claude/settings.local.json`, keeping every other key and your own hooks; invalid JSON is left untouched and noted. Preferences live in `~/.ccteam/preferences.toml`; `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
 
 ### `project` (Project Lifecycle)
 

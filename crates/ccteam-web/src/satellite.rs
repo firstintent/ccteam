@@ -371,23 +371,13 @@ fn initialize_satellite_project(
     }
     let requested_slug = ccteam_core::validate_slug_format(requested_slug)?;
     let slug = ccteam_core::pick_unused_project_slug(&paths.root, &requested_slug)?;
-    ccteam_core::bootstrap_project_at_dir(
+    ccteam_core::create_project(
         paths,
-        &path,
-        &slug,
-        "(created by daemon project binding)",
-        "dev",
-    )?;
-    ccteam_core::upsert_project_in_config(
-        &paths.root,
-        ccteam_core::ProjectEntry {
-            slug: slug.clone(),
-            path: path.clone(),
-            host: ccteam_core::LOCAL_HOST.to_string(),
-            remote_slug: None,
-            remote_path: None,
-            team: "dev".to_string(),
-            installed_at: chrono::Utc::now(),
+        &ccteam_core::NewProject {
+            slug: &slug,
+            dir: &path,
+            team: None,
+            owner: None,
         },
     )?;
     Ok((slug, path))
@@ -486,5 +476,32 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(HOST_CHANNEL_SUBPROTOCOL)
         );
+    }
+
+    #[test]
+    fn project_binding_uses_the_shared_creation_footprint() {
+        ccteam_core::disable_tool_surface_bootstrap_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let target = tmp.path().join("workspace");
+        ccteam_core::ProjectState::initial_for_team("old".into(), "ops".into())
+            .save(&CcteamPaths::project_state_in(&target))
+            .unwrap();
+        let (slug, dir) =
+            initialize_satellite_project(&paths, target.to_str().unwrap(), "demo").unwrap();
+        assert_eq!(dir, target);
+        assert!(target.join(".ccteam/state.json").is_file());
+        assert!(target.join("AGENTS.md").is_file());
+        assert!(target.join(".gitignore").is_file());
+        assert!(!target.join("CLAUDE.md").exists());
+        assert!(!target.join(".ccteam/workflow.yaml").exists());
+        let registered = ccteam_core::lookup_project_in_config(&paths.root, &slug)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registered.path, target);
+        assert_eq!(registered.team, "ops");
     }
 }

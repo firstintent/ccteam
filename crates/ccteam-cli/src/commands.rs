@@ -43,10 +43,11 @@ pub struct InitOptions {
     /// flag — set internally by `project new` / tests; the CLI always
     /// takes the `dev` default.
     pub team: Option<String>,
-    /// Overwrite every ccteam-managed file (state.json, settings.json
-    /// marker section, workflow.yaml, helper templates). Without `force`
-    /// re-runs preserve the user-edited workflow. Never touches
-    /// `.claude/agents/*.md` — ccteam seeds no roles (roleless default).
+    /// Re-stamp the team on a refresh (a re-run otherwise keeps the recorded
+    /// one) and step past the install-target guards: the ccteam source repo,
+    /// `$HOME` / the filesystem root, and a slug already registered at another
+    /// path. Never touches `.claude/agents/*.md` — ccteam seeds no roles
+    /// (roleless default).
     pub force: bool,
     /// Set the project owner identity (`ProjectState.owner`,
     /// `"channel:chat_id"` — e.g. `user:<tenant>` / `telegram:<chat_id>`). A
@@ -56,23 +57,23 @@ pub struct InitOptions {
     pub owner: Option<String>,
 }
 
-/// Unified project install. Scaffolds `.ccteam/state.json` +
-/// `.ccteam/workflow.yaml`, seeds NO roles (roleless default — the
-/// default session is a bare vendor reading the project
-/// `CLAUDE.md`/`AGENTS.md`), and registers the project in
-/// `~/.ccteam/config.yaml`.
+/// Unified project install: the install-target and slug guards, then
+/// [`ccteam_core::create_project`] — the same creation path web `POST
+/// /projects`, IM `/newproject` and the satellite binding use, so they all leave
+/// the same files. That is `.ccteam/state.json`, a placeholder `AGENTS.md` for a
+/// project with neither `CLAUDE.md` nor `AGENTS.md`, and `.ccteam/` in
+/// `.gitignore`, plus the `~/.ccteam/config.yaml::projects[]` entry. It seeds NO
+/// roles (roleless default — the default session is a bare vendor reading the
+/// project's `AGENTS.md`/`CLAUDE.md`).
 ///
 /// Three scenarios, one command:
 ///
-/// 1. **Fresh cwd / fresh dir**: writes `.ccteam/state.json` +
-///    `.ccteam/workflow.yaml` and the ccteam-managed hook section in
-///    `.claude/settings.local.json`; appends to
-///    `~/.ccteam/config.yaml::projects[]`.
+/// 1. **Fresh cwd / fresh dir**: creates the project.
 /// 2. **Existing repo cwd** (no `.ccteam/` yet): same as (1) — never
 ///    touches existing user files.
-/// 3. **Already-ccteam project cwd**: refreshes state.json + the
-///    settings marker section; preserves `workflow.yaml` unless
-///    `--force` (overwrite). `.claude/agents/*.md` is always left alone.
+/// 3. **Already-ccteam project cwd**: refreshes `state.json` (the recorded
+///    team and owner survive unless given); `.claude/agents/*.md` is always
+///    left alone.
 ///
 /// MCP registration lives in `ccteam config` (not here). The global
 /// `~/.ccteam/` skeleton + hook dispatcher are ensured idempotently on
@@ -91,10 +92,9 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // `ensure_ccteam_home` (ccteam-core) folds that canonical-dir loop
     // and the V0.6.1 F139 `hook.sh` dispatcher materialization into one
     // idempotent call shared by every create/start path (init here, the
-    // web/IM `bootstrap_project_at_dir`, the daemon at `ccteam start`).
-    // The hook.sh write must precede `install_project_at` so the
-    // freshly-rendered `.claude/settings.local.json` hook commands point
-    // at a file that actually exists.
+    // web/IM `create_project`, the daemon at `ccteam start`).
+    // Project creation ensures this home too; keep it here so the install
+    // checks and receipt can use the global paths before creating a project.
     ccteam_core::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home (dirs + hook.sh)")?;
 
     // -- 2. Resolve project install target ---------------------------
@@ -164,23 +164,10 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         }
     }
 
-    // -- 4. Project install pass ------------------------------------
+    // -- 4. Create / refresh the project (scaffold + owner + config.yaml) ---
     let project_report = install_project_at(paths, &target, &target_slug, &target_team, &opts)?;
 
-    // -- 5. Upsert config.yaml::projects[] --------------------------
-    let entry = ccteam_core::ProjectEntry {
-        slug: project_report.slug.clone(),
-        path: target.clone(),
-        host: ccteam_core::LOCAL_HOST.to_string(),
-        remote_slug: None,
-        remote_path: None,
-        team: project_report.team.clone(),
-        installed_at: chrono::Utc::now(),
-    };
-    ccteam_core::upsert_project_in_config(&paths.root, entry)
-        .context("upsert project into ~/.ccteam/config.yaml")?;
-
-    // -- 6. Health check + optional wizard --------------------------
+    // -- 5. Health check + optional wizard --------------------------
     let bin = current_ccteam_bin().ok();
     let claude = Command::new("claude").arg("--version").output();
     let tmux = ccteam_core::tmux_version();
@@ -201,16 +188,12 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         target.join(".ccteam").join("state.json").display(),
         project_report.state_action,
     ));
-    out.push_str(&format!(
-        "  workflow.yaml    {} ({})\n",
-        target.join(".ccteam").join("workflow.yaml").display(),
-        project_report.workflow_action,
-    ));
-    out.push_str(&format!(
-        "  agents dir       {} ({})\n",
-        target.join(".claude").join("agents").display(),
-        project_report.agents_action,
-    ));
+    if project_report.agents_md_scaffolded {
+        out.push_str(&format!(
+            "  AGENTS.md        {} (placeholder scaffolded)\n",
+            target.join("AGENTS.md").display(),
+        ));
+    }
     if let Some(note) = &project_report.hooks_note {
         out.push_str(&format!(
             "  claude settings  {} ({note})\n",
@@ -319,8 +302,8 @@ struct ProjectInstallReport {
     owner: Option<String>,
     fresh: bool,
     state_action: &'static str,
-    workflow_action: &'static str,
-    agents_action: &'static str,
+    /// A placeholder `AGENTS.md` was written for an empty project.
+    agents_md_scaffolded: bool,
     /// What happened to old ccteam hook entries in
     /// `.claude/settings.local.json` (docs-local issue #212); `None` when
     /// there was nothing to report.
@@ -337,7 +320,8 @@ impl ProjectInstallReport {
     }
 }
 
-/// Lay down (or refresh) a ccteam project at `target`.
+/// Lay down (or refresh) a ccteam project at `target` — a thin wrapper over
+/// [`ccteam_core::create_project`], the single creation path (issue #222).
 fn install_project_at(
     paths: &CcteamPaths,
     target: &std::path::Path,
@@ -345,15 +329,11 @@ fn install_project_at(
     team: &str,
     opts: &InitOptions,
 ) -> Result<ProjectInstallReport> {
-    let ccteam_dir = target.join(".ccteam");
-    let state_path = ccteam_dir.join("state.json");
-    let fresh = !state_path.exists();
-
     // v0.8.20 F1: `--owner` stamps `ProjectState.owner` at init. Normalize the
-    // raw value (bare → `user:`; `:`-bearing → verbatim) once, then apply it in
-    // whichever branch we take. Light, non-blocking validation: an unknown
-    // `user:<tenant>` warns on stderr but is still written (the tenant may be
-    // created later). Override-on-reinit needs no `--force`.
+    // raw value (bare → `user:`; `:`-bearing → verbatim) once. Light,
+    // non-blocking validation: an unknown `user:<tenant>` warns on stderr but is
+    // still written (the tenant may be created later). Override-on-reinit needs
+    // no `--force`.
     let requested_owner = opts.owner.as_deref().and_then(normalize_owner);
     if let Some(owner) = &requested_owner {
         if let Some(tenant_id) = owner.strip_prefix("user:") {
@@ -370,93 +350,35 @@ fn install_project_at(
         }
     }
 
-    let state_action: &'static str;
-    let workflow_action: &'static str;
-    let agents_action: &'static str;
-    let final_team: String;
-    let owner_final: Option<String>;
-
-    if fresh {
-        ccteam_core::bootstrap_project_at_dir(
-            paths,
-            target,
+    // A refresh keeps the recorded team unless `--force` or an explicit team.
+    let team = (opts.force || opts.team.is_some()).then_some(team);
+    let created = ccteam_core::create_project(
+        paths,
+        &ccteam_core::NewProject {
             slug,
-            "(installed via `ccteam init`)",
+            dir: target,
             team,
-        )?;
-        ccteam_core::scaffold_workflow_yaml(target, false)?;
-        state_action = "created";
-        workflow_action = "scaffolded";
-        // v0.9.0 W2 (F6.1) — engine neutralization: init seeds NO role. The
-        // default session is roleless (bare vendor reads project CLAUDE.md /
-        // AGENTS.md); `.claude/agents/` is left untouched.
-        agents_action = "none (roleless default)";
-        final_team = team.to_string();
-        // Fresh state.json was written with owner = None; stamp it when asked.
-        if let Some(owner) = &requested_owner {
-            let mut st = ccteam_core::ProjectState::load(&state_path)
-                .with_context(|| format!("load {} to set owner", state_path.display()))?;
-            st.owner = Some(owner.clone());
-            st.save(&state_path)?;
-            owner_final = Some(owner.clone());
-        } else {
-            owner_final = None;
-        }
-    } else {
-        let mut existing_state = ccteam_core::ProjectState::load(&state_path)
-            .with_context(|| format!("load existing {}", state_path.display()))?;
-        if opts.force || opts.team.is_some() {
-            existing_state.team = team.to_string();
-        }
-        existing_state.slug = slug.to_string();
-        existing_state.tmux_session = format!("ccteam-{slug}");
-        // Override on re-init only when `--owner` is given; otherwise preserve.
-        if let Some(owner) = &requested_owner {
-            existing_state.owner = Some(owner.clone());
-        }
-        existing_state.save(&state_path)?;
-        final_team = existing_state.team.clone();
-        owner_final = existing_state.owner.clone();
-        state_action = "refreshed";
-
-        workflow_action = if opts.force {
-            ccteam_core::scaffold_workflow_yaml(target, true)?;
-            "overwritten (--force)"
-        } else {
-            "preserved"
-        };
-
-        // v0.9.0 W2 (F6.1) — ccteam seeds no roles, so there is nothing to
-        // (re)scaffold or reset; `--force` no longer touches
-        // `.claude/agents/` (user files there survive untouched).
-        agents_action = if opts.force {
-            "none (roleless default)"
-        } else {
-            "preserved"
-        };
-    }
+            owner: requested_owner.as_deref(),
+        },
+    )?;
 
     // docs-local issue #212 — re-running `ccteam init` is how an existing
-    // project sheds the Claude Code hooks earlier ccteam versions wrote (a
-    // fresh install already ran the same scrub inside
-    // `bootstrap_project_at_dir`, so here it only reports). Best-effort: a
-    // user file that is not valid JSON is left alone and noted, never fatal.
-    let hooks_note = match ccteam_core::remove_ccteam_hooks(
-        &target.join(".claude").join("settings.local.json"),
-        false,
-    ) {
-        Ok(report) => scrub_note(&report),
-        Err(err) => Some(format!("left untouched: {err:#}")),
-    };
+    // project sheds the Claude Code hooks earlier ccteam versions wrote;
+    // `create_project` ran the scrub, this only reports it. A user file that is
+    // not valid JSON is left alone and noted, never fatal.
+    let hooks_note = created.settings_scrub.as_ref().and_then(scrub_note);
 
     Ok(ProjectInstallReport {
         slug: slug.to_string(),
-        team: final_team,
-        owner: owner_final,
-        fresh,
-        state_action,
-        workflow_action,
-        agents_action,
+        team: created.team,
+        owner: created.owner,
+        fresh: created.fresh,
+        state_action: if created.fresh {
+            "created"
+        } else {
+            "refreshed"
+        },
+        agents_md_scaffolded: created.agents_md_scaffolded,
         hooks_note,
     })
 }
@@ -1846,8 +1768,8 @@ pub(crate) fn unroster_trigger_path(slug: &str) -> std::path::PathBuf {
 /// Options for `ccteam remove <slug>`.
 #[derive(Debug, Clone, Default)]
 pub struct RemoveOptions {
-    /// Also `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`,
-    /// and `<project>/workflow.yaml`. Business code + `.env` untouched.
+    /// Also remove `<project>/.ccteam/` and scrub old ccteam hook entries.
+    /// User roles, project instructions, business code and `.env` stay intact.
     pub purge: bool,
     /// Print every step that *would* run, but don't touch filesystem
     /// / config / daemon.
@@ -3703,13 +3625,13 @@ fn purge_imd_registry_for_slug(
 /// Helper for `run_remove --purge` — deletes exactly ccteam's own
 /// footprint inside `<project>/` (or, under `--dry-run`, just records
 /// the planned step). A project's on-disk ccteam footprint is `.ccteam/`
-/// (state.json + workflow.yaml) plus any ccteam hook entries an earlier
+/// (state.json and the rest of ccteam's per-project state) plus any ccteam hook entries an earlier
 /// version (or a terminal-protocol session) left inside
 /// `.claude/settings.local.json`. (ccteam seeds NO role, so there is
 /// no ccteam-owned persona to purge.)
 ///
 /// **DELETE** (ccteam-managed only):
-/// - `<project>/.ccteam/` — state.json + workflow.yaml live here (W2).
+/// - `<project>/.ccteam/` — state.json and everything else ccteam keeps per project.
 /// - ccteam's own hook entries inside `<project>/.claude/settings.local.json`
 ///   (surgically, via [`ccteam_core::remove_ccteam_hooks`]). If stripping
 ///   them leaves the file an empty object, the now-vestigial file is deleted.
@@ -3729,8 +3651,7 @@ fn purge_project_managed_paths(
     dry_run: bool,
     report: &mut RemoveReport,
 ) -> Result<()> {
-    // 1. `.ccteam/` dir (state.json + workflow.yaml). W2 moved
-    // workflow.yaml under `.ccteam/`, so this one delete covers both.
+    // 1. `.ccteam/` dir — state.json and everything else ccteam keeps per project.
     let ccteam_dir = project_dir.join(".ccteam");
     if ccteam_dir.is_dir() {
         if dry_run {
@@ -3828,7 +3749,12 @@ mod tests {
         DISABLE_TOOL_SURFACE.get_or_init(disable_tool_surface_bootstrap_for_tests);
     }
 
+    /// Every test builds its paths here, so this is the one place that keeps a
+    /// project creation (`pre_trust_project`) off the developer's real
+    /// `~/.claude.json` — tests that forgot `ensure_isolation()` used to leak
+    /// their tempdirs into it.
     fn fresh_paths(tmp: &TempDir) -> CcteamPaths {
+        ensure_isolation();
         CcteamPaths {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
@@ -4374,7 +4300,7 @@ mod tests {
         let body = run_show(&paths, &slug, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"]["slug"], slug);
-        // v0.8.6: `.ccteam/` keeps only state.json + workflow.yaml, so
+        // v0.8.6: `.ccteam/` keeps only state.json at creation, so
         // there is no `spec` artifact to surface.
         assert!(
             v["artifacts"].as_object().unwrap().is_empty(),
@@ -4549,21 +4475,17 @@ mod tests {
     }
 
     #[test]
-    fn run_init_is_idempotent_and_preserves_user_workflow_yaml() {
-        // V0.5.0 F101: HELPER_TEMPLATES is empty so the V0.4.x
-        // `~/.ccteam/templates/review-with-user-loop.md` idempotency
-        // probe is gone. workflow.yaml is the new canonical
-        // "preserve without --force, overwrite with --force" artifact —
-        // it's user-territory by design (see `force_overwrites_user_workflow_and_agents`).
+    fn run_init_is_idempotent_and_never_overwrites_project_files() {
+        // The only knowledge file init writes is the empty-project `AGENTS.md`
+        // placeholder; once the user has edited it, no re-run (not even
+        // `--force`) may touch it.
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
-        let path = tmp
-            .path()
-            .join("idem-demo")
-            .join(".ccteam")
-            .join("workflow.yaml");
+        let path = tmp.path().join("idem-demo").join("AGENTS.md");
         std::fs::write(&path, "USER EDIT").unwrap();
+        let workflow = tmp.path().join("idem-demo/.ccteam/workflow.yaml");
+        std::fs::write(&workflow, "budgets_v060: {}\n").unwrap();
         run_init(&paths, init_opts_targeting_tmp(&tmp, "idem-demo")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
         run_init(
@@ -4575,7 +4497,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
+        assert_eq!(
+            std::fs::read_to_string(&workflow).unwrap(),
+            "budgets_v060: {}\n"
+        );
     }
 
     /// Fresh install scaffolds the project skeleton AND registers in
@@ -4596,14 +4522,28 @@ mod tests {
         )
         .unwrap();
         assert!(target.join(".ccteam").join("state.json").is_file());
-        assert!(
-            target.join(".ccteam").join("workflow.yaml").is_file(),
-            "V0.4.6 F83: workflow.yaml must land in .ccteam/, not project root",
-        );
-        assert!(
-            !target.join("workflow.yaml").exists(),
-            "V0.4.6 F83: workflow.yaml must NOT be at the project root after fresh init",
-        );
+        // Issue #222 — init writes exactly what every other create entry writes
+        // (they share `ccteam_core::create_project`): no workflow.yaml, no
+        // CLAUDE.md, just the state, the AGENTS.md placeholder and the ignore.
+        let mut files = Vec::new();
+        let mut stack = vec![target.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push(
+                        path.strip_prefix(&target)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        files.sort();
+        assert_eq!(files, [".ccteam/state.json", ".gitignore", "AGENTS.md"]);
         // v0.9.0 (engine neutralization): fresh init seeds NO role — the default
         // session is roleless (bare vendor reads the project CLAUDE.md/AGENTS.md).
         assert!(
@@ -4616,7 +4556,7 @@ mod tests {
         );
         // v0.8.6: init no longer writes the `.ccteam/agents` neutral copy
         // nor the `.ccteam/skills` placeholder layout — `.ccteam/` holds
-        // only state.json + workflow.yaml.
+        // only state.json.
         assert!(
             !target.join(".ccteam").join("agents").exists(),
             "v0.8.6: .ccteam/agents neutral copy must NOT be written",
@@ -4684,11 +4624,9 @@ mod tests {
             !lead.exists(),
             "__lead.md must NOT be scaffolded in default mode"
         );
-        let wf = target.join(".ccteam").join("workflow.yaml");
-        let body = std::fs::read_to_string(&wf).unwrap();
         assert!(
-            !body.contains("mode: agent-team"),
-            "default workflow.yaml must NOT declare agent-team mode",
+            !target.join(".ccteam").join("workflow.yaml").exists(),
+            "init must NOT scaffold a workflow.yaml (issue #222)",
         );
         // docs-local issue #212 — init writes no Claude settings at all.
         assert!(
@@ -4697,11 +4635,10 @@ mod tests {
         );
     }
 
-    /// Re-running on an existing ccteam project preserves user-edited
-    /// workflow.yaml + agents/*.md. workflow.yaml lives in `.ccteam/`,
-    /// not the root.
+    /// Re-running on an existing ccteam project preserves the user's files
+    /// (AGENTS.md, agents/*.md) and the recorded team and owner.
     #[test]
-    fn run_init_refresh_preserves_user_workflow_and_agents() {
+    fn run_init_refresh_preserves_user_files_team_and_owner() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let target = tmp.path().join("f72-refresh");
@@ -4709,12 +4646,13 @@ mod tests {
             &paths,
             InitOptions {
                 install_in: Some(target.clone()),
+                team: Some("ops".into()),
+                owner: Some("user:u1".into()),
                 ..InitOptions::default()
             },
         )
         .unwrap();
-        let wf_path = target.join(".ccteam").join("workflow.yaml");
-        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
+        std::fs::write(target.join("AGENTS.md"), "USER GUIDE\n").unwrap();
         // v0.9.0: init no longer creates `.claude/agents/`; the user authors it.
         std::fs::create_dir_all(target.join(".claude").join("agents")).unwrap();
         std::fs::write(
@@ -4733,13 +4671,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(&wf_path).unwrap(),
-            "USER WORKFLOW\n"
+            std::fs::read_to_string(target.join("AGENTS.md")).unwrap(),
+            "USER GUIDE\n"
         );
         assert_eq!(
             std::fs::read_to_string(target.join(".claude").join("agents").join("cto.md")).unwrap(),
             "USER AGENT\n"
         );
+        let state =
+            ccteam_core::ProjectState::load(&target.join(".ccteam").join("state.json")).unwrap();
+        assert_eq!(state.team, "ops", "a plain re-run keeps the recorded team");
+        assert_eq!(state.owner.as_deref(), Some("user:u1"));
     }
 
     /// docs-local issue #212 — re-running `ccteam init` on a project an
@@ -4804,7 +4746,7 @@ mod tests {
                 ..InitOptions::default()
             };
             run_init(&paths, opts()).unwrap_or_else(|e| panic!("{name}: fresh init: {e:#}"));
-            assert!(target.join(".ccteam").join("workflow.yaml").exists());
+            assert!(target.join(".ccteam").join("state.json").exists());
             run_init(&paths, opts()).unwrap_or_else(|e| panic!("{name}: re-init: {e:#}"));
             assert_eq!(std::fs::read_to_string(&local).unwrap(), body, "{name}");
         }
@@ -4834,10 +4776,9 @@ mod tests {
         assert!(parse.contains("not valid JSON"), "{parse}");
     }
 
-    /// `--force` re-runs overwrite user files. workflow.yaml lives in
-    /// `.ccteam/`, not the root.
+    /// `--force` re-stamps the team on a refresh; it never overwrites a project file.
     #[test]
-    fn run_init_force_overwrites_user_workflow_and_agents() {
+    fn run_init_force_restamps_team_and_keeps_project_files() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let target = tmp.path().join("f72-force");
@@ -4845,12 +4786,12 @@ mod tests {
             &paths,
             InitOptions {
                 install_in: Some(target.clone()),
+                team: Some("ops".into()),
                 ..InitOptions::default()
             },
         )
         .unwrap();
-        let wf_path = target.join(".ccteam").join("workflow.yaml");
-        std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
+        std::fs::write(target.join("AGENTS.md"), "USER GUIDE\n").unwrap();
         run_init(
             &paths,
             InitOptions {
@@ -4860,9 +4801,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_ne!(
-            std::fs::read_to_string(&wf_path).unwrap(),
-            "USER WORKFLOW\n"
+        let state =
+            ccteam_core::ProjectState::load(&target.join(".ccteam").join("state.json")).unwrap();
+        assert_eq!(state.team, "dev", "--force re-stamps the default team");
+        assert_eq!(
+            std::fs::read_to_string(target.join("AGENTS.md")).unwrap(),
+            "USER GUIDE\n"
         );
     }
 
@@ -5018,12 +4962,6 @@ mod tests {
             state_path.exists(),
             "state.json must exist after --force init; checked {}",
             state_path.display()
-        );
-        let workflow_path = fake_repo.join(".ccteam").join("workflow.yaml");
-        assert!(
-            workflow_path.exists(),
-            "workflow.yaml must exist after --force init; checked {}",
-            workflow_path.display()
         );
     }
 
