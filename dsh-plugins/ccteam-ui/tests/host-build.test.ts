@@ -73,7 +73,7 @@ describe('client bundle loader contract', () => {
     expect(typeof exported).toBe('object')
     expect(exported.name).toBe('ccteam-ui')
     expect(typeof exported.apply).toBe('function')
-    expect(exported.inject).toEqual(['slots', 'locale', 'settingsScope'])
+    expect(exported.inject).toEqual(['slots', 'locale'])
     // Whatever the client half requires must be answerable by the module table.
     expect(required.length).toBeGreaterThan(0)
     for (const spec of required) expect(isClientExternal(spec)).toBe(true)
@@ -108,12 +108,12 @@ describe('client bundle loader contract', () => {
     // convention every DSH client package follows (ui-goal lists
     // ui-conversation, ui-settings-general lists ui-sidebar).
     expect(pkg.dsh.client.inject).toEqual([
-      '@deepseek-ai/dsh-client-runtime',
       '@deepseek-ai/dsh-client-locale',
       '@deepseek-ai/dsh-client-ui-layout',
       '@deepseek-ai/dsh-client-ui-sidebar',
       '@deepseek-ai/dsh-client-ui-settings',
-      '@deepseek-ai/dsh-client-ui-settings-plugins',
+      '@deepseek-ai/dsh-client-ui-renderer',
+      '@deepseek-ai/dsh-client-ui-workspace',
     ])
     expect(pkg.files).toContain('lib')
     expect(pkg.files).toContain('cordis.patch.yml')
@@ -131,10 +131,9 @@ describe('client bundle loader contract', () => {
 })
 
 describe('client externals', () => {
-  it('is exactly the platform seed table plus the preloaded runtime', () => {
+  it('is exactly only the shared platform modules used by this plugin', () => {
     expect([...CLIENT_EXTERNALS].sort()).toEqual([
       '@deepseek-ai/cordis',
-      '@deepseek-ai/dsh-client-runtime/client',
       '@deepseek-ai/dsh-client-ui-primitives',
       '@deepseek-ai/dsh-client-ui-slots',
       'react',

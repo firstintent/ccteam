@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apply } from '../src/index.js'
+import { apply, Config } from '../src/index.js'
 import { AcpClient, makeFakeCtx, shortSocketPath } from './host-cordis-fakes.js'
 
 interface WireCall {
@@ -51,7 +51,7 @@ afterEach(() => {
 describe('apply', () => {
   it('registers exactly the six ccteam tool names', () => {
     const h = makeFakeCtx()
-    apply(h.ctx as never)
+    apply(h.ctx as never, Config({ enrollment: 'ccteam-enroll:e1:secret', daemonUrl: 'http://daemon.test' }))
 
     expect(h.tools.map(tool => tool.name).sort()).toEqual([
       'agent',
@@ -66,7 +66,7 @@ describe('apply', () => {
   it('runs tool-surface-only (mode 2) on the enrollment credential with no listeners', async () => {
     const calls = stubDaemon()
     const h = makeFakeCtx({ settings: { enrollment: 'ccteam-enroll:e1:secret' } })
-    apply(h.ctx as never)
+    apply(h.ctx as never, Config({ enrollment: 'ccteam-enroll:e1:secret', daemonUrl: 'http://daemon.test' }))
 
     expect(h.ctx.on).not.toHaveBeenCalled()
 
@@ -84,7 +84,7 @@ describe('apply', () => {
     process.env.CCTEAM_DSH_APPROVAL = 'hitl'
     const calls = stubDaemon()
     const h = makeFakeCtx({ settings: { enrollment: 'ccteam-enroll:e1:secret' } })
-    apply(h.ctx as never)
+    apply(h.ctx as never, Config({ enrollment: 'ccteam-enroll:e1:secret', daemonUrl: 'http://daemon.test' }))
 
     // No transport: the env switch is gone, only `transportSocket` starts one.
     expect(h.ctx.on).not.toHaveBeenCalled()
@@ -101,10 +101,10 @@ describe('apply', () => {
    * (schema default), so the enrollment a human pasted into the DSH settings
    * card must still win.
    */
-  it('takes the enrollment from the settings card when the row config carries the schema default', async () => {
+  it('uses the native live enrollment reference', async () => {
     const calls = stubDaemon()
     const h = makeFakeCtx({ settings: { enrollment: 'ccteam-enroll:from-card:secret' } })
-    apply(h.ctx as never, { enrollment: '', daemonUrl: '' })
+    apply(h.ctx as never, Config({ enrollment: 'ccteam-enroll:from-card:secret', daemonUrl: 'http://daemon.test' }))
 
     const status = h.tools.find(tool => tool.name === 'status')!
     await status.execute({}, { agent: { id: 'dsh-1', session: { id: 'dsh-1' }, followup: vi.fn() } })
@@ -119,7 +119,7 @@ describe('apply', () => {
     const calls = stubDaemon()
     const socketPath = shortSocketPath()
     const h = makeFakeCtx({ settings: { enrollment: 'ccteam-enroll:e1:secret' } })
-    apply(h.ctx as never, { transportSocket: socketPath })
+    apply(h.ctx as never, Config({ transportSocket: socketPath, enrollment: 'ccteam-enroll:e1:secret', daemonUrl: 'http://daemon.test' }))
 
     const client = await AcpClient.connect(socketPath)
     closers.push(() => client.close())

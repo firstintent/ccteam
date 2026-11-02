@@ -4,7 +4,6 @@ export const DEFAULT_DAEMON_URL = 'http://127.0.0.1:7331'
 export const SETTINGS_NAMESPACE = 'ccteam-ui'
 
 export const UNCHECKED_STATUS = 'Not checked. If the daemon is unreachable, run: ccteam start'
-const NO_SERVICE_STATUS = 'Settings service unavailable. If the daemon is unreachable, run: ccteam start'
 
 /**
  * ONE flat namespace for all three faces of this plugin. The base URL is
@@ -21,7 +20,7 @@ const NO_SERVICE_STATUS = 'Settings service unavailable. If the daemon is unreac
  *
  * Keys are FLAT on purpose: this schema is also the shape of the row `config`
  * that ccteam's materializer writes into a profile's `cordis.patch.yml`, and
- * that config reaches `apply(ctx, config)` verbatim. Nesting a key under a
+ * Cordis supplies live references to `apply(ctx, config)`. Nesting a key under a
  * namespace makes the value silently undefined (shipped once, v0.10.0).
  */
 export interface CcteamSettings {
@@ -44,76 +43,45 @@ export interface CcteamSettings {
   enginePath: string
 }
 
-export const CcteamSettingsSchema: Schema<CcteamSettings> = Schema.object({
-  daemonUrl: Schema.string().default(DEFAULT_DAEMON_URL).description('ccteam daemon URL.'),
-  enrollment: Schema.string()
-    .default('')
-    .role('secret')
-    .description('Enrollment credential from ccteam config (tool surface).'),
-  restToken: Schema.string()
-    .default('')
-    .role('secret')
-    .description('Personal ccteam REST API token (ccteam web console → Account).'),
-  defaultProject: Schema.string()
-    .default('')
-    .description('Project slug new sessions land in when the panel does not name one.'),
-  connectionStatus: Schema.string().default(UNCHECKED_STATUS),
-  autoStart: Schema.boolean()
-    .default(true)
-    .description('Install the ccteam engine and start its daemon when this plugin loads.'),
-  enginePath: Schema.string()
-    .default('')
-    .description('Advanced: path to the ccteam binary. Empty = PATH, then the canonical install path.'),
-})
+/** Native Config is the single authority; DSH projects volatile fields into its forms. */
+export const CCTEAM_SETTINGS_FIELDS = {
+  daemonUrl: Schema.string().default(DEFAULT_DAEMON_URL).description('ccteam daemon URL.').volatile(),
+  enrollment: Schema.string().default('').role('secret').description('ccteam enrollment credential.').volatile(),
+  restToken: Schema.string().default('').role('secret').description('Personal ccteam REST API token.').volatile(),
+  defaultProject: Schema.string().default('').description('Default ccteam project slug.').volatile(),
+  connectionStatus: Schema.string().default(UNCHECKED_STATUS).volatile(),
+  autoStart: Schema.boolean().default(true).description('Install and start the local ccteam engine.').volatile(),
+  enginePath: Schema.string().default('').description('Path to the ccteam binary; empty uses PATH.').volatile(),
+}
+export const CcteamSettingsSchema = Schema.object(CCTEAM_SETTINGS_FIELDS)
+
+export type LiveSettings = ReturnType<typeof CcteamSettingsSchema>
 
 export interface SettingsScope<T> {
   get(): T
-  watch?(callback: (next: T, prev: T) => void | Promise<void>): () => void
-  /**
-   * Merge a patch into the user layer. Present on the real service
-   * (`@deepseek-ai/dsh-settings`); optional here because the no-service
-   * fallback below has nowhere to write.
-   */
   update?(patch: object): Promise<void>
 }
 
-export interface SettingsContext {
-  settings?: {
-    register<T>(
-      ns: string,
-      schema: Schema<T>,
-      options?: { applies?: 'live' | 'restart'; base?: Partial<T> },
-    ): SettingsScope<T>
-  }
-}
-
-/**
- * Register the settings card. Credentials live here and in closure scope only:
- * they are never written to `process.env`, never logged, and never leave the
- * host half (see bff.ts and tools.ts).
- */
-export function registerCcteamSettings(
-  ctx: SettingsContext,
-  base?: Partial<CcteamSettings>,
+/** Read the framework-owned references on every operation; no second settings registry. */
+export function bindCcteamSettings(
+  ctx: { get?(name: string): unknown; fiber?: { entry?: { id: string } } },
+  config: LiveSettings,
 ): SettingsScope<CcteamSettings> {
-  if (ctx.settings === undefined) {
-    return {
-      get: () => ({
-        daemonUrl: base?.daemonUrl ?? DEFAULT_DAEMON_URL,
-        enrollment: base?.enrollment ?? '',
-        restToken: base?.restToken ?? '',
-        defaultProject: base?.defaultProject ?? '',
-        connectionStatus: base?.connectionStatus ?? NO_SERVICE_STATUS,
-        autoStart: base?.autoStart ?? true,
-        enginePath: base?.enginePath ?? '',
-      }),
-    }
+  return {
+    get: () => ({
+      daemonUrl: config.daemonUrl.get(),
+      enrollment: config.enrollment.get(),
+      restToken: config.restToken.get(),
+      defaultProject: config.defaultProject.get(),
+      connectionStatus: config.connectionStatus.get(),
+      autoStart: config.autoStart.get(),
+      enginePath: config.enginePath.get(),
+    }),
+    async update(patch) {
+      const service = ctx.get?.('settings') as import('@deepseek-ai/dsh-settings').SettingsForms | undefined
+      const entryId = ctx.fiber?.entry?.id
+      if (service === undefined || entryId === undefined) throw new Error('DSH profile settings are unavailable')
+      await service.update(entryId, patch)
+    },
   }
-  return ctx.settings.register(SETTINGS_NAMESPACE, CcteamSettingsSchema, {
-    // `live` for the panel's own reads (the BFF resolves through closures on
-    // every request); the tool and transport faces read their credential per
-    // call, so an edit reaches them without a restart too.
-    applies: 'live',
-    base,
-  })
 }

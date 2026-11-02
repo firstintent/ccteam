@@ -10,11 +10,11 @@ import { useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react'
 import clsx from 'clsx'
 import {
-  IconCloseFill14,
-  IconLoadingOutline16,
-  IconPaperclipOutline16,
-  IconSendOutline16,
-  IconStopFill16,
+  IconCloseFillRegular,
+  IconLoadingOutlineRegular,
+  IconPaperclipOutlineRegular,
+  IconSendOutlineRegular,
+  IconStopFillRegular,
   Menu,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -185,8 +185,8 @@ export function Composer(props: ComposerProps) {
             {props.attachments.map(attachment => (
               <span key={attachment.key} className={css.chip} title={attachment.error ?? attachment.name}>
                 {attachment.uploading === true
-                  ? <IconLoadingOutline16 className={css.spin} size={12} />
-                  : <IconPaperclipOutline16 size={12} />}
+                  ? <IconLoadingOutlineRegular className={css.spin} size={12} />
+                  : <IconPaperclipOutlineRegular size={12} />}
                 <span className={css.chipText}>
                   {attachment.error !== undefined
                     ? t('chat.attach.failed', { kind: attachment.error })
@@ -201,7 +201,7 @@ export function Composer(props: ComposerProps) {
                       props.onRemoveAttachment?.(attachment.key)
                     }}
                   >
-                    <IconCloseFill14 size={12} />
+                    <IconCloseFillRegular size={12} />
                   </button>
                 )}
               </span>
@@ -234,7 +234,7 @@ export function Composer(props: ComposerProps) {
                     fileRef.current?.click()
                   }}
                 >
-                  <IconPaperclipOutline16 size={16} />
+                  <IconPaperclipOutlineRegular size={16} />
                 </button>
               </>
             )}
@@ -251,7 +251,7 @@ export function Composer(props: ComposerProps) {
                     title={t('chat.stop')}
                     onClick={onStop}
                   >
-                    <IconStopFill16 size={14} />
+                    <IconStopFillRegular size={14} />
                   </button>
                 )
               : (
@@ -263,7 +263,7 @@ export function Composer(props: ComposerProps) {
                     disabled={!canSend}
                     onClick={submit}
                   >
-                    {busy === true ? <IconLoadingOutline16 className={css.spin} size={16} /> : <IconSendOutline16 size={16} />}
+                    {busy === true ? <IconLoadingOutlineRegular className={css.spin} size={16} /> : <IconSendOutlineRegular size={16} />}
                   </button>
                 )}
           </div>

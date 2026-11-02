@@ -12,7 +12,7 @@ faces, and every DSH profile that installs it gets all three:
 Built the way a DSH client plugin is built: `dsh.client` in package.json
 names the packages it composes against, the client half contributes its seats
 through `ctx.slots.inject(...) → ctx.slots.register(...)`
-(`sidebar.footer.action`, `shell.overlay`, `settings.plugin.item`), copy goes
+(`sidebar.footer.action`, `shell.overlay`, `settings.section`), copy goes
 through `ctx.locale`, business state reaches components as framework-bound
 selector hooks, and stylesheets are lightningcss CSS Modules under the
 preset's `[hash]_[local]` pattern.
@@ -30,8 +30,7 @@ the rest.
 ## Install (hand-started DSH)
 
 1. `dsh plugin --profile web add @ccteam/ccteam-ui`
-2. Restart `dsh web`, hard-refresh, then open DSH Settings → Plugins →
-   **ccteam-ui** and fill in one card: the daemon URL, your personal REST
+2. Restart `dsh web`, hard-refresh, then open DSH Settings → **ccteam-ui** and fill in one card: the daemon URL, your personal REST
    token (ccteam web console → Settings → Account) for the workbench, and the
    enrollment credential (Settings → Access) for the agent's tools.
 3. Look for the ccteam button at the bottom of the sidebar.

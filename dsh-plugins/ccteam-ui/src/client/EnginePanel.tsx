@@ -9,13 +9,13 @@ import { useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import {
   Button,
-  IconCheckOutline14,
-  IconCloseOutline16,
-  IconCopyOutline16,
-  IconFolderOpen16,
-  IconLoadingOutline16,
-  IconPlayOutline16,
-  IconWarningOutline16,
+  IconCheckOutlineRegular,
+  IconCloseOutlineRegular,
+  IconCopyOutlineRegular,
+  IconFolderOpenRegular,
+  IconLoadingOutlineRegular,
+  IconPlayOutlineRegular,
+  IconWarningOutlineRegular,
   StateDot,
   writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -43,7 +43,7 @@ export function CopyChip({ text, t }: { text: string; t: T }) {
           setCopied(true)
         }}
       >
-        {copied ? <IconCheckOutline14 size={14} /> : <IconCopyOutline16 size={14} />}
+        {copied ? <IconCheckOutlineRegular size={14} /> : <IconCopyOutlineRegular size={14} />}
       </button>
     </span>
   )
@@ -118,7 +118,7 @@ export function EnginePanel({ t, status, pending, error, mode, onStart, onOpenSe
     <div className={css.firstRun} data-first-run={mode} data-engine-state={state ?? 'unknown'}>
       <div className={css.firstRunCard} role="group" aria-label={title}>
         <div className={css.firstRunTitle}>
-          {busy || status === null ? <IconLoadingOutline16 className={css.spin} size={16} /> : <EngineDot dot={dot} size={10} />}
+          {busy || status === null ? <IconLoadingOutlineRegular className={css.spin} size={16} /> : <EngineDot dot={dot} size={10} />}
           <span>{title}</span>
         </div>
         {reason !== null && <p className={css.firstRunBody}>{reason}</p>}
@@ -139,7 +139,7 @@ export function EnginePanel({ t, status, pending, error, mode, onStart, onOpenSe
               <Button
                 variant="primary"
                 size="md"
-                icon={pending === 'start' ? <IconLoadingOutline16 className={css.spin} size={16} /> : <IconPlayOutline16 size={16} />}
+                icon={pending === 'start' ? <IconLoadingOutlineRegular className={css.spin} size={16} /> : <IconPlayOutlineRegular size={16} />}
                 disabled={pending !== null}
                 onClick={onStart}
               >
@@ -188,7 +188,7 @@ export function VersionBanner({ t, relation, canUpdate, pending, onUpdate, onDis
   if (relation.kind !== 'engine-older' && relation.kind !== 'plugin-older') return null
   return (
     <div className={css.banner} role="status" data-relation={relation.kind}>
-      <IconWarningOutline16 className={css.bannerIcon} size={16} />
+      <IconWarningOutlineRegular className={css.bannerIcon} size={16} />
       <span className={css.bannerText}>
         {relation.kind === 'engine-older'
           ? t('banner.engineOlder', { engine: relation.engine, pinned: relation.pinned })
@@ -203,7 +203,7 @@ export function VersionBanner({ t, relation, canUpdate, pending, onUpdate, onDis
         )}
         {relation.kind === 'plugin-older' && <CopyChip text={PLUGIN_UPDATE_COMMAND} t={t} />}
         <button type="button" className={css.iconBtn} aria-label={t('banner.dismiss')} onClick={onDismiss}>
-          <IconCloseOutline16 size={14} />
+          <IconCloseOutlineRegular size={14} />
         </button>
       </span>
     </div>
@@ -250,7 +250,7 @@ export function ProjectPanel({ t, busy, error, useWorkspaces, onCreate }: Projec
     <div className={css.firstRun} data-first-run="no-project">
       <div className={css.firstRunCard} role="group" aria-label={t('firstrun.project.title')}>
         <div className={css.firstRunTitle}>
-          <IconFolderOpen16 size={18} />
+          <IconFolderOpenRegular size={18} />
           <span>{t('firstrun.project.title')}</span>
         </div>
         <p className={css.firstRunBody}>{t('firstrun.project.body')}</p>
@@ -303,7 +303,7 @@ export function ProjectPanel({ t, busy, error, useWorkspaces, onCreate }: Projec
             size="md"
             type="button"
             disabled={busy}
-            icon={busy ? <IconLoadingOutline16 className={css.spin} size={16} /> : undefined}
+            icon={busy ? <IconLoadingOutlineRegular className={css.spin} size={16} /> : undefined}
             onClick={submit}
           >
             {busy ? t('firstrun.project.adding') : t('firstrun.project.add')}

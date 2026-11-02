@@ -97,11 +97,11 @@ describe('DSH ACP socket transport', () => {
 
     h.sessionEvent(sessionId, 'turn/start', { turn: 1 })
     h.sessionEvent(sessionId, 'user/message', { id: messageId, role: 'user', content: [{ type: 'text', text: 'hello' }] })
-    h.sessionEvent(sessionId, 'assistant/chunk', { turn: 1, step: 0, chunk: { type: 'reasoning-delta', text: 'thinking' } })
+    h.assistantStream(sessionId, { turn: 1, step: 0, chunk: { type: 'reasoning-delta', text: 'thinking' } })
     h.sessionEvent(sessionId, 'assistant/message', {
       turn: 1,
       step: 0,
-      message: { content: [{ type: 'text', text: 'partial answer' }] },
+      message: { content: [{ type: 'reasoning', text: 'thinking' }, { type: 'text', text: 'partial answer' }] },
       usage: { inputTokens: 4, outputTokens: 2 },
     })
     h.sessionEvent(sessionId, 'turn/end', { turn: 1, reason: { kind: 'max-tokens' } })
@@ -115,6 +115,7 @@ describe('DSH ACP socket transport', () => {
       sessionId,
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial answer' } },
     })
+    expect(client.updates.filter(update => (update.update as { sessionUpdate: string }).sessionUpdate === 'agent_thought_chunk')).toHaveLength(1)
     expect(client.updates).toContainEqual({
       sessionId,
       update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } },
@@ -200,15 +201,7 @@ describe('DSH ACP socket transport', () => {
   })
 
   it('re-mounts the STORED preset on resume, ignoring the _meta request', async () => {
-    const h = await startTransport({
-      persistence: {
-        meta: { agentPreset: 'minimal' },
-        events: [
-          { type: 'agent-preset/selected', data: { agentPreset: 'cordis' } },
-          { type: 'turn/start', data: { turn: 1 } },
-        ],
-      },
-    })
+    const h = await startTransport()
     const client = await connectClient(h.socketPath)
 
     await client.request('session/load', {
@@ -216,11 +209,12 @@ describe('DSH ACP socket transport', () => {
       _meta: { ccteam: { agentPreset: 'code' } },
     })
 
-    const request = h.resume.mock.calls[0]![0] as { setup?: (agentCtx: unknown) => Promise<void> }
+    const request = h.resume.mock.calls[0]![0] as { setup?: (agentCtx: unknown, agent: unknown) => Promise<void> }
     expect(request.setup).toBeTypeOf('function')
-    await request.setup!('agent-ctx')
-    // The newest agent-preset/selected event outranks the creation header,
-    // and the ccteam-side request never overrides vendor storage.
+    const agent = h.agents.get('persisted-1')!
+    await request.setup!('agent-ctx', agent)
+    expect(h.agentPresets.presetForSession).toHaveBeenCalledWith(agent.session)
+    // DSH resolves its persisted selection; the bridge never replays its log.
     expect(h.agentPresets.mount).toHaveBeenCalledWith('agent-ctx', 'cordis')
   })
 
@@ -305,7 +299,7 @@ describe('DSH ACP socket transport', () => {
     // A human types in the DSH web UI while our message waits in the inbox.
     h.sessionEvent(sessionId, 'turn/start', { turn: 1 })
     h.sessionEvent(sessionId, 'user/message', { id: 'human-message', role: 'user', content: [{ type: 'text', text: 'hi' }] })
-    h.sessionEvent(sessionId, 'assistant/chunk', { turn: 1, step: 0, chunk: { type: 'reasoning-delta', text: 'human thought' } })
+    h.assistantStream(sessionId, { turn: 1, step: 0, chunk: { type: 'reasoning-delta', text: 'human thought' } })
     h.sessionEvent(sessionId, 'assistant/message', {
       turn: 1,
       step: 0,
@@ -326,11 +320,11 @@ describe('DSH ACP socket transport', () => {
     h.sessionEvent(sessionId, 'assistant/message', {
       turn: 2,
       step: 0,
-      message: { content: [{ type: 'text', text: 'ccteam answer' }] },
+      message: { content: [{ type: 'reasoning', text: 'settled thought' }, { type: 'text', text: 'ccteam answer' }] },
       usage: { inputTokens: 7, outputTokens: 3 },
     })
     h.sessionEvent(sessionId, 'tool/call', { turn: 2, step: 0, callId: 'ours', name: 'bash', arguments: '{"a":1}' })
-    h.sessionEvent(sessionId, 'tool/result', { turn: 2, step: 0, message: { source: { callId: 'ours' }, content: [] } })
+    h.sessionEvent(sessionId, 'tool/result', { turn: 2, step: 0, message: { source: { callId: 'ours' }, content: [], isError: true } })
     h.sessionEvent(sessionId, 'turn/end', { turn: 2, reason: { kind: 'completed' } })
 
     const result = await prompt
@@ -338,8 +332,10 @@ describe('DSH ACP socket transport', () => {
       stopReason: 'end_turn',
       _meta: { inputTokens: 7, outputTokens: 3 },
     })
+    expect(client.updates).toContainEqual({ sessionId, update: expect.objectContaining({ sessionUpdate: 'tool_call_update', toolCallId: 'ours', status: 'failed', isError: true }) })
     const texts = JSON.stringify(client.updates)
     expect(texts).toContain('ccteam answer')
+    expect(texts).toContain('settled thought')
     expect(texts).not.toContain('human answer')
     expect(texts).not.toContain('human thought')
     expect(texts).not.toContain('human-call')

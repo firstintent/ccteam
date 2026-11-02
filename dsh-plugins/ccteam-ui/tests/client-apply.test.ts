@@ -21,17 +21,17 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
     StateDot: stub,
     Tooltip: stub,
     writeClipboard: stub,
-    IconBranchOutline16: stub,
-    IconCheckOutline14: stub,
-    IconChevronDownOutline14: stub,
-    IconChevronLeftOutline14: stub,
-    IconCloseOutline16: stub,
-    IconCopyOutline16: stub,
-    IconPlusOutline16: stub,
-    IconSendOutline16: stub,
-    IconSettingsOutline14: stub,
-    IconTreeCorner8x10: stub,
-    IconWarningOutline16: stub,
+    IconBranchOutlineRegular: stub,
+    IconCheckOutlineRegular: stub,
+    IconChevronDownOutlineRegular: stub,
+    IconChevronLeftOutlineRegular: stub,
+    IconCloseOutlineRegular: stub,
+    IconCopyOutlineRegular: stub,
+    IconPlusOutlineRegular: stub,
+    IconSendOutlineRegular: stub,
+    IconSettingsOutlineRegular: stub,
+    IconTreeCornerRegular: stub,
+    IconWarningOutlineRegular: stub,
   }
 })
 
@@ -64,19 +64,19 @@ function fakeScope(namespace: string) {
       mode: 'host' as const,
     }),
     subscribe: () => () => {},
-    set: () => Promise.resolve(),
-    unset: () => Promise.resolve(),
+    mutate: () => Promise.resolve(true),
   }
 }
 
 /** A recording client context: every service the plugin injects, no React. */
-function recordingCtx() {
+function recordingCtx(settings = true) {
   const effects: Array<{ label: string | undefined; dispose: (() => void) | void }> = []
   const dictionaries: Array<{ ns: string; locales: string[] }> = []
   const waits: Wait[] = []
   const registrations: Registration[] = []
   const bound: string[] = []
   const ctx = {
+    inject(deps: string[], body: (ctx: unknown) => void) { if (settings || !deps.includes('configForms')) body(ctx) },
     effect(setup: () => (() => void) | void, label?: string) {
       const dispose = setup()
       effects.push({ label, dispose })
@@ -104,10 +104,12 @@ function recordingCtx() {
         }
       },
     },
-    settingsScope: {
-      bind(spec: { namespace: string }) {
-        bound.push(spec.namespace)
-        return fakeScope(spec.namespace)
+    configForms: {
+      describe() { return { getSnapshot: () => ({ view: { namespaces: [] } }), subscribe: () => () => {} } },
+      whileServed(_namespaces: string[], register: () => () => void) { return register() },
+      get(namespace: string) {
+        bound.push(namespace)
+        return fakeScope(namespace)
       },
     },
   }
@@ -126,9 +128,16 @@ function declareAll(waits: Wait[]): void {
 }
 
 describe('plugin face', () => {
+  it('keeps the workbench and entry active without the optional settings provider', () => {
+    const { ctx, waits, registrations } = recordingCtx(false)
+    apply(ctx as never)
+    declareAll(waits)
+    expect(registrations.map(row => row.options.name)).toEqual(['sidebar.footer.action', 'shell.overlay'])
+  })
+
   it('is a DSH client plugin: name, required services, apply', () => {
     expect(name).toBe('ccteam-ui')
-    expect(inject).toEqual(['slots', 'locale', 'settingsScope'])
+    expect(inject).toEqual(['slots', 'locale'])
     expect(typeof apply).toBe('function')
   })
 })
@@ -143,13 +152,15 @@ describe('apply', () => {
       'ccteam-ui: persistence',
       'ccteam-ui: team event stream',
       'ccteam-ui: engine poller',
+      'ccteam-ui: settings form',
+      'ccteam-ui: settings section',
     ])
   })
 
   it('contributes every seat through slots.inject, never a direct register at apply time', () => {
     const { ctx, waits, registrations } = recordingCtx()
     apply(ctx as never)
-    expect(waits.map(wait => wait.key)).toEqual(['sidebar.footer.action', 'shell.overlay', 'settings.plugin.item'])
+    expect(waits.map(wait => wait.key)).toEqual(['sidebar.footer.action', 'shell.overlay', 'settings.section'])
     // Nothing is registered until the framework reports the slot declared.
     expect(registrations).toEqual([])
   })
@@ -168,8 +179,8 @@ describe('apply', () => {
     expect(panel?.component).toBe(Workbench)
     expect(panel?.options).toMatchObject({ id: 'ccteam', order: 0, locale: 'ccteam' })
 
-    const cards = byName('settings.plugin.item')
-    expect(cards.map(card => card.options.key)).toEqual(['ccteam-ui'])
+    const cards = byName('settings.section')
+    expect(cards.map(card => card.options.id)).toEqual(['ccteam-ui'])
     for (const card of cards) {
       expect(card.component).toBe(SettingsCard)
       expect(card.options.locale).toBe('ccteam')
@@ -203,7 +214,7 @@ describe('apply', () => {
     const { ctx, waits, registrations } = recordingCtx()
     apply(ctx as never)
     declareAll(waits)
-    for (const card of registrations.filter(r => r.options.name === 'settings.plugin.item')) {
+    for (const card of registrations.filter(r => r.options.name === 'settings.section')) {
       const face = (card.options.inject as () => {
         hooks: { card: { getSnapshot(): { available: boolean; fields: Record<string, unknown> }; subscribe: unknown } }
         spec: { namespace: string; fields: Array<{ field: string; kind: string }> }
@@ -212,7 +223,7 @@ describe('apply', () => {
         discard: unknown
         reset: unknown
       })()
-      expect(face.spec.namespace).toBe(card.options.key)
+      expect(face.spec.namespace).toBe(card.options.id)
       expect(typeof face.hooks.card.subscribe).toBe('function')
       const state = face.hooks.card.getSnapshot()
       expect(state.available).toBe(true)

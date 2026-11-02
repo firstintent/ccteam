@@ -75,7 +75,12 @@ for plugin in "${plugins[@]}"; do
   # Two-path reproducibility gate: same source, different directory, same bytes.
   mirror="$staging/mirror-$plugin"
   rm -rf "$mirror"
-  cp -al "$src" "$mirror" 2>/dev/null || cp -a "$src" "$mirror"
+  if ! cp -al "$src" "$mirror" 2>/dev/null; then
+    # A cross-filesystem hardlink failure can leave a partial destination.
+    # Recreate it so the fallback cannot nest the source beneath that directory.
+    rm -rf "$mirror"
+    cp -a "$src" "$mirror"
+  fi
   (cd "$mirror" && npm run build >/dev/null)
   mirror_out="$staging/$plugin-mirror"
   mkdir -p "$mirror_out"

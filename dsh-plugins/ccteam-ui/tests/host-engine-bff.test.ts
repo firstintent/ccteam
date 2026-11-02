@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { createBff, type EngineFace } from '../src/bff.js'
-import { ENGINE_VERSION, apply } from '../src/index.js'
+import { ENGINE_VERSION, apply, Config } from '../src/index.js'
 import { DEFAULT_DAEMON_URL } from '../src/settings.js'
 import { API_PREFIX, type ApiMethod, type EngineStatus } from '../src/shared/contract.js'
 import { FakeFetch, FakeRequest, FakeResponse, FakeWebServer, hostCtx } from './host-fakes.js'
@@ -160,24 +160,8 @@ describe('engine methods through the BFF', () => {
 describe('a schema default is a blank row, not a pin', () => {
   function applied(config: Record<string, unknown>, card: Record<string, unknown> = {}) {
     const server = new FakeWebServer()
-    const ctx = hostCtx({
-      webServer: server,
-      settings: {
-        register: () => ({
-          get: () => ({
-            daemonUrl: DEFAULT_DAEMON_URL,
-            enrollment: '',
-            restToken: '',
-            defaultProject: '',
-            connectionStatus: '',
-            autoStart: false,
-            enginePath: '',
-            ...card,
-          }),
-        }),
-      },
-    })
-    apply(ctx as never, config as never)
+    const ctx = hostCtx({ webServer: server })
+    apply(ctx as never, Config({ autoStart: false, ...config, ...card }))
     return server
   }
 
@@ -208,9 +192,9 @@ describe('a schema default is a blank row, not a pin', () => {
     expect(status.supervised).toBe(true)
   })
 
-  it('does read a ccteam-materialized row — one carrying credentials — as exactly that', async () => {
+  it('does read a ccteam-materialized row — explicitly marked engineManaged — as exactly that', async () => {
     const status = await engineStatusOf(
-      applied({ daemonUrl: 'http://127.0.0.1:7331', restToken: 'ccteam:deadbeef' }),
+      applied({ engineManaged: true, daemonUrl: 'http://127.0.0.1:7331', restToken: 'ccteam:deadbeef' }),
     )
 
     expect(status.supervised).toBe(false)

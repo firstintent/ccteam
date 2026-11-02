@@ -416,7 +416,6 @@ async fn proxy_http(
 ) -> Response {
     let (parts, body) = req.into_parts();
     let port = target.port;
-    let plugin_bundle = is_plugin_bundle_path(parts.uri.path());
     let upstream = format!(
         "http://127.0.0.1:{port}{}",
         parts
@@ -430,7 +429,7 @@ async fn proxy_http(
     builder = builder.headers(headers);
     builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     match builder.send().await {
-        Ok(resp) => response_from_reqwest(resp, plugin_bundle).await,
+        Ok(resp) => response_from_reqwest(resp).await,
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": err.to_string() })),
@@ -457,48 +456,10 @@ async fn proxy_http(
 const CRYPTO_RANDOM_UUID_POLYFILL: &str = r#"<script>(function(){var c=window.crypto;if(!c||typeof c.getRandomValues!=="function")return;if(typeof c.randomUUID==="function")return;var h=[];for(var i=0;i<256;i++)h.push((i+256).toString(16).slice(1));Object.defineProperty(c,"randomUUID",{configurable:true,writable:true,value:function(){var b=new Uint8Array(16);c.getRandomValues(b);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;return h[b[0]]+h[b[1]]+h[b[2]]+h[b[3]]+"-"+h[b[4]]+h[b[5]]+"-"+h[b[6]]+h[b[7]]+"-"+h[b[8]]+h[b[9]]+"-"+h[b[10]]+h[b[11]]+h[b[12]]+h[b[13]]+h[b[14]]+h[b[15]]}})})();</script>"#;
 
 /// Declares that the page owns its Host, through DSH's own transport hook.
-///
-/// DSH keeps its **privileged surface** — the settings document (every
-/// Settings page: General, Models, Plugin configuration), and the deliverables
-/// file actions — reachable only from "the operator's own machine". The client
-/// decides that from the page authority (`dsh-client-connection`:
-/// `isLoopback = transport.ownsHost || page hostname is loopback`), and a
-/// non-loopback page gets every settings scope in `memory` mode: the describe
-/// mirror never asks the Host, so the Plugin configuration tab renders nothing
-/// at all — not the cards, not even the "no settings" line — while the same
-/// instance opened from `127.0.0.1` shows everything. Real-machine v0.10.4: a
-/// LAN browser on ccteam web → DSH saw an empty tab and had nowhere to paste a
-/// REST token.
-///
-/// Through the companion port that stand-in is ccteam's authenticated
-/// identity: the page reaches an instance that belongs to that identity alone
-/// (the operator's own `~/.dsh`, or the tenant's isolated home), after ccteam
-/// auth, and the server-side Host/Origin fence is already satisfied by the
-/// loopback rewrite in [`proxy_request_headers`]. `__DSH_TRANSPORT__.ownsHost`
-/// is the hook DSH documents for exactly this ("a shell that assembles its
-/// own transport"); the companion port is that shell.
-///
-/// Version-safe by construction, because the two published shapes of the hook
-/// differ and a served page carries the global for both:
-/// - DSH ≤ 0.1.1-rc.2 has no `ownsHost` and reads
-///   `transport?.createApiClient() ?? new WebApiClient()` — a global WITHOUT
-///   `createApiClient` aborts the whole boot ("transport?.createApiClient is
-///   not a function", real-machine), so the declaration ships a
-///   `createApiClient` that answers `undefined` and lets the default carrier
-///   through. On those versions the flag is simply not read: settings stay
-///   loopback-only there (a `127.0.0.1` tunnel is the way in), nothing else
-///   changes.
-/// - DSH after rc.2 reads `ownsHost`, ignores `createApiClient`, and takes
-///   `fetch` / `openStream` / `loadBundle` from the global only when present —
-///   none are, so HTTP + WebSocket + HTTP bundles stay the defaults.
-///
-/// An existing global (a shell that brought its own transport) is left alone
-/// except for the missing flag. Consequence to know once the flag is read:
-/// deliverables actions then act on the daemon host — the workspace machine.
-/// For DSH ≤ 0.1.1-rc.2, whose client never reads the flag, the companion
-/// port back-ports that read into the served client-connection bundle
-/// (`backport_owns_host`), so the declaration is effective on every version.
-const DSH_TRANSPORT_OWNS_HOST: &str = r#"<script>(function(){var g=window,t=g.__DSH_TRANSPORT__;if(t===undefined){g.__DSH_TRANSPORT__={ownsHost:true,createApiClient:function(){return undefined}};return}if(t!==null&&typeof t==="object"&&t.ownsHost===undefined){t.ownsHost=true}})();</script>"#;
+/// The authenticated companion page owns its per-identity Host. Use DSH's
+/// public transport hook before browser modules initialize; vendor bundles
+/// remain opaque and stream through unchanged across DSH releases.
+const DSH_TRANSPORT_OWNS_HOST: &str = r#"<script>(function(){var g=window,t=g.__DSH_TRANSPORT__;if(t===undefined){g.__DSH_TRANSPORT__={ownsHost:true};return}if(t!==null&&typeof t==="object"&&t.ownsHost===undefined){t.ownsHost=true}})();</script>"#;
 
 /// Splice the companion head scripts in as the first thing inside `<head>` so
 /// they run before the boot script and every client plugin module. Returns
@@ -518,33 +479,6 @@ fn inject_polyfill(html: &str) -> Option<String> {
     Some(out)
 }
 
-/// The one line DSH ≤ 0.1.1-rc.2 decides `isLoopback` on: page hostname
-/// alone. Upstream added the `__DSH_TRANSPORT__.ownsHost` read after rc.2
-/// shipped, and the client-connection bundle is served verbatim
-/// (`/plugins/<id>/client.js`), so the companion port back-ports exactly that
-/// read: the rc.2 line gains the same branch newer DSH evaluates natively.
-/// Anything else — another version, a minified build — passes through
-/// byte-for-byte, which is also how this retires: the first DSH release that
-/// reads the flag itself no longer carries the line.
-const RC2_IS_LOOPBACK_LINE: &str =
-    "isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),";
-const RC2_IS_LOOPBACK_OWNS_HOST: &str = "isLoopback: pageLocation === void 0 || \
-     globalThis.__DSH_TRANSPORT__?.ownsHost === true || \
-     isLoopbackHostname(pageLocation.hostname),";
-
-fn backport_owns_host(bundle: &str) -> Option<String> {
-    bundle
-        .contains(RC2_IS_LOOPBACK_LINE)
-        .then(|| bundle.replacen(RC2_IS_LOOPBACK_LINE, RC2_IS_LOOPBACK_OWNS_HOST, 1))
-}
-
-/// `/plugins/<id>/client.js` — DSH client-modules' bundle route (the rev rides
-/// the query string, which is not part of the path).
-fn is_plugin_bundle_path(path: &str) -> bool {
-    path.strip_prefix("/plugins/")
-        .is_some_and(|rest| !rest.starts_with('/') && rest.ends_with("/client.js"))
-}
-
 fn content_type_starts_with(headers: &HeaderMap, prefixes: &[&str]) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -559,53 +493,20 @@ fn is_html_response(headers: &HeaderMap) -> bool {
     content_type_starts_with(headers, &["text/html"])
 }
 
-fn is_javascript_response(headers: &HeaderMap) -> bool {
-    content_type_starts_with(headers, &["text/javascript", "application/javascript"])
-}
-
-/// What the companion port splices into a buffered upstream body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Splice {
-    /// The document: head scripts (secure-context polyfill + `ownsHost`).
-    Html,
-    /// A plugin client bundle: the rc.2 `ownsHost` back-port.
-    PluginBundle,
-}
-
-fn splice_for(headers: &HeaderMap, plugin_bundle: bool) -> Option<Splice> {
-    if is_html_response(headers) {
-        Some(Splice::Html)
-    } else if plugin_bundle && is_javascript_response(headers) {
-        Some(Splice::PluginBundle)
-    } else {
-        None
-    }
-}
-
-async fn response_from_reqwest(resp: reqwest::Response, plugin_bundle: bool) -> Response {
+async fn response_from_reqwest(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
 
-    // HTML (small) and plugin client bundles (a few hundred KB, browser-cached
-    // per rev) are buffered so their splice can be applied; everything else —
-    // assets, RPC payloads, downloads — keeps streaming untouched.
-    // `accept-encoding` is stripped on the way out (see
-    // `should_strip_request_header`), so the body here is always identity and
-    // splicing can never corrupt a compressed stream.
-    if let Some(splice) = splice_for(&headers, plugin_bundle) {
+    // Only HTML needs the public transport declaration. Scripts, downloads,
+    // and RPC streams remain opaque, including their original headers.
+    if is_html_response(&headers) {
         match resp.bytes().await {
             Ok(bytes) => {
                 let body = match std::str::from_utf8(&bytes) {
-                    Ok(text) => {
-                        let patched = match splice {
-                            Splice::Html => inject_polyfill(text),
-                            Splice::PluginBundle => backport_owns_host(text),
-                        };
-                        match patched {
-                            Some(patched) => Body::from(patched),
-                            None => Body::from(bytes),
-                        }
-                    }
+                    Ok(text) => match inject_polyfill(text) {
+                        Some(patched) => Body::from(patched),
+                        None => Body::from(bytes),
+                    },
                     // Not UTF-8 → not something to splice; pass it through.
                     Err(_) => Body::from(bytes),
                 };
@@ -940,10 +841,6 @@ mod tests {
         assert!(!patched.contains("fetch:"));
         assert!(!patched.contains("openStream"));
         assert!(patched.contains("t.ownsHost===undefined"));
-        // DSH ≤ 0.1.1-rc.2 calls `transport?.createApiClient()` unconditionally
-        // and `??`-falls through to its default carrier on `undefined`; a
-        // global without it aborts the boot.
-        assert!(patched.contains("createApiClient:function(){return undefined}"));
     }
 
     #[test]
@@ -952,80 +849,66 @@ mod tests {
         assert!(inject_polyfill("plain text").is_none());
     }
 
-    #[test]
-    fn rc2_connection_bundle_gains_the_owns_host_branch() {
-        let bundle = format!(
-            "\t\t\tconst handle = {{\n\t\t\t\tapi,\n\t\t\t\t{RC2_IS_LOOPBACK_LINE}\n\t\t\t\thostDescription: {{}}\n"
-        );
-        let patched = backport_owns_host(&bundle).expect("the rc.2 line is back-ported");
-        assert_eq!(
-            patched
-                .matches("__DSH_TRANSPORT__?.ownsHost === true")
-                .count(),
-            1,
-            "exactly one ownsHost read is added"
-        );
-        assert!(
-            !patched.contains(RC2_IS_LOOPBACK_LINE),
-            "the hostname-only line is replaced, not duplicated"
-        );
-        assert!(
-            patched.contains("isLoopbackHostname(pageLocation.hostname),"),
-            "the hostname read stays as the fallback"
-        );
-        let (before, after) = bundle.split_once(RC2_IS_LOOPBACK_LINE).unwrap();
-        assert!(patched.starts_with(before) && patched.ends_with(after));
-    }
-
-    #[test]
-    fn other_bundles_pass_through_untouched() {
-        for js in [
-            "",
-            "export const x = 1;",
-            // The post-rc.2 shape already reads the flag: nothing to back-port.
-            "isLoopback: transport?.ownsHost === true || isLoopbackHostname(pageLocation.hostname),",
-        ] {
-            assert!(backport_owns_host(js).is_none(), "{js:?}");
-        }
-    }
-
-    #[test]
-    fn only_plugin_bundle_paths_are_back_port_candidates() {
-        assert!(is_plugin_bundle_path(
-            "/plugins/@deepseek-ai/dsh-client-connection/client.js"
-        ));
-        assert!(is_plugin_bundle_path("/plugins/x/client.js"));
-        for path in [
+    async fn proxy_fixture(content_type: &'static str, body: &'static [u8]) -> Response {
+        let app = axum::Router::new().route(
             "/",
-            "/plugins",
-            "/plugins/",
-            "/plugins/client.js",
-            "/plugins//client.js",
-            "/assets/index-abc.js",
-            "/ccteam/api/tree",
-        ] {
-            assert!(!is_plugin_bundle_path(path), "{path}");
-        }
-        let js = |ct: &str| {
-            let mut h = HeaderMap::new();
-            h.insert(header::CONTENT_TYPE, ct.parse().unwrap());
-            h
-        };
+            axum::routing::get(
+                move || async move { ([(header::CONTENT_TYPE, content_type)], body) },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let output = response_from_reqwest(response).await;
+        // The proxied stream must be consumed before its source server stops.
+        let (parts, body) = output.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        server.abort();
+        Response::from_parts(parts, Body::from(bytes))
+    }
+
+    #[tokio::test]
+    async fn vendor_javascript_is_forwarded_byte_for_byte() {
+        let bundle =
+            b"isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),";
+        let response = proxy_fixture("text/javascript", bundle).await;
         assert_eq!(
-            splice_for(&js("text/javascript; charset=utf-8"), true),
-            Some(Splice::PluginBundle)
+            response.headers()[header::CONTENT_LENGTH],
+            bundle.len().to_string()
         );
         assert_eq!(
-            splice_for(&js("application/javascript"), true),
-            Some(Splice::PluginBundle)
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            bundle
         );
+    }
+
+    #[tokio::test]
+    async fn html_proxy_declares_native_transport_without_stale_length() {
+        let response = proxy_fixture("text/html", b"<html><head></head><body></body></html>").await;
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("ownsHost:true"));
+    }
+
+    #[tokio::test]
+    async fn non_utf8_assets_are_forwarded_without_text_decoding() {
+        let bytes = b"\x00\xff\xfe\x80";
+        let response = proxy_fixture("application/octet-stream", bytes).await;
         assert_eq!(
-            splice_for(&js("text/javascript"), false),
-            None,
-            "a JS asset off the bundle route streams through"
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
         );
-        assert_eq!(splice_for(&js("text/html"), true), Some(Splice::Html));
-        assert_eq!(splice_for(&js("application/json"), true), None);
     }
 
     #[test]

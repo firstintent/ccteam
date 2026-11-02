@@ -142,13 +142,7 @@ export interface BffOptions {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }
 
-export interface WebServerLike {
-  register(route: {
-    kind: 'exact' | 'prefix'
-    path: string
-    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
-  }): () => void
-}
+export type WebServerLike = Pick<import('@deepseek-ai/dsh-host-webserver').WebServer, 'register'>
 
 export interface BffContext {
   webServer: WebServerLike

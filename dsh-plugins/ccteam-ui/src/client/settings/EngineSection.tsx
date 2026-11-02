@@ -10,9 +10,9 @@ import { useEffect, useState } from 'react'
 import {
   Button,
   DisclosureRow,
-  IconCodeOutline16,
-  IconRightUpOutline14,
-  IconSettingsOutline14,
+  IconCodeOutlineRegular,
+  IconRightUpOutlineRegular,
+  IconSettingsOutlineRegular,
   Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { EngineLogResponse } from '../../shared/contract.js'
@@ -131,7 +131,7 @@ export function EngineSection({ t, engine, api, dispatch, autoStart, onAutoStart
           {status?.reachable === true && (
             <a className={css.engineLink} href={status.daemonUrl} target="_blank" rel="noreferrer">
               {t('engine.openWeb')}
-              <IconRightUpOutline14 size={12} />
+              <IconRightUpOutlineRegular size={12} />
             </a>
           )}
         </p>
@@ -205,7 +205,7 @@ export function EngineSection({ t, engine, api, dispatch, autoStart, onAutoStart
             />
           </label>
           <DisclosureRow
-            icon={<IconSettingsOutline14 size={14} />}
+            icon={<IconSettingsOutlineRegular size={14} />}
             title={t('engine.advanced')}
             open={advancedOpen}
             expandable
@@ -255,7 +255,7 @@ export function EngineSection({ t, engine, api, dispatch, autoStart, onAutoStart
             </div>
           </DisclosureRow>
           <DisclosureRow
-            icon={<IconCodeOutline16 size={14} />}
+            icon={<IconCodeOutlineRegular size={14} />}
             title={t('engine.log')}
             open={logOpen}
             expandable

@@ -11,15 +11,15 @@ import { useEffect, useRef, useState } from 'react'
 import clsx from 'clsx'
 import {
   Button,
-  IconApiOutline14,
-  IconChevronDownOutline14,
-  IconCodeOutline16,
-  IconEditOutline16,
-  IconGlobeOutline14,
-  IconLoadingOutline16,
-  IconPaperclipOutline16,
-  IconSparkle16,
-  IconThinkOutline16,
+  IconApiOutlineRegular,
+  IconChevronDownOutlineRegular,
+  IconCodeOutlineRegular,
+  IconEditOutlineRegular,
+  IconGlobeOutlineRegular,
+  IconLoadingOutlineRegular,
+  IconPaperclipOutlineRegular,
+  IconSparkleRegular,
+  IconThinkOutlineRegular,
   MarkdownText,
   Menu,
   StateDot,
@@ -124,7 +124,7 @@ function ModelSwitch({ node, chat, models, t, onSwitch }: {
           <b>{node.vendor}</b>
           {currentModel !== null && <span>· {currentModel}</span>}
           {currentEffort !== null && <span>· {currentEffort}</span>}
-          <IconChevronDownOutline14 size={12} />
+          <IconChevronDownOutlineRegular size={12} />
         </button>
       )}
     />
@@ -134,18 +134,18 @@ function ModelSwitch({ node, chat, models, t, onSwitch }: {
 function StepIcon({ kind }: { kind: string }) {
   switch (kind) {
     case 'command_exec':
-      return <IconCodeOutline16 className={css.stepIcon} size={14} />
+      return <IconCodeOutlineRegular className={css.stepIcon} size={14} />
     case 'file_change':
-      return <IconEditOutline16 className={css.stepIcon} size={14} />
+      return <IconEditOutlineRegular className={css.stepIcon} size={14} />
     case 'web_search':
-      return <IconGlobeOutline14 className={css.stepIcon} size={14} />
+      return <IconGlobeOutlineRegular className={css.stepIcon} size={14} />
     case 'thinking':
-      return <IconThinkOutline16 className={css.stepIcon} size={14} />
+      return <IconThinkOutlineRegular className={css.stepIcon} size={14} />
     case 'tool_call':
     case 'tool_result':
-      return <IconApiOutline14 className={css.stepIcon} size={14} />
+      return <IconApiOutlineRegular className={css.stepIcon} size={14} />
     default:
-      return <IconSparkle16 className={css.stepIcon} size={14} />
+      return <IconSparkleRegular className={css.stepIcon} size={14} />
   }
 }
 
@@ -169,7 +169,7 @@ function Steps({ steps, selected, t, onSelect }: { steps: Step[]; selected: stri
           <span className={css.stepSummary}>{step.summary}</span>
           {step.status === 'completed'
             ? <StateDot className={css.stepDot} state="done" size={8} />
-            : <IconLoadingOutline16 className={clsx(css.stepDot, css.spin)} size={12} />}
+            : <IconLoadingOutlineRegular className={clsx(css.stepDot, css.spin)} size={12} />}
         </button>
       ))}
     </div>
@@ -192,7 +192,7 @@ function Attachments({ attachments }: { attachments: AttachmentRef[] | undefined
                 rel="noreferrer"
                 onClick={attachment.url === undefined ? event => event.preventDefault() : undefined}
               >
-                <IconPaperclipOutline16 size={12} />
+                <IconPaperclipOutlineRegular size={12} />
                 {attachment.name}
               </a>
             )
@@ -209,7 +209,7 @@ function ChoiceCard({ row, t, onResolve }: {
   const chosen = row.resolved === undefined ? undefined : row.options.find(o => o.id === row.resolved)
   return (
     <div className={css.choiceCard}>
-      {row.content !== '' && <div className={css.markdown}><MarkdownText text={row.content} /></div>}
+      {row.content !== '' && <div className={css.markdown}><MarkdownText text={row.content} labels={{ code: { copyLabel: t('chat.copyCode'), copiedLabel: t('states.copied') }, footnotes: t('chat.footnotes') }} /></div>}
       {chosen !== undefined
         ? <div className={css.choiceResolved}>{t('chat.choice.resolved', { label: chosen.label })}</div>
         : (
@@ -282,7 +282,7 @@ function Row({ row, selectedStep, t, onSelectStep, onResolve }: {
       return (
         <div className={css.turnAssistant}>
           <Steps steps={row.steps} selected={selectedStep} t={t} onSelect={onSelectStep} />
-          {row.content !== '' && <div className={css.markdown}><MarkdownText text={row.content} /></div>}
+          {row.content !== '' && <div className={css.markdown}><MarkdownText text={row.content} labels={{ code: { copyLabel: t('chat.copyCode'), copiedLabel: t('states.copied') }, footnotes: t('chat.footnotes') }} /></div>}
           <Attachments attachments={row.attachments} />
         </div>
       )

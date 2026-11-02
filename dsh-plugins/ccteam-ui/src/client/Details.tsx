@@ -8,9 +8,9 @@
 import { useEffect, useState } from 'react'
 import {
   Button,
-  IconCheckOutline14,
-  IconCloseOutline16,
-  IconCopyOutline16,
+  IconCheckOutlineRegular,
+  IconCloseOutlineRegular,
+  IconCopyOutlineRegular,
   Input,
   StateDot,
   writeClipboard,
@@ -145,7 +145,7 @@ export function Details(props: DetailsProps) {
       <div className={css.detailsHead}>
         <span>{step !== undefined ? t('details.step') : t('details.title')}</span>
         <button type="button" className={css.iconBtn} aria-label={t('panel.close')} onClick={props.onClose}>
-          <IconCloseOutline16 size={16} />
+          <IconCloseOutlineRegular size={16} />
         </button>
       </div>
       <div className={css.detailsBody}>
@@ -294,7 +294,7 @@ export function Details(props: DetailsProps) {
                           <Button
                             variant="ghost"
                             size="sm"
-                            icon={copied ? <IconCheckOutline14 size={14} /> : <IconCopyOutline16 size={14} />}
+                            icon={copied ? <IconCheckOutlineRegular size={14} /> : <IconCopyOutlineRegular size={14} />}
                             onClick={() => {
                               writeClipboard(node.sid)
                               setCopied(true)

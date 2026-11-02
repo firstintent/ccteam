@@ -15,12 +15,12 @@ import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import {
   Button,
-  IconChevronDownOutline14,
-  IconEllipsisOutline16,
-  IconPlusOutline16,
-  IconSearchOutline16,
-  IconTreeCorner8x10,
-  IconWarningOutline16,
+  IconChevronDownOutlineRegular,
+  IconEllipsisOutlineRegular,
+  IconPlusOutlineRegular,
+  IconSearchOutlineRegular,
+  IconTreeCornerRegular,
+  IconWarningOutlineRegular,
   Menu,
   Modal,
   StateDot,
@@ -145,7 +145,7 @@ function ProjectHead({ slug, collapsed, total, count, canSpawn, t, onToggle, onA
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const items: MenuEntry[] = [
-    { id: 'new', label: t('project.new'), icon: <IconPlusOutline16 size={16} />, disabled: !canSpawn },
+    { id: 'new', label: t('project.new'), icon: <IconPlusOutlineRegular size={16} />, disabled: !canSpawn },
     { id: 'copy', label: t('project.copySlug') },
     { type: 'separator', id: 'sep-1' },
     { id: 'solo', label: t('project.solo') },
@@ -161,7 +161,7 @@ function ProjectHead({ slug, collapsed, total, count, canSpawn, t, onToggle, onA
         onClick={onToggle}
       >
         <span className={css.projectChevron} aria-hidden="true">
-          <IconChevronDownOutline14 size={12} />
+          <IconChevronDownOutlineRegular size={12} />
         </span>
         <span className={css.projectName}>{slug}</span>
         {total !== null && <span className={css.projectCount}>{total}</span>}
@@ -193,7 +193,7 @@ function ProjectHead({ slug, collapsed, total, count, canSpawn, t, onToggle, onA
                 setMenuOpen(previous => !previous)
               }}
             >
-              <IconEllipsisOutline16 size={16} />
+              <IconEllipsisOutlineRegular size={16} />
             </button>
           )}
         />
@@ -207,7 +207,7 @@ function ProjectHead({ slug, collapsed, total, count, canSpawn, t, onToggle, onA
             onAction('new')
           }}
         >
-          <IconPlusOutline16 size={16} />
+          <IconPlusOutlineRegular size={16} />
         </button>
       </span>
     </div>
@@ -295,7 +295,7 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
       }}
       onKeyDown={onRowKey}
     >
-      {depth > 0 && <IconTreeCorner8x10 className={css.treeCorner} />}
+      {depth > 0 && <IconTreeCornerRegular className={css.treeCorner} />}
       <span className={css.glyph} aria-hidden="true">{vendorGlyph(node.vendor)}</span>
       <span className={css.rowMain}>
         {renaming
@@ -358,7 +358,7 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
               event.stopPropagation()
             }}
           >
-            <IconEllipsisOutline16 size={14} />
+            <IconEllipsisOutlineRegular size={14} />
           </button>
         )}
       />
@@ -425,14 +425,14 @@ export function TeamColumn(props: TeamColumnProps) {
           variant="outline"
           size="md"
           className={css.newBtn}
-          icon={<IconPlusOutline16 size={16} />}
+          icon={<IconPlusOutlineRegular size={16} />}
           disabled={!props.canSpawn}
           onClick={props.onNew}
         >
           {t('tree.spawn')}
         </Button>
         <label className={css.search}>
-          <IconSearchOutline16 size={14} />
+          <IconSearchOutlineRegular size={14} />
           <input
             className={css.searchInput}
             type="search"
@@ -453,7 +453,7 @@ export function TeamColumn(props: TeamColumnProps) {
                 else props.onCollapseAll()
               }}
             >
-              <IconChevronDownOutline14 className={css.foldAllIcon} data-collapsed={anyCollapsed ? '' : undefined} size={12} />
+              <IconChevronDownOutlineRegular className={css.foldAllIcon} data-collapsed={anyCollapsed ? '' : undefined} size={12} />
             </button>
           </Tooltip>
         </label>
@@ -461,7 +461,7 @@ export function TeamColumn(props: TeamColumnProps) {
       <div className={css.teamList}>
         {props.graphError !== null && graph === null && (
           <div className={css.state}>
-            <IconWarningOutline16 className={css.stateIcon} size={20} />
+            <IconWarningOutlineRegular className={css.stateIcon} size={20} />
             <div className={css.stateBody}>{t('tree.error')}</div>
             <Button variant="outline" size="sm" onClick={props.onRetry}>{t('states.retry')}</Button>
           </div>

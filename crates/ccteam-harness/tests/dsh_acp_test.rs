@@ -1440,8 +1440,6 @@ async fn session_new_carries_the_per_session_ccteam_identity() {
             "bearer": "ccteam-sid:s-meta:seKret1234",
             "mcpUrl": "http://127.0.0.1:65535/mcp",
             "approvalMode": "skip",
-            // Unset mode = the ccteam default: `standard` (the vendor's own).
-            "agentPreset": "standard",
         })),
         "session/new must install this hire's ccteam identity: {params}"
     );
@@ -1527,22 +1525,37 @@ async fn mode_axis_picks_the_agent_preset_on_session_new() {
     );
     adapter.close_thread(&handle).await.unwrap();
 
-    let mut bad = spawn_ctx_with_model(&tmp, "s-mode-bad");
-    bad.mode = Some("turbo".to_string());
-    let err = adapter
+    let mut custom = spawn_ctx_with_model(&tmp, "s-mode-custom");
+    custom.mode = Some("custom-preset".to_string());
+    custom.effort = Some("high".to_string());
+    let handle = adapter
         .start_thread(
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &bad,
+            &custom,
         )
         .await
-        .expect_err("unknown mode must refuse the spawn");
-    let text = err.to_string();
-    assert!(
-        text.contains("turbo") && text.contains("ptc"),
-        "the refusal names the token and the valid set: {text}"
+        .expect("DSH owns native preset validation");
+    let records = read_dump(&dump);
+    let params = &records
+        .iter()
+        .rev()
+        .find(|record| record["method"] == "session/new")
+        .unwrap()["params"];
+    assert_eq!(
+        params
+            .pointer("/_meta/ccteam/agentPreset")
+            .and_then(Value::as_str),
+        Some("custom-preset")
     );
+    assert_eq!(
+        params
+            .pointer("/agentOptions/reasoningEffort")
+            .and_then(Value::as_str),
+        Some("high")
+    );
+    adapter.close_thread(&handle).await.unwrap();
 }
 
 /// hitl vs skip is a per-session posture on a runtime that serves both.

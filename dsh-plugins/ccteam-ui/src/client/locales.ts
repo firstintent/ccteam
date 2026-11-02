@@ -2,6 +2,8 @@
 
 /** Simplified Chinese dictionary. */
 export const zh = {
+  'chat.footnotes': '脚注',
+  'chat.copyCode': '复制代码',
   'entry.title': 'ccteam',
   'entry.label': '打开 ccteam 工作台',
   'entry.badge': '{count} 个回合已完成',
@@ -54,7 +56,7 @@ export const zh = {
   'states.unreachable.title': '未连接到 ccteam',
   'states.unreachable.body': '启动 daemon 后重试:',
   'states.unconfigured.title': '还没配置 ccteam',
-  'states.unconfigured.step1': '打开 DSH 设置 → 插件 → 插件配置 → ccteam-ui',
+  'states.unconfigured.step1': '打开 DSH 设置 → ccteam-ui',
   'states.unconfigured.step2': '填入 daemon URL 和你的 REST token(ccteam web → 设置 → 账户)',
   'chat.working': '正在工作',
   'chat.waiting': '等待你的决定',
@@ -257,7 +259,7 @@ export const zh = {
   'firstrun.engine.reason.ready': '引擎正常;启动、停止与日志在设置卡的「引擎」段。',
   'firstrun.start': '启动引擎',
   'firstrun.openSettings': '打开设置',
-  'firstrun.settings.hint': '引擎设置在 DSH 设置 → 插件 → 插件配置 → ccteam-ui',
+  'firstrun.settings.hint': '引擎设置在 DSH 设置 → ccteam-ui',
   'firstrun.project.title': '添加工作区',
   'firstrun.project.body': '把一个已有目录注册为 ccteam 项目;之后就能在这里为它新建会话。',
   'firstrun.project.import': '从 DSH 导入',
@@ -280,6 +282,8 @@ export type CcteamLocaleKey = keyof typeof zh
 
 /** English dictionary, checked complete against the zh key set. */
 export const en = {
+  'chat.footnotes': 'Footnotes',
+  'chat.copyCode': 'Copy code',
   'entry.title': 'ccteam',
   'entry.label': 'Open the ccteam workbench',
   'entry.badge': '{count} turns completed',
@@ -332,7 +336,7 @@ export const en = {
   'states.unreachable.title': 'Not connected to ccteam',
   'states.unreachable.body': 'Start the daemon, then retry:',
   'states.unconfigured.title': 'ccteam is not configured',
-  'states.unconfigured.step1': 'Open DSH Settings → Plugins → Plugin configuration → ccteam-ui',
+  'states.unconfigured.step1': 'Open DSH Settings → ccteam-ui',
   'states.unconfigured.step2': 'Set the daemon URL and your REST token (ccteam web → Settings → Account)',
   'chat.working': 'Working',
   'chat.waiting': 'Waiting for your decision',
@@ -535,7 +539,7 @@ export const en = {
   'firstrun.engine.reason.ready': 'The engine is fine; start, stop and the log live in the settings card\'s Engine section.',
   'firstrun.start': 'Start the engine',
   'firstrun.openSettings': 'Open settings',
-  'firstrun.settings.hint': 'Engine settings: DSH Settings → Plugins → Plugin configuration → ccteam-ui',
+  'firstrun.settings.hint': 'Engine settings: DSH Settings → ccteam-ui',
   'firstrun.project.title': 'Add a workspace',
   'firstrun.project.body': 'Register an existing directory as a ccteam project; new sessions for it start here.',
   'firstrun.project.import': 'Import from DSH',

@@ -1,3 +1,10 @@
+import type {} from '@deepseek-ai/dsh-agent-default-model'
+import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
+import type { Context } from '@deepseek-ai/cordis'
+import type { AgentRegistry, AgentHandle, AgentOptions, AgentSetup, Agent, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
+import type { Session, SessionId, SessionEvent, SessionEventMap } from '@deepseek-ai/dsh-session'
+import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, unlinkSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
@@ -5,29 +12,10 @@ import { dirname } from 'node:path'
 import { parseCcteamMeta, type SessionCredentialStore } from './credentials.js'
 import { createUserTextMessage, sessionIdOfAgent, type ContentBlock, type DshAgent } from './tools.js'
 
-export interface DshAgents {
-  create(options: {
-    sessionId: string
-    meta?: { cwd?: string; agentPreset?: string }
-    agentOptions?: unknown
-    setup?: (agentCtx: unknown) => Promise<void>
-  }): Promise<DshAgentHandle>
-  resume(options: {
-    resumeSessionId: string
-    agentOptions?: unknown
-    setup?: (agentCtx: unknown) => Promise<void>
-  }): Promise<DshAgentHandle>
-  get?(id: string): DshAgent | undefined
-}
+export type DshAgents = Pick<AgentRegistry, 'create' | 'resume' | 'get'>
+export type DshAgentHandle = AgentHandle
 
-export interface DshAgentHandle {
-  agent: DshAgent
-  dispose?(): Promise<void> | void
-}
-
-export interface DshWorkspace {
-  attachSession(sessionId: string): Promise<void>
-}
+export type DshWorkspace = Awaited<ReturnType<WorkspaceRegistry['create']>>
 
 /**
  * DSH's agent-preset roster (Cordis service `agentPresets`,
@@ -35,16 +23,9 @@ export interface DshWorkspace {
  * vendor tools and moves them behind presets, so an agent created without
  * `setup: mount(...)` has no bash/read/write at all — only globally-registered
  * tools like ccteam's own (real-machine `unknown tool "bash"` regression).
- * Shipped ids: `standard` | `code` (PTC) | `minimal` | `cordis` (creator).
+ * The vendor owns its roster and default; ccteam forwards native preset ids.
  */
-export interface DshAgentPresets {
-  resolve(id?: string): Promise<{ id?: string } | undefined>
-  mount(agentCtx: unknown, id?: string): Promise<unknown>
-}
-
-interface DshSessionPersistence {
-  inspect(sessionId: string): Promise<{ meta?: unknown; events?: unknown[] }>
-}
+export type DshAgentPresets = Pick<AgentPresetRegistry, 'resolve' | 'mount' | 'presetForSession'>
 
 /**
  * DSH's permission-preset roster (Cordis service `permissionPresets`).
@@ -53,36 +34,13 @@ interface DshSessionPersistence {
  * approval prompts — the DSH counterpart of ccteam's `skip` posture); a
  * `hitl` hire keeps the vendor's pinned default so approvals keep flowing.
  */
-interface DshPermissionPresets {
-  set(session: unknown, name: string): void
-}
+type DshPermissionPresets = Pick<PermissionPresetService, 'set'>
 
 const HIRE_PERMISSION_PRESET = 'danger-full-access'
 
-export interface DshWorkspaceRegistry {
-  create(path: string, title?: string): Promise<DshWorkspace>
-}
+export type DshWorkspaceRegistry = Pick<WorkspaceRegistry, 'create'>
 
-export interface TransportContext {
-  agents: DshAgents
-  /**
-   * Optional service lookup (`ctx.get`). Cordis THROWS on `ctx.workspaceRegistry`
-   * when the service is not in this plugin's `inject` list — and it cannot be:
-   * `dsh-workspace` ships in the web-app bundle only, so a hard inject would
-   * dead-lock plugin activation on every non-web profile (mode 2). `ctx.get`
-   * is the vendor's own optional accessor (dsh-host-apiproxy uses it for
-   * `sessionPersistence`).
-   */
-  get?(name: string): unknown
-  agentDefaultModel?: {
-    currentSelection(): { provider?: string; model?: string } | undefined
-  }
-  on?(event: string, handler: (...args: never[]) => unknown): () => void
-  effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void
-  logger?: {
-    warn(message: string): void
-  }
-}
+export type TransportContext = Pick<Context, 'agents' | 'get' | 'agentDefaultModel' | 'on' | 'effect' | 'logger'>
 
 export interface DshSocketTransportOptions {
   version: string
@@ -126,6 +84,8 @@ interface Inflight {
 
 interface SessionRecord {
   agent: DshAgent
+  stream?: { attemptId: string; revision: number; turn: number }
+  thoughtStreamed?: boolean
   /** Turn currently open on this session, ccteam-owned or human-owned. */
   openTurn?: number
   inflight?: Inflight
@@ -180,7 +140,7 @@ export class WorkspaceMounter {
     const operation = this.chain.then(() => registry.create(cwd))
     this.chain = operation.then(() => undefined, () => undefined)
     const workspace = await operation
-    await workspace.attachSession(sessionId)
+    await workspace.attachSession(sessionId as SessionId)
   }
 }
 
@@ -330,9 +290,12 @@ export class DshAcpServer {
     this.input.on('end', onClose)
     this.input.on('error', onClose)
 
-    const offSession = this.ctx.on?.('session/event', ((session: unknown, event: unknown) => {
+    const offSession = this.ctx.on('session/event', (session, event) => {
       this.onSessionEvent(session, event)
-    }) as never)
+    })
+    const offStream = this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+      this.onAssistantStream(agent, frame)
+    })
     const offError = this.ctx.on?.('agent/error', ((payload: unknown) => {
       this.onAgentError(payload)
     }) as never)
@@ -346,6 +309,7 @@ export class DshAcpServer {
       this.input.off('end', onClose)
       this.input.off('error', onClose)
       offSession?.()
+      offStream?.()
       offError?.()
       offApproval?.()
       // Agents stay live and un-cancelled: the human at the DSH UI owns them too.
@@ -474,7 +438,7 @@ export class DshAcpServer {
   private async composeCreatePreset(
     requested: string | undefined,
     sessionId: string,
-  ): Promise<{ id?: string; setup?: (agentCtx: unknown) => Promise<void> }> {
+  ): Promise<{ id?: string; setup?: (agentCtx: unknown, agent: DshAgent) => Promise<void> }> {
     const presets = this.presetService()
     if (presets === undefined) {
       if (requested !== undefined) {
@@ -498,76 +462,36 @@ export class DshAcpServer {
     return {
       id,
       setup: async agentCtx => {
-        await presets.mount(agentCtx, id)
+        await presets.mount(agentCtx as Parameters<DshAgentPresets['mount']>[0], id)
       },
     }
   }
 
-  /** Re-mount the STORED preset when resuming a persisted session. */
-  private async composeResumeSetup(
-    sessionId: string,
-  ): Promise<((agentCtx: unknown) => Promise<void>) | undefined> {
+  /** DSH owns persisted preset selection, including switches made in its UI. */
+  private composeResumeSetup(): AgentSetup | undefined {
     const presets = this.presetService()
     if (presets === undefined) return undefined
-    const stored = await this.storedPreset(sessionId)
-    return async agentCtx => {
-      await presets.mount(agentCtx, stored)
-    }
-  }
-
-  /**
-   * The preset a persisted session was using: the newest
-   * `agent-preset/selected` event wins (a blank-session switch in the DSH UI),
-   * else the creation header's `agentPreset`; `undefined` mounts the vendor
-   * default. Mirrors the vendor's own `resolveSessionPreset` fold — the
-   * package is not importable from this plugin, so the two-field fold is
-   * reimplemented against the same durable data.
-   */
-  private async storedPreset(sessionId: string): Promise<string | undefined> {
-    const svc = typeof this.ctx.get === 'function' ? this.ctx.get('sessionPersistence') : undefined
-    const persistence = svc as DshSessionPersistence | undefined
-    if (typeof persistence?.inspect !== 'function') return undefined
-    try {
-      const inspected = await persistence.inspect(sessionId)
-      const events = Array.isArray(inspected?.events) ? inspected.events : []
-      for (let i = events.length - 1; i >= 0; i--) {
-        const event = asRecord(events[i])
-        if (event.type !== 'agent-preset/selected') continue
-        const chosen = asRecord(event.data).agentPreset
-        if (typeof chosen === 'string' && chosen.trim() !== '') return chosen
-      }
-      const header = asRecord(inspected?.meta).agentPreset
-      return typeof header === 'string' && header.trim() !== '' ? header : undefined
-    } catch (error) {
-      this.ctx.logger?.warn(
-        `ccteam dsh transport could not read the stored preset of ${sessionId}: ${errorMessage(error)}`,
-      )
-      return undefined
+    return async (agentCtx, agent) => {
+      const stored = presets.presetForSession(agent.session as Session) ?? undefined
+      await presets.mount(agentCtx as Parameters<DshAgentPresets['mount']>[0], stored)
     }
   }
 
   private async newSession(params: unknown): Promise<{ sessionId: string }> {
     const body = requireRecord(params, 'session/new params')
     const cwd = requireString(body, 'cwd')
-    const sessionId = randomUUID()
+    const sessionId = randomUUID() as SessionId
     const agentOptions = this.resolveAgentOptions(body.agentOptions)
     const meta = parseCcteamMeta(body)
     if (meta !== undefined) this.credentials?.set(sessionId, meta)
     let handle: DshAgentHandle
     try {
       const preset = await this.composeCreatePreset(meta?.agentPreset, sessionId)
-      const request: {
-        sessionId: string
-        meta: { cwd: string; agentPreset?: string }
-        agentOptions?: unknown
-        setup?: (agentCtx: unknown) => Promise<void>
-      } = {
+      const request: Parameters<DshAgents['create']>[0] = {
         sessionId,
         meta: { cwd, ...(preset.id === undefined ? {} : { agentPreset: preset.id }) },
       }
-      if (agentOptions !== undefined) request.agentOptions = agentOptions
-      if (preset.setup !== undefined) request.setup = preset.setup
-      handle = await this.ctx.agents.create(request)
+      handle = await this.ctx.agents.create({ ...request, ...agentOptions === undefined ? {} : { agentOptions }, ...preset.setup === undefined ? {} : { setup: preset.setup } })
     } catch (error) {
       this.credentials?.delete(sessionId)
       throw errorToRpc(error)
@@ -595,7 +519,7 @@ export class DshAcpServer {
       return
     }
     try {
-      presets.set(agent.session, HIRE_PERMISSION_PRESET)
+      presets.set(agent.session as Session, HIRE_PERMISSION_PRESET)
     } catch (error) {
       this.ctx.logger?.warn(
         `ccteam dsh transport could not set ${HIRE_PERMISSION_PRESET} on ${sessionId}: ${errorMessage(error)}`,
@@ -605,7 +529,7 @@ export class DshAcpServer {
 
   private async loadSession(params: unknown): Promise<{ sessionId: string }> {
     const body = requireRecord(params, 'session/load params')
-    const sessionId = requireString(body, 'sessionId')
+    const sessionId = requireString(body, 'sessionId') as SessionId
     const agentOptions = this.resolveAgentOptions(body.agentOptions)
     const meta = parseCcteamMeta(body)
     if (meta !== undefined) this.credentials?.set(sessionId, meta)
@@ -619,7 +543,7 @@ export class DshAcpServer {
         // The stored preset is authoritative on resume (the human may have
         // switched it in the DSH UI); `_meta.ccteam.agentPreset` is a
         // creation-only field and deliberately ignored here.
-        const setup = await this.composeResumeSetup(sessionId)
+        const setup = this.composeResumeSetup()
         const handle = await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           ...agentOptions === undefined ? {} : { agentOptions },
@@ -636,7 +560,7 @@ export class DshAcpServer {
 
   private async prompt(params: unknown): Promise<PromptResult> {
     const body = requireRecord(params, 'session/prompt params')
-    const sessionId = requireString(body, 'sessionId')
+    const sessionId = requireString(body, 'sessionId') as SessionId
     const record = this.sessions.get(sessionId)
     if (record === undefined) throw new RpcError(`unknown session: ${sessionId}`, -32602)
     if (record.inflight !== undefined) throw new RpcError('a prompt is already in flight for this session', -32602)
@@ -665,18 +589,15 @@ export class DshAcpServer {
     })
   }
 
-  private onSessionEvent(session: unknown, event: unknown): void {
+  private onSessionEvent(session: Session, event: SessionEvent): void {
     const sessionId = sessionIdFromSession(session)
     if (sessionId === undefined) return
     const record = this.sessions.get(sessionId)
     if (record === undefined) return
-    const ev = asRecord(event)
-    const type = typeof ev.type === 'string' ? ev.type : ''
-    const data = asRecord(ev.data)
-
-    switch (type) {
+    switch (event.type) {
       case 'turn/start': {
-        const turn = numberField(data, 'turn')
+        const data = event.data
+        const turn = data.turn
         record.openTurn = turn
         const inflight = record.inflight
         if (inflight !== undefined && inflight.bindNextTurn && turn !== undefined) {
@@ -686,9 +607,10 @@ export class DshAcpServer {
         break
       }
       case 'user/message': {
+        const data = event.data
         const inflight = record.inflight
         if (inflight === undefined || inflight.ownedTurn !== undefined) break
-        if (stringField(data, 'id') !== inflight.messageId) break
+        if (data.id !== inflight.messageId) break
         if (record.openTurn === undefined) {
           inflight.bindNextTurn = true
           break
@@ -696,25 +618,24 @@ export class DshAcpServer {
         inflight.ownedTurn = record.openTurn
         break
       }
-      case 'assistant/message':
-        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
+      case 'assistant/message': {
+        const data = event.data
+        if (!this.ownsTurn(record, data.turn)) break
         this.onAssistantMessage(sessionId, data, record)
         break
-      case 'assistant/chunk':
-        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
-        this.onAssistantChunk(sessionId, data, record)
-        break
+      }
       case 'tool/call': {
-        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
-        const callId = stringField(data, 'callId')
+        const data = event.data
+        if (!this.ownsTurn(record, data.turn)) break
+        const callId = data.callId
         if (callId !== undefined) record.inflight?.toolCalls.add(callId)
         this.notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId: callId ?? 'tool',
-            name: stringField(data, 'name') ?? 'tool',
-            title: stringField(data, 'name') ?? 'tool',
+            name: data.name ?? 'tool',
+            title: data.name ?? 'tool',
             rawInput: parseMaybeJson(data.arguments),
             status: 'pending',
           },
@@ -722,22 +643,25 @@ export class DshAcpServer {
         break
       }
       case 'tool/result': {
-        const callId = stringField(asRecord(asRecord(data.message).source), 'callId')
-        if (!this.ownsToolResult(record, numberField(data, 'turn'), callId)) break
+        const data = event.data
+        const callId = data.message.source.callId
+        if (!this.ownsToolResult(record, data.turn, callId)) break
+        const failed = data.message.isError === true
         this.notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId: callId ?? 'tool',
-            status: 'completed',
+            status: failed ? 'failed' : 'completed',
             content: toolResultText(data),
-            isError: toolResultIsError(data),
+            isError: failed,
           },
         })
         break
       }
       case 'turn/end': {
-        const turn = numberField(data, 'turn')
+        const data = event.data
+        const turn = data.turn
         if (turn === undefined || record.openTurn === turn) record.openTurn = undefined
         const inflight = record.inflight
         if (inflight === undefined || !this.ownsTurn(record, turn)) break
@@ -776,47 +700,39 @@ export class DshAcpServer {
     return callId !== undefined && record.inflight?.toolCalls.has(callId) === true
   }
 
-  private onAssistantMessage(sessionId: string, data: Record<string, unknown>, record: SessionRecord): void {
-    const message = asRecord(data.message)
-    const content = message.content
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        const normalized = asRecord(block)
-        if (normalized.type === 'text' && typeof normalized.text === 'string' && normalized.text.length > 0) {
-          this.notify({
-            sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: normalized.text },
-            },
-          })
-        }
+  private onAssistantMessage(sessionId: string, data: SessionEventMap['assistant/message'], record: SessionRecord): void {
+    for (const block of data.message.content) {
+      if (block.type === 'text' && block.text !== '') {
+        this.notify({ sessionId, update: {
+          sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: block.text },
+        } })
+      } else if (block.type === 'reasoning' && block.text !== '' && !record.thoughtStreamed) {
+        this.notify({ sessionId, update: {
+          sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: block.text },
+        } })
       }
     }
+    record.thoughtStreamed = false
     accumulateUsage(record.inflight?.usage, asRecord(data.usage))
   }
 
-  private onAssistantChunk(sessionId: string, data: Record<string, unknown>, record: SessionRecord): void {
-    const chunk = asRecord(data.chunk)
-    if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string' && chunk.text.length > 0) {
-      this.notify({
-        sessionId,
-        update: {
-          sessionUpdate: 'agent_thought_chunk',
-          content: { type: 'text', text: chunk.text },
-        },
-      })
-    } else if (chunk.type === 'usage') {
-      accumulateUsage(record.inflight?.usage, asRecord(chunk.usage))
-      const usage = normalizeUsage(asRecord(chunk.usage))
-      this.notify({
-        sessionId,
-        update: {
-          sessionUpdate: 'usage_update',
-          used: usage.inputTokens,
-          size: usage.contextWindow,
-        },
-      })
+  /** Follow the public live-stream frames; settled messages own token accounting. */
+  private onAssistantStream(agent: Agent, frame: AssistantStreamFrame): void {
+    const record = this.sessions.get(agent.id)
+    if (record === undefined || record.agent !== agent) return
+    if (frame.type === 'start') {
+      record.stream = { attemptId: frame.attemptId, revision: frame.revision, turn: frame.turn }
+      return
+    }
+    const stream = record.stream
+    if (stream === undefined || stream.attemptId !== frame.attemptId || stream.revision !== frame.revision
+      || !this.ownsTurn(record, stream.turn)) return
+    if (frame.type === 'end') { record.stream = undefined; return }
+    if (frame.chunk.type === 'reasoning-delta' && frame.chunk.text !== '') {
+      record.thoughtStreamed = true
+      this.notify({ sessionId: agent.id, update: {
+        sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: frame.chunk.text },
+      } })
     }
   }
 
@@ -903,11 +819,11 @@ export class DshAcpServer {
     })
   }
 
-  private resolveAgentOptions(requested: unknown): unknown | undefined {
+  private resolveAgentOptions(requested: unknown): AgentOptions | undefined {
     const selection = this.ctx.agentDefaultModel?.currentSelection()
     const selected = isModelSelection(selection) ? selection : undefined
     if (requested === undefined) return selected
-    if (!isRecord(requested)) return requested
+    if (!isRecord(requested)) throw new RpcError('agentOptions must be an object', -32602)
 
     const merged: Record<string, unknown> = { ...requested }
     if (stringField(merged, 'provider') === undefined && selected?.provider !== undefined) {
@@ -916,7 +832,7 @@ export class DshAcpServer {
     if (stringField(merged, 'model') === undefined && selected?.model !== undefined) {
       merged.model = selected.model
     }
-    return Object.keys(merged).length === 0 ? undefined : merged
+    return Object.keys(merged).length === 0 ? undefined : merged as AgentOptions
   }
 }
 
@@ -1027,21 +943,8 @@ function sessionIdFromSession(session: unknown): string | undefined {
   return stringField(header, 'id') ?? stringField(asRecord(session), 'id')
 }
 
-function toolResultText(data: Record<string, unknown>): ContentBlock {
-  const content = asRecord(asRecord(data.message).content)
-  if (Array.isArray(asRecord(data.message).content)) {
-    return { type: 'text', text: JSON.stringify(asRecord(data.message).content) }
-  }
-  return { type: 'text', text: JSON.stringify(content) }
-}
-
-function toolResultIsError(data: Record<string, unknown>): boolean {
-  const message = asRecord(data.message)
-  const content = message.content
-  if (Array.isArray(content)) {
-    return content.some(block => asRecord(block).isError === true)
-  }
-  return data.error !== undefined
+function toolResultText(data: SessionEventMap['tool/result']): ContentBlock {
+  return { type: 'text', text: JSON.stringify(data.message.content) }
 }
 
 function isErrorReason(reason: unknown): boolean {

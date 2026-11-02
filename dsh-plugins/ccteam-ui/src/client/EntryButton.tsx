@@ -7,7 +7,7 @@
  * ccteam is not reachable; toggles the workbench through the one store.
  */
 import clsx from 'clsx'
-import { IconBranchOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconBranchOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { EntryButtonProps } from './slots.js'
 import css from './workbench.module.css'
 
@@ -34,7 +34,7 @@ export function EntryButton({ wide, useConsole, dispatch, t }: EntryButtonProps)
           dispatch({ type: 'toggle_panel' })
         }}
       >
-        <IconBranchOutline16 size={wide ? 16 : 18} />
+        <IconBranchOutlineRegular size={wide ? 16 : 18} />
         {wide && <span className={css.entryLabel}>{t('entry.title')}</span>}
         {badge > 0
           ? (

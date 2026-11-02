@@ -357,10 +357,9 @@ pub struct CreateSessionForm {
     #[serde(default)]
     pub effort: Option<String>,
     /// Explicit vendor session-mode token, forwarded verbatim and validated
-    /// by the vendor adapter. DSH only today: its agent preset — `standard` |
-    /// `ptc` (alias `code`) | `minimal` | `creator` (alias `cordis`);
-    /// omitted → DSH hires default to `standard`. Other vendors refuse a non-empty
-    /// mode.
+    /// by the vendor adapter. DSH accepts native agent-preset ids and resolves
+    /// its own default when omitted; `creator` selects `cordis`. Other vendors
+    /// refuse a non-empty mode.
     #[serde(default)]
     pub mode: Option<String>,
 }
