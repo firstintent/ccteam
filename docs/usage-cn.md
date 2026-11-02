@@ -145,7 +145,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### DSH Web
 
-**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
+**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走同源 `/dsh/` 反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
 一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`agent {vendor:"dsh"}`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
 
@@ -158,7 +158,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 
-如果 ccteam 前面有 HTTPS 反代,**伴生端口也必须一起反代**。DSH Web 没有 base-path 支持,所以用第二个 HTTPS 端口或子域;只反代 `:7331` 会让 iframe 继续加载明文 HTTP,浏览器按 mixed-content 拒绝。
+DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、RPC 和 WebSocket,自动沿用浏览器的协议与端口。直接访问主 Web 端口、通过 80/443 的 HTTP/HTTPS 反代均可用;反代只需覆盖主 Web 监听并支持 WebSocket upgrade,不用额外开放公网端口或子域。独立伴生入口(通常是 `:7332/`)仍可访问,它本身是明文 HTTP,需要 HTTPS 时由反代提供 TLS。
 
 ### 创建项目
 

@@ -12,6 +12,8 @@
  */
 
 export const API_PREFIX = '/ccteam/api'
+/** Browser URLs follow the DSH document mount, at / or behind a path proxy. */
+export const API_RELATIVE_PREFIX = API_PREFIX.slice(1)
 
 /** Sub-paths under {@link API_PREFIX} that are not JSON methods. */
 export const EVENTS_PATH = '/events'

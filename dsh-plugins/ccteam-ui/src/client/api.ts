@@ -5,7 +5,7 @@
  * URL or credential. Both transports are injectable so tests run without
  * fetch/EventSource.
  */
-import { API_PREFIX, ATTACHMENT_PATH, EVENTS_PATH, UPLOAD_PATH } from '../shared/contract.js'
+import { API_RELATIVE_PREFIX, ATTACHMENT_PATH, EVENTS_PATH, UPLOAD_PATH } from '../shared/contract.js'
 import type {
   ApiMethod,
   EngineActionResult,
@@ -114,7 +114,7 @@ export interface ApiClient {
 
 /**
  * Build the events URL for an optional sid filter.
- * @param prefix - API prefix (contract API_PREFIX in production).
+ * @param prefix - API prefix (document-relative in production).
  * @param sid - session filter; omitted subscribes to the whole team stream.
  * @returns the subscription URL.
  */
@@ -152,7 +152,7 @@ export function attachmentUrl(prefix: string, project: string, name: string): st
  * @returns the client.
  */
 export function createApi(deps: ApiDeps = {}): ApiClient {
-  const prefix = deps.prefix ?? API_PREFIX
+  const prefix = deps.prefix ?? API_RELATIVE_PREFIX
   const fetchFn = deps.fetchFn ?? ((input: string, init?: RequestInit) => fetch(input, init))
   const createEventSource = deps.createEventSource
     ?? ((url: string): EventSourceLike =>

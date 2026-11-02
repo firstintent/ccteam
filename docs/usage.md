@@ -145,7 +145,7 @@ Every daemon start (`ccteam start` / `ccteam daemon start`, including the DSH pl
 
 ### DSH Web
 
-The **DSH** page embeds native DeepSeek Harness Web through the companion listener. It uses the same ccteam login cookie as the rest of the console; the DSH process never receives the ccteam cookie or bearer token.
+The **DSH** page embeds native DeepSeek Harness Web through `/dsh/` on the same web origin. It uses the same ccteam login cookie as the rest of the console; the DSH process never receives the ccteam cookie or bearer token. The dedicated companion listener (normally `:7332/`) remains available.
 
 An identity runs **one** DSH runtime, and ccteam is its second client: sessions you hire from ccteam (`/new dsh`, `agent {vendor:"dsh"}`) are created inside that same runtime, so they show up live in this page's sidebar under the project's workspace, you can open one mid-task to watch or interject, and the agent's next dispatch continues the same conversation. A hire joins one of DSH's four agent presets — `standard`, `ptc`, `minimal`, or `creator` — which pick its toolset; ccteam defaults to `standard`, `mode=` on `/new dsh` (or `mode` on the spawn APIs) picks another, and a hire runs on the `danger-full-access` permission preset (full file access, no approval prompts) unless spawned with `hitl`.
 
@@ -157,7 +157,7 @@ An identity runs **one** DSH runtime, and ccteam is its second client: sessions 
 - **Plain-HTTP LAN access:** DSH Web is written for a loopback origin, where browsers grant it secure-context APIs — it mints every RPC id with `crypto.randomUUID`, which browsers withhold from plain HTTP on a LAN address. Because ccteam is what moves the UI off loopback, the companion listener restores that one API (a real `crypto.getRandomValues`-backed UUID v4) in the HTML it serves, and stays out of the way when the browser already provides it. Serving the console over HTTPS or opening it on the daemon host needs none of this.
 - **Settings from a LAN browser:** the authenticated companion page declares ownership of its per-identity Host through DSH's public `__DSH_TRANSPORT__.ownsHost` hook. DSH handles settings through its native configuration forms; vendor JavaScript is forwarded unchanged. File actions act on the daemon host — the workspace machine.
 
-When running ccteam behind HTTPS, proxy the DSH companion listener as well as the main web listener. DSH Web has no base-path support, so use a second HTTPS port or subdomain; proxying only `:7331` leaves the iframe on plain HTTP and browsers block it as mixed content.
+When running ccteam behind an HTTP or HTTPS reverse proxy on port 80 or 443, proxy the main web listener, including WebSocket upgrades. The DSH page uses that same external origin for its HTML, assets, RPC and WebSockets; no additional public port or subdomain is needed. Direct access to the main web port also works. The dedicated companion listener is plain HTTP unless your reverse proxy adds TLS in front of it.
 
 For the opposite direction — installing ccteam's plugins into a `dsh web` you run yourself, and using the ccteam workbench inside DSH’s own console — see [dsh-plugin.md](dsh-plugin.md) ([中文](dsh-plugin-cn.md)).
 

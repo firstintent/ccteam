@@ -57,13 +57,23 @@ describe("isDisabled — tolerate both off encodings", () => {
 });
 
 describe("embedSrc — only when serving", () => {
-  it("is the companion origin when running/attached, null otherwise", () => {
-    // jsdom serves http://localhost/ by default.
-    expect(embedSrc(status({ state: "running" }))).toBe("http://localhost:7332/");
-    expect(embedSrc(status({ state: "attached" }))).toBe("http://localhost:7332/");
+  it("uses the same-origin mount when running/attached, null otherwise", () => {
+    expect(embedSrc(status({ state: "running" }))).toBe("/dsh/");
+    expect(embedSrc(status({ state: "attached" }))).toBe("/dsh/");
     expect(embedSrc(status({ state: "starting" }))).toBeNull();
     expect(embedSrc(status({ state: "stopped" }))).toBeNull();
     expect(embedSrc(null)).toBeNull();
+  });
+
+  it.each([
+    "http://localhost:7331/app/dsh",
+    "http://ccteam.example/app/dsh",
+    "https://ccteam.example/app/dsh",
+    "https://ccteam.example:8443/app/dsh",
+  ])("keeps the external origin of %s instead of exposing the companion port", (page) => {
+    const target = new URL(embedSrc(status())!, page);
+    expect(target.origin).toBe(new URL(page).origin);
+    expect(target.pathname).toBe("/dsh/");
   });
 });
 

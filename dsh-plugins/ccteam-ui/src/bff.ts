@@ -37,6 +37,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   API_PREFIX,
+  API_RELATIVE_PREFIX,
   ATTACHMENT_PATH,
   EVENTS_PATH,
   UPLOAD_PATH,
@@ -952,11 +953,11 @@ function residencyOf(residency: string | undefined): Residency | undefined {
 }
 
 function attachmentUrlFor(project: string, name: string): string {
-  return `${API_PREFIX}${ATTACHMENT_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
+  return `${API_RELATIVE_PREFIX}${ATTACHMENT_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
 }
 
 function attachmentUrlForSid(sid: string, name: string): string {
-  return `${API_PREFIX}${ATTACHMENT_PATH}?sid=${encodeURIComponent(sid)}&name=${encodeURIComponent(name)}`
+  return `${API_RELATIVE_PREFIX}${ATTACHMENT_PATH}?sid=${encodeURIComponent(sid)}&name=${encodeURIComponent(name)}`
 }
 
 /**
