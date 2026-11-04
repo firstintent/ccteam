@@ -517,6 +517,7 @@ mod tests {
         depth: u32,
     ) {
         let mut m = ccteam_harness::SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             tool_face: None,
@@ -630,6 +631,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                claude_account: None,
                 driveable: true,
                 detached: None,
                 context_pct: None,
@@ -723,6 +725,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                claude_account: None,
                 driveable: true,
                 detached: None,
                 context_pct: None,

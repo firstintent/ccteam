@@ -45,6 +45,11 @@ pub const DAEMON_WORKERS_ENV: &str = "CCTEAM_DAEMON_WORKERS";
 /// on every collection guarantees an older config.yaml still parses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CcteamConfig {
+    /// Explicit cswap subscription grants, keyed by canonical owner tag.
+    /// Operators use their local accounts; tenants need a named identity
+    /// reference from account discovery. No credentials are stored here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cswap_account_grants: BTreeMap<String, Vec<String>>,
     /// Canonical base for `ccteam init --in <slug>`. When absent,
     /// `CcteamPaths::from_env` falls back to `$HOME/projects`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +279,7 @@ pub fn default_claude_jobs_retention_days() -> u32 {
 impl Default for CcteamConfig {
     fn default() -> Self {
         Self {
+            cswap_account_grants: BTreeMap::new(),
             projects_root: None,
             default_project: None,
             projects: Vec::new(),
@@ -492,6 +498,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let entry = sample_entry("foo", &PathBuf::from("/home/rob/code/foo"));
         let cfg = CcteamConfig {
+            cswap_account_grants: Default::default(),
             projects_root: Some(PathBuf::from("/work/repos")),
             default_project: Some("foo".to_string()),
             projects: vec![entry.clone()],

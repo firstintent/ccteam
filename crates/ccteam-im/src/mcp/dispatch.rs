@@ -2114,6 +2114,7 @@ async fn run_session_tool(
 /// refused rather than silently ignored, because "my model setting did
 /// nothing" is a far worse bug report than "that parameter is not for this".
 const AGENT_SPAWN_ONLY_PARAMS: &[&str] = &[
+    "claude_account",
     "vendor",
     "model",
     "effort",
@@ -2721,6 +2722,12 @@ async fn run_agent_spawn_at(
         .filter(|s| !s.is_empty())
         .map(String::from);
     let tuning = crate::gateway::SpawnTuning {
+        claude_account: args
+            .get("claude_account")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         model,
         effort,
         mode,

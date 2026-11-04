@@ -48,12 +48,15 @@ use futures::stream::BoxStream;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::execution::claude_accounts::CswapLaunch;
 use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
 use crate::execution::session_status::{read_status_file, write_context_file, write_status_file};
-use crate::execution::transcript_tail::anthropic_project_dir;
+use crate::execution::transcript_tail::{
+    anthropic_bound_project_dir, anthropic_project_dir, anthropic_project_dir_in,
+};
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, DetachedActivity,
     Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn,
@@ -1721,7 +1724,14 @@ impl ClaudeStreamJsonAdapter {
                 );
             }
         }
-        let init = Self::init_transport(transport).await;
+        let timeout = if env.iter().any(|(key, _)| key == "CCTEAM_CSWAP_LAUNCH")
+            && std::env::var_os("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS").is_none()
+        {
+            Duration::from_secs(60)
+        } else {
+            init_timeout()
+        };
+        let init = Self::init_transport(transport, timeout).await;
         if init.is_err() {
             // The failed handshake already killed the child: a record left
             // behind would read as a body that exited unobserved, and the
@@ -1747,7 +1757,7 @@ impl ClaudeStreamJsonAdapter {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("ccteam-exec.v1 connect: {e:#}")))?;
         let transport = StreamJsonTransport::spawn_from_io(reader, writer, None);
-        Self::init_transport(transport).await
+        Self::init_transport(transport, init_timeout()).await
     }
 
     /// Shared `initialize` control_request handshake — see
@@ -1755,9 +1765,10 @@ impl ClaudeStreamJsonAdapter {
     /// the capability handshake stream-json uses.
     async fn init_transport(
         transport: StreamJsonTransport,
+        timeout: Duration,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         match transport
-            .request_control("initialize", json!({}), init_timeout())
+            .request_control("initialize", json!({}), timeout)
             .await
         {
             Ok(body) if body.subtype == "success" => Ok((
@@ -1881,7 +1892,22 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // a local resume failure — same contract, just optimistic instead
         // of fs-checked (tech-design §4.4: satellite `--resume` is how a
         // remote rebuild continues context, PRD F3.4).
-        let resume = ctx.remote.is_some() || Self::session_jsonl_exists(&ctx.cwd, &uuid);
+        if ctx.claude_account.is_some() && ctx.remote.is_some() {
+            return Err(HarnessError::SpawnFailed(
+                "cswap accounts are not supported on remote projects".into(),
+            ));
+        }
+        let resume = ctx.remote.is_some()
+            || ctx
+                .claude_account
+                .as_ref()
+                .and_then(|account| account.config_dir.as_ref())
+                .map(|dir| {
+                    anthropic_project_dir_in(&dir.join("projects"), &ctx.cwd)
+                        .join(format!("{uuid}.jsonl"))
+                        .exists()
+                })
+                .unwrap_or_else(|| Self::session_jsonl_exists(&ctx.cwd, &uuid));
 
         // v0.8.24 C1 / v0.9.0 W3 — curated per-session MCP. `--mcp-config`
         // is a RELATIVE path (`.ccteam/chat/<sid>/mcp.json`, cwd = project
@@ -1930,6 +1956,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // `ccteam-exec.v1` WS bridge — tech-design §0.4: execution location
         // is a transport parameter); everything after this `match` is
         // identical for both.
+        let mut effective_account = ctx.claude_account.clone();
         let (transport, init) = if let Some(remote) = ctx.remote.as_ref() {
             let build_spec = |resume: bool| {
                 Self::build_exec_spec(ctx, make_argv(resume), &env, ship_mcp, &mcp_relpath)
@@ -1960,6 +1987,21 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             }
         } else {
             let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
+            let launch = match ctx.claude_account.as_ref() {
+                Some(account) => Some(
+                    CswapLaunch::prepare(
+                        account,
+                        &make_argv(resume),
+                        &env,
+                        &ctx.cwd,
+                        &crate::execution::turns_mirror::chat_dir(&ctx.project_dir, &ctx.sid),
+                        &uuid,
+                    )
+                    .await
+                    .map_err(|error| HarnessError::SpawnFailed(format!("cswap: {error:#}")))?,
+                ),
+                None => None,
+            };
             // `resume` here means the transcript `<uuid>.jsonl` is on disk, and
             // claude refuses `--session-id <uuid>` for an existing transcript
             // ("Session ID … is already in use", exit 1): a fresh fallback on
@@ -1967,7 +2009,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // resume into a second, misleading failure. Surface the resume
             // failure itself. Nothing sticks: the transcript is untouched and
             // the next message tries `--resume` again (docs-local issue #211).
-            Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body)
+            let result = Self::spawn_and_init(
+                &launch.as_ref().map(|launch| launch.argv.clone()).unwrap_or_else(|| make_argv(resume)),
+                launch.as_ref().map(|launch| launch.env.as_slice()).unwrap_or(&env), &ctx.cwd, body)
                 .await
                 .map_err(|err| {
                     if !resume {
@@ -1983,7 +2027,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         "claude --resume {uuid} failed: {err}. The conversation is intact on \
                          disk; the next resume retries it"
                     ))
-                })?
+                })?;
+            if let Some(launch) = launch {
+                match launch.binding() {
+                    Ok(binding) => effective_account = Some(binding),
+                    Err(error) => {
+                        let _ = result.0.shutdown().await;
+                        return Err(HarnessError::SpawnFailed(format!(
+                            "cswap profile confirmation failed: {error:#}"
+                        )));
+                    }
+                }
+            }
+            result
         };
 
         let identity = SessionIdentity {
@@ -2173,6 +2229,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 "role": spec.role,
                 "project_dir": ctx.project_dir.to_string_lossy(),
                 "cwd": ctx.cwd.to_string_lossy(),
+                "claude_account": effective_account,
             }),
         })
     }
@@ -2549,7 +2606,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         if ctx.vendor_uuid.is_empty() {
             return None;
         }
-        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        let path = anthropic_bound_project_dir(&ctx.cwd, ctx.claude_account.as_ref())?
+            .join(format!("{}.jsonl", ctx.vendor_uuid));
         let observed_until = ctx.observed_until;
         let last = ctx.last_observed_assistant.clone();
         tokio::task::spawn_blocking(move || {
@@ -2564,7 +2622,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         if ctx.vendor_uuid.is_empty() {
             return None;
         }
-        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        let path = anthropic_bound_project_dir(&ctx.cwd, ctx.claude_account.as_ref())?
+            .join(format!("{}.jsonl", ctx.vendor_uuid));
         tokio::task::spawn_blocking(move || recovery::activity(&path, std::time::SystemTime::now()))
             .await
             .ok()
@@ -2853,9 +2912,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // it belongs.
         if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
             let (cwd, uuid) = (PathBuf::from(cwd), h.identity.clone());
-            let gating = tokio::task::spawn_blocking(move || turn_gating::read(&cwd, &uuid))
-                .await
-                .unwrap_or(None);
+            let config_dir = h
+                .raw_extras
+                .get("claude_account")
+                .and_then(|value| value.get("config_dir"))
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from);
+            let gating = tokio::task::spawn_blocking(move || {
+                turn_gating::read(&cwd, &uuid, config_dir.as_deref())
+            })
+            .await
+            .unwrap_or(None);
             status.goal = gating.as_ref().and_then(|gating| gating.goal.clone());
             status.stop_hook_blocks = gating.map(|gating| gating.stop_hook_blocks);
         }

@@ -71,6 +71,12 @@ fn resolve_claude_uuid(target: &SessionTitleTarget) -> Option<String> {
 /// (stream-json and the frozen terminal protocol) — the title surface is a
 /// property of the vendor, not of the wire protocol.
 pub fn push_claude_custom_title(target: &SessionTitleTarget, title: &str) -> TitleSync {
+    if let Some(account) = &target.claude_account {
+        let Some(config_dir) = &account.config_dir else {
+            return TitleSync::Deferred("session profile has not been confirmed".into());
+        };
+        return push_claude_custom_title_in(&config_dir.join("projects"), target, title);
+    }
     let Some(home) = dirs::home_dir() else {
         return TitleSync::Deferred("no home dir to resolve ~/.claude/projects".into());
     };
@@ -122,6 +128,7 @@ mod tests {
 
     fn target(project_dir: &Path, uuid: &str) -> SessionTitleTarget {
         SessionTitleTarget {
+            claude_account: None,
             sid: "s7".into(),
             vendor_uuid: uuid.into(),
             project_dir: project_dir.to_path_buf(),

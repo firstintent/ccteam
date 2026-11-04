@@ -1157,6 +1157,11 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
 }
 .cockpit-markdown pre.has-copy { padding-top: 2.2rem; }
 .cockpit-markdown .code-copy:hover { color: var(--text); }
+.cswap-options { padding: 0.5rem 0.75rem; }
+.cswap-options summary { cursor: pointer; color: var(--text-muted); }
+.cswap-options label { display: grid; gap: 0.35rem; margin: 0.6rem 0; }
+.cswap-options select { width: 100%; max-width: 20rem; padding: 0.4rem; background: var(--bg-card); color: var(--text); border: 1px solid var(--border); border-radius: 0.35rem; }
+.cswap-options small { display: block; max-width: 20rem; color: var(--text-muted); white-space: normal; }
 .cockpit-markdown hr { border: none; border-top: 1px solid var(--border-soft); margin: 0.75rem 0; }
 .cockpit-markdown .cockpit-table-wrap {
   margin: 0.75rem 0;

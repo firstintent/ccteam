@@ -415,6 +415,9 @@ pub enum DetachOutcome {
 /// finished a turn (or several) while no daemon was reading it.
 #[derive(Debug, Clone)]
 pub struct UnobservedTurnCtx {
+    /// Explicit profile binding from the session ledger; never infer it from
+    /// an ambient home or a possibly unreadable metadata file during reads.
+    pub claude_account: Option<crate::execution::claude_accounts::ClaudeAccountBinding>,
     pub sid: String,
     pub slug: String,
     /// The session's working directory (the vendor transcript lives keyed by
@@ -1164,6 +1167,8 @@ pub enum DirectiveOutcome {
 /// `thread/name/set`) answers [`TitleSync::Deferred`] when `thread` is `None`.
 #[derive(Debug, Clone)]
 pub struct SessionTitleTarget {
+    /// The session's ledger-owned profile, including stopped sessions.
+    pub claude_account: Option<crate::execution::claude_accounts::ClaudeAccountBinding>,
     /// ccteam session id (`s{n}`).
     pub sid: String,
     /// The vendor's own session id as recorded in `meta.json` (Claude session
@@ -1838,6 +1843,9 @@ pub struct ThreadErrorEvent {
 /// per-model cost accuracy).
 #[derive(Debug, Clone, Default)]
 pub struct SpawnCtx {
+    /// Optional Claude subscription binding. Only local stream-json supports
+    /// cswap; default spawns never probe or invoke it (issue #229).
+    pub claude_account: Option<crate::execution::claude_accounts::ClaudeAccountBinding>,
     pub slug: String,
     pub sid: String,
     /// Which THREAD of this sid is starting. A sid outlives any one thread —

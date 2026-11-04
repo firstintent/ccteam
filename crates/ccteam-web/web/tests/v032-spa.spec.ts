@@ -491,6 +491,41 @@ test("conversation posts a turn; sidebar hover-stop stops the session", async ({
   );
 });
 
+for (const installed of [false, true]) {
+  test(`optional cswap account picker: installed=${installed}`, async ({ page }) => {
+    const captured = await mockCcteamApi(page);
+    let discoveries = 0;
+    const account = "a".repeat(64);
+    await page.route("**/api/v1/vendors/claude/accounts", route => {
+      discoveries++;
+      return route.fulfill({ json: { available: installed, accounts: installed
+        ? [{ id: account, slot: "2", label: "work (t***@example.test)", active: false }] : [] } });
+    });
+    await page.goto("/app/");
+    await expect(page.getByTestId("home-view")).toBeVisible();
+    expect(discoveries).toBe(0);
+    await page.getByTestId("model-btn").click();
+    await page.getByText("高级选项", { exact: true }).click();
+    const picker = page.getByRole("combobox", { name: "Claude 账号" });
+    await expect(picker).toBeVisible();
+    await expect.poll(() => discoveries).toBe(1);
+    if (installed) {
+      await picker.selectOption(account);
+    } else {
+      await expect(page.getByText(/cswap 不可用/)).toBeVisible();
+      await expect(picker).toHaveValue("");
+    }
+    await page.getByTestId("model-btn").click();
+    await page.getByTestId("composer-textarea").fill("Use the selected login");
+    await page.getByTestId("home-send").click();
+    await expect.poll(() => captured.some(row => row.url.endsWith("/projects/dev-team/sessions"))).toBe(true);
+    const create = captured.find(row => row.url.endsWith("/projects/dev-team/sessions"));
+    if (installed) expect(create?.body).toHaveProperty("claude_account", account);
+    else expect(create?.body).not.toHaveProperty("claude_account");
+    await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
+  });
+}
+
 test("home lazy-create: first message POSTs session without a host override, then the turn", async ({
   page,
 }) => {

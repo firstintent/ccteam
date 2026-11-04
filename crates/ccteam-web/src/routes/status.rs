@@ -659,6 +659,7 @@ mod tests {
 
     fn view(sid: &str, project: &str, vendor: &str) -> ccteam_im::gateway::SessionView {
         ccteam_im::gateway::SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,

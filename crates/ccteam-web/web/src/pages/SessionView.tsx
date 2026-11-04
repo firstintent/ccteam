@@ -863,6 +863,12 @@ export default function SessionView({
           </button>
         ) : null}
         {session?.role ? <span className="chip session-role" data-testid="session-role" title={session.role}>{session.role}</span> : null}
+        {session?.claude_account ? <span className="chip" data-testid="session-claude-account"
+          title={session.claude_account.active
+            ? (lang === "en" ? "Default login; may follow cswap auto" : "默认登录，可能跟随 cswap auto 切换")
+            : session.claude_account.label}>
+          {session.claude_account.active ? (lang === "en" ? "Default login" : "默认登录") : `cswap ${session.claude_account.slot}`}
+        </span> : null}
         <span className="session-model" data-testid="session-model" title={displayStatusModel ?? vendor}>
           {displayStatusModel ?? vendor}
         </span>

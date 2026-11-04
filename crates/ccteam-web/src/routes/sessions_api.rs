@@ -322,6 +322,10 @@ fn apply_progress_activity_status(
 /// Accepts form or JSON via [`FormOrJson`].
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionForm {
+    /// Optional stable cswap account id returned by GET /vendors/claude/accounts.
+    /// Only local Claude stream-json supports account selection.
+    #[serde(default)]
+    pub claude_account: Option<String>,
     pub role: String,
     #[serde(default)]
     pub vendor: Option<String>,
@@ -384,6 +388,7 @@ fn spawn_tuning_from_form(
     mode: Option<String>,
 ) -> ccteam_im::gateway::SpawnTuning {
     ccteam_im::gateway::SpawnTuning {
+        claude_account: None,
         model,
         effort,
         mode,
@@ -466,12 +471,25 @@ pub(crate) async fn handle_create_session(
     };
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
-    let tuning = spawn_tuning_from_form(
+    let mut tuning = spawn_tuning_from_form(
         vendor,
         form.model.clone(),
         form.effort.clone(),
         form.mode.clone(),
     );
+    tuning.claude_account = form
+        .claude_account
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    if tuning.claude_account.is_some()
+        && (vendor != AgentVendor::Claude || protocol != SessionProtocol::StreamJson)
+    {
+        return create_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cswap accounts require local Claude stream-json".into(),
+            mode,
+        );
+    }
     let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
         Arc::clone(gw),
         slug.clone(),
@@ -486,6 +504,12 @@ pub(crate) async fn handle_create_session(
     .await;
     match created {
         Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
+        Err(error) if error.is::<ccteam_im::gateway::CswapAccountDenied>() => {
+            create_error(StatusCode::FORBIDDEN, error.to_string(), mode)
+        }
+        Err(error) if error.is::<ccteam_im::gateway::CswapAccountUnsupported>() => {
+            create_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string(), mode)
+        }
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
         // role has no `.claude/agents/<role>.md`) from a real internal failure
         // (adapter spawn / fs error). A bad role is a client error → 422
@@ -2955,6 +2979,7 @@ mod tests {
 
     fn view(sid: &str) -> SessionView {
         SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3036,6 +3061,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3090,6 +3116,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![
             SessionView {
+                claude_account: None,
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
@@ -3116,6 +3143,7 @@ mod tests {
                 delegation_depth: 0,
             },
             SessionView {
+                claude_account: None,
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
@@ -3177,6 +3205,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3225,6 +3254,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,

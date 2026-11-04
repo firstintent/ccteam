@@ -115,6 +115,11 @@ impl StreamJsonTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Only account launches clear inherited profile selection. Normal
+        // Claude starts preserve the daemon user's existing environment.
+        if env.iter().any(|(key, _)| key == "CCTEAM_CSWAP_LAUNCH") {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        }
         // The body leads its own process group, so ending it (a user stop, or
         // a detached body a queued turn is waiting on) can end the background
         // processes it started too — `session_body::terminate` signals the
@@ -402,7 +407,7 @@ async fn run_reader<R: AsyncRead + Unpin + Send>(
                 let parsed: Outbound = match serde_json::from_str(trimmed) {
                     Ok(v) => v,
                     Err(err) => {
-                        tracing::warn!(error = %err, line = %trimmed, "stream-json: parse failure");
+                        tracing::warn!(error = %err, "stream-json: discarded non-protocol output");
                         continue;
                     }
                 };

@@ -337,6 +337,7 @@ export function ChatComposer({
   allowedVendors,
   catalog: catalogOverride,
   topSlot,
+  advancedSlot,
   sendTestId = "composer-send",
   uploadSlug,
   prefill,
@@ -380,6 +381,8 @@ export function ChatComposer({
   catalog?: VendorCatalog;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
+  /** Optional new-session controls; conversation composers never change accounts. */
+  advancedSlot?: React.ReactNode;
   sendTestId?: string;
   /** Project slug uploads + the skill picker target. Omit (e.g. while the
    *  Home new-project row is open) to disable attaching with a hint. */
@@ -1062,6 +1065,7 @@ export function ChatComposer({
                   <span className="check">✓</span>
                 </button>
               ))}
+              {advancedSlot}
             </div>
           </div>
           <button type="button" className="icon-btn" title="mic" aria-label="mic">

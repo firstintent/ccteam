@@ -11,6 +11,12 @@ pub const ADMIN_WEB_ID: &str = "web-api";
 /// outside it (`telegram:<chat_id>`, …) are IM-owned; `None` is unowned.
 pub const WEB_OWNER_PREFIX: &str = "user:";
 
+/// Project access alone never grants the right to spend another owner's
+/// subscription. Account grants name stable identities, not movable slots.
+pub fn can_use_cswap_account(is_operator: bool, granted: &[String], account: &str) -> bool {
+    is_operator || granted.iter().any(|id| id == account)
+}
+
 /// Return the persisted owner tag for resources created by a web identity.
 pub fn owner_tag(user_id: &str, is_admin: bool) -> String {
     if is_admin {
@@ -108,6 +114,23 @@ pub fn operator_im_pool_sees(viewer_identity: &str, named_operator: bool, owner:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_use_requires_operator_or_an_explicit_identity_grant() {
+        assert!(can_use_cswap_account(true, &[], "account-a"));
+        assert!(!can_use_cswap_account(false, &[], "account-a"));
+        assert!(can_use_cswap_account(
+            false,
+            &["account-a".into()],
+            "account-a"
+        ));
+        assert!(!can_use_cswap_account(
+            false,
+            &["account-a".into()],
+            "account-b"
+        ));
+        assert!(!can_use_cswap_account(false, &["*".into()], "account-a"));
+    }
 
     #[test]
     fn owner_and_web_chat_tags_are_stable() {
