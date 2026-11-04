@@ -1140,7 +1140,12 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
   position: absolute;
   top: 0.3rem;
   right: 0.3rem;
-  padding: 0.15rem 0.45rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0.3rem;
   font-family: var(--font-sans);
   font-size: 0.65rem;
   line-height: 1.3;
@@ -1149,11 +1154,8 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
   border: 1px solid var(--border);
   border-radius: 0.3rem;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s;
 }
-.cockpit-markdown pre.has-copy:hover .code-copy,
-.cockpit-markdown .code-copy:focus-visible { opacity: 1; }
+.cockpit-markdown pre.has-copy { padding-top: 2.2rem; }
 .cockpit-markdown .code-copy:hover { color: var(--text); }
 .cockpit-markdown hr { border: none; border-top: 1px solid var(--border-soft); margin: 0.75rem 0; }
 .cockpit-markdown .cockpit-table-wrap {
