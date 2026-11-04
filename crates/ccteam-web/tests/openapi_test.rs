@@ -71,6 +71,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ),
         // VENDOR-QUOTA-1 — vendor subscription-quota snapshot (admin).
         ("GET", "/api/v1/vendors/quota"),
+        // #229 — optional, identity-filtered cswap discovery.
+        ("GET", "/api/v1/vendors/claude/accounts"),
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),

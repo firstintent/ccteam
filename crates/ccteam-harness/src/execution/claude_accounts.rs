@@ -142,7 +142,31 @@ pub async fn discover_accounts() -> Result<Vec<CswapAccount>> {
     if !help.contains("--no-share-history") || !help.contains("--require-session") {
         bail!("this cswap version lacks account-isolation options; upgrade cswap or use default login");
     }
+    // Newer cswap versions optionally infer setup-token quota using a tiny
+    // model request. Discovery must not create inference outside a session.
+    verify_cswap_settings(
+        &cswap_output(&["config", "list", "--json"], Duration::from_secs(5)).await?,
+    )?;
     parse_accounts(&cswap_output(&["list", "--json"], Duration::from_secs(20)).await?)
+}
+
+fn verify_cswap_settings(bytes: &[u8]) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("cswap settings discovery returned invalid JSON")?;
+    if value["schemaVersion"].as_u64() != Some(1) {
+        bail!("unsupported cswap settings schema");
+    }
+    let settings = value["settings"]
+        .as_array()
+        .context("cswap settings discovery has no settings")?;
+    for setting in settings {
+        if setting["key"].as_str() == Some("usage.headerProbe")
+            && setting["value"].as_bool() != Some(false)
+        {
+            bail!("disable cswap usage.headerProbe before account discovery: ccteam does not run quota inference probes");
+        }
+    }
+    Ok(())
 }
 
 async fn cswap_output(args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
@@ -342,6 +366,9 @@ pub fn run_relay(args: &[OsString]) -> Result<()> {
         .env_remove(ORIGINAL_PATH_ENV);
     let is_stream_json = args.iter().any(|arg| arg == "--input-format");
     if !is_stream_json {
+        // The SDK initialize request can already be queued in inherited
+        // stdin while cswap probes auth. Probes must never consume it.
+        command.stdin(std::process::Stdio::null());
         return exec(command, args);
     }
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -392,7 +419,9 @@ pub fn run_relay(args: &[OsString]) -> Result<()> {
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
     ] {
-        if std::env::var_os(key).is_some_and(|v| !v.is_empty() && v != "0" && v != "false") {
+        if std::env::var_os(key)
+            .is_some_and(|value| override_is_active(key, &value.to_string_lossy()))
+        {
             bail!("selected cswap subscription conflicts with {key}; remove the provider override first");
         }
     }
@@ -482,12 +511,11 @@ fn verify_subscription_settings(config_dir: &Path, cwd: &Path) -> Result<()> {
                 "CLAUDE_CODE_USE_VERTEX",
                 "CLAUDE_CODE_USE_FOUNDRY",
             ] {
-                if env.get(key).is_some_and(|value| {
-                    !value.is_null()
-                        && value.as_str() != Some("")
-                        && value.as_str() != Some("0")
-                        && value.as_str() != Some("false")
-                        && value != false
+                if env.get(key).is_some_and(|value| match value {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::String(value) => override_is_active(key, value),
+                    serde_json::Value::Bool(false) => !is_cloud_switch(key),
+                    _ => true,
                 }) {
                     bail!("selected subscription conflicts with {key} in Claude settings");
                 }
@@ -495,6 +523,19 @@ fn verify_subscription_settings(config_dir: &Path, cwd: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_cloud_switch(key: &str) -> bool {
+    matches!(
+        key,
+        "CLAUDE_CODE_USE_BEDROCK" | "CLAUDE_CODE_USE_VERTEX" | "CLAUDE_CODE_USE_FOUNDRY"
+    )
+}
+
+fn override_is_active(key: &str, value: &str) -> bool {
+    // "0" disables a boolean cloud switch, but is a real stdin descriptor
+    // for FD authentication; an arbitrary URL/key is never a boolean flag.
+    !value.is_empty() && (!is_cloud_switch(key) || !matches!(value, "0" | "false"))
 }
 
 fn bounded_auth_probe(mut command: std::process::Command) -> Result<std::process::Output> {
@@ -588,6 +629,8 @@ mod tests {
             r#"{"apiKeyHelper":"return-a-key"}"#,
             r#"{"env":{"ANTHROPIC_API_KEY":"must-not-win"}}"#,
             r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#,
+            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR":"0"}}"#,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"false"}}"#,
         ] {
             std::fs::write(profile.join("settings.json"), body).unwrap();
             assert!(verify_subscription_settings(&profile, &project).is_err());
@@ -598,5 +641,18 @@ mod tests {
         )
         .unwrap();
         assert!(verify_subscription_settings(&profile, &project).is_ok());
+    }
+
+    #[test]
+    fn discovery_never_enables_vendor_quota_inference() {
+        assert!(verify_cswap_settings(br#"{"schemaVersion":1,"settings":[]}"#).is_ok());
+        assert!(verify_cswap_settings(
+            br#"{"schemaVersion":1,"settings":[{"key":"usage.headerProbe","value":false}]}"#
+        )
+        .is_ok());
+        assert!(verify_cswap_settings(
+            br#"{"schemaVersion":1,"settings":[{"key":"usage.headerProbe","value":true}]}"#
+        )
+        .is_err());
     }
 }

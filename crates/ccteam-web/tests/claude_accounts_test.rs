@@ -31,7 +31,7 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
     ccteam_core::config::save(&paths.root, &config).unwrap();
     let calls = tmp.path().join("calls");
     let cswap = tmp.path().join("cswap");
-    std::fs::write(&cswap, format!("#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = run ]; then echo '--no-share-history --require-session'; exit 0; fi\nprintf '%s\\n' '{{\"schemaVersion\":1,\"accounts\":[{{\"number\":1,\"email\":\"one@example.test\"}},{{\"number\":2,\"email\":\"two@example.test\"}}]}}'\n", calls.display())).unwrap();
+    std::fs::write(&cswap, format!("#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = run ]; then echo '--no-share-history --require-session'; exit 0; fi\nif [ \"$1\" = config ]; then echo '{{\"schemaVersion\":1,\"settings\":[]}}'; exit 0; fi\nprintf '%s\\n' '{{\"schemaVersion\":1,\"accounts\":[{{\"number\":1,\"email\":\"one@example.test\"}},{{\"number\":2,\"email\":\"two@example.test\"}}]}}'\n", calls.display())).unwrap();
     std::fs::set_permissions(&cswap, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::env::set_var("CCTEAM_CSWAP_BIN", &cswap);
     let mut gateway = Gateway::new(
@@ -92,7 +92,7 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
     assert_eq!(operator["accounts"].as_array().unwrap().len(), 2);
     assert_eq!(
         std::fs::read_to_string(&calls).unwrap().lines().count(),
-        2,
+        3,
         "discovery is coalesced and cached"
     );
     config.cswap_account_grants.clear();

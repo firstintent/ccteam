@@ -16,6 +16,7 @@ from pathlib import Path
 profile = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
 email = os.environ.get('CSWAP_FAKE_DEFAULT_EMAIL', 'two@example.test') if 'CLAUDE_CONFIG_DIR' not in os.environ else 'two@example.test'
 if sys.argv[1:3] == ['auth', 'status']:
+    assert sys.stdin.read(1) == '', 'auth probe consumed stream-json input'
     print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','email':email,'orgId':''}))
     sys.exit(0)
 args = sys.argv[1:]
@@ -44,6 +45,9 @@ if sys.argv[1:]==['list','--json']:
     sys.exit(0)
 if sys.argv[1:]==['run','--help']:
     print('--no-share-history --require-session')
+    sys.exit(0)
+if sys.argv[1:]==['config','list','--json']:
+    print(json.dumps({'schemaVersion':1,'settings':[]}))
     sys.exit(0)
 assert sys.argv[1:3]==['run','2']
 assert '--no-share-history' in sys.argv
