@@ -1209,9 +1209,24 @@ async fn get_context_breakdown(transport: &StreamJsonTransport) -> Option<crate:
 /// array (group·severity) + `extra_usage` (credits). `None` on timeout / error /
 /// a CLI without the subtype (probed: `get_usage` is the real subtype;
 /// `rate_limits`/`usage` error). Short timeout — must never stall the dashboard.
+///
+/// `skip_behaviors: true` is load-bearing. By default claude ALSO computes
+/// `behaviors` (the "what's contributing to your usage" recommendations) by
+/// scanning the account's local transcript history, which ccteam never reads.
+/// That scan grows with history: on a well-used host it took ~3.9s (probed,
+/// claude 2.1.318) against ~1ms with the flag, so every ask blew the deadline
+/// below — the live read AND the release-time capture both came back `None`,
+/// and the IM `⚡ 用量` row froze on the last snapshot that had ever made it
+/// (an old account's, kept "valid" until its weekly reset). The rate-limit
+/// half is untouched by the flag: claude still answers it from the account
+/// the process is signed in as. A CLI predating the flag ignores the field.
 async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::AccountUsage> {
     let body = transport
-        .request_control("get_usage", json!({}), Duration::from_secs(3))
+        .request_control(
+            "get_usage",
+            json!({ "skip_behaviors": true }),
+            Duration::from_secs(3),
+        )
         .await
         .ok()?;
     if body.subtype != "success" {
@@ -1261,11 +1276,15 @@ fn parse_get_usage_response(resp: &serde_json::Value) -> Option<crate::AccountUs
         credits_pct: pct(extra),
         model_windows: model_windows(rl),
     };
-    if usage == crate::AccountUsage::default() {
-        None
-    } else {
-        Some(usage)
-    }
+    // An answer is an observation only if it carries at least one WINDOW. The
+    // tier alone (`rate_limits: null` — claude could not reach its usage
+    // endpoint, or the account is not metered) says nothing about headroom,
+    // so it must not stand in for one: the caller then asks the next session
+    // or falls back to the last real observation instead of overwriting it
+    // with a row that renders as nothing. Which windows exist is the
+    // account's business — a plan without a 5-hour window (only `seven_day`)
+    // is a full observation, as is one reporting only per-model buckets.
+    usage.has_window().then_some(usage)
 }
 
 /// Per-model weekly windows out of the `rate_limits` object.
@@ -3249,8 +3268,89 @@ mod deferred_queue_tests {
 
 #[cfg(test)]
 mod account_usage_tests {
-    use super::parse_get_usage_response;
+    use super::{get_account_usage, parse_get_usage_response, StreamJsonTransport};
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// The 2026-11-06 freeze. Without `skip_behaviors`, claude first scans the
+    /// account's local transcript history to build usage recommendations —
+    /// ~3.9s on a well-used host, past the 3s deadline — so every live read
+    /// AND every release-time capture came back `None` and the IM row showed
+    /// a days-old snapshot of a since-replaced account. The peer here answers
+    /// the way that claude did for an ask WITHOUT the flag (only after the
+    /// deadline), so leaving the flag out fails this test.
+    #[tokio::test]
+    async fn get_usage_skips_the_slow_behaviors_scan() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client);
+        let transport = StreamJsonTransport::spawn_from_io(client_read, client_write, None);
+        tokio::spawn(async move {
+            let (peer_read, mut peer_write) = tokio::io::split(&mut peer);
+            let mut line = String::new();
+            BufReader::new(peer_read)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request["request"]["subtype"], "get_usage");
+            if request["request"]["skip_behaviors"] != json!(true) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let reply = json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request["request_id"],
+                    "response": {
+                        "subscription_type": "team",
+                        "rate_limits": {
+                            "five_hour": {"utilization": 34, "resets_at": "2026-11-06T13:50:00Z"},
+                            "seven_day": {"utilization": 35, "resets_at": "2026-11-10T13:00:00Z"}
+                        }
+                    }
+                }
+            });
+            peer_write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            peer_write.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let usage = tokio::time::timeout(Duration::from_secs(10), get_account_usage(&transport))
+            .await
+            .expect("the ask is bounded by its own deadline")
+            .expect("answered inside the deadline");
+        assert_eq!(usage.subscription.as_deref(), Some("team"));
+        assert_eq!(usage.five_hour_pct, Some(34));
+        assert_eq!(usage.weekly_pct, Some(35));
+    }
+
+    /// A plan with NO 5-hour window (live shape, claude 2.1.318: `five_hour`
+    /// is `null`) is a complete observation: the weekly window and the tier,
+    /// and no 5-hour figure from anywhere.
+    #[test]
+    fn a_plan_without_a_five_hour_window_reports_only_its_weekly_one() {
+        let usage = parse_get_usage_response(&json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": null,
+                "seven_day": {"utilization": 20, "resets_at": "2026-11-09T18:59:59Z"},
+                "limits": [
+                    {"kind": "weekly_all", "group": "weekly", "percent": 20, "severity": "normal"}
+                ]
+            }
+        }))
+        .expect("a weekly window alone is an observation");
+        assert_eq!(usage.five_hour_pct, None);
+        assert_eq!(usage.five_hour_resets_at, None);
+        assert_eq!(usage.weekly_pct, Some(20));
+        assert_eq!(usage.weekly_severity.as_deref(), Some("normal"));
+        assert_eq!(usage.subscription.as_deref(), Some("max"));
+    }
 
     /// The `get_usage` response for a Max account whose server DOES send the
     /// declared per-model array. Key set pinned against a live claude 2.1.245.
@@ -3370,6 +3470,15 @@ mod account_usage_tests {
     fn refuses_to_invent_rows_from_an_empty_answer() {
         assert!(parse_get_usage_response(&json!({})).is_none());
         assert!(parse_get_usage_response(&json!({"rate_limits": {}})).is_none());
+        // The tier with no windows (claude could not reach its usage endpoint)
+        // says nothing about headroom: not an observation either, so it can
+        // never overwrite the last one that did.
+        assert!(parse_get_usage_response(&json!({
+            "subscription_type": "team",
+            "rate_limits_available": false,
+            "rate_limits": null
+        }))
+        .is_none());
         assert!(parse_get_usage_response(&json!({
             "rate_limits": {"seven_day_opus": {}, "model_scoped": [{"utilization": 5.0}]}
         }))

@@ -161,7 +161,7 @@ fn parse_grok_billing(response: &serde_json::Value) -> Option<crate::AccountUsag
         credits_pct,
         ..Default::default()
     };
-    (usage != crate::AccountUsage::default()).then_some(usage)
+    usage.has_window().then_some(usage)
 }
 
 struct LiveSession {
