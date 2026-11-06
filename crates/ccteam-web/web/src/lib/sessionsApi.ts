@@ -23,6 +23,7 @@ import { backgroundHeaders } from "./backgroundRequest";
  *  `crates/ccteam-im/src/gateway.rs::SessionView`). `sid` is the gateway
  *  `s{n}` id; `permission_mode` is `"skip"` | `"hitl"` (W2). */
 export interface SessionView {
+  claude_account?: CswapAccount | null;
   sid: string;
   project: string;
   role: string;
@@ -467,6 +468,7 @@ export function resolveApproval(
  *  server-side when omitted; pass `"hitl"` to opt the new session into W2
  *  IM-approval prompts for non-allowlist tool calls. */
 export interface CreateSessionOpts {
+  claude_account?: string;
   role: string;
   vendor?: string;
   permission_mode?: "skip" | "hitl";
@@ -504,8 +506,26 @@ export function createSession(
   if (opts.model) body.model = opts.model;
   if (opts.effort) body.effort = opts.effort;
   if (opts.mode) body.mode = opts.mode;
+  if (opts.claude_account) body.claude_account = opts.claude_account;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }
+
+export interface CswapAccount {
+  id: string;
+  slot: string;
+  label: string;
+  /** Discovery: currently the default login. Session: default fallback mode. */
+  active: boolean;
+}
+export interface CswapAccounts {
+  available: boolean;
+  accounts: CswapAccount[];
+  /** `not_granted`: cswap may be fine, this identity just has no grant. */
+  reason?: "not_granted";
+  message?: string;
+}
+export const getCswapAccounts = () =>
+  getJson<CswapAccounts>("/api/v1/vendors/claude/accounts");
 
 // ── v0.8.21 history / resume / external-import ───────────────────────────────
 

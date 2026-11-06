@@ -166,6 +166,10 @@ DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、
 
 ### 开会话、切换、对话
 
+本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，头部会标记「默认登录」，该会话可继续跟随外部 `cswap auto`；其他账号使用独立 profile，恢复时保持原身份和目录，不能静默退回默认号。仅首选新会话可以回退，已隔离的会话遇到账号移除、slot 换绑或目录变化会报错并保留历史。
+
+账号列表由 `GET /api/v1/vendors/claude/accounts` 返回，创建请求的 `claude_account` 使用其中的稳定 id。管理员 token 与已点名的 IM operator 可使用执行端全部本机账号；用个人链接登录的用户只能看到管理员在「设置 → 管理员 → 用户 → Claude 账号」中授权给他的账号（`PUT /api/v1/users/{id}/cswap-accounts`，落在 `config.yaml` 的 `cswap_account_grants`）。未授权时账号菜单提示尚未授权，默认登录照常可用。项目访问权不包含订阅消费权。远程项目、其他 vendor 与 terminal 协议不支持这个选项。ccteam 不代装 cswap，也不会自动换号。若 cswap 提供 `usage.headerProbe`，必须保持关闭，避免账号发现触发额度推理探针。
+
 - **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi·DSH / Pi 自己的 RPC)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。

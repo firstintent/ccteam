@@ -85,6 +85,7 @@ impl PiTestEnv {
 
     fn ctx(&self, sid: &str) -> SpawnCtx {
         SpawnCtx {
+            claude_account: None,
             generation: 0,
             mode: None,
             slug: "pi-test".to_string(),

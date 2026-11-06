@@ -64,6 +64,7 @@ pub fn external_node_meta(
         AgentVendor::Claude | AgentVendor::Codex | AgentVendor::Pi => SessionProtocol::StreamJson,
     };
     let mut meta = SessionMeta {
+        claude_account: None,
         model_pinned_generation: None,
         tool_face: None,
         managed_by: ManagedBy::External,

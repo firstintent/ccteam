@@ -234,6 +234,7 @@ fn setup(tmp: &Path) -> PathBuf {
 
 fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),
@@ -578,6 +579,7 @@ async fn child_death_then_restart_recovers() {
 
 fn ctx_hitl(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         permission_mode: PermissionMode::Hitl,
         ..ctx(tmp, slug, sid)
@@ -2601,6 +2603,7 @@ async fn recover_unobserved_turn_reads_the_vendor_transcript() {
         .with_timezone(&chrono::Utc);
     let recovered = adapter
         .recover_unobserved_turn(&UnobservedTurnCtx {
+            claude_account: None,
             sid: "s43".into(),
             slug: "proj".into(),
             cwd: tmp.path().to_path_buf(),
@@ -2623,6 +2626,7 @@ async fn recover_unobserved_turn_reads_the_vendor_transcript() {
         .with_timezone(&chrono::Utc);
     assert!(adapter
         .recover_unobserved_turn(&UnobservedTurnCtx {
+            claude_account: None,
             sid: "s43".into(),
             slug: "proj".into(),
             cwd: tmp.path().to_path_buf(),

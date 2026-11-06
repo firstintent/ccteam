@@ -181,6 +181,22 @@ pub fn anthropic_project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(resolve_project_dir_in(&base, cwd))
 }
 
+/// Resolve a managed sid's bound Claude profile for reads that outlive its
+/// process (recovery, titles). An unreadable binding must never fall back to
+/// another account's history.
+pub fn anthropic_bound_project_dir(
+    cwd: &Path,
+    account: Option<&super::claude_accounts::ClaudeAccountBinding>,
+) -> Option<PathBuf> {
+    match account {
+        Some(account) => Some(anthropic_project_dir_in(
+            &account.config_dir.as_ref()?.join("projects"),
+            cwd,
+        )),
+        None => anthropic_project_dir(cwd),
+    }
+}
+
 /// [`anthropic_project_dir`] against an explicitly supplied Claude projects
 /// root — the injection seam (same shape as [`discover_active_session_in`]) so
 /// tests never touch the real `~/.claude/projects/`.

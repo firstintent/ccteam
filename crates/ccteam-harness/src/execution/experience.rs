@@ -553,6 +553,7 @@ mod tests {
         let project = tmp.path();
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             tool_face: None,
@@ -631,6 +632,7 @@ mod tests {
         // Seed meta + turns for s1.
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             tool_face: None,

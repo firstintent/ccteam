@@ -156,6 +156,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // spawn-tuning discovery — the affordance side of `POST .../sessions`
         // taking `model` + `effort` (no project named, so no project ACL).
         .routes(routes!(super::models::handle_models))
+        .routes(routes!(super::claude_accounts::handle_claude_accounts))
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp)
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
@@ -186,6 +187,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::users::handle_delete_user))
         // v0.8.20 F3 — admin re-reveals a tenant's personal login link.
         .routes(routes!(super::users::handle_user_link))
+        // #229 — admin grants local cswap subscriptions to a tenant.
+        .routes(routes!(
+            super::users::handle_get_user_cswap_accounts,
+            super::users::handle_put_user_cswap_accounts
+        ))
         // v0.8.20 F2 — per-user IM bot config (self-serve `/me/im` + admin).
         .routes(routes!(
             super::users::handle_put_me_im,
