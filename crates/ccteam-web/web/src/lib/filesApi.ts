@@ -59,7 +59,18 @@ export const mintFilePreview = (
 
 /** Local Markdown references only; ordinary web/navigation links retain their
  * browser behavior. Project containment is checked again by the server. */
-export function fileLinkTarget(href: string): FileTarget | null {
+export function fileLinkTarget(href: string, origin?: string): FileTarget | null {
+  // Replies may spell a local path as an absolute URL on this console.
+  // Compare origins, never a deployment hostname or a string prefix.
+  if (origin && /^(?:https?:)?\/\//i.test(href)) {
+    try {
+      const url = new URL(href, origin);
+      if (url.origin !== origin) return null;
+      href = `${url.pathname}${url.search}${url.hash}`;
+    } catch {
+      return null;
+    }
+  }
   if (
     /^(?:https?|ftp|javascript|data|blob|mailto|tel|file):/i.test(href) ||
     /^[a-z][a-z\d+.-]*:\/\//i.test(href) ||
@@ -89,6 +100,36 @@ export function fileLinkTarget(href: string): FileTarget | null {
   )
     return null;
   return { path, ...(line && line > 0 ? { line } : {}) };
+}
+
+/** One resolver per mounted conversation: share root discovery and preview
+ * requests across its messages, without caching capabilities across logins. */
+export function createFilePreviewResolver(slug: string) {
+  let root: Promise<string> | undefined;
+  const previews = new Map<string, { expires: number; url: Promise<string> }>();
+  return async (target: FileTarget, renew = false): Promise<string | null> => {
+    if (target.line || !supportsFilePreview(target.path)) return null;
+    root ??= getProjectFiles(slug).then((tree) => tree.root).catch((error: unknown) => {
+      root = undefined;
+      throw error;
+    });
+    const path = projectRelativePath(await root, target.path);
+    if (!path) return null;
+    const cached = previews.get(path);
+    if (cached && (cached.expires === Infinity || (!renew && cached.expires > Date.now()))) return cached.url;
+    const entry = {
+      expires: Infinity,
+      url: mintFilePreview(slug, path).then((preview) => {
+        entry.expires = Date.now() + Math.max(0, preview.expires_in * 1000 - 5000);
+        return preview.url;
+      }).catch((error: unknown) => {
+        previews.delete(path);
+        throw error;
+      }),
+    };
+    previews.set(path, entry);
+    return entry.url;
+  };
 }
 
 export interface FileTab {

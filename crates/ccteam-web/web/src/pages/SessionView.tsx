@@ -38,7 +38,7 @@ import {
 } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import { ContextPanel } from "../components/ContextPanel";
-import type { FileTarget } from "../lib/filesApi";
+import { createFilePreviewResolver, type FileTarget } from "../lib/filesApi";
 import "../components/fileWorkspace.css";
 import { InlineRename } from "../components/InlineRename";
 import { copyText } from "../lib/clipboard";
@@ -263,6 +263,11 @@ export default function SessionView({
   onRename?: (sid: string, title: string) => void | Promise<void>;
 }) {
   const t = makeT(lang);
+  const previewProject = session?.project;
+  const resolveFilePreview = useMemo(
+    () => previewProject ? createFilePreviewResolver(previewProject) : undefined,
+    [previewProject],
+  );
   // Inline title edit in the header. `pendingTitle` is the optimistic value
   // shown only WHILE the shell's rename is in flight — without it the header
   // visibly snaps back to the old title for a beat after Enter. It is cleared
@@ -1126,6 +1131,7 @@ export default function SessionView({
                               <Markdown
                                 content={row.content}
                                 onFileOpen={openFile}
+                                resolveFilePreview={resolveFilePreview}
                               />
                             ) : null}
                             <OutboundAttachments

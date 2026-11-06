@@ -1007,6 +1007,63 @@ test("file workspace follows repeated line links into the same file", async ({
     .toBeLessThan(readingPosition + 5);
 });
 
+test.describe("touch workspace chat links and code copy", () => {
+  test.use({ hasTouch: true });
+  for (const width of [390, 1360]) {
+    test(`document previews and per-block copy at ${width}px`, async ({ page }) => {
+      await mockCcteamApi(page);
+      await page.setViewportSize({ width, height: 1000 });
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+          writeText: async (text: string) => { (window as typeof window & { copiedCode?: string }).copiedCode = text; },
+        } });
+      });
+      const origin = new URL(page.url() === "about:blank" ? test.info().project.use.baseURL! : page.url()).origin;
+      await page.route("**/api/v1/sessions/s1", route => route.fulfill({ json: {
+        sid: "s1", events: [{ turn_id: "links-copy", role: "reviewer", user: "inspect", assistant:
+          `[issue](/repo/docs/issue.md) [same site](${origin}/repo/docs/issue.md) [external](https://elsewhere.example/issue.md)\n\n` +
+          '```ts\nconst answer = "<hello>";\n```\n\n```\nsecond block\n```',
+        }],
+      } }));
+      await page.route("**/api/v1/projects/dev-team/files", route => route.fulfill({ json: {
+        root: "/repo", paths: ["docs/", "docs/issue.md"], git_status: {}, truncated: false,
+      } }));
+      let minted = 0;
+      await page.route("**/api/v1/projects/dev-team/files/preview", route => {
+        expect(route.request().postDataJSON()).toEqual({ path: "docs/issue.md" });
+        return route.fulfill({ json: {
+          url: `/api/v1/projects/dev-team/files/preview/ticket-${++minted}/docs/issue.md`, expires_in: 3600,
+        } });
+      });
+      await page.context().route("**/files/preview/ticket-*/docs/issue.md", route => route.fulfill({
+        contentType: "text/html", body: "<!doctype html><h1>Issue preview</h1>",
+      }));
+      await page.goto("/app/chat/s/s1");
+      const expected = "/api/v1/projects/dev-team/files/preview/ticket-1/docs/issue.md";
+      await expect(page.getByRole("link", { name: "issue", exact: true })).toHaveAttribute("href", expected);
+      await expect(page.getByRole("link", { name: "same site", exact: true })).toHaveAttribute("href", expected);
+      await expect(page.getByRole("link", { name: "external", exact: true })).toHaveAttribute("href", "https://elsewhere.example/issue.md");
+      expect(minted).toBe(1);
+      const popupEvent = page.waitForEvent("popup");
+      await page.getByRole("link", { name: "same site", exact: true }).tap();
+      const popup = await popupEvent;
+      await expect(popup.getByRole("heading", { name: "Issue preview" })).toBeVisible();
+      expect(new URL(popup.url()).origin).toBe(origin);
+      await popup.close();
+      const buttons = page.locator("pre .code-copy");
+      await expect(buttons).toHaveCount(2);
+      await expect(buttons.first().locator("svg")).toBeVisible();
+      await expect(buttons.first()).toHaveCSS("opacity", "1");
+      await buttons.first().tap();
+      await expect(buttons.first()).toHaveAttribute("aria-label", "已复制");
+      expect(await page.evaluate(() => (window as typeof window & { copiedCode?: string }).copiedCode)).toBe('const answer = "<hello>";\n');
+      await buttons.last().focus();
+      await page.keyboard.press("Enter");
+      expect(await page.evaluate(() => (window as typeof window & { copiedCode?: string }).copiedCode)).toBe("second block\n");
+    });
+  }
+});
+
 test("file workspace previews Markdown and opens the rendered document in a new page", async ({
   page,
 }) => {

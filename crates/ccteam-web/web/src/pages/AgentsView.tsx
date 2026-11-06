@@ -6,8 +6,9 @@
 //
 // - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
 //   designed to stay readable with 100+ sessions. Every row carries what its
-//   session is running right now (模型 · effort, off the graph's live statusline
-//   join) and links to the real chat route `/chat/s/<sid>` — right/middle-click
+//   session is running right now (模型 · effort, plus `ctx N%` — how full its
+//   context window is — all off the graph's live statusline join) and links to
+//   the real chat route `/chat/s/<sid>` — right/middle-click
 //   open-in-new-tab works because these are real hyperlinks. Narrow canvases
 //   fold each row into two wrapped lines (index.css @container agents-canvas).
 // - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
@@ -66,6 +67,7 @@ import {
   type ActivityFold,
 } from "./chatTranscript";
 import { vendorDotClass } from "../lib/vendors";
+import { CTX_WARN_PCT } from "../lib/statusLine";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
@@ -105,6 +107,18 @@ function treeDotClass(node: AgentNode, pulsing: Set<string>): string {
  *  guess. */
 function modelEffortLabel(node: AgentNode): string {
   return [node.model?.trim(), node.effort?.trim()].filter(Boolean).join(" · ") || "—";
+}
+
+/** The ctx cell — how full the session's context window is right now, off
+ *  the same live statusline join as {@link modelEffortLabel}, in the chat
+ *  footer's own words (`ctx 63%`, `⚠` from {@link CTX_WARN_PCT}). A node with
+ *  no live window (released, or a vendor that reports none) is a dash, never
+ *  a stale or invented number. */
+function contextCell(node: AgentNode): { text: string; warn: boolean } {
+  const pct = node.context_pct;
+  if (typeof pct !== "number" || !Number.isFinite(pct)) return { text: "—", warn: false };
+  const warn = pct >= CTX_WARN_PCT;
+  return { text: `ctx ${Math.round(pct)}%${warn ? "⚠" : ""}`, warn };
 }
 
 /** The cost cell: vendor-reported USD when priced, else the raw token ledger
@@ -229,6 +243,7 @@ export function AgentsTree({
           {project.rows.map(({ node: n, indent, hasChildren }) => {
             const isCollapsed = collapsed.has(n.sid);
             const isDelegating = delegating.has(n.sid);
+            const ctx = contextCell(n);
             return (
               <div
                 key={n.sid}
@@ -280,6 +295,13 @@ export function AgentsTree({
                 <span className="agents-tree-meta">
                   <span className="agents-tree-model mono" title={t("teamColModel")}>
                     {modelEffortLabel(n)}
+                  </span>
+                  <span
+                    className={ctx.warn ? "agents-tree-ctx mono warn" : "agents-tree-ctx mono"}
+                    title={t("teamColContext")}
+                    data-testid={`agents-tree-ctx-${n.sid}`}
+                  >
+                    {ctx.text}
                   </span>
                   {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
                   <span className={treeDotClass(n, pulsing)} aria-hidden="true" />
