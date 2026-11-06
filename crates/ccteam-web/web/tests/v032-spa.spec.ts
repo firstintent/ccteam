@@ -491,40 +491,98 @@ test("conversation posts a turn; sidebar hover-stop stops the session", async ({
   );
 });
 
-for (const installed of [false, true]) {
-  test(`optional cswap account picker: installed=${installed}`, async ({ page }) => {
+for (const state of ["missing", "not_granted", "installed"] as const) {
+  test(`optional cswap account picker beside the model menu: ${state}`, async ({ page }) => {
     const captured = await mockCcteamApi(page);
     let discoveries = 0;
     const account = "a".repeat(64);
     await page.route("**/api/v1/vendors/claude/accounts", route => {
       discoveries++;
-      return route.fulfill({ json: { available: installed, accounts: installed
-        ? [{ id: account, slot: "2", label: "work (t***@example.test)", active: false }] : [] } });
+      return route.fulfill({ json: state === "installed"
+        ? { available: true, accounts: [{ id: account, slot: "2", label: "work (t***@example.test)", active: false }] }
+        : state === "not_granted"
+          ? { available: false, reason: "not_granted", accounts: [] }
+          : { available: false, accounts: [] } });
     });
     await page.goto("/app/");
     await expect(page.getByTestId("home-view")).toBeVisible();
+    // The account control is its own composer button, not a model-menu section.
+    await page.getByTestId("model-btn").click();
+    await expect(page.getByTestId("model-menu")).toBeVisible();
+    await expect(page.getByTestId("model-menu")).not.toContainText("Claude 账号");
+    await expect(page.getByTestId("model-menu")).not.toContainText("高级选项");
     expect(discoveries).toBe(0);
-    await page.getByTestId("model-btn").click();
-    await page.getByText("高级选项", { exact: true }).click();
-    const picker = page.getByRole("combobox", { name: "Claude 账号" });
-    await expect(picker).toBeVisible();
+    const accountBtn = page.getByTestId("claude-account-btn");
+    await expect(accountBtn).toContainText("默认登录");
+    await accountBtn.click();
+    await expect(page.getByTestId("model-menu")).toBeHidden();
+    const menu = page.getByTestId("claude-account-menu");
+    await expect(menu).toBeVisible();
     await expect.poll(() => discoveries).toBe(1);
-    if (installed) {
-      await picker.selectOption(account);
+    if (state === "installed") {
+      await menu.getByRole("menuitemradio", { name: /cswap 2/ }).click();
+      await expect(menu).toBeHidden();
+      await expect(accountBtn).toContainText("cswap 2");
     } else {
-      await expect(page.getByText(/cswap 不可用/)).toBeVisible();
-      await expect(picker).toHaveValue("");
+      await expect(menu).toContainText(state === "not_granted" ? "管理员尚未给你授权" : "cswap 不可用");
+      await expect(menu.getByRole("menuitemradio", { name: "默认登录" })).toHaveAttribute("aria-checked", "true");
+      await accountBtn.click();
     }
-    await page.getByTestId("model-btn").click();
     await page.getByTestId("composer-textarea").fill("Use the selected login");
     await page.getByTestId("home-send").click();
     await expect.poll(() => captured.some(row => row.url.endsWith("/projects/dev-team/sessions"))).toBe(true);
     const create = captured.find(row => row.url.endsWith("/projects/dev-team/sessions"));
-    if (installed) expect(create?.body).toHaveProperty("claude_account", account);
+    if (state === "installed") expect(create?.body).toHaveProperty("claude_account", account);
     else expect(create?.body).not.toHaveProperty("claude_account");
     await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
   });
 }
+
+test("cswap account control fits the composer row on a phone", async ({ page }) => {
+  await mockCcteamApi(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/app/");
+  const accountBtn = page.getByTestId("claude-account-btn");
+  await expect(accountBtn).toBeVisible();
+  const send = await page.getByTestId("home-send").boundingBox();
+  expect(send).not.toBeNull();
+  expect(send!.x + send!.width).toBeLessThanOrEqual(390);
+});
+
+test("admin grants a user cswap accounts from the users table", async ({ page }) => {
+  await mockCcteamApi(page);
+  const first = "a".repeat(64);
+  const second = "b".repeat(64);
+  const stale = "c".repeat(64);
+  let saved: unknown = null;
+  await page.route("**/api/v1/users", route => route.fulfill({ json: [
+    { id: "u1", handle: "rob", linked_chat: null, created_at: "2026-11-06T00:00:00Z" },
+  ] }));
+  await page.route("**/api/v1/vendors/claude/accounts", route => route.fulfill({ json: {
+    available: true, accounts: [
+      { id: first, slot: "1", label: "home (h***@example.test)", active: true },
+      { id: second, slot: "2", label: "work (w***@example.test)", active: false },
+    ],
+  } }));
+  await page.route("**/api/v1/users/u1/cswap-accounts", route => {
+    if (route.request().method() === "PUT") {
+      saved = route.request().postDataJSON();
+      return route.fulfill({ json: saved });
+    }
+    return route.fulfill({ json: { accounts: [first, stale] } });
+  });
+  await page.goto("/app/settings/admin");
+  await page.getByTestId("settings-user-cswap-u1").click();
+  const editor = page.getByTestId("settings-user-cswap-editor-u1");
+  await expect(editor.getByRole("checkbox", { name: /cswap 1/ })).toBeChecked();
+  await expect(editor.getByRole("checkbox", { name: /cswap 2/ })).not.toBeChecked();
+  await expect(editor).toContainText("cccccccccccc…");
+  await editor.getByRole("checkbox", { name: /cswap 2/ }).check();
+  await editor.getByRole("checkbox", { name: /cccccccccccc/ }).uncheck();
+  await page.getByTestId("settings-user-cswap-save-u1").click();
+  await expect.poll(() => saved).toEqual({ accounts: [first, second] });
+  await expect(editor).toBeHidden();
+});
 
 test("home lazy-create: first message POSTs session without a host override, then the turn", async ({
   page,

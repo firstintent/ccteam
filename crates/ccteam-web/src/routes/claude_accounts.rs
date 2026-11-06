@@ -32,7 +32,15 @@ pub(crate) async fn handle_claude_accounts(
         Err(_) => return unavailable("Account permissions are unavailable".into()),
     };
     if access.as_ref().is_some_and(Vec::is_empty) {
-        return unavailable("No cswap accounts are assigned to this identity".into());
+        // Distinct from "cswap missing": the tool may be fine, this user just
+        // has no grant. The operator grants from Settings → Admin → Users.
+        return Json(serde_json::json!({
+            "available": false,
+            "reason": "not_granted",
+            "accounts": [],
+            "message": "No cswap accounts are granted to this user; an administrator can grant them in Settings → Admin → Users",
+        }))
+        .into_response();
     }
     match app.cswap_accounts.accounts().await {
         Ok(accounts) => {

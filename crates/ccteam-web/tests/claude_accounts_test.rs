@@ -62,6 +62,10 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
         .await
         .unwrap();
     assert_eq!(denied["available"], false);
+    assert_eq!(
+        denied["reason"], "not_granted",
+        "a missing grant is not reported as a missing tool"
+    );
     assert_eq!(denied["accounts"], serde_json::json!([]));
     assert!(
         !calls.exists(),
@@ -111,4 +115,97 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
         serde_json::json!([]),
         "cache must not retain a revoked grant"
     );
+
+    // The operator grants from the web; tenants cannot grant themselves.
+    let grants = |user: &str| format!("http://{address}/api/v1/users/{user}/cswap-accounts");
+    let status = |response: reqwest::Response| response.status().as_u16();
+    assert_eq!(
+        status(
+            client
+                .put(grants(&bob.id))
+                .bearer_auth(format!("ccteam:{}", bob.web_token))
+                .json(&serde_json::json!({"accounts": [second]}))
+                .send()
+                .await
+                .unwrap()
+        ),
+        403
+    );
+    for bad in ["2", "*", "two@example.test"] {
+        assert_eq!(
+            status(
+                client
+                    .put(grants(&bob.id))
+                    .bearer_auth(format!("ccteam:{admin}"))
+                    .json(&serde_json::json!({"accounts": [bad]}))
+                    .send()
+                    .await
+                    .unwrap()
+            ),
+            400,
+            "{bad} is not a stable account id"
+        );
+    }
+    assert_eq!(
+        status(
+            client
+                .put(grants("u-missing"))
+                .bearer_auth(format!("ccteam:{admin}"))
+                .json(&serde_json::json!({"accounts": []}))
+                .send()
+                .await
+                .unwrap()
+        ),
+        404
+    );
+    let saved: serde_json::Value = client
+        .put(grants(&bob.id))
+        .bearer_auth(format!("ccteam:{admin}"))
+        .json(&serde_json::json!({"accounts": [second, second]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["accounts"], serde_json::json!([second]));
+    let listed: serde_json::Value = client
+        .get(grants(&bob.id))
+        .bearer_auth(format!("ccteam:{admin}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["accounts"], serde_json::json!([second]));
+    let granted: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(format!("ccteam:{}", bob.web_token))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(granted["available"], true);
+    assert_eq!(granted["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(granted["accounts"][0]["id"], second);
+
+    // Deleting the tenant drops its grant instead of leaving it dangling.
+    assert_eq!(
+        status(
+            client
+                .delete(format!("http://{address}/api/v1/users/{}", bob.id))
+                .bearer_auth(format!("ccteam:{admin}"))
+                .send()
+                .await
+                .unwrap()
+        ),
+        200
+    );
+    assert!(ccteam_core::config::load(&paths.root)
+        .unwrap()
+        .cswap_account_grants
+        .is_empty());
 }

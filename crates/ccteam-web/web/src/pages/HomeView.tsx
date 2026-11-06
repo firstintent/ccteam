@@ -575,7 +575,7 @@ export default function HomeView({
             disabled={pending}
             draft={effectiveDraft}
             onDraftChange={setDraft}
-            advancedSlot={effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
+            accountSlot={effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
               ? <CswapAccountPicker value={claudeAccount} onChange={setClaudeAccount} lang={lang} /> : undefined}
             catalog={catalog}
             allowedVendors={hostVendors ?? undefined}

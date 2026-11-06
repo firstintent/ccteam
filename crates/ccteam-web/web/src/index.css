@@ -556,6 +556,26 @@ button { font-family: inherit; cursor: pointer; }
 }
 .model-btn:hover { background: var(--bg-soft); color: var(--text); }
 .model-btn .eff { color: var(--text-faint); }
+.account-btn svg { width: 15px; height: 15px; flex: none; }
+.account-btn .account-label { max-width: 10rem; overflow: hidden; text-overflow: ellipsis; }
+.account-menu { width: max-content; max-width: min(420px, calc(100vw - 48px)); }
+.account-menu .sel-item { white-space: nowrap; }
+.account-menu .sel-item .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.account-menu .account-note { margin: 4px 10px 6px; max-width: 18rem; font-size: 11.5px; line-height: 1.45; color: var(--text-muted); white-space: normal; }
+.account-menu .account-retry { color: #0E7490; }
+html.dark .account-menu .account-retry { color: #67e8f9; }
+/* Phones: the row must keep mic + send on screen, so labels yield first —
+   HITL and account go icon-only (state stays visible), effort hides, and the
+   model label ellipsizes. */
+@media (max-width: 600px) {
+  .account-btn .account-label, .hitl-btn span, .model-btn .eff { display: none; }
+  .hitl-btn { padding: 6px 8px; }
+  .composer-row .right, .composer-row .model-sel, .model-btn { min-width: 0; }
+  .model-btn .model-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  /* The account button sits mid-row; anchor its menu to the row's right edge. */
+  .composer-row .right { position: relative; }
+  .composer-row .account-sel { position: static; }
+}
 
 .send-btn {
   width: 36px; height: 36px; border-radius: 50%; flex: none;
@@ -1157,11 +1177,6 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
 }
 .cockpit-markdown pre.has-copy { padding-top: 2.2rem; }
 .cockpit-markdown .code-copy:hover { color: var(--text); }
-.cswap-options { padding: 0.5rem 0.75rem; }
-.cswap-options summary { cursor: pointer; color: var(--text-muted); }
-.cswap-options label { display: grid; gap: 0.35rem; margin: 0.6rem 0; }
-.cswap-options select { width: 100%; max-width: 20rem; padding: 0.4rem; background: var(--bg-card); color: var(--text); border: 1px solid var(--border); border-radius: 0.35rem; }
-.cswap-options small { display: block; max-width: 20rem; color: var(--text-muted); white-space: normal; }
 .cockpit-markdown hr { border: none; border-top: 1px solid var(--border-soft); margin: 0.75rem 0; }
 .cockpit-markdown .cockpit-table-wrap {
   margin: 0.75rem 0;

@@ -414,6 +414,27 @@ pub fn remove_project(ccteam_root: &Path, slug: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Replace one owner's cswap account grants (#229). An empty set removes
+/// the owner's entry so a deleted tenant leaves no dangling grant behind.
+pub fn set_cswap_account_grants(
+    ccteam_root: &Path,
+    owner: &str,
+    accounts: &[String],
+) -> Result<()> {
+    let mut cfg = load(ccteam_root)?;
+    let mut accounts = accounts.to_vec();
+    accounts.sort();
+    accounts.dedup();
+    if accounts.is_empty() {
+        if cfg.cswap_account_grants.remove(owner).is_none() {
+            return Ok(());
+        }
+    } else {
+        cfg.cswap_account_grants.insert(owner.to_string(), accounts);
+    }
+    save(ccteam_root, &cfg)
+}
+
 /// Find a registered project by slug.
 pub fn lookup_project(ccteam_root: &Path, slug: &str) -> Result<Option<ProjectEntry>> {
     let cfg = load(ccteam_root)?;

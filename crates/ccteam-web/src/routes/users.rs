@@ -230,7 +230,142 @@ pub(crate) async fn handle_delete_user(
         )
             .into_response();
     }
+    // A removed tenant's subscription grants go with it.
+    if let Err(err) = ccteam_core::config::set_cswap_account_grants(
+        &app.paths.root,
+        &ccteam_core::identity::owner_tag(&id, false),
+        &[],
+    ) {
+        tracing::warn!(%err, "DELETE /api/v1/users: cswap grant cleanup failed");
+    }
     Json(json!({"removed": true})).into_response()
+}
+
+/// `GET`/`PUT /api/v1/users/{id}/cswap-accounts` — the tenant's granted
+/// account ids (#229). Ids are the stable references from
+/// `GET /api/v1/vendors/claude/accounts`, never slots or emails.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CswapAccountGrants {
+    pub accounts: Vec<String>,
+}
+
+/// `Some(404)` unless `id` names a registered tenant (same shape as
+/// [`deny_non_admin`]).
+fn deny_unknown_tenant(app: &AppState, id: &str) -> Option<Response> {
+    if TenantRegistry::load(&app.paths.users_dir())
+        .by_id(id)
+        .is_some()
+    {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {id}")})),
+        )
+            .into_response(),
+    )
+}
+
+/// `GET /api/v1/users/{id}/cswap-accounts` — which local subscriptions this
+/// tenant may spend (admin only). Project visibility never implies a grant.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{id}/cswap-accounts",
+    tag = "users",
+    params(("id" = String, Path, description = "Tenant id")),
+    responses(
+        (status = 200, description = "Granted account ids", body = CswapAccountGrants),
+        (status = 403, description = "Not the admin/owner"),
+        (status = 404, description = "Unknown tenant"),
+        (status = 500, description = "config.yaml unreadable"),
+    ),
+)]
+pub(crate) async fn handle_get_user_cswap_accounts(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    if let Some(missing) = deny_unknown_tenant(&app, &id) {
+        return missing;
+    }
+    match ccteam_core::config::load(&app.paths.root) {
+        Ok(config) => Json(CswapAccountGrants {
+            accounts: config
+                .cswap_account_grants
+                .get(&ccteam_core::identity::owner_tag(&id, false))
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{err}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/users/{id}/cswap-accounts` — replace the tenant's grants
+/// (admin only). Takes effect on the next discovery / spawn / resume: every
+/// account use re-reads the grants, so a revoke also blocks cold resumes.
+#[utoipa::path(
+    put,
+    path = "/api/v1/users/{id}/cswap-accounts",
+    tag = "users",
+    params(("id" = String, Path, description = "Tenant id")),
+    request_body(content = CswapAccountGrants, description = "Full replacement set of account ids; empty revokes all"),
+    responses(
+        (status = 200, description = "Persisted grants", body = CswapAccountGrants),
+        (status = 400, description = "Not a stable account id"),
+        (status = 403, description = "Not the admin/owner"),
+        (status = 404, description = "Unknown tenant"),
+        (status = 500, description = "config.yaml write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_user_cswap_accounts(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+    Json(form): Json<CswapAccountGrants>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    if let Some(missing) = deny_unknown_tenant(&app, &id) {
+        return missing;
+    }
+    // Grants name the sha256 identity reference, so a slot number, alias or
+    // `*` typed by hand can never silently widen access.
+    if let Some(bad) = form
+        .accounts
+        .iter()
+        .find(|account| account.len() != 64 || !account.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("not a cswap account id: {bad}")})),
+        )
+            .into_response();
+    }
+    let owner = ccteam_core::identity::owner_tag(&id, false);
+    if let Err(err) =
+        ccteam_core::config::set_cswap_account_grants(&app.paths.root, &owner, &form.accounts)
+    {
+        tracing::error!(%err, "PUT /api/v1/users/{{id}}/cswap-accounts: config write failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{err}")})),
+        )
+            .into_response();
+    }
+    let mut accounts = form.accounts;
+    accounts.sort();
+    accounts.dedup();
+    Json(CswapAccountGrants { accounts }).into_response()
 }
 
 /// `PUT /api/v1/me/im` (+ admin `/users/{id}/im`) body — v0.8.20 F2.
