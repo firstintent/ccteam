@@ -272,6 +272,28 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
     expect(html).toMatch(/agents-tree-model[^>]*>—</);
   });
 
+  it("每行展示实时上下文占比 — ctx N%, ⚠ at the chat footer's threshold, dash when nothing live", () => {
+    const rows = [
+      fixtureNode({ sid: "s0", context_pct: 63 }),
+      fixtureNode({ sid: "s1", context_pct: 85 }),
+      fixtureNode({ sid: "s2", context_pct: 0 }),
+      // Released: no live window — never a stale number.
+      fixtureNode({ sid: "s3", residency: "released" }),
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsTree nodes={rows} edges={[]} selected={null} pulsing={new Set()} onSelect={() => {}} />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toMatch(/class="agents-tree-ctx mono"[^>]*data-testid="agents-tree-ctx-s0">ctx 63%</);
+    expect(html).toMatch(/class="agents-tree-ctx mono warn"[^>]*data-testid="agents-tree-ctx-s1">ctx 85%⚠</);
+    // 0% is a real reading (a fresh window), not "unknown".
+    expect(html).toMatch(/data-testid="agents-tree-ctx-s2">ctx 0%</);
+    expect(html).toMatch(/data-testid="agents-tree-ctx-s3">—</);
+    // The column says what it is, in the reader's language.
+    expect(html).toContain('title="上下文(实时)"');
+  });
+
   it("renders Pi as its own topology identity with provider/model-id", () => {
     const html = renderToString(
       <MemoryRouter>

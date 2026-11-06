@@ -1568,6 +1568,25 @@ pub struct AccountUsage {
     pub model_windows: Vec<ModelWindow>,
 }
 
+impl AccountUsage {
+    /// Whether this says anything about HEADROOM — at least one rate-limit
+    /// window (5-hour, weekly, credits, or a per-model bucket). The tier alone
+    /// is a label for a window, never a fact on its own.
+    ///
+    /// The one "is this an observation" rule: the adapter parse, the cache
+    /// recorder and the cache reader all answer with it, so an answer that
+    /// says nothing can neither be shown as a row nor overwrite one that did.
+    /// Which windows exist is the account's own business (a plan with no
+    /// 5-hour window still has a weekly one), so no particular window is
+    /// required.
+    pub fn has_window(&self) -> bool {
+        self.five_hour_pct.is_some()
+            || self.weekly_pct.is_some()
+            || self.credits_pct.is_some()
+            || !self.model_windows.is_empty()
+    }
+}
+
 /// One model's own weekly rate-limit window, as the vendor meters it.
 ///
 /// `model` is the vendor's own bucket name (claude: `opus` / `sonnet` — the

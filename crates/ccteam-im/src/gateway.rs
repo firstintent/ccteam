@@ -13485,9 +13485,10 @@ impl Gateway {
     /// been idle-released (2026-08-30 IM report: the `⚡ 用量` row vanished from
     /// a released card, and after a daemon restart from every card).
     ///
-    /// So the fact gets a home. Any live session of `vendor` is asked (they all
-    /// report the same account, so the first answer wins) and what it says is
-    /// recorded; when none answers, the vendor's last observation is read back
+    /// So the fact gets a home. Live sessions of `vendor` are asked in the
+    /// caller's order (the first answer wins — the `/status` card puts its own
+    /// focus first, since across a login switch processes can disagree on the
+    /// account) and what it says is recorded; when none answers, the vendor's last observation is read back
     /// from [`ccteam_harness::usage_catalog`], which drops each window at the
     /// vendor's own declared reset so nothing stale is ever presented as
     /// current. Callers get one `Option` and never branch on residency.
@@ -13644,7 +13645,19 @@ impl Gateway {
             }
             SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new(), None),
         };
-        let account = self.account_usage_for(vendor, visible).await;
+        // A resident focus is asked FIRST: the card describes the account THIS
+        // session spends from. Every live process of a vendor normally reports
+        // the same account, but not across a login switch — a process started
+        // before it can still be signed in as the old account — and `visible`
+        // has no stable order, so "first answer wins" over it alone could show
+        // either account and flip between them from one `/status` to the next.
+        let askers: Vec<&GatewaySession> = match focus {
+            SessionRowSource::Resident(s) => std::iter::once(*s)
+                .chain(visible.iter().copied().filter(|v| v.id != s.id))
+                .collect(),
+            SessionRowSource::Released(..) => visible.to_vec(),
+        };
+        let account = self.account_usage_for(vendor, &askers).await;
 
         // The ledger half — title / turn / cost / tokens and the spawn-time
         // model + effort picks — lives in `meta.json` for both residencies:
@@ -22478,6 +22491,87 @@ mod tests {
         );
     }
 
+    /// 2026-11-06 IM report: after the host's claude login moved from a plan
+    /// with no 5-hour window (`max`) to one with it (`team`), the `⚡ 用量` row
+    /// kept showing the old account. Across a login switch two live processes
+    /// can be signed in as different accounts, so the card must report the
+    /// account its OWN session spends from — not whichever live session the
+    /// fleet happens to list first (`s1` here, always, in sid order).
+    #[tokio::test]
+    async fn status_reports_the_focused_sessions_own_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let week = Some((now + chrono::Duration::days(3)).to_rfc3339());
+        // s1 started before the switch: the old plan, no 5-hour window at all.
+        fake.set_thread_account_usage(
+            &gateway.sessions["s1"].thread.identity,
+            AccountUsage {
+                subscription: Some("max".into()),
+                weekly_pct: Some(20),
+                weekly_resets_at: week.clone(),
+                ..Default::default()
+            },
+        );
+        // s2 started after it: the new plan, with both windows.
+        fake.set_thread_account_usage(
+            &gateway.sessions["s2"].thread.identity,
+            AccountUsage {
+                subscription: Some("team".into()),
+                five_hour_pct: Some(34),
+                five_hour_resets_at: Some((now + chrono::Duration::hours(2)).to_rfc3339()),
+                weekly_pct: Some(35),
+                weekly_resets_at: week,
+                ..Default::default()
+            },
+        );
+        let usage_row = |card: &str| {
+            card.lines()
+                .find(|line| line.contains("⚡ 用量"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        // The focus is s2 (the last `/new`): its own account, both windows.
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        let row = usage_row(&card);
+        assert!(
+            row.starts_with("⚡ 用量: 5h 34% (→") && row.ends_with(" · team"),
+            "s2's card shows s2's account, not the first-listed s1's: {row}"
+        );
+
+        // Back on s1: its own plan — no 5-hour segment, nothing borrowed.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        let row = usage_row(&card);
+        assert!(
+            row.starts_with("⚡ 用量: 周 20% (→") && row.ends_with(" · max"),
+            "s1's card shows s1's account, with no 5h window: {row}"
+        );
+    }
+
     /// The card layout is one function of the facts: every optional block is
     /// keyed on its fact being present — never on residency — in this order.
     /// Locks the shape once so no state-specific twin can drift from it.
@@ -25861,6 +25955,10 @@ mod tests {
         /// trait default). Account-scoped: every session sharing this fake
         /// answers with the same windows, exactly like one vendor account.
         account_usage: Arc<Mutex<Option<AccountUsage>>>,
+        /// Per-thread override of `account_usage`, keyed by thread identity:
+        /// one process still signed in as a DIFFERENT account than the rest
+        /// (a login switch it started before).
+        account_usage_by_thread: Arc<std::sync::Mutex<HashMap<String, AccountUsage>>>,
         /// Monotone submission counter, so every accepted message gets its OWN
         /// execution-turn id. One id per THREAD was enough while nothing
         /// correlated a completion with the message that asked for it; a
@@ -25957,6 +26055,7 @@ mod tests {
                 panic_recover_for: Arc::default(),
                 recovered_for: Arc::default(),
                 account_usage: Arc::new(Mutex::new(None)),
+                account_usage_by_thread: Arc::default(),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -26205,6 +26304,13 @@ mod tests {
         /// Set the account usage this fake reports from `account_usage`.
         async fn set_account_usage(&self, usage: Option<AccountUsage>) {
             *self.account_usage.lock().await = usage;
+        }
+
+        fn set_thread_account_usage(&self, identity: &str, usage: AccountUsage) {
+            self.account_usage_by_thread
+                .lock()
+                .unwrap()
+                .insert(identity.to_string(), usage);
         }
 
         fn new_with_event_delay(vendor: AgentVendor, event_delay: std::time::Duration) -> Self {
@@ -26509,8 +26615,17 @@ mod tests {
             None
         }
 
-        async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
-            self.account_usage.lock().await.clone()
+        async fn account_usage(&self, h: &ThreadHandle) -> Option<AccountUsage> {
+            let own = self
+                .account_usage_by_thread
+                .lock()
+                .unwrap()
+                .get(&h.identity)
+                .cloned();
+            match own {
+                Some(usage) => Some(usage),
+                None => self.account_usage.lock().await.clone(),
+            }
         }
 
         async fn handle_directive(
