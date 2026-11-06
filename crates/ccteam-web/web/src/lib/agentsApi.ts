@@ -16,6 +16,11 @@ export interface AgentNode {
    *  (`low`/`medium`/`high`/`xhigh`/`max`); absent on idle nodes and on
    *  vendors with no effort axis. */
   effort?: string | null;
+  /** How full the context window is RIGHT NOW (0-100, rounded) — the same
+   *  live statusline join as `model`. Only a session ccteam holds a process
+   *  for has a live window; every other node omits it (never a stale or
+   *  fabricated number). */
+  context_pct?: number | null;
   host: string;
   /** What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
    *  `detached` for a body that outlived the daemon. */

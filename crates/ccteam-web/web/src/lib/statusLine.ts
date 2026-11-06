@@ -60,6 +60,10 @@ export function formatStatusLine(status: SessionStatus): string | null {
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
+/** Context occupancy (%) at and above which a window is flagged `⚠` — one
+ *  threshold for the chat bubble footer and the team topology's ctx cell. */
+export const CTX_WARN_PCT = 85;
+
 export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boolean } | null {
   if (!status) return null;
   // The metrics half of the bubble footer (`turn N · ctx N%`); SessionView
@@ -68,8 +72,9 @@ export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boo
   const parts: string[] = [`turn ${status.turn}`];
   const pct = contextPct(status.context);
   const roundedPct = typeof pct === "number" && Number.isFinite(pct) ? Math.round(pct) : null;
-  if (roundedPct !== null) parts.push(`ctx ${roundedPct}%${roundedPct >= 85 ? "⚠" : ""}`);
-  return { text: parts.join(" · "), warn: roundedPct !== null && roundedPct >= 85 };
+  const warn = roundedPct !== null && roundedPct >= CTX_WARN_PCT;
+  if (roundedPct !== null) parts.push(`ctx ${roundedPct}%${warn ? "⚠" : ""}`);
+  return { text: parts.join(" · "), warn };
 }
 
 /** TurnStatus serializes ContextUsage's numerator/denominator; derive pct

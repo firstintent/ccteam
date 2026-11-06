@@ -1289,15 +1289,15 @@ select:focus-visible,
    @container query. `min-width: 0` keeps a wide tree from stretching the
    canvas and squeezing the panel. */
 .agents-canvas { flex: 1; min-width: 0; overflow: auto; padding: 8px 20px; container-type: inline-size; container-name: agents-canvas; }
-.agents-tree { min-width: 780px; display: flex; flex-direction: column; gap: 10px; padding-bottom: 12px; }
+.agents-tree { min-width: 850px; display: flex; flex-direction: column; gap: 10px; padding-bottom: 12px; }
 .agents-tree-project { width: max-content; min-width: 100%; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; background: var(--bg-card); }
 .agents-tree-project-head { height: 26px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--bg-soft); border-bottom: 1px solid var(--border-soft); color: var(--text-faint); font-size: 11px; }
 .agents-tree-project-head .mono { color: var(--text-muted); font-weight: 600; }
 .agents-tree-project-name { display: inline-flex; align-items: center; gap: 4px; min-width: 0; margin-left: -6px; }
 .agents-tree-project-name .agents-tree-toggle:hover { background: var(--bg-card); }
-.agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 8px 90px 86px 38px auto; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
+.agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 64px 8px 90px 86px 38px auto; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
 /* Host badge column exists only when the graph spans >1 host. */
-.agents-tree.with-host .agents-tree-row { grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 90px 8px 90px 86px 38px auto; }
+.agents-tree.with-host .agents-tree-row { grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 64px 90px 8px 90px 86px 38px auto; }
 /* Identity / metrics groups are pure layout handles: transparent here (the
    row is one flat grid line), real flex boxes in card mode below. */
 .agents-tree-main, .agents-tree-meta { display: contents; }
@@ -1321,6 +1321,9 @@ select:focus-visible,
 .agents-tree-model { color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agents-tree-active { white-space: nowrap; text-align: right; }
 .agents-tree-cost, .agents-tree-turns { color: var(--text-muted); text-align: right; font-variant-numeric: tabular-nums; }
+/* Live context occupancy — same ⚠ threshold + accent as the chat footer's `ctx N%`. */
+.agents-tree-ctx { color: var(--text-faint); font-size: 11px; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; }
+.agents-tree-ctx.warn { color: var(--accent, #b45309); font-weight: 600; }
 .agents-tree-row .dot.busy { animation: agent-active-pulse 1.8s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) {
   .agents-tree-row .dot.busy { animation: none; }
@@ -1367,7 +1370,7 @@ select:focus-visible,
 }
 /* Card mode — the row stops being one wide table line and becomes two:
      [guide][toggle] vendor · sid · title …………………………… 打开 ↗
-     [guide][toggle] claude-opus-5 · high · host ● 2分钟前 $0.42 12t
+     [guide][toggle] claude-opus-5 · high · ctx 63% · host ● 2分钟前 $0.42 12t
    The tree guide + toggle span both lines (so depth stays readable) and the
    metrics line starts under the title, not at the card edge. Nothing scrolls
    horizontally at any width. */
@@ -1396,7 +1399,7 @@ select:focus-visible,
   /* Title + model truncate rather than push the card wider than the canvas. */
   .agents-tree-title { flex: 1 1 auto; min-width: 0; }
   .agents-tree-model { flex: 0 1 auto; min-width: 0; }
-  .agents-tree-active, .agents-tree-cost, .agents-tree-turns { text-align: left; }
+  .agents-tree-active, .agents-tree-cost, .agents-tree-turns, .agents-tree-ctx { text-align: left; }
 }
 /* v0.9.11 TEAM-2 — 拓扑|分工 tab seg + charter tab (roster cards + editor). */
 .agents-seg { margin: 0 28px 8px; }
