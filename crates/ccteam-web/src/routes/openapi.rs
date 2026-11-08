@@ -156,6 +156,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // spawn-tuning discovery — the affordance side of `POST .../sessions`
         // taking `model` + `effort` (no project named, so no project ACL).
         .routes(routes!(super::models::handle_models))
+        .routes(routes!(super::claude_accounts::handle_claude_accounts))
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp)
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))

@@ -39,6 +39,7 @@ const F175_SID: &str = "s1";
 
 fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),

@@ -337,6 +337,7 @@ export function ChatComposer({
   allowedVendors,
   catalog: catalogOverride,
   topSlot,
+  accountSlot,
   sendTestId = "composer-send",
   uploadSlug,
   prefill,
@@ -380,6 +381,9 @@ export function ChatComposer({
   catalog?: VendorCatalog;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
+  /** New-session account menu, beside the model menu; conversation
+   *  composers never change accounts. */
+  accountSlot?: React.ReactNode;
   sendTestId?: string;
   /** Project slug uploads + the skill picker target. Omit (e.g. while the
    *  Home new-project row is open) to disable attaching with a hint. */
@@ -992,7 +996,8 @@ export function ChatComposer({
           <span>{t("approve")}</span>
         </button>
         <div className="right">
-          <div className={`sel ${menuOpen ? "open" : ""}`} ref={selRef}>
+          {accountSlot}
+          <div className={`sel model-sel ${menuOpen ? "open" : ""}`} ref={selRef}>
             <button
               type="button"
               className="model-btn"
@@ -1003,7 +1008,7 @@ export function ChatComposer({
               }}
             >
               <span className={`dot ${spec.id}`} />
-              <span>{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
+              <span className="model-label">{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
               <span className="eff">{effortText}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">

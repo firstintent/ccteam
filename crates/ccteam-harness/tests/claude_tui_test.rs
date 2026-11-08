@@ -46,6 +46,7 @@ fn kill_session_quiet(name: &str) {
 async fn spawn_time_effort_is_refused_rather_than_ignored() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: "tui-effort".into(),
@@ -96,6 +97,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.clone(),
@@ -148,6 +150,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.clone(),
@@ -215,6 +218,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.clone(),
@@ -502,6 +506,7 @@ async fn claude_directive_bare_model_passes_through_to_native_picker() {
         role: "alice".to_string(),
     };
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.clone(),

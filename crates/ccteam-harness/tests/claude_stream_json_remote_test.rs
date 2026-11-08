@@ -117,6 +117,7 @@ fn ctx_remote(
     target: RemoteExecTarget,
 ) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),

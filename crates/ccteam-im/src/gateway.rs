@@ -64,6 +64,11 @@ pub struct RoleNotFound {
     pub role: String,
 }
 
+/// The frozen terminal protocol and remote projects do not support cswap.
+#[derive(Debug, thiserror::Error)]
+#[error("cswap accounts require a local Claude stream-json session")]
+pub struct CswapAccountUnsupported;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
     channel: String,
@@ -2487,6 +2492,9 @@ pub struct SessionInventory {
 // `assert_eq!`/`==`, which only need `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionView {
+    /// Display-only account facts; private profile paths stay in meta.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
     /// Gateway session id (`s{n}`) — the network-API session namespace.
     pub sid: String,
     /// Project slug the session runs in.
@@ -2750,6 +2758,8 @@ pub struct StartOutcome {
 /// exist so a caller can pick well; they are never a gate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnTuning {
+    /// Stable identity reference returned by optional cswap discovery.
+    pub claude_account: Option<String>,
     /// Explicit model id; overrides the role's `model:` frontmatter.
     pub model: Option<String>,
     /// Explicit reasoning-effort token (vendor-specific value set — the
@@ -2765,6 +2775,7 @@ impl SpawnTuning {
     fn normalized(self) -> Self {
         let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         Self {
+            claude_account: clean(self.claude_account),
             model: clean(self.model),
             effort: clean(self.effort),
             mode: clean(self.mode),
@@ -3102,6 +3113,7 @@ struct RoutingState {
 /// stale session's `system:init` — while the on-demand resume path runs the
 /// same core under its already-held lock. One construction site, no drift.
 struct MetaRebuildPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     generation: u64,
     sid: String,
     slug: String,
@@ -3154,6 +3166,7 @@ struct MetaRebuildPlan {
 /// construction site (`plan_new_session`), no drift between the inline and
 /// lock-dropping callers.
 struct NewSessionPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     generation: u64,
     id: String,
     /// Canonical resource owner used by session ACL and persisted meta.
@@ -3214,6 +3227,7 @@ struct NewSessionPlan {
 /// marker from the OLD thread (`identity@started_at`); apply discards the
 /// freshly spawned thread if the session vanished or was replaced meanwhile.
 struct ResumeDeadPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     session_id: String,
     project: String,
     role: String,
@@ -3930,6 +3944,13 @@ impl Gateway {
             BodyGate::PostMortem(body) => Some(body),
         };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
+        if meta.claude_account.is_some()
+            && (meta.vendor != AgentVendor::Claude
+                || meta.protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
+        }
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         // Both tuning axes, one precedence — see `respawn_tuning`.
         let (model_id, effort) = respawn_tuning(
@@ -3973,6 +3994,7 @@ impl Gateway {
         self.rebuild_reservations
             .insert(meta.sid.clone(), generation);
         Ok(MetaRebuildPlan {
+            claude_account: meta.claude_account.clone(),
             generation,
             sid: meta.sid.clone(),
             slug: slug.to_string(),
@@ -4054,6 +4076,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.slug.clone(),
                     sid: plan.sid.clone(),
@@ -5009,6 +5032,7 @@ impl Gateway {
         };
         let activity = adapter
             .detached_activity(&UnobservedTurnCtx {
+                claude_account: meta.claude_account.clone(),
                 sid: d.sid.clone(),
                 slug: d.slug.clone(),
                 cwd: d.cwd.clone(),
@@ -5304,6 +5328,7 @@ impl Gateway {
         };
         let recovered = adapter
             .recover_unobserved_turn(&UnobservedTurnCtx {
+                claude_account: meta.claude_account.clone(),
                 sid: sid.to_string(),
                 slug: slug.to_string(),
                 cwd: cwd.to_path_buf(),
@@ -6181,8 +6206,17 @@ impl Gateway {
                     role,
                     permission_mode,
                     protocol,
-                    tuning,
+                    mut tuning,
                 } = parse_new_command_args(&args)?;
+                if vendor == AgentVendor::Claude && tuning.claude_account.is_none() {
+                    tuning.claude_account = self
+                        .current_session
+                        .get(chat)
+                        .and_then(|sid| self.session_catalog.find_or_load(&sid, &self.projects))
+                        .and_then(|entry| entry.meta.claude_account)
+                        .filter(|binding| !binding.default_login)
+                        .map(|binding| binding.id);
+                }
                 let project = self.require_current_project(chat)?;
                 let handle = role.clone();
                 let outcome = self
@@ -7608,6 +7642,18 @@ impl Gateway {
         // v0.8.24 A-U3 — an explicit composer choice beats the role's
         // `model:` frontmatter; effort has no role-level default.
         let tuning = tuning.normalized();
+        let claude_account = tuning
+            .claude_account
+            .map(|id| {
+                if vendor != AgentVendor::Claude
+                    || protocol != SessionProtocol::StreamJson
+                    || host != ccteam_core::LOCAL_HOST
+                {
+                    return Err(CswapAccountUnsupported.into());
+                }
+                ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(id)
+            })
+            .transpose()?;
         let model_id = tuning.model.or_else(|| {
             // Pi owns a vendor-specific `pi.model` frontmatter key. Passing
             // the generic role model through SpawnCtx would make it look like
@@ -7669,6 +7715,7 @@ impl Gateway {
             .tenant_project_owner(&project)
             .unwrap_or_else(|| canonical_owner(&reply_to));
         Ok(NewSessionPlan {
+            claude_account,
             generation,
             id,
             owner,
@@ -7768,6 +7815,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.id.clone(),
@@ -7810,6 +7858,12 @@ impl Gateway {
             }
         });
         let mut meta = SessionMeta {
+            claude_account: thread
+                .raw_extras
+                .get("claude_account")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .or_else(|| plan.claude_account.clone()),
             model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -7872,6 +7926,7 @@ impl Gateway {
         let meta =
             prepared_meta.unwrap_or_else(|| Self::meta_for_new_session(&plan, &thread, trigger));
         let NewSessionPlan {
+            claude_account: _,
             generation,
             id,
             owner,
@@ -8060,6 +8115,20 @@ impl Gateway {
                 ));
             }
         };
+        let claude_account = self
+            .session_catalog
+            .find_or_load(&sid, &self.projects)
+            .and_then(|entry| entry.meta.claude_account);
+        if claude_account.is_none()
+            && old_thread
+                .raw_extras
+                .get("claude_account")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(anyhow!(
+                "session account metadata is unavailable; the current process was kept"
+            ));
+        }
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
         // the retired transcript.
@@ -8111,6 +8180,7 @@ impl Gateway {
                 model_id.clone(),
                 effort.clone(),
                 mode.clone(),
+                claude_account,
                 permission_mode,
                 secret.clone(),
                 &host,
@@ -11122,6 +11192,11 @@ impl Gateway {
         let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
+        let had_account = s
+            .thread
+            .raw_extras
+            .get("claude_account")
+            .is_some_and(|value| !value.is_null());
         let fenced_generation = s.generation;
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
@@ -11139,6 +11214,19 @@ impl Gateway {
             .find_or_load(session_id, &self.projects)
             .map(|entry| entry.meta);
         let mode = meta.as_ref().and_then(|m| m.mode.clone());
+        let claude_account = meta.as_ref().and_then(|meta| meta.claude_account.clone());
+        if had_account && claude_account.is_none() {
+            return Err(anyhow!(
+                "session account metadata is unavailable; refusing to resume with default login"
+            ));
+        }
+        if claude_account.is_some()
+            && (vendor != AgentVendor::Claude
+                || protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
+        }
         let (model_id, effort) = respawn_tuning(
             &cwd,
             session_id,
@@ -11160,6 +11248,7 @@ impl Gateway {
         // apply installs this same value on the live entry (issue #14②).
         let generation = self.next_live_generation();
         Ok(Some(ResumeDeadPlan {
+            claude_account,
             session_id: session_id.to_string(),
             project,
             role,
@@ -11204,6 +11293,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.session_id.clone(),
@@ -11233,6 +11323,7 @@ impl Gateway {
         thread: ThreadHandle,
     ) -> Result<()> {
         let ResumeDeadPlan {
+            claude_account: _,
             session_id,
             project,
             role,
@@ -11333,6 +11424,7 @@ impl Gateway {
         effort: Option<String>,
         // Replayed from `meta.mode`, same contract.
         mode: Option<String>,
+        claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
@@ -11364,6 +11456,7 @@ impl Gateway {
                     role: role.to_string(),
                 },
                 &SpawnCtx {
+                    claude_account,
                     generation,
                     slug: slug.to_string(),
                     sid: sid.to_string(),
@@ -13732,6 +13825,10 @@ impl Gateway {
                     .map(|guard| guard.pending_for_sid(&s.id).is_some())
                     .unwrap_or(false);
                 SessionView {
+                    claude_account: meta
+                        .as_ref()
+                        .and_then(|meta| meta.claude_account.as_ref())
+                        .map(|account| account.display()),
                     sid: s.id.clone(),
                     project: s.project.clone(),
                     role: s.role.clone(),
@@ -14248,6 +14345,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -14352,6 +14450,7 @@ impl Gateway {
             let sid = format!("s{}", guard.next_session);
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
+                claude_account: None,
                 model_pinned_generation: None,
                 managed_by: Default::default(),
                 stopped_at: None,
@@ -15624,6 +15723,23 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
+        if plan.vendor == AgentVendor::Claude && plan.claude_account.is_none() {
+            if let Some(binding) = parent_sid
+                .as_ref()
+                .and_then(|sid| self.session_catalog.find_or_load(sid, &self.projects))
+                .and_then(|entry| entry.meta.claude_account)
+                .filter(|account| !account.default_login)
+            {
+                if plan.protocol != SessionProtocol::StreamJson
+                    || plan.host != ccteam_core::LOCAL_HOST
+                {
+                    anyhow::bail!(
+                        "inherited cswap account requires a local Claude stream-json session"
+                    );
+                }
+                plan.claude_account = Some(binding);
+            }
+        }
         plan.parent_sid = parent_sid.clone();
         plan.spawned_by_role = spawned_by_role;
         plan.delegation_depth = child_depth;
@@ -15793,6 +15909,23 @@ impl Gateway {
                 tuning,
             )?;
             plan.remote = host_target.remote;
+            if plan.vendor == AgentVendor::Claude && plan.claude_account.is_none() {
+                if let Some(binding) = parent_sid
+                    .as_ref()
+                    .and_then(|sid| guard.session_catalog.find_or_load(sid, &guard.projects))
+                    .and_then(|entry| entry.meta.claude_account)
+                    .filter(|account| !account.default_login)
+                {
+                    if plan.protocol != SessionProtocol::StreamJson
+                        || plan.host != ccteam_core::LOCAL_HOST
+                    {
+                        anyhow::bail!(
+                            "inherited cswap account requires a local Claude stream-json session"
+                        );
+                    }
+                    plan.claude_account = Some(binding);
+                }
+            }
             plan.parent_sid = parent_sid.clone();
             plan.spawned_by_role = spawned_by_role;
             plan.delegation_depth = child_depth;
@@ -18888,6 +19021,7 @@ impl Gateway {
         self.persist_session_meta(&dir, &meta)?;
 
         let target = SessionTitleTarget {
+            claude_account: meta.claude_account.clone(),
             sid: sid.to_string(),
             vendor_uuid: meta.vendor_uuid.clone(),
             project_dir: dir,
@@ -18972,6 +19106,9 @@ fn detached_body_view(
 ) -> SessionView {
     let m = |f: &dyn Fn(&SessionMeta) -> String| meta.map(f).unwrap_or_default();
     SessionView {
+        claude_account: meta
+            .and_then(|meta| meta.claude_account.as_ref())
+            .map(|account| account.display()),
         sid: d.sid.clone(),
         project: d.slug.clone(),
         role: m(&|m| m.role.clone()),
@@ -19150,6 +19287,10 @@ fn released_session_view(
     current: &std::collections::HashSet<String>,
 ) -> SessionView {
     SessionView {
+        claude_account: meta
+            .claude_account
+            .as_ref()
+            .map(|account| account.display()),
         sid: meta.sid.clone(),
         project: slug.to_string(),
         role: meta.role.clone(),
@@ -19193,6 +19334,10 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
                 .max(0) as u64
         });
     SessionView {
+        claude_account: meta
+            .claude_account
+            .as_ref()
+            .map(|account| account.display()),
         sid: meta.sid.clone(),
         project: meta.slug.clone(),
         role: String::new(),
@@ -21400,6 +21545,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
                 "model" | "m" => tuning.model = Some(value.to_string()),
                 "effort" | "e" => tuning.effort = Some(value.to_string()),
                 "mode" => tuning.mode = Some(value.to_string()),
+                "claude_account" => tuning.claude_account = Some(value.to_string()),
                 other => {
                     return Err(anyhow!(
                         "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=, mode=<mode>)\nsyntax: {NEW_COMMAND_SYNTAX}"
@@ -21592,6 +21738,7 @@ mod tests {
             assert_eq!(
                 parsed.tuning,
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("kimi-code/k3".to_string()),
                     effort: Some("max".to_string()),
@@ -24432,6 +24579,149 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cswap_role_switch_never_defaults_after_metadata_loss() {
+        for corrupt in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            seed_role_with_model(tmp.path(), "reviewer", None);
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+            let id = ccteam_harness::execution::claude_accounts::account_id("two@example.test", "");
+            let created = gateway
+                .create_session_api_tuned(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning {
+                        claude_account: Some(id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut binding =
+                ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(id)
+                    .unwrap();
+            binding.config_dir = Some(tmp.path().join("account-profile"));
+            gateway
+                .sessions
+                .get_mut(&created.sid)
+                .unwrap()
+                .thread
+                .raw_extras["claude_account"] = serde_json::to_value(binding).unwrap();
+            let meta_path = ccteam_harness::execution::session_meta::session_meta_path(
+                tmp.path(),
+                &created.sid,
+            );
+            if corrupt {
+                std::fs::write(&meta_path, "invalid-json").unwrap();
+            } else {
+                std::fs::remove_file(&meta_path).unwrap();
+            }
+            gateway.session_catalog = Default::default();
+            let started = fake.starts.load(Ordering::SeqCst);
+            let result = gateway
+                .switch_current_role(
+                    &ChatKey::new("web", "web-api", "web-api"),
+                    "reviewer".into(),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "missing/corrupt account metadata must not trigger a default spawn"
+            );
+            assert_eq!(fake.starts.load(Ordering::SeqCst), started);
+            assert!(gateway.sessions.contains_key(&created.sid));
+        }
+    }
+
+    #[tokio::test]
+    async fn cswap_selection_needs_no_grant_but_only_runs_local_stream_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let id = ccteam_harness::execution::claude_accounts::account_id("two@example.test", "");
+        let tuning = SpawnTuning {
+            claude_account: Some(id.clone()),
+            ..Default::default()
+        };
+        for (vendor, protocol) in [
+            (AgentVendor::Codex, SessionProtocol::StreamJson),
+            (AgentVendor::Claude, SessionProtocol::Terminal),
+        ] {
+            let denied = gateway.plan_new_session(
+                ChatKey::new("web", "web-api", "web-api"),
+                "alpha".into(),
+                vendor,
+                String::new(),
+                String::new(),
+                PermissionMode::Skip,
+                protocol,
+                tuning.clone(),
+            );
+            assert!(denied.err().unwrap().is::<CswapAccountUnsupported>());
+        }
+        assert_eq!(
+            gateway.next_session, 0,
+            "a rejected choice allocates no sid"
+        );
+        // Owner decision 2026-11-06: no per-identity grant — a per-user web
+        // login (Tenant) uses any local account exactly like the admin.
+        let plan = gateway
+            .plan_new_session(
+                ChatKey::new("web", "tenant", "tenant"),
+                "alpha".into(),
+                AgentVendor::Claude,
+                String::new(),
+                String::new(),
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                tuning,
+            )
+            .unwrap();
+        assert_eq!(plan.claude_account.as_ref().unwrap().id, id);
+        let mut binding = plan.claude_account.clone().unwrap();
+        binding.config_dir = Some(tmp.path().join("private-account"));
+        binding.slot = "2".into();
+        binding.label = "work".into();
+        let thread = ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ccteam_harness::ExecutionMode::Chat,
+            identity: "vendor-id".into(),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({"vendor_uuid":"vendor-id","claude_account":binding}),
+        };
+        let meta = Gateway::meta_for_new_session(&plan, &thread, None);
+        assert_eq!(
+            meta.claude_account.as_ref().unwrap().config_dir,
+            Some(tmp.path().join("private-account"))
+        );
+        ccteam_harness::execution::session_meta::write_session_meta(tmp.path(), &meta).unwrap();
+        assert_eq!(
+            ccteam_harness::execution::transcript_tail::anthropic_bound_project_dir(
+                tmp.path(),
+                meta.claude_account.as_ref()
+            ),
+            Some(
+                ccteam_harness::execution::transcript_tail::anthropic_project_dir_in(
+                    &tmp.path().join("private-account/projects"),
+                    tmp.path()
+                )
+            )
+        );
+        let public =
+            serde_json::to_string(&released_session_view(&meta, "alpha", &Default::default()))
+                .unwrap();
+        assert!(
+            !public.contains("private-account"),
+            "private profile paths must not escape through session DTOs"
+        );
+        assert!(!public.contains("config_dir"));
+    }
+
     /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)
     /// reaches the adapter's `SpawnCtx`, and the explicit model beats the
     /// role's `model:` frontmatter; without tuning the role default holds
@@ -24453,6 +24743,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("future-model-from-vendor".into()),
                     effort: Some("max".into()),
@@ -24486,6 +24777,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("  ".into()),
                     effort: Some("".into()),
@@ -24527,6 +24819,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("opus".into()),
                     effort: Some("xhigh".into()),
@@ -24618,6 +24911,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("claude-sonnet-5".into()),
                     effort: Some("xhigh".into()),
@@ -24683,6 +24977,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: None,
                     effort: None,
@@ -24753,6 +25048,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("opus".into()),
                     effort: Some("xhigh".into()),
@@ -24943,6 +25239,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("claude-sonnet-5".into()),
                     effort: Some("xhigh".into()),
@@ -34280,6 +34577,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
@@ -34359,6 +34657,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),

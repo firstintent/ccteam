@@ -52,6 +52,8 @@ One trade-off worth knowing about the steer: on Claude the steering line is show
 
 Rule of thumb: **long work → background + completion notification** (close the laptop); **quick questions → wait inline**. Wire your session once (§8), then these phrases work as-is in your everyday session.
 
+Local Claude children inherit their parent's isolated cswap profile by default; children of a default-login session keep default login. A new `agent` call may pass any local stable `claude_account` id. Follow-ups to an existing sid cannot change accounts. Remote projects, other vendors and terminal sessions do not support this choice. See the [usage guide](usage.md) for installation and default-account fallback behavior.
+
 ## 4. Making delegation pay (best practices, in plain language)
 
 These turn "it works" into "it's good". They're one sentence each — fold them into how you phrase the ask:

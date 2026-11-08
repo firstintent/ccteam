@@ -57,6 +57,7 @@ fn clear_fake() {
 
 fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: "demo".into(),
@@ -264,6 +265,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let project = tmp.path();
     let sid = "s-resume";
     let meta = SessionMeta {
+        claude_account: None,
         model_pinned_generation: None,
         mode: None,
         tool_face: None,
@@ -361,6 +363,7 @@ async fn resume_carries_mcp_servers() {
     }
 
     let meta = SessionMeta {
+        claude_account: None,
         model_pinned_generation: None,
         mode: None,
         tool_face: None,
@@ -397,6 +400,7 @@ async fn resume_carries_mcp_servers() {
 
     // A SpawnCtx WITH a secret → `acp_mcp_servers_http` yields a non-empty array.
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: "demo".into(),

@@ -175,15 +175,15 @@ describe("model button label", () => {
     );
 
   it("new-session draft: the vendor prefixes the default/picked model", () => {
-    expect(renderBtn()).toContain("<span>claude · 默认</span>");
+    expect(renderBtn()).toContain("<span class=\"model-label\">claude · 默认</span>");
     expect(renderBtn({ draft: { ...defaultDraft(), model: "opus" } })).toContain(
-      "<span>claude · opus</span>",
+      "<span class=\"model-label\">claude · opus</span>",
     );
     expect(
       renderBtn({
         draft: { ...defaultDraft(), vendor: "codex", model: "默认", protocol: "app-server" },
       }),
-    ).toContain("<span>codex · 默认</span>");
+    ).toContain("<span class=\"model-label\">codex · 默认</span>");
   });
 
   it("conversation: the live model rides after the vendor; an unreported model leaves the vendor alone", () => {
@@ -192,10 +192,10 @@ describe("model button label", () => {
         modelLabel: "gpt-5.5",
         draft: { ...defaultDraft(), vendor: "codex", model: "", protocol: "app-server" },
       }),
-    ).toContain("<span>codex · gpt-5.5</span>");
+    ).toContain("<span class=\"model-label\">codex · gpt-5.5</span>");
     const html = renderBtn({ modelLabel: "" });
-    expect(html).toContain("<span>claude</span>");
-    expect(html).not.toContain("<span>claude · ");
+    expect(html).toContain("<span class=\"model-label\">claude</span>");
+    expect(html).not.toContain("<span class=\"model-label\">claude · ");
   });
 
   it("conversation: a live kimi session shows the same vendor · model · effort shape", () => {
@@ -203,7 +203,7 @@ describe("model button label", () => {
       modelLabel: "kimi-code/k3",
       draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
     });
-    expect(html).toContain("<span>Kimi · kimi-code/k3</span>");
+    expect(html).toContain("<span class=\"model-label\">Kimi · kimi-code/k3</span>");
     // Effort renders as the vendor's own token, never a translated word —
     // identical in zh and en. Nothing reported ⇒ `default`.
     expect(html).toContain('<span class="eff">default</span>');
