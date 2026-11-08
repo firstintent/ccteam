@@ -717,6 +717,20 @@ async fn f10_real_codex_stdio_new_smoke() {
 /// Spawn a scripted peer that accepts ONE connection and serves the
 /// supplied request → response map. Notifications can be pushed
 /// out-of-band via the returned channel.
+/// Pin `HOME` + `CCTEAM_HOME` to one process-wide temp dir. Adapters record
+/// vendor model catalogs (and the observed default model) under
+/// `ccteam_root_from_env()`; unpinned, these fixtures were written into the
+/// developer's real `~/.ccteam/model-catalog.json` and showed up as the
+/// composer's model rows.
+fn isolate_state_home() {
+    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = STATE.get_or_init(|| tempfile::TempDir::new().unwrap());
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("CCTEAM_HOME", dir.path().join(".ccteam"));
+    }
+}
+
 async fn spawn_scripted_peer(
     sock: PathBuf,
     handler: impl Fn(&Value) -> Value + Send + 'static,
@@ -724,6 +738,7 @@ async fn spawn_scripted_peer(
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::Sender<Value>,
 ) {
+    isolate_state_home();
     let listener = UnixListener::bind(&sock).unwrap();
     let (notif_tx, mut notif_rx) = tokio::sync::mpsc::channel::<Value>(16);
     let task = tokio::spawn(async move {

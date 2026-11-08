@@ -21,7 +21,22 @@ fn fake_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi_acp/fake_kimi_acp.py")
 }
 
+/// Pin `HOME` + `CCTEAM_HOME` to one process-wide temp dir. Adapters record
+/// vendor model catalogs (and the observed default model) under
+/// `ccteam_root_from_env()`; unpinned, these fixtures were written into the
+/// developer's real `~/.ccteam/model-catalog.json` and showed up as the
+/// composer's model rows.
+fn isolate_state_home() {
+    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = STATE.get_or_init(|| tempfile::TempDir::new().unwrap());
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("CCTEAM_HOME", dir.path().join(".ccteam"));
+    }
+}
+
 fn install_fake() {
+    isolate_state_home();
     let bin = fake_bin();
     assert!(bin.is_file(), "missing fake at {}", bin.display());
     let wrapper = std::env::temp_dir().join(format!(
