@@ -1,15 +1,17 @@
-//! Discovery never turns project access into permission to spend every local
-//! subscription. This integration process owns its temporary HOME and store.
+//! Discovery is open to every authenticated identity (owner decision
+//! 2026-11-06, #229) yet still never leaks raw emails and runs the optional
+//! tool once per cache window. This integration process owns its temporary
+//! HOME and store.
 #![cfg(unix)]
 
-use ccteam_core::{config::CcteamConfig, tenants::TenantRegistry, CcteamPaths};
+use ccteam_core::{tenants::TenantRegistry, CcteamPaths};
 use ccteam_harness::{execution::claude_accounts::account_id, ClaudeStreamJsonAdapter};
 use ccteam_im::gateway::Gateway;
 use ccteam_web::{router_with_state, AppState, AuthState};
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 #[tokio::test]
-async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
+async fn every_identity_discovers_every_local_account_without_a_grant() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", tmp.path().join("home"));
     std::env::set_var("CCTEAM_HOME", tmp.path().join("state"));
@@ -24,11 +26,6 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
     tenants.save(&paths.users_dir()).unwrap();
     let first = account_id("one@example.test", "");
     let second = account_id("two@example.test", "");
-    let mut config = CcteamConfig::default();
-    config
-        .cswap_account_grants
-        .insert(format!("user:{}", alice.id), vec![first.clone()]);
-    ccteam_core::config::save(&paths.root, &config).unwrap();
     let calls = tmp.path().join("calls");
     let cswap = tmp.path().join("cswap");
     std::fs::write(&cswap, format!("#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = run ]; then echo '--no-share-history --require-session'; exit 0; fi\nif [ \"$1\" = config ]; then echo '{{\"schemaVersion\":1,\"settings\":[]}}'; exit 0; fi\nprintf '%s\\n' '{{\"schemaVersion\":1,\"accounts\":[{{\"number\":1,\"email\":\"one@example.test\"}},{{\"number\":2,\"email\":\"two@example.test\"}}]}}'\n", calls.display())).unwrap();
@@ -52,160 +49,43 @@ async fn account_discovery_filters_grants_before_spawning_the_optional_tool() {
     });
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://{address}/api/v1/vendors/claude/accounts");
-    let denied: serde_json::Value = client
-        .get(&url)
-        .bearer_auth(format!("ccteam:{}", bob.web_token))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(denied["available"], false);
-    assert_eq!(
-        denied["reason"], "not_granted",
-        "a missing grant is not reported as a missing tool"
-    );
-    assert_eq!(denied["accounts"], serde_json::json!([]));
-    assert!(
-        !calls.exists(),
-        "an ungranted tenant must not even invoke account discovery"
-    );
-    let allowed: serde_json::Value = client
-        .get(&url)
-        .bearer_auth(format!("ccteam:{}", alice.web_token))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(allowed["accounts"].as_array().unwrap().len(), 1);
-    assert_eq!(allowed["accounts"][0]["id"], first);
-    assert!(!allowed.to_string().contains(&second));
-    assert!(!allowed.to_string().contains("one@"));
-    let operator: serde_json::Value = client
-        .get(&url)
-        .bearer_auth(format!("ccteam:{admin}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(operator["accounts"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        std::fs::read_to_string(&calls).unwrap().lines().count(),
-        3,
-        "discovery is coalesced and cached"
-    );
-    config.cswap_account_grants.clear();
-    ccteam_core::config::save(&paths.root, &config).unwrap();
-    let revoked: serde_json::Value = client
-        .get(&url)
-        .bearer_auth(format!("ccteam:{}", alice.web_token))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        revoked["accounts"],
-        serde_json::json!([]),
-        "cache must not retain a revoked grant"
-    );
 
-    // The operator grants from the web; tenants cannot grant themselves.
-    let grants = |user: &str| format!("http://{address}/api/v1/users/{user}/cswap-accounts");
-    let status = |response: reqwest::Response| response.status().as_u16();
-    assert_eq!(
-        status(
-            client
-                .put(grants(&bob.id))
-                .bearer_auth(format!("ccteam:{}", bob.web_token))
-                .json(&serde_json::json!({"accounts": [second]}))
-                .send()
-                .await
-                .unwrap()
-        ),
-        403
-    );
-    for bad in ["2", "*", "two@example.test"] {
+    for token in [alice.web_token.clone(), bob.web_token.clone(), admin.into()] {
+        let listed: serde_json::Value = client
+            .get(&url)
+            .bearer_auth(format!("ccteam:{token}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["available"], true);
+        let ids: std::collections::BTreeSet<_> = listed["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|account| account["id"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            status(
-                client
-                    .put(grants(&bob.id))
-                    .bearer_auth(format!("ccteam:{admin}"))
-                    .json(&serde_json::json!({"accounts": [bad]}))
-                    .send()
-                    .await
-                    .unwrap()
-            ),
-            400,
-            "{bad} is not a stable account id"
+            ids,
+            [first.clone(), second.clone()].into(),
+            "tenants and the admin see the same local accounts"
+        );
+        assert!(
+            !listed.to_string().contains("one@"),
+            "labels are masked; raw emails never leave the daemon"
         );
     }
     assert_eq!(
-        status(
-            client
-                .put(grants("u-missing"))
-                .bearer_auth(format!("ccteam:{admin}"))
-                .json(&serde_json::json!({"accounts": []}))
-                .send()
-                .await
-                .unwrap()
-        ),
-        404
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        3,
+        "discovery is coalesced and cached across identities"
     );
-    let saved: serde_json::Value = client
-        .put(grants(&bob.id))
-        .bearer_auth(format!("ccteam:{admin}"))
-        .json(&serde_json::json!({"accounts": [second, second]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(saved["accounts"], serde_json::json!([second]));
-    let listed: serde_json::Value = client
-        .get(grants(&bob.id))
-        .bearer_auth(format!("ccteam:{admin}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(listed["accounts"], serde_json::json!([second]));
-    let granted: serde_json::Value = client
-        .get(&url)
-        .bearer_auth(format!("ccteam:{}", bob.web_token))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(granted["available"], true);
-    assert_eq!(granted["accounts"].as_array().unwrap().len(), 1);
-    assert_eq!(granted["accounts"][0]["id"], second);
-
-    // Deleting the tenant drops its grant instead of leaving it dangling.
+    let anonymous = client.get(&url).send().await.unwrap();
     assert_eq!(
-        status(
-            client
-                .delete(format!("http://{address}/api/v1/users/{}", bob.id))
-                .bearer_auth(format!("ccteam:{admin}"))
-                .send()
-                .await
-                .unwrap()
-        ),
-        200
+        anonymous.status().as_u16(),
+        401,
+        "discovery still sits behind the web-token gate"
     );
-    assert!(ccteam_core::config::load(&paths.root)
-        .unwrap()
-        .cswap_account_grants
-        .is_empty());
 }

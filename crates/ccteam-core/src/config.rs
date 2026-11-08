@@ -45,11 +45,6 @@ pub const DAEMON_WORKERS_ENV: &str = "CCTEAM_DAEMON_WORKERS";
 /// on every collection guarantees an older config.yaml still parses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CcteamConfig {
-    /// Explicit cswap subscription grants, keyed by canonical owner tag.
-    /// Operators use their local accounts; tenants need a named identity
-    /// reference from account discovery. No credentials are stored here.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub cswap_account_grants: BTreeMap<String, Vec<String>>,
     /// Canonical base for `ccteam init --in <slug>`. When absent,
     /// `CcteamPaths::from_env` falls back to `$HOME/projects`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,7 +274,6 @@ pub fn default_claude_jobs_retention_days() -> u32 {
 impl Default for CcteamConfig {
     fn default() -> Self {
         Self {
-            cswap_account_grants: BTreeMap::new(),
             projects_root: None,
             default_project: None,
             projects: Vec::new(),
@@ -414,27 +408,6 @@ pub fn remove_project(ccteam_root: &Path, slug: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Replace one owner's cswap account grants (#229). An empty set removes
-/// the owner's entry so a deleted tenant leaves no dangling grant behind.
-pub fn set_cswap_account_grants(
-    ccteam_root: &Path,
-    owner: &str,
-    accounts: &[String],
-) -> Result<()> {
-    let mut cfg = load(ccteam_root)?;
-    let mut accounts = accounts.to_vec();
-    accounts.sort();
-    accounts.dedup();
-    if accounts.is_empty() {
-        if cfg.cswap_account_grants.remove(owner).is_none() {
-            return Ok(());
-        }
-    } else {
-        cfg.cswap_account_grants.insert(owner.to_string(), accounts);
-    }
-    save(ccteam_root, &cfg)
-}
-
 /// Find a registered project by slug.
 pub fn lookup_project(ccteam_root: &Path, slug: &str) -> Result<Option<ProjectEntry>> {
     let cfg = load(ccteam_root)?;
@@ -519,7 +492,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let entry = sample_entry("foo", &PathBuf::from("/home/rob/code/foo"));
         let cfg = CcteamConfig {
-            cswap_account_grants: Default::default(),
             projects_root: Some(PathBuf::from("/work/repos")),
             default_project: Some("foo".to_string()),
             projects: vec![entry.clone()],

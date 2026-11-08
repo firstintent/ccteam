@@ -504,9 +504,6 @@ pub(crate) async fn handle_create_session(
     .await;
     match created {
         Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
-        Err(error) if error.is::<ccteam_im::gateway::CswapAccountDenied>() => {
-            create_error(StatusCode::FORBIDDEN, error.to_string(), mode)
-        }
         Err(error) if error.is::<ccteam_im::gateway::CswapAccountUnsupported>() => {
             create_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string(), mode)
         }

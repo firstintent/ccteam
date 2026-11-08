@@ -71,7 +71,7 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ),
         // VENDOR-QUOTA-1 — vendor subscription-quota snapshot (admin).
         ("GET", "/api/v1/vendors/quota"),
-        // #229 — optional, identity-filtered cswap discovery.
+        // #229 — optional cswap discovery.
         ("GET", "/api/v1/vendors/claude/accounts"),
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
@@ -86,9 +86,6 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("DELETE", "/api/v1/users/{id}"),
         // v0.8.20 F3 — admin re-reveals a tenant's personal login link.
         ("GET", "/api/v1/users/{id}/link"),
-        // #229 — admin grants local cswap subscriptions to a tenant.
-        ("GET", "/api/v1/users/{id}/cswap-accounts"),
-        ("PUT", "/api/v1/users/{id}/cswap-accounts"),
         // v0.8.20 F2 — per-user IM bot config (self-serve + admin).
         ("PUT", "/api/v1/me/im"),
         // The caller's own bots, masked (same shape as GET /config/im).

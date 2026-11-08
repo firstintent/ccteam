@@ -40,7 +40,7 @@
 // `useEffect` keyed on a `pollNonce` and is ALWAYS cleared on unmount /
 // re-run (cleanup `clearTimeout`) so navigating away never leaks a timer.
 
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Hash, Link2, MessageSquare, Send, Users } from "lucide-react";
 import {
   getSlackAppManifest,
@@ -66,7 +66,6 @@ import {
   getMyLarkOpenIdCandidates,
   getMySlackUserIdCandidates,
   getMyTelegramChatIdCandidates,
-  getUserCswapAccounts,
   getUserLink,
   listUsers,
   putMyIm,
@@ -74,12 +73,10 @@ import {
   putMyRequireMention,
   putMySlackAllowedUsers,
   putMyTelegramAllowedChats,
-  putUserCswapAccounts,
   type SenderCandidate,
   type TenantView,
 } from "../lib/usersApi";
 import { makeT, type Lang } from "../lib/i18n";
-import { getCswapAccounts, type CswapAccounts } from "../lib/sessionsApi";
 import { cn } from "../lib/utils";
 import {
   Badge,
@@ -2000,115 +1997,6 @@ function MySlackCard({ status, onSaved }: MyImCardProps<ImConfigStatus["slack"]>
   );
 }
 
-/** #229 — which local cswap subscriptions one tenant may spend. The admin
- *  sees every discovered account (operator); grants store the stable id, so a
- *  later slot move or alias change never re-points a grant. */
-export function CswapGrantEditor({ userId, handle, onDone }: {
-  userId: string;
-  handle: string;
-  onDone: () => void;
-}) {
-  const [accounts, setAccounts] = useState<CswapAccounts | null>(null);
-  const [granted, setGranted] = useState<string[] | null>(null);
-  const [loadedGrants, setLoadedGrants] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    let live = true;
-    Promise.all([getCswapAccounts(), getUserCswapAccounts(userId)])
-      .then(([discovered, grants]) => {
-        if (!live) return;
-        setAccounts(discovered);
-        setGranted(grants.accounts);
-        setLoadedGrants(grants.accounts);
-      })
-      .catch((err) => {
-        if (!live || (err instanceof Error && err.message === "UNAUTHENTICATED")) return;
-        setError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      live = false;
-    };
-  }, [userId]);
-
-  const toggle = (id: string) =>
-    setGranted((current) =>
-      current?.includes(id) ? current.filter((g) => g !== id) : [...(current ?? []), id],
-    );
-
-  async function save() {
-    if (!granted || saving) return;
-    setSaving(true);
-    try {
-      await putUserCswapAccounts(userId, granted);
-      toastBus.handler?.info(`已更新 ${handle} 的 Claude 账号授权 / Grants saved`);
-      onDone();
-    } catch (err) {
-      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const known = new Set(accounts?.accounts.map((a) => a.id) ?? []);
-  // A grant whose account cswap no longer lists stays visible so it can be revoked.
-  const stale = loadedGrants.filter((id) => !known.has(id));
-  return (
-    <div data-testid={`settings-user-cswap-editor-${userId}`} className="flex flex-col gap-2">
-      <p className="text-[11px] text-text-muted">
-        允许 <b className="text-text-primary">{handle}</b> 新建会话时选用哪些本机 cswap 订阅账号(能看到项目不等于能用你的订阅)。
-      </p>
-      {error ? (
-        <p className="text-[11px] font-mono text-status-error">加载失败: {error}</p>
-      ) : !accounts || !granted ? (
-        <p className="text-[11px] font-mono text-text-dim">loading…</p>
-      ) : (
-        <>
-          {accounts.available === false ? (
-            <p className="text-[11px] font-mono text-text-dim">
-              cswap 不可用: {accounts.message ?? "unknown"}
-            </p>
-          ) : accounts.accounts.length === 0 ? (
-            <p className="text-[11px] font-mono text-text-dim">cswap 里还没有账号。</p>
-          ) : null}
-          {accounts.accounts.map((a) => (
-            <label key={a.id} className="flex items-center gap-2 text-[12px] text-text-primary">
-              <input
-                type="checkbox"
-                checked={granted.includes(a.id)}
-                onChange={() => toggle(a.id)}
-              />
-              <span>{`cswap ${a.slot} · ${a.label}`}</span>
-              {a.active ? <Badge variant="idle">当前默认</Badge> : null}
-            </label>
-          ))}
-          {stale.map((id) => (
-            <label key={id} className="flex items-center gap-2 text-[12px] text-text-dim">
-              <input type="checkbox" checked={granted.includes(id)} onChange={() => toggle(id)} />
-              <span className="font-mono">{`${id.slice(0, 12)}… (cswap 未列出 / not listed)`}</span>
-            </label>
-          ))}
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              data-testid={`settings-user-cswap-save-${userId}`}
-              disabled={saving}
-              onClick={() => void save()}
-            >
-              {saving ? "…" : "保存"}
-            </Button>
-            <Button variant="ghost" size="sm" onClick={onDone}>
-              取消
-            </Button>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
 export function UserManagementSection() {
   const [users, setUsers] = useState<TenantView[] | null>(null);
   const [forbidden, setForbidden] = useState(false);
@@ -2118,7 +2006,6 @@ export function UserManagementSection() {
   // The one-time personal link surfaced after a create (token shown once).
   const [newLink, setNewLink] = useState<{ handle: string; link: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [grantsFor, setGrantsFor] = useState<string | null>(null);
 
   const load = useCallback(() => {
     listUsers()
@@ -2286,8 +2173,8 @@ export function UserManagementSection() {
                   </tr>
                 ) : (
                   users.map((u) => (
-                    <Fragment key={u.id}>
                     <tr
+                      key={u.id}
                       className="border-b border-surface-800 last:border-b-0 hover:bg-surface-800/40"
                     >
                       <td className="px-3 py-2.5">
@@ -2335,15 +2222,6 @@ export function UserManagementSection() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              data-testid={`settings-user-cswap-${u.id}`}
-                              aria-expanded={grantsFor === u.id}
-                              onClick={() => setGrantsFor(grantsFor === u.id ? null : u.id)}
-                            >
-                              Claude 账号
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
                               onClick={() => setConfirmDelete(u.id)}
                             >
                               删除
@@ -2352,18 +2230,6 @@ export function UserManagementSection() {
                         )}
                       </td>
                     </tr>
-                    {grantsFor === u.id ? (
-                      <tr className="border-b border-surface-800 last:border-b-0">
-                        <td colSpan={4} className="px-3 py-2.5">
-                          <CswapGrantEditor
-                            userId={u.id}
-                            handle={u.handle}
-                            onDone={() => setGrantsFor(null)}
-                          />
-                        </td>
-                      </tr>
-                    ) : null}
-                    </Fragment>
                   ))
                 )}
               </tbody>

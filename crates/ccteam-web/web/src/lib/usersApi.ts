@@ -60,27 +60,6 @@ export function getUserLink(id: string): Promise<UserLinkResponse> {
   return getJson<UserLinkResponse>(`/api/v1/users/${encodeURIComponent(id)}/link`);
 }
 
-/** `GET`/`PUT /api/v1/users/{id}/cswap-accounts` — the stable cswap account
- *  ids a tenant may spend (#229). Ids come from account discovery; project
- *  visibility never implies a grant. */
-export interface CswapAccountGrants {
-  accounts: string[];
-}
-
-/** `GET /api/v1/users/{id}/cswap-accounts` (admin only). */
-export function getUserCswapAccounts(id: string): Promise<CswapAccountGrants> {
-  return getJson<CswapAccountGrants>(`/api/v1/users/${encodeURIComponent(id)}/cswap-accounts`);
-}
-
-/** `PUT /api/v1/users/{id}/cswap-accounts` — full replacement; `[]` revokes all (admin only). */
-export function putUserCswapAccounts(id: string, accounts: string[]): Promise<CswapAccountGrants> {
-  return sendJson<CswapAccountGrants>(
-    `/api/v1/users/${encodeURIComponent(id)}/cswap-accounts`,
-    "PUT",
-    { accounts },
-  );
-}
-
 /** `PUT /api/v1/me/im` body — per-platform PATCH semantics: an OMITTED
  *  platform is left alone, an explicit `null` clears it. (It used to be
  *  whole-body replace, so saving a Telegram token wiped the Lark app the form

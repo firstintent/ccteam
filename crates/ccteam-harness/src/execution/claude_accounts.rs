@@ -19,7 +19,7 @@ const REAL_BIN_ENV: &str = "CCTEAM_CSWAP_CLAUDE";
 const ORIGINAL_PATH_ENV: &str = "CCTEAM_CSWAP_PATH";
 const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 
-/// Safe to return to an authorized frontend. No credentials or profile paths.
+/// Safe to return to any authenticated frontend. No credentials or profile paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CswapAccount {
     pub id: String,

@@ -520,8 +520,6 @@ export interface CswapAccount {
 export interface CswapAccounts {
   available: boolean;
   accounts: CswapAccount[];
-  /** `not_granted`: cswap may be fine, this identity just has no grant. */
-  reason?: "not_granted";
   message?: string;
 }
 export const getCswapAccounts = () =>

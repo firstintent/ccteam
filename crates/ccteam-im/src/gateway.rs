@@ -64,11 +64,6 @@ pub struct RoleNotFound {
     pub role: String,
 }
 
-/// Account grants are independent from project visibility (#229).
-#[derive(Debug, thiserror::Error)]
-#[error("cswap account is not available to this identity")]
-pub struct CswapAccountDenied;
-
 /// The frozen terminal protocol and remote projects do not support cswap.
 #[derive(Debug, thiserror::Error)]
 #[error("cswap accounts require a local Claude stream-json session")]
@@ -3949,16 +3944,12 @@ impl Gateway {
             BodyGate::PostMortem(body) => Some(body),
         };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
-        if let Some(account) = &meta.claude_account {
-            if meta.vendor != AgentVendor::Claude
+        if meta.claude_account.is_some()
+            && (meta.vendor != AgentVendor::Claude
                 || meta.protocol != SessionProtocol::StreamJson
-                || host != ccteam_core::LOCAL_HOST
-            {
-                return Err(CswapAccountUnsupported.into());
-            }
-            if !account.default_login {
-                self.authorize_cswap_account(reply_to, &account.id)?;
-            }
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
         }
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         // Both tuning axes, one precedence — see `respawn_tuning`.
@@ -7660,7 +7651,6 @@ impl Gateway {
                 {
                     return Err(CswapAccountUnsupported.into());
                 }
-                self.authorize_cswap_account(&reply_to, &id)?;
                 ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(id)
             })
             .transpose()?;
@@ -8138,12 +8128,6 @@ impl Gateway {
             return Err(anyhow!(
                 "session account metadata is unavailable; the current process was kept"
             ));
-        }
-        if let Some(account) = claude_account
-            .as_ref()
-            .filter(|account| !account.default_login)
-        {
-            self.authorize_cswap_account(chat, &account.id)?;
         }
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
@@ -11236,16 +11220,12 @@ impl Gateway {
                 "session account metadata is unavailable; refusing to resume with default login"
             ));
         }
-        if let Some(account) = &claude_account {
-            if vendor != AgentVendor::Claude
+        if claude_account.is_some()
+            && (vendor != AgentVendor::Claude
                 || protocol != SessionProtocol::StreamJson
-                || host != ccteam_core::LOCAL_HOST
-            {
-                return Err(CswapAccountUnsupported.into());
-            }
-            if !account.default_login {
-                self.authorize_cswap_account(&owner, &account.id)?;
-            }
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
         }
         let (model_id, effort) = respawn_tuning(
             &cwd,
@@ -12603,51 +12583,6 @@ impl Gateway {
             return Principal::Operator;
         }
         Principal::Guest(canonical_owner(chat).identity())
-    }
-
-    /// Optional account discovery and creation share the same principal
-    /// resolver and grants. `None` means operator, `Some` is the allowed set.
-    pub fn cswap_account_access(&self, web_chat_id: &str) -> Result<Option<Vec<String>>> {
-        self.cswap_account_access_for_chat(&ChatKey::new("web", web_chat_id, web_chat_id))
-    }
-
-    fn cswap_account_access_for_chat(&self, chat: &ChatKey) -> Result<Option<Vec<String>>> {
-        // Stored owners use user:<id>; resolve that trusted canonical owner
-        // through the existing web principal parser for cold resumes.
-        let web_owner =
-            (chat.channel == "user").then(|| ChatKey::new("web", &chat.chat_id, &chat.chat_id));
-        let principal = self.principal(web_owner.as_ref().unwrap_or(chat));
-        if principal == Principal::Operator {
-            return Ok(None);
-        }
-        let owner = match principal {
-            Principal::Tenant(id) => ccteam_core::identity::owner_tag(&id, false),
-            Principal::Guest(owner) => owner,
-            Principal::Operator => unreachable!(),
-        };
-        let Some(paths) = &self.project_paths else {
-            return Ok(Some(Vec::new()));
-        };
-        let config = ccteam_core::config::load(&paths.root)?;
-        Ok(Some(
-            config
-                .cswap_account_grants
-                .get(&owner)
-                .cloned()
-                .unwrap_or_default(),
-        ))
-    }
-
-    fn authorize_cswap_account(&self, chat: &ChatKey, id: &str) -> Result<()> {
-        let access = self.cswap_account_access_for_chat(chat)?;
-        if !ccteam_core::identity::can_use_cswap_account(
-            access.is_none(),
-            access.as_deref().unwrap_or_default(),
-            id,
-        ) {
-            return Err(CswapAccountDenied.into());
-        }
-        Ok(())
     }
 
     /// Whether this IM chat speaks for the box owner.
@@ -15795,7 +15730,6 @@ impl Gateway {
                 .and_then(|entry| entry.meta.claude_account)
                 .filter(|account| !account.default_login)
             {
-                self.authorize_cswap_account(&plan.reply_to, &binding.id)?;
                 if plan.protocol != SessionProtocol::StreamJson
                     || plan.host != ccteam_core::LOCAL_HOST
                 {
@@ -15982,7 +15916,6 @@ impl Gateway {
                     .and_then(|entry| entry.meta.claude_account)
                     .filter(|account| !account.default_login)
                 {
-                    guard.authorize_cswap_account(&plan.reply_to, &binding.id)?;
                     if plan.protocol != SessionProtocol::StreamJson
                         || plan.host != ccteam_core::LOCAL_HOST
                     {
@@ -24706,7 +24639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cswap_selection_is_authorized_before_allocating_a_session() {
+    async fn cswap_selection_needs_no_grant_but_only_runs_local_stream_json() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
@@ -24715,18 +24648,6 @@ mod tests {
             claude_account: Some(id.clone()),
             ..Default::default()
         };
-        let denied = gateway.plan_new_session(
-            ChatKey::new("web", "tenant", "tenant"),
-            "alpha".into(),
-            AgentVendor::Claude,
-            String::new(),
-            String::new(),
-            PermissionMode::Skip,
-            SessionProtocol::StreamJson,
-            tuning.clone(),
-        );
-        assert!(denied.err().unwrap().is::<CswapAccountDenied>());
-        assert_eq!(gateway.next_session, 0);
         for (vendor, protocol) in [
             (AgentVendor::Codex, SessionProtocol::StreamJson),
             (AgentVendor::Claude, SessionProtocol::Terminal),
@@ -24743,9 +24664,15 @@ mod tests {
             );
             assert!(denied.err().unwrap().is::<CswapAccountUnsupported>());
         }
+        assert_eq!(
+            gateway.next_session, 0,
+            "a rejected choice allocates no sid"
+        );
+        // Owner decision 2026-11-06: no per-identity grant — a per-user web
+        // login (Tenant) uses any local account exactly like the admin.
         let plan = gateway
             .plan_new_session(
-                ChatKey::new("web", "web-api", "web-api"),
+                ChatKey::new("web", "tenant", "tenant"),
                 "alpha".into(),
                 AgentVendor::Claude,
                 String::new(),

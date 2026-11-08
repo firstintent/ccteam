@@ -37,15 +37,6 @@ describe("optional cswap account selection", () => {
     container.remove();
   });
 
-  it("tells an ungranted user who can grant access instead of blaming cswap", async () => {
-    const { container, root, button } = await mount({ available: false, reason: "not_granted", accounts: [] });
-    await act(() => button.click());
-    expect(container.textContent).toContain("管理员尚未给你授权 cswap 账号");
-    expect(container.textContent).not.toContain("cswap 不可用");
-    await act(() => root.unmount());
-    container.remove();
-  });
-
   it("picks an account from its own menu and closes on outside press", async () => {
     const onChange = vi.fn();
     const account = { id: "a".repeat(64), slot: "2", label: "work (t***@example.test)", active: false };

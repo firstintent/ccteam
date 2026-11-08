@@ -45,16 +45,13 @@ export function CswapAccountPicker({ value, onChange, lang }: {
   const unavailable = accounts?.available === false;
   const status = loading ? (en ? "Checking cswap…" : "检查 cswap…")
     : error ? error
-      : unavailable && accounts.reason === "not_granted"
-        ? (en ? "No cswap accounts are granted to you yet; an administrator can grant them in Settings → Admin → Users. Default login remains available."
-          : "管理员尚未给你授权 cswap 账号（设置 → 管理员 → 用户），仍可使用默认登录。")
-        : unavailable
-          ? `${en ? "cswap unavailable; default login remains available." : "cswap 不可用，仍可继续使用默认登录。"} ${accounts.message ?? ""}`
-          : accounts?.accounts.length === 0
-            ? (en ? "No authorized cswap accounts. You can still use default login." : "没有已授权的 cswap 账号，仍可使用默认登录。")
-            : accounts
-              ? (en ? "Default accounts follow cswap auto; other accounts use isolated profiles." : "当前默认账号会跟随 cswap auto；其他账号使用独立 profile。")
-              : "";
+      : unavailable
+        ? `${en ? "cswap unavailable; default login remains available." : "cswap 不可用，仍可继续使用默认登录。"} ${accounts.message ?? ""}`
+        : accounts?.accounts.length === 0
+          ? (en ? "cswap has no accounts yet. You can still use default login." : "cswap 里还没有账号，仍可使用默认登录。")
+          : accounts
+            ? (en ? "Default accounts follow cswap auto; other accounts use isolated profiles." : "当前默认账号会跟随 cswap auto；其他账号使用独立 profile。")
+            : "";
   return (
     <div className={`sel account-sel ${open ? "open" : ""}`} ref={ref}>
       <button
