@@ -685,6 +685,97 @@ pub(crate) async fn handle_patch_session(
     }
 }
 
+/// PUT body for `PUT /api/v1/sessions/{sid}/claude-account` (#236).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SwitchClaudeAccountRequest {
+    /// A stable account id from `GET /api/v1/vendors/claude/accounts`;
+    /// `null` returns the session to the default login.
+    #[serde(default)]
+    pub claude_account: Option<String>,
+}
+
+/// `PUT /api/v1/sessions/{sid}/claude-account`
+///
+/// Move a local Claude stream-json session to another cswap account, or back
+/// to the default login (#236). Only the session's account binding changes:
+/// a resident process is released and the next message resumes the SAME sid
+/// under the new account (cswap's shared history keeps the transcript
+/// readable from every account). Picking the current account is a no-op.
+///
+/// 200 `{sid, claude_account, changed, released}` (`claude_account: null` =
+/// default login). 404 unknown/inaccessible session (`gate_sid`). 409 the
+/// session is mid-turn, waiting on the user, running background work, or
+/// still has a process from before a daemon restart. 422 not a local Claude
+/// stream-json session, an account cswap does not list (or cswap is
+/// unavailable), or history still private to the current account. 503 no
+/// gateway.
+#[utoipa::path(
+    put,
+    path = "/api/v1/sessions/{sid}/claude-account",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body = SwitchClaudeAccountRequest,
+    responses(
+        (status = 200, description = "`{sid, claude_account, changed, released}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 409, description = "Busy: mid-turn, awaiting the user, background work or a pre-restart process"),
+        (status = 422, description = "Unsupported session, unlisted account / cswap unavailable, or history not shared yet"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_switch_claude_account(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+    Json(body): Json<SwitchClaudeAccountRequest>,
+) -> Response {
+    use ccteam_im::gateway::ClaudeAccountSwitchError as SwitchError;
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let refuse = |status: StatusCode, error: String| {
+        (status, Json(json!({ "error": error }))).into_response()
+    };
+    let target = match body.claude_account.filter(|id| !id.trim().is_empty()) {
+        None => None,
+        // The id must be one cswap lists right now: that both validates it
+        // and supplies the `#slot name` the session shows until it resumes.
+        Some(id) => match app.cswap_accounts.accounts().await {
+            Ok(accounts) => match accounts.into_iter().find(|account| account.id == id) {
+                Some(account) => Some(account),
+                None => {
+                    return refuse(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "cswap does not list this account; choose one from the account list".into(),
+                    )
+                }
+            },
+            Err(error) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")),
+        },
+    };
+    match ccteam_im::gateway::Gateway::switch_claude_account_shared(gw, &sid, target).await {
+        Ok(switch) => Json(json!({
+            "sid": sid,
+            "claude_account": switch.claude_account,
+            "changed": switch.changed,
+            "released": switch.released,
+        }))
+        .into_response(),
+        Err(SwitchError::UnknownSession(_)) => unknown_session(&sid),
+        Err(SwitchError::Busy(message)) => refuse(StatusCode::CONFLICT, message),
+        Err(error @ (SwitchError::Unsupported(_) | SwitchError::Refused(_))) => {
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        Err(SwitchError::Internal(error)) => {
+            tracing::warn!(%sid, error = %format!("{error:#}"), "switch_claude_account failed");
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        }
+    }
+}
+
 /// Serialize a [`SessionRename`] for the PATCH response. Split out so the
 /// wire shape — including the vendor-sync report the SPA renders — is
 /// unit-testable without a live gateway.

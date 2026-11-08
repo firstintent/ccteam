@@ -515,7 +515,8 @@ export interface CswapAccount {
   slot: string;
   /** cswap alias, else the email's local part (never the domain). */
   label: string;
-  /** Discovery: currently the default login. Session: default fallback mode. */
+  /** Discovery: currently the default login. Session: runs on the default
+   *  login (picked while it was the default; follows cswap auto). */
   active: boolean;
   /** Whole-percent quota windows; absent when the plan has none (Max has no
    *  5h) or cswap has no reading. Discovery only. */
@@ -534,6 +535,42 @@ export const accountName = (account: Pick<CswapAccount, "slot" | "label">) =>
   `#${account.slot} ${account.label}`;
 export const getCswapAccounts = () =>
   getJson<CswapAccounts>("/api/v1/vendors/claude/accounts");
+
+/** `PUT /api/v1/sessions/{sid}/claude-account` (#236). */
+export interface ClaudeAccountSwitch {
+  sid: string;
+  /** The session's binding now; `null` = default login. */
+  claude_account: CswapAccount | null;
+  /** False when the pick was the session's current account. */
+  changed: boolean;
+  /** A resident process was released; the next message resumes the SAME
+   *  session under the new account. */
+  released: boolean;
+}
+/** Move a running/released Claude session to another cswap account, or back
+ *  to the default login (`null`). 409 = busy (mid-turn, awaiting you,
+ *  background work), 422 = not possible (history not shared yet, unlisted
+ *  account, cswap unavailable) — both surface the server's message. */
+export async function switchSessionClaudeAccount(
+  sid: string,
+  account: string | null,
+): Promise<ClaudeAccountSwitch> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/claude-account`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ claude_account: account }),
+    });
+  } catch (e) {
+    throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
+  }
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("NOT_FOUND");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as ClaudeAccountSwitch;
+}
 
 // ── v0.8.21 history / resume / external-import ───────────────────────────────
 

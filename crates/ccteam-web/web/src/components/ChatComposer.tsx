@@ -384,8 +384,8 @@ export function ChatComposer({
   catalog?: VendorCatalog;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
-  /** New-session account menu, beside the model menu; conversation
-   *  composers never change accounts. */
+  /** Claude account menu, beside the model menu: the account to start
+   *  with (new session) or the one the session runs on, switchable (#236). */
   accountSlot?: React.ReactNode;
   sendTestId?: string;
   /** Project slug uploads + the skill picker target. Omit (e.g. while the

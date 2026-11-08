@@ -69,6 +69,38 @@ pub struct RoleNotFound {
 #[error("cswap accounts require a local Claude stream-json session")]
 pub struct CswapAccountUnsupported;
 
+/// Why a session's Claude account switch was refused (#236). None of these
+/// touched the session: binding, process and history are as they were.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeAccountSwitchError {
+    /// No session with this sid.
+    #[error("unknown session: {0}")]
+    UnknownSession(String),
+    /// Not a local Claude stream-json session.
+    #[error(transparent)]
+    Unsupported(#[from] CswapAccountUnsupported),
+    /// The process is doing something releasing it would cut short.
+    #[error("{0}")]
+    Busy(String),
+    /// Switching would lose the conversation or misdescribe the session.
+    #[error("{0}")]
+    Refused(String),
+    /// Bookkeeping failed (meta write, release).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// A session's account after [`Gateway::switch_claude_account_shared`].
+#[derive(Debug, Clone)]
+pub struct ClaudeAccountSwitch {
+    /// The new binding as any frontend may show it; `None` = default login.
+    pub claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+    /// The binding actually changed (picking the current account is a no-op).
+    pub changed: bool,
+    /// A resident process was released; the next message resumes the sid.
+    pub released: bool,
+}
+
 /// One deadline for every live account-usage ask in a single read (#234). A
 /// live answer is an in-memory read on the vendor side (claude `get_usage`
 /// with `skip_behaviors` answers in milliseconds); past this, the vendor's
@@ -798,6 +830,9 @@ enum ReleaseReason {
     Capacity,
     /// Nobody spoke to it for its harness's `sessions.idle_release_secs`.
     Idle,
+    /// The user moved the session to another Claude account (#236); the next
+    /// message resumes the same sid under it.
+    AccountSwitch,
 }
 
 impl ReleaseReason {
@@ -805,6 +840,7 @@ impl ReleaseReason {
         match self {
             ReleaseReason::Capacity => "capacity",
             ReleaseReason::Idle => "idle",
+            ReleaseReason::AccountSwitch => "account_switch",
         }
     }
 }
@@ -15252,6 +15288,21 @@ impl Gateway {
         let Some((slug, adapter, thread)) = fenced else {
             return Ok(false);
         };
+        Self::finish_release_shared(gateway, sid, slug, adapter, thread, reason).await?;
+        Ok(true)
+    }
+
+    /// The part of a release after the session is fenced out of the live map:
+    /// every caller (both residency policies and an account switch) ends a
+    /// process the same way.
+    async fn finish_release_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        slug: String,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        thread: ThreadHandle,
+        reason: ReleaseReason,
+    ) -> Result<()> {
         // Last chance to read an ACCOUNT-scoped fact from this session: the
         // windows belong to the vendor account, not to the process, so they are
         // captured before the process that can report them goes away. Without
@@ -15286,7 +15337,186 @@ impl Gateway {
             .await
             .emit_session_evicted(sid, &slug, reason);
         tracing::info!(sid, %slug, reason = reason.as_str(), "ccteam-im: released session");
-        Ok(true)
+        Ok(())
+    }
+
+    /// Move a session to another cswap account, or back to the default login
+    /// (#236). Only the binding changes — the sid, its focus routes and its
+    /// history stay — and a resident process is released exactly like an
+    /// idle release, so the next message resumes the SAME sid under the new
+    /// account (the vendor prompt cache is rebuilt, as any account change
+    /// requires). A user-explicit command, never a daemon decision.
+    ///
+    /// Refused, with nothing changed, while the process is mid-turn, waiting
+    /// on the user or running background work, and whenever the transcript
+    /// would not be readable from the new account (history still private to
+    /// the current account's profile): resuming there would silently start
+    /// the conversation over.
+    pub async fn switch_claude_account_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        target: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+    ) -> std::result::Result<ClaudeAccountSwitch, ClaudeAccountSwitchError> {
+        use ccteam_harness::execution::claude_accounts::{
+            history_follows_switch, ClaudeAccountBinding,
+        };
+        let next = match &target {
+            Some(account) => {
+                let mut binding = ClaudeAccountBinding::requested(account.id.clone())
+                    .map_err(|error| ClaudeAccountSwitchError::Refused(error.to_string()))?;
+                // Display only until the launch confirms the profile; the
+                // spawn re-resolves the slot from the identity.
+                binding.slot = account.slot.clone();
+                binding.label = account.label.clone();
+                Some(binding)
+            }
+            None => None,
+        };
+        // The per-sid claim every lock-free resume takes (acquired before the
+        // gateway lock): a cold start planned from the OLD binding can neither
+        // overlap this switch nor land after it and overwrite it.
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _claim = claims.lock_for_sid(sid).await;
+
+        let (slug, cwd, meta, live) = {
+            let guard = gateway.lock().await;
+            let (slug, cwd, meta) = guard
+                .find_meta_for_sid(sid)
+                .map_err(|_| ClaudeAccountSwitchError::UnknownSession(sid.to_string()))?;
+            if meta.managed_by == ccteam_harness::execution::session_meta::ManagedBy::External {
+                return Err(ClaudeAccountSwitchError::Refused(
+                    "this agent was started by hand; ccteam does not launch it".into(),
+                ));
+            }
+            let host = guard.ensure_session_host_binding(&slug, &meta.host)?.0;
+            if meta.vendor != AgentVendor::Claude
+                || meta.protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST
+            {
+                return Err(CswapAccountUnsupported.into());
+            }
+            if guard.detached.contains_key(sid) {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "this session's process from before the daemon restart is still running; \
+                     interrupt or stop it first"
+                        .into(),
+                ));
+            }
+            let live = guard
+                .sessions
+                .get(sid)
+                .map(|s| (s.generation, Arc::clone(&s.adapter), s.thread.clone()));
+            (slug, cwd, meta, live)
+        };
+        let current = meta.claude_account.clone();
+        let unchanged = match (&current, &next) {
+            (None, None) => true,
+            (Some(current), None) => current.default_login,
+            (Some(current), Some(next)) => !current.default_login && current.id == next.id,
+            (None, Some(_)) => false,
+        };
+        if unchanged {
+            return Ok(ClaudeAccountSwitch {
+                claude_account: current.as_ref().map(ClaudeAccountBinding::display),
+                changed: false,
+                released: false,
+            });
+        }
+
+        // Slow checks without the gateway lock: an adapter round-trip and fs.
+        if let Some((_, adapter, thread)) = &live {
+            if adapter
+                .running_tasks(thread)
+                .await
+                .iter()
+                .any(|task| task.outlives_turn())
+            {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "background work is still running in this session; wait for it or stop it \
+                     first"
+                        .into(),
+                ));
+            }
+        }
+        let uuid = if meta.vendor_uuid.is_empty() {
+            ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid(
+                &slug, sid,
+            )
+        } else {
+            meta.vendor_uuid.clone()
+        };
+        let (history_cwd, from) = (cwd.clone(), current.clone());
+        let portable = tokio::task::spawn_blocking(move || {
+            history_follows_switch(&history_cwd, &uuid, from.as_ref())
+        })
+        .await
+        .unwrap_or(false);
+        if !portable {
+            return Err(ClaudeAccountSwitchError::Refused(
+                "this conversation's history is still private to the current account's profile. \
+                 cswap moves it into the shared history the next time this session runs on that \
+                 account while no other Claude uses it; switch after that"
+                    .into(),
+            ));
+        }
+
+        let fenced = {
+            let mut guard = gateway.lock().await;
+            let generation = guard.sessions.get(sid).map(|s| s.generation);
+            if generation != live.as_ref().map(|(generation, ..)| *generation) {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "the session just started or stopped; try again".into(),
+                ));
+            }
+            if let Some(session) = guard.sessions.get(sid) {
+                let in_flight = session
+                    .turn_started_at
+                    .lock()
+                    .map(|started| started.is_some())
+                    .unwrap_or(true);
+                if in_flight {
+                    return Err(ClaudeAccountSwitchError::Busy(
+                        "a turn is running; wait for it to finish or interrupt it first".into(),
+                    ));
+                }
+            }
+            if guard.pending.lock().await.pending_for_sid(sid).is_some() {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "the session is waiting for your decision; answer it first".into(),
+                ));
+            }
+            // Re-read under the lock so a concurrent rename is not lost.
+            let mut meta = guard
+                .session_catalog
+                .find_or_load(sid, &guard.projects)
+                .map(|entry| entry.meta)
+                .ok_or_else(|| ClaudeAccountSwitchError::UnknownSession(sid.to_string()))?;
+            meta.claude_account = next.clone();
+            guard.persist_session_meta(&cwd, &meta)?;
+            let fenced = generation.and_then(|generation| guard.fence_out_session(sid, generation));
+            if fenced.is_none() {
+                guard.emit_session_account_changed(sid, &slug);
+            }
+            fenced
+        };
+        let released = fenced.is_some();
+        if let Some((slug, adapter, thread)) = fenced {
+            Self::finish_release_shared(
+                gateway,
+                sid,
+                slug,
+                adapter,
+                thread,
+                ReleaseReason::AccountSwitch,
+            )
+            .await?;
+        }
+        tracing::info!(sid, %slug, released, "ccteam-im: switched Claude account");
+        Ok(ClaudeAccountSwitch {
+            claude_account: next.as_ref().map(ClaudeAccountBinding::display),
+            changed: true,
+            released,
+        })
     }
 
     /// How long a releasing session may take to report its account usage
@@ -19154,6 +19384,29 @@ impl Gateway {
     /// twin is `meta.json` itself, already written by the caller). Same frame
     /// family as [`Self::emit_session_evicted`], so the SPA's existing
     /// `session_lifecycle` listener refreshes the rail with no client change.
+    /// Lifecycle twin of an account switch on a session with no resident
+    /// process (a released one emits `evicted` instead); refreshes the rail
+    /// and the session header like a rename.
+    fn emit_session_account_changed(&self, sid: &str, slug: &str) {
+        self.emit_user_signal(GatewayEvent {
+            interim: false,
+            id: format!("session-account-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session account changed: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "account_changed".to_string(),
+                reason: "user".to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            status: None,
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
+    }
+
     fn emit_session_renamed(&self, sid: &str, slug: &str) {
         self.emit_user_signal(GatewayEvent {
             interim: false,
@@ -24826,6 +25079,208 @@ mod tests {
         }
     }
 
+    fn cswap_account(
+        slot: &str,
+        label: &str,
+    ) -> ccteam_harness::execution::claude_accounts::CswapAccount {
+        ccteam_harness::execution::claude_accounts::CswapAccount {
+            id: ccteam_harness::execution::claude_accounts::account_id(
+                &format!("{label}@example.test"),
+                "",
+            ),
+            slot: slot.into(),
+            label: label.into(),
+            active: false,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            usage_status: None,
+        }
+    }
+
+    async fn account_session(
+        tmp: &std::path::Path,
+        vendor: AgentVendor,
+        account: Option<String>,
+    ) -> (Arc<FakeAdapter>, Arc<tokio::sync::Mutex<Gateway>>, String) {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp);
+        let created = gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                String::new(),
+                vendor,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    claude_account: account,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        (
+            fake,
+            Arc::new(tokio::sync::Mutex::new(gateway)),
+            created.sid,
+        )
+    }
+
+    async fn stored_account(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        sid: &str,
+    ) -> Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding> {
+        let guard = gateway.lock().await;
+        guard
+            .session_catalog
+            .find_or_load(sid, &guard.projects)
+            .unwrap()
+            .meta
+            .claude_account
+    }
+
+    /// #236 — a switch rebinds the SAME sid and releases its process; the
+    /// next resume runs under the new account, and back to the default login.
+    #[tokio::test]
+    async fn claude_account_switch_rebinds_the_sid_and_resumes_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+
+        let same = Gateway::switch_claude_account_shared(&gateway, &sid, Some(one.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !same.changed && !same.released,
+            "the current account is a no-op"
+        );
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        let switched = Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone()))
+            .await
+            .unwrap();
+        assert!(switched.changed && switched.released);
+        let shown = switched.claude_account.unwrap();
+        assert_eq!((shown.slot.as_str(), shown.label.as_str()), ("2", "work"));
+        assert!(
+            !gateway.lock().await.sessions.contains_key(&sid),
+            "the process is released, the session is not"
+        );
+        let stored = stored_account(&gateway, &sid).await.unwrap();
+        assert_eq!(stored.id, two.id);
+        assert_eq!(
+            stored.config_dir, None,
+            "the next launch confirms the profile"
+        );
+
+        Gateway::resume_stopped_session_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "user:web-api",
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.spawn_accounts.lock().await.last().cloned(),
+            Some(Some(two.id.clone())),
+            "the same sid resumes under the new account"
+        );
+
+        let default = Gateway::switch_claude_account_shared(&gateway, &sid, None)
+            .await
+            .unwrap();
+        assert!(default.changed && default.released && default.claude_account.is_none());
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+        // Not resident any more: a further switch only rebinds.
+        let again = Gateway::switch_claude_account_shared(&gateway, &sid, Some(one.clone()))
+            .await
+            .unwrap();
+        assert!(again.changed && !again.released);
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+    }
+
+    /// #236 — refusals leave the binding and the process exactly as they were.
+    #[tokio::test]
+    async fn claude_account_switch_refuses_without_touching_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = cswap_account("2", "work");
+        let (_fake, gateway, sid) = account_session(tmp.path(), AgentVendor::Claude, None).await;
+
+        // Mid-turn: releasing would cut the turn short.
+        let started = {
+            let guard = gateway.lock().await;
+            let session = guard.sessions.get(&sid).unwrap();
+            *session.turn_started_at.lock().unwrap() = Some(Instant::now());
+            Arc::clone(&session.turn_started_at)
+        };
+        let busy = Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone())).await;
+        assert!(
+            matches!(busy, Err(ClaudeAccountSwitchError::Busy(_))),
+            "{busy:?}"
+        );
+        *started.lock().unwrap() = None;
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+
+        // History only in the current account's private profile: another
+        // account would resume nothing and start the conversation over.
+        let mut private =
+            ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(
+                cswap_account("3", "solo").id,
+            )
+            .unwrap();
+        private.config_dir = Some(tmp.path().join("profile-3"));
+        let uuid = {
+            let guard = gateway.lock().await;
+            let mut meta = guard
+                .session_catalog
+                .find_or_load(&sid, &guard.projects)
+                .unwrap()
+                .meta;
+            meta.claude_account = Some(private.clone());
+            guard.persist_session_meta(tmp.path(), &meta).unwrap();
+            if meta.vendor_uuid.is_empty() {
+                ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid(
+                    "alpha", &sid,
+                )
+            } else {
+                meta.vendor_uuid
+            }
+        };
+        let transcript = ccteam_harness::execution::transcript_tail::anthropic_project_dir_in(
+            &tmp.path().join("profile-3/projects"),
+            tmp.path(),
+        );
+        std::fs::create_dir_all(&transcript).unwrap();
+        std::fs::write(transcript.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+        let private_history =
+            Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone())).await;
+        assert!(
+            matches!(private_history, Err(ClaudeAccountSwitchError::Refused(_))),
+            "{private_history:?}"
+        );
+        assert_eq!(stored_account(&gateway, &sid).await, Some(private));
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        // Only a local Claude stream-json session runs through cswap.
+        let other = tempfile::tempdir().unwrap();
+        let (_fake, codex, codex_sid) =
+            account_session(other.path(), AgentVendor::Codex, None).await;
+        let unsupported =
+            Gateway::switch_claude_account_shared(&codex, &codex_sid, Some(two)).await;
+        assert!(
+            matches!(unsupported, Err(ClaudeAccountSwitchError::Unsupported(_))),
+            "{unsupported:?}"
+        );
+        assert!(matches!(
+            Gateway::switch_claude_account_shared(&codex, "s404", None).await,
+            Err(ClaudeAccountSwitchError::UnknownSession(_))
+        ));
+    }
+
     #[tokio::test]
     async fn cswap_selection_needs_no_grant_but_only_runs_local_stream_json() {
         let tmp = tempfile::tempdir().unwrap();
@@ -25999,6 +26454,8 @@ mod tests {
         /// `SpawnCtx::generation` captured per start_thread, so a test can assert
         /// the thread was stamped with the generation the live map installs.
         spawn_generations: Arc<Mutex<Vec<u64>>>,
+        /// #236 — the cswap account id (`None` = default login) per start_thread.
+        spawn_accounts: Arc<Mutex<Vec<Option<String>>>>,
         /// #203 — when set, every `start_thread` reports this id as
         /// `raw_extras.vendor_uuid` (a vendor whose resume ladder fell back to
         /// a fresh thread). `None` = no vendor id (the default `{}` extras).
@@ -26156,6 +26613,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 spawn_generations: Arc::new(Mutex::new(Vec::new())),
+                spawn_accounts: Arc::new(Mutex::new(Vec::new())),
                 next_vendor_uuid: Arc::new(std::sync::Mutex::new(None)),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
@@ -26535,6 +26993,11 @@ mod tests {
                 .await
                 .push((ctx.model_id.clone(), ctx.effort.clone()));
             self.spawn_generations.lock().await.push(ctx.generation);
+            self.spawn_accounts.lock().await.push(
+                ctx.claude_account
+                    .as_ref()
+                    .map(|account| account.id.clone()),
+            );
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
             let raw_extras = match self.next_vendor_uuid.lock().unwrap().as_deref() {

@@ -182,17 +182,16 @@ pub fn anthropic_project_dir(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve a managed sid's bound Claude profile for reads that outlive its
-/// process (recovery, titles). An unreadable binding must never fall back to
-/// another account's history.
+/// process (recovery, titles). A confirmed profile is read as recorded. A
+/// binding no launch has confirmed yet (a new session, or one that just
+/// switched accounts) reads cswap's shared history: switching is only allowed
+/// once the transcript is there (#236).
 pub fn anthropic_bound_project_dir(
     cwd: &Path,
     account: Option<&super::claude_accounts::ClaudeAccountBinding>,
 ) -> Option<PathBuf> {
-    match account {
-        Some(account) => Some(anthropic_project_dir_in(
-            &account.config_dir.as_ref()?.join("projects"),
-            cwd,
-        )),
+    match account.and_then(|account| account.config_dir.as_ref()) {
+        Some(config_dir) => Some(anthropic_project_dir_in(&config_dir.join("projects"), cwd)),
         None => anthropic_project_dir(cwd),
     }
 }

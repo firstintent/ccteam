@@ -572,6 +572,8 @@ button { font-family: inherit; cursor: pointer; }
 .account-row .quota-stale { color: var(--text-faint); font-size: 11px; }
 .account-row .sub, .account-row .check { margin-left: 0; padding-left: 0; }
 .account-menu .account-note { margin: 4px 10px 6px; max-width: 18rem; font-size: 11.5px; line-height: 1.45; color: var(--text-muted); white-space: normal; }
+.account-menu .account-note.err { color: var(--red-text); }
+.account-menu .sel-item[disabled] { opacity: .55; cursor: progress; }
 .account-menu .account-retry { color: #0E7490; }
 html.dark .account-menu .account-retry { color: #67e8f9; }
 /* Phones: the row must keep mic + send on screen, so labels yield first —

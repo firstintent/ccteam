@@ -537,6 +537,34 @@ for (const state of ["missing", "installed"] as const) {
   });
 }
 
+test("a running Claude session names its account and switches it in place (#236)", async ({ page }) => {
+  const captured = await mockCcteamApi(page);
+  const cloud = { id: "a".repeat(64), slot: "1", label: "cloud", active: true, seven_day_pct: 40 };
+  const work = { id: "b".repeat(64), slot: "2", label: "work", active: false, five_hour_pct: 11, seven_day_pct: 100 };
+  await page.route("**/api/v1/vendors/claude/accounts", route =>
+    route.fulfill({ json: { available: true, accounts: [cloud, work] } }));
+  await page.route("**/api/v1/sessions/s1/claude-account", route => {
+    captured.push({ url: route.request().url(), method: route.request().method(), body: route.request().postDataJSON() });
+    return route.fulfill({ json: { sid: "s1", claude_account: { ...work, five_hour_pct: undefined, seven_day_pct: undefined },
+      changed: true, released: true } });
+  });
+  await page.goto("/app/chat/s/s1");
+  await expect(page.getByTestId("conversation-view")).toBeVisible();
+  const accountBtn = page.getByTestId("claude-account-btn");
+  // A default-login session says which cswap account that login is now.
+  await expect(accountBtn).toHaveText("默认 · #1 cloud");
+  await expect(page.getByTestId("session-claude-account")).toHaveCount(0);
+  await accountBtn.click();
+  const menu = page.getByTestId("claude-account-menu");
+  await expect(menu).toContainText("下一条消息在同一会话里按新账号继续");
+  await menu.getByRole("menuitemradio", { name: /#2 work/ }).click();
+  await expect(menu).toBeHidden();
+  const put = captured.find(row => row.url.endsWith("/api/v1/sessions/s1/claude-account"));
+  expect(put).toMatchObject({ method: "PUT", body: { claude_account: work.id } });
+  await expect(accountBtn).toHaveText("#2 work");
+  await expect(page.getByTestId("session-claude-account")).toHaveText("#2 work");
+});
+
 test("cswap account control fits the composer row on a phone", async ({ page }) => {
   await mockCcteamApi(page);
   await page.setViewportSize({ width: 390, height: 844 });

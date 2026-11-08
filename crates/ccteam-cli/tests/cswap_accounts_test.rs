@@ -44,20 +44,30 @@ if sys.argv[1:]==['list','--json']:
     print(json.dumps({'schemaVersion':1,'accounts':[{'number':2,'email':os.environ.get('CSWAP_FAKE_ACCOUNT_EMAIL','two@example.test'),'organizationUuid':'','alias':'work','active':os.environ.get('CSWAP_FAKE_ACTIVE')=='1'}]}))
     sys.exit(0)
 if sys.argv[1:]==['run','--help']:
-    print('--no-share-history --require-session')
+    print('--share-history --no-share-history --require-session')
     sys.exit(0)
 if sys.argv[1:]==['config','list','--json']:
     print(json.dumps({'schemaVersion':1,'settings':[]}))
     sys.exit(0)
 assert sys.argv[1:3]==['run','2']
-assert '--no-share-history' in sys.argv
+assert '--share-history' in sys.argv and '--no-share-history' not in sys.argv
 active=os.environ.get('CSWAP_FAKE_ACTIVE')=='1'
 if active and '--require-session' in sys.argv:
     sys.exit(4)
 env=dict(os.environ)
 if not active:
-    profile=Path.home()/'cswap-profiles'/'two'
+    # Shared history links the profile's projects/ to ~/.claude/projects;
+    # a deferred share (profile busy) leaves the profile's own directory.
+    deferred=os.environ.get('CSWAP_FAKE_DEFER_SHARE')=='1'
+    profile=Path.home()/'cswap-profiles'/('two-private' if deferred else 'two')
     profile.mkdir(parents=True,exist_ok=True)
+    shared=Path.home()/'.claude'/'projects'
+    shared.mkdir(parents=True,exist_ok=True)
+    projects=profile/'projects'
+    if deferred:
+        projects.mkdir(exist_ok=True)
+    elif not projects.is_symlink():
+        projects.symlink_to(shared)
     env['CLAUDE_CONFIG_DIR']=str(profile)
     for key in ['ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN']:
         env.pop(key,None)
@@ -218,6 +228,59 @@ async fn account_launches_preserve_protocol_profiles_and_default_optional_behavi
             .as_ref()
     );
     adapter.close_thread(&resumed).await.unwrap();
+
+    // #236 — cswap's shared history makes the sid portable across accounts:
+    // the same transcript resumes on the default login and back on slot 2.
+    let resumed_with = |root: &Path| {
+        log(root)["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == selected.identity.as_str())
+    };
+    let on_default = adapter
+        .start_thread(&spec, &ctx(root, "s2", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        log(root)["profile"],
+        home.join(".claude").to_string_lossy().as_ref()
+    );
+    assert!(
+        resumed_with(root),
+        "default login resumes the shared transcript"
+    );
+    adapter.close_thread(&on_default).await.unwrap();
+    let back = adapter
+        .start_thread(&spec, &ctx(root, "s2", Some(requested.clone())))
+        .await
+        .unwrap();
+    assert_eq!(
+        log(root)["profile"],
+        home.join("cswap-profiles/two").to_string_lossy().as_ref()
+    );
+    assert!(
+        resumed_with(root),
+        "the account resumes the same transcript"
+    );
+    adapter.close_thread(&back).await.unwrap();
+
+    // History cswap has not shared into the target profile yet must never
+    // start the conversation over: the launch fails before Claude runs.
+    std::env::set_var("CSWAP_FAKE_DEFER_SHARE", "1");
+    let before = log(root);
+    let refused = adapter
+        .start_thread(&spec, &ctx(root, "s2", Some(requested.clone())))
+        .await;
+    let reason = refused.expect_err("a hidden transcript must not start fresh");
+    assert!(
+        reason
+            .to_string()
+            .contains("not visible in the selected account"),
+        "the refusal names its reason: {reason}"
+    );
+    assert_eq!(log(root), before, "no Claude process may start fresh");
+    std::env::remove_var("CSWAP_FAKE_DEFER_SHARE");
 
     // A movable slot is not an account identity. Replacing slot 2 fails closed.
     std::env::set_var("CSWAP_FAKE_ACCOUNT_EMAIL", "replacement@example.test");

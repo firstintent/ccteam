@@ -28,7 +28,7 @@ async fn every_identity_discovers_every_local_account_without_a_grant() {
     let second = account_id("two@example.test", "");
     let calls = tmp.path().join("calls");
     let cswap = tmp.path().join("cswap");
-    std::fs::write(&cswap, format!("#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = run ]; then echo '--no-share-history --require-session'; exit 0; fi\nif [ \"$1\" = config ]; then echo '{{\"schemaVersion\":1,\"settings\":[]}}'; exit 0; fi\nprintf '%s\\n' '{{\"schemaVersion\":1,\"accounts\":[{{\"number\":1,\"email\":\"one@example.test\"}},{{\"number\":2,\"email\":\"two@example.test\"}}]}}'\n", calls.display())).unwrap();
+    std::fs::write(&cswap, format!("#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = run ]; then echo '--share-history --no-share-history --require-session'; exit 0; fi\nif [ \"$1\" = config ]; then echo '{{\"schemaVersion\":1,\"settings\":[]}}'; exit 0; fi\nprintf '%s\\n' '{{\"schemaVersion\":1,\"accounts\":[{{\"number\":1,\"email\":\"one@example.test\"}},{{\"number\":2,\"email\":\"two@example.test\"}}]}}'\n", calls.display())).unwrap();
     std::fs::set_permissions(&cswap, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::env::set_var("CCTEAM_CSWAP_BIN", &cswap);
     let mut gateway = Gateway::new(
@@ -88,4 +88,121 @@ async fn every_identity_discovers_every_local_account_without_a_grant() {
         401,
         "discovery still sits behind the web-token gate"
     );
+
+    // #236 — switching a session's account. A released Claude session only
+    // rebinds (nothing spawns); its next message resumes under the account.
+    use ccteam_harness::execution::session_meta::{
+        read_session_meta, write_session_meta, SessionMeta, SessionOrigin,
+    };
+    use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
+    let state = paths.project_state("project");
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    ccteam_core::ProjectState::initial("project".into())
+        .save(&state)
+        .unwrap();
+    write_session_meta(
+        tmp.path(),
+        &SessionMeta {
+            claude_account: None,
+            model_pinned_generation: None,
+            mode: None,
+            tool_face: None,
+            managed_by: Default::default(),
+            stopped_at: None,
+            sid: "s7".into(),
+            slug: "project".into(),
+            vendor: AgentVendor::Claude,
+            protocol: SessionProtocol::StreamJson,
+            role: String::new(),
+            permission_mode: PermissionMode::Skip,
+            owner: "user:web-api".into(),
+            vendor_uuid: String::new(),
+            model: None,
+            observed_model: None,
+            effort: None,
+            host: "local".into(),
+            created_at: "2026-11-08T00:00:00Z".into(),
+            last_active: "2026-11-08T00:00:00Z".into(),
+            origin: SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
+            tokens_total: None,
+            role_sha: None,
+            skills_sha: None,
+            trigger: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
+        },
+    )
+    .unwrap();
+    let switch = |sid: &str, account: serde_json::Value, token: Option<&str>| {
+        let request = client
+            .put(format!(
+                "http://{address}/api/v1/sessions/{sid}/claude-account"
+            ))
+            .json(&serde_json::json!({ "claude_account": account }));
+        match token {
+            Some(token) => request.bearer_auth(format!("ccteam:{token}")),
+            None => request,
+        }
+        .send()
+    };
+    let status = |response: reqwest::Response| response.status().as_u16();
+    assert_eq!(
+        status(switch("s7", serde_json::Value::Null, None).await.unwrap()),
+        401
+    );
+    assert_eq!(
+        status(
+            switch("s404", serde_json::Value::Null, Some(admin))
+                .await
+                .unwrap()
+        ),
+        404
+    );
+    assert_eq!(
+        status(
+            switch("s7", "f".repeat(64).into(), Some(admin))
+                .await
+                .unwrap()
+        ),
+        422,
+        "only an account cswap lists can be chosen"
+    );
+    let switched: serde_json::Value = switch("s7", second.clone().into(), Some(admin))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(switched["changed"], true);
+    assert_eq!(
+        switched["released"], false,
+        "a released session only rebinds"
+    );
+    assert_eq!(switched["claude_account"]["slot"], "2");
+    assert_eq!(switched["claude_account"]["label"], "two");
+    let stored = read_session_meta(tmp.path(), "s7")
+        .unwrap()
+        .claude_account
+        .unwrap();
+    assert_eq!(
+        (stored.id.as_str(), stored.config_dir),
+        (second.as_str(), None)
+    );
+    let default: serde_json::Value = switch("s7", serde_json::Value::Null, Some(admin))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(default["changed"], true);
+    assert!(default["claude_account"].is_null());
+    assert!(read_session_meta(tmp.path(), "s7")
+        .unwrap()
+        .claude_account
+        .is_none());
 }

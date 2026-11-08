@@ -86,6 +86,41 @@ impl ClaudeAccountBinding {
     }
 }
 
+/// Whether a sid's Claude transcript stays readable after the session moves
+/// to another account (#236). cswap's shared history links every profile's
+/// `projects/` to `~/.claude/projects`; a transcript that exists only in one
+/// account's private profile (written before sharing, or while cswap
+/// deferred merging it) would be invisible elsewhere, and resuming there
+/// would start the conversation over.
+pub fn history_follows_switch(cwd: &Path, uuid: &str, from: Option<&ClaudeAccountBinding>) -> bool {
+    dirs::home_dir().is_some_and(|home| {
+        history_follows_switch_in(&home.join(".claude").join("projects"), cwd, uuid, from)
+    })
+}
+
+/// [`history_follows_switch`] against an explicit shared projects root.
+pub fn history_follows_switch_in(
+    shared_projects: &Path,
+    cwd: &Path,
+    uuid: &str,
+    from: Option<&ClaudeAccountBinding>,
+) -> bool {
+    let file = format!("{uuid}.jsonl");
+    if anthropic_project_dir_in(shared_projects, cwd)
+        .join(&file)
+        .exists()
+    {
+        return true;
+    }
+    // Not shared: only safe when the current profile holds no history either.
+    from.and_then(|binding| binding.config_dir.as_ref())
+        .is_none_or(|dir| {
+            !anthropic_project_dir_in(&dir.join("projects"), cwd)
+                .join(&file)
+                .exists()
+        })
+}
+
 pub fn account_id(email: &str, organization: &str) -> String {
     let identity = serde_json::to_vec(&(email, organization)).expect("string pair serializes");
     format!("{:x}", Sha256::digest(identity))
@@ -172,8 +207,8 @@ pub fn cswap_bin() -> OsString {
 pub async fn discover_accounts() -> Result<Vec<CswapAccount>> {
     let help = cswap_output(&["run", "--help"], Duration::from_secs(5)).await?;
     let help = String::from_utf8_lossy(&help);
-    if !help.contains("--no-share-history") || !help.contains("--require-session") {
-        bail!("this cswap version lacks account-isolation options; upgrade cswap or use default login");
+    if !help.contains("--share-history") || !help.contains("--require-session") {
+        bail!("this cswap version lacks shared-history or session options; upgrade cswap or use default login");
     }
     // Newer cswap versions optionally infer setup-token quota using a tiny
     // model request. Discovery must not create inference outside a session.
@@ -354,16 +389,22 @@ impl CswapLaunch {
                 launch.directory.to_string_lossy().into_owned(),
             ),
         ]);
-        // A prior default fallback is a normal default-profile session forever;
-        // re-running its old slot after auto switched would move its history.
+        // A prior default fallback stays a default-profile session that follows
+        // cswap auto; re-running its old slot would quietly pin it instead.
         if binding.default_login {
             launch.argv = vec![entry.to_string_lossy().into_owned()];
         } else {
+            // cswap's shared history (its default since 1.0) links every
+            // profile's `projects/` to `~/.claude/projects`, so a sid's
+            // transcript is readable from any account and the session can
+            // switch accounts by sid (#236). Credentials stay per profile.
+            // Explicit, so a user-wide `run.shareHistory false` cannot strand
+            // a switched session's history in one account.
             launch.argv = vec![
                 cswap_bin().to_string_lossy().into_owned(),
                 "run".into(),
                 binding.slot,
-                "--no-share-history".into(),
+                "--share-history".into(),
             ];
             if binding.config_dir.is_some() {
                 launch.argv.push("--require-session".into());
@@ -372,6 +413,14 @@ impl CswapLaunch {
         }
         launch.argv.extend_from_slice(&argv[1..]);
         Ok(launch)
+    }
+
+    /// Why the relay refused this launch, if it did.
+    pub fn failure(&self) -> Option<String> {
+        std::fs::read_to_string(self.directory.join(FAILURE_FILE))
+            .ok()
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty())
     }
 
     pub fn binding(&self) -> Result<ClaudeAccountBinding> {
@@ -385,6 +434,19 @@ impl CswapLaunch {
 pub fn run_relay(args: &[OsString]) -> Result<()> {
     let directory =
         PathBuf::from(std::env::var_os(RELAY_ENV).context("cswap relay is not configured")?);
+    let result = relay(&directory, args);
+    // The daemon discards a launch's stderr (Claude's debug stream), so a
+    // refusal leaves its reason where the launch can read it back and say
+    // why the session did not start. Reasons never carry credentials.
+    if let Err(error) = &result {
+        let _ = std::fs::write(directory.join(FAILURE_FILE), format!("{error:#}"));
+    }
+    result
+}
+
+const FAILURE_FILE: &str = "failure.txt";
+
+fn relay(directory: &Path, args: &[OsString]) -> Result<()> {
     let request: LaunchRequest =
         serde_json::from_slice(&std::fs::read(directory.join("request.json"))?)?;
     let real_bin = std::env::var_os(REAL_BIN_ENV).context("cswap relay has no Claude binary")?;
@@ -498,7 +560,19 @@ pub fn run_relay(args: &[OsString]) -> Result<()> {
         .iter()
         .position(|arg| arg == "--session-id" || arg == "--resume")
         .context("cswap relay has no session UUID argument")?;
-    args[flag] = if transcript.exists() {
+    let has_transcript = transcript.exists();
+    // The daemon asks for `--resume` only when it saw this sid's transcript.
+    // Not finding it in the profile cswap prepared (history sharing deferred
+    // while another Claude still used that profile's own history) must not
+    // silently start the conversation over (#236).
+    if args[flag] == "--resume" && !has_transcript {
+        bail!(
+            "this conversation's history is not visible in the selected account's profile yet \
+             (cswap shares history once no other Claude uses that profile); the session and \
+             its history were kept, retry later or switch back"
+        );
+    }
+    args[flag] = if has_transcript {
         "--resume"
     } else {
         "--session-id"
@@ -724,6 +798,36 @@ mod tests {
         )
         .unwrap();
         assert!(verify_subscription_settings(&profile, &project).is_ok());
+    }
+
+    #[test]
+    fn history_follows_a_switch_only_from_shared_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let shared = tmp.path().join("home/.claude/projects");
+        let private = tmp.path().join("cswap/sessions/3-a");
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let mut bound = ClaudeAccountBinding::requested("a".repeat(64)).unwrap();
+        bound.config_dir = Some(private.clone());
+        let write = |root: &Path| {
+            let dir = anthropic_project_dir_in(root, &cwd);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+        };
+        // No transcript anywhere yet: nothing to lose.
+        assert!(history_follows_switch_in(&shared, &cwd, uuid, Some(&bound)));
+        assert!(history_follows_switch_in(&shared, &cwd, uuid, None));
+        // Only in the private profile: another account would start over.
+        write(&private.join("projects"));
+        assert!(!history_follows_switch_in(
+            &shared,
+            &cwd,
+            uuid,
+            Some(&bound)
+        ));
+        // Once cswap shares it, every account reads the same transcript.
+        write(&shared);
+        assert!(history_follows_switch_in(&shared, &cwd, uuid, Some(&bound)));
     }
 
     #[test]

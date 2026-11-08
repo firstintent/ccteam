@@ -2044,6 +2044,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 launch.as_ref().map(|launch| launch.env.as_slice()).unwrap_or(&env), &ctx.cwd, body)
                 .await
                 .map_err(|err| {
+                    // A relay refusal (profile/identity drift, history not
+                    // visible yet, auth override) is the real reason.
+                    let err = match launch.as_ref().and_then(CswapLaunch::failure) {
+                        Some(reason) => HarnessError::SpawnFailed(format!("cswap: {reason}")),
+                        None => err,
+                    };
                     if !resume {
                         return err;
                     }

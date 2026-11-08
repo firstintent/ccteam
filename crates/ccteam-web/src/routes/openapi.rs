@@ -276,6 +276,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_session_history,
             super::sessions_api::handle_patch_session
         ))
+        // #236 — move a session to another cswap account / the default login.
+        .routes(routes!(super::sessions_api::handle_switch_claude_account))
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_context))
         .routes(routes!(super::sessions_api::handle_session_turn))
