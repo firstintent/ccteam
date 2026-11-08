@@ -64,6 +64,9 @@ pub struct VendorModels {
     pub source: Option<String>,
     /// Observed model ids; `[]` when never observed (NOT "has no models").
     pub models: Vec<ModelEntry>,
+    /// The concrete id the vendor runs when no model is requested (what the
+    /// picker's default row stands for); `null` until observed.
+    pub default_model: Option<String>,
     /// Reasoning-effort ladder offered for this vendor: vendor-declared when
     /// its handshake said so, else the CLI-verified fallback. Empty means
     /// ccteam knows of no effort axis for this vendor (OpenCode today).
@@ -109,6 +112,7 @@ pub(crate) async fn handle_models(State(app): State<AppState>) -> impl IntoRespo
                             .collect()
                     })
                     .unwrap_or_default(),
+                default_model: entry.and_then(|e| e.default_model.clone()),
                 // Deliberately the harness helper rather than a local fold
                 // over `entry.models`: the "vendor-declared, else pinned
                 // fallback" precedence has ONE home, and a web-local copy

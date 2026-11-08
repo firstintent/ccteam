@@ -53,7 +53,9 @@ export interface ProjectHostIdentity {
   online: boolean;
 }
 
-const MODEL_DRAFT_KEY = "ccteam.home.model.v1";
+// v2: the default became claude · opus · high (owner 2026-11-08); a v1
+// draft would keep pinning the old vendor-default pick.
+const MODEL_DRAFT_KEY = "ccteam.home.model.v2";
 
 /** Load the persisted draft without consulting the advisory live catalog.
  * Render-time structural normalization drops retired keys and repairs the

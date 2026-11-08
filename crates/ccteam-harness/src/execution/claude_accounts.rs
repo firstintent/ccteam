@@ -24,8 +24,21 @@ const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 pub struct CswapAccount {
     pub id: String,
     pub slot: String,
+    /// cswap alias, else the email's local part. The domain never leaves
+    /// the daemon (owner 2026-11-08: number + name + quota only).
     pub label: String,
     pub active: bool,
+    /// Rolling 5-hour window, whole percent. Absent for plans without one
+    /// (Max) and whenever cswap has no reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_pct: Option<u16>,
+    /// Weekly window, whole percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_pct: Option<u16>,
+    /// cswap's `usageStatus` when it is not `ok` (e.g. `relogin_required`).
+    /// With percentages present they are cswap's last good reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_status: Option<String>,
 }
 
 /// Private session metadata. `config_dir` is the literal path exported by
@@ -66,6 +79,9 @@ impl ClaudeAccountBinding {
             slot: self.slot.clone(),
             label: self.label.clone(),
             active: self.default_login,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            usage_status: None,
         }
     }
 }
@@ -103,14 +119,26 @@ pub fn parse_accounts(bytes: &[u8]) -> Result<Vec<CswapAccount>> {
             .filter(|n| *n > 0)
             .context("cswap account has no slot")?
             .to_string();
-        let alias = row["alias"].as_str().filter(|s| !s.trim().is_empty());
-        let masked = email
-            .split_once('@')
-            .map(|(name, domain)| format!("{}***@{domain}", name.chars().next().unwrap_or('*')))
-            .unwrap_or_else(|| "***".into());
-        let label = alias
-            .map(|alias| format!("{alias} ({masked})"))
-            .unwrap_or(masked);
+        let label = row["alias"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| email.split_once('@').map_or(email, |(name, _)| name))
+            .to_string();
+        // Live reading first; cswap keeps the last good one when a fetch fails.
+        let usage = Some(&row["usage"])
+            .filter(|u| u.is_object())
+            .or_else(|| Some(&row["lastGoodUsage"]).filter(|u| u.is_object()));
+        let pct = |window: &str| {
+            usage
+                .and_then(|u| u[window]["pct"].as_f64())
+                .filter(|p| p.is_finite())
+                .map(|p| p.clamp(0.0, 999.0).round() as u16)
+        };
+        let usage_status = row["usageStatus"]
+            .as_str()
+            .filter(|status| *status != "ok")
+            .map(str::to_string);
         let id = account_id(email, org);
         if accounts
             .insert(
@@ -120,6 +148,9 @@ pub fn parse_accounts(bytes: &[u8]) -> Result<Vec<CswapAccount>> {
                     slot,
                     label,
                     active: row["active"].as_bool().unwrap_or(false),
+                    five_hour_pct: pct("fiveHour"),
+                    seven_day_pct: pct("sevenDay"),
+                    usage_status,
                 },
             )
             .is_some()
@@ -127,7 +158,9 @@ pub fn parse_accounts(bytes: &[u8]) -> Result<Vec<CswapAccount>> {
             bail!("cswap contains duplicate account identities; repair its account list first");
         }
     }
-    Ok(accounts.into_values().collect())
+    let mut accounts: Vec<_> = accounts.into_values().collect();
+    accounts.sort_by_key(|account| account.slot.parse::<u64>().unwrap_or(u64::MAX));
+    Ok(accounts)
 }
 
 pub fn cswap_bin() -> OsString {
@@ -592,17 +625,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_references_are_identity_based_and_labels_are_redacted() {
+    fn account_references_are_identity_based_and_labels_drop_the_domain() {
         let body = br#"{"schemaVersion":1,"accounts":[{"number":2,"email":"alice@example.test","organizationUuid":"org","alias":"work","active":false}]}"#;
         let account = parse_accounts(body).unwrap().pop().unwrap();
         assert_eq!(account.id, account_id("alice@example.test", "org"));
-        assert_eq!(account.label, "work (a***@example.test)");
-        assert!(!serde_json::to_string(&account).unwrap().contains("alice@"));
+        assert_eq!(account.label, "work");
+        assert!(!serde_json::to_string(&account)
+            .unwrap()
+            .contains("example.test"));
+        let unaliased = String::from_utf8(body.to_vec())
+            .unwrap()
+            .replace(",\"alias\":\"work\"", "");
+        assert_eq!(
+            parse_accounts(unaliased.as_bytes()).unwrap()[0].label,
+            "alice"
+        );
         let moved = String::from_utf8(body.to_vec())
             .unwrap()
             .replace("\"number\":2", "\"number\":7");
         assert_eq!(parse_accounts(moved.as_bytes()).unwrap()[0].id, account.id);
         assert_ne!(account.id, account_id("alice@example.test", "another-org"));
+    }
+
+    #[test]
+    fn quota_windows_follow_the_plan_and_rows_sort_by_slot() {
+        let body = br#"{"schemaVersion":1,"accounts":[
+            {"number":10,"email":"stale@x","usageStatus":"unavailable","usage":null,"lastGoodUsage":{"fiveHour":{"pct":40.4},"sevenDay":{"pct":60}}},
+            {"number":5,"email":"sddenter@x","usageStatus":"ok","usage":{"sevenDay":{"pct":100.0}}},
+            {"number":1,"email":"cloud@x","usageStatus":"ok","usage":{"fiveHour":{"pct":10.6},"sevenDay":{"pct":100}}},
+            {"number":6,"email":"gone@x","usageStatus":"relogin_required","usage":null}
+        ]}"#;
+        let accounts = parse_accounts(body).unwrap();
+        let slots: Vec<_> = accounts.iter().map(|a| a.slot.as_str()).collect();
+        assert_eq!(
+            slots,
+            ["1", "5", "6", "10"],
+            "numeric slot order, not id order"
+        );
+        let cloud = &accounts[0];
+        assert_eq!(
+            (cloud.five_hour_pct, cloud.seven_day_pct),
+            (Some(11), Some(100))
+        );
+        assert_eq!(cloud.usage_status, None);
+        let max = &accounts[1];
+        assert_eq!(max.label, "sddenter");
+        assert_eq!(
+            (max.five_hour_pct, max.seven_day_pct),
+            (None, Some(100)),
+            "a plan without a 5h window reports only the weekly one"
+        );
+        let gone = &accounts[2];
+        assert_eq!((gone.five_hour_pct, gone.seven_day_pct), (None, None));
+        assert_eq!(gone.usage_status.as_deref(), Some("relogin_required"));
+        let stale = &accounts[3];
+        assert_eq!(
+            (stale.five_hour_pct, stale.seven_day_pct),
+            (Some(40), Some(60))
+        );
+        assert_eq!(stale.usage_status.as_deref(), Some("unavailable"));
+        let wire = serde_json::to_value(max).unwrap();
+        assert!(wire.get("five_hour_pct").is_none());
     }
 
     #[test]

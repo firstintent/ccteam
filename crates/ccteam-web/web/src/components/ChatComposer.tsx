@@ -48,8 +48,11 @@ import type { VendorCatalog } from "../lib/modelsApi";
 import {
   effortRowLabel,
   effortRowsFor,
+  MODEL_DEFAULT,
+  modelRowLabel,
   modelRowsFor,
   selectDraftModel,
+  switchDraftVendor,
   vendorSpec,
   visibleProtocols,
   VENDORS,
@@ -401,6 +404,7 @@ export function ChatComposer({
   const catalog = catalogOverride ?? fetchedCatalog;
   const [text, setText] = useState(() => loadDraft(draftKey));
   const [menuOpen, setMenuOpen] = useState(false);
+  const [vendorOpen, setVendorOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -416,6 +420,7 @@ export function ChatComposer({
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
+  const vendorRef = useRef<HTMLDivElement | null>(null);
   const attachRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
@@ -463,20 +468,23 @@ export function ChatComposer({
     autoGrow();
   }, [text, autoGrow]);
 
-  // Close either menu on any outside click.
+  // Close any menu on an outside click; a click inside one menu still closes
+  // its siblings (each menu button stops propagation, so they handle that).
   useEffect(() => {
-    if (!menuOpen && !attachOpen) return;
+    if (!menuOpen && !attachOpen && !vendorOpen) return;
     const close = (e: MouseEvent) => {
       const target = e.target instanceof Node ? e.target : null;
       if (target && selRef.current?.contains(target)) return;
+      if (target && vendorRef.current?.contains(target)) return;
       if (target && attachRef.current?.contains(target)) return;
       setMenuOpen(false);
+      setVendorOpen(false);
       setAttachOpen(false);
       setSkillsOpen(false);
     };
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
-  }, [menuOpen, attachOpen]);
+  }, [menuOpen, attachOpen, vendorOpen]);
 
   // ---- attachments -----------------------------------------------------------
 
@@ -702,6 +710,19 @@ export function ChatComposer({
     setMenuOpen(false);
   };
 
+  const pickVendor = (vendor: VendorId) => {
+    setVendorOpen(false);
+    if (locked) {
+      toastBus.handler?.info(
+        lang === "en"
+          ? "The harness is fixed for this session — start a new session to change it."
+          : "本会话的 vendor 已固定 —— 新建会话可更换。",
+      );
+      return;
+    }
+    onDraftChange(switchDraftVendor(draft, vendor));
+  };
+
   /** `effort` is the vendor's own token, verbatim; `""` = vendor default. */
   const pickEffort = (effort: string) => {
     if (locked) {
@@ -723,9 +744,15 @@ export function ChatComposer({
   };
 
   const spec = vendorSpec(draft.vendor);
-  // Vendor is ALWAYS spelled out next to the model — a bare "默认"/"opus"
-  // plus a colored dot left the harness unreadable (owner feedback).
-  const modelText = modelLabel ?? draft.model;
+  // The vendor has its own button now; the model button names the model —
+  // for the vendor default, the concrete id the daemon observed (owner
+  // 2026-11-08), else 默认. A conversation shows what the session reports.
+  const modelText = modelLabel !== undefined
+    ? modelLabel || MODEL_DEFAULT
+    : modelRowLabel(draft.vendor, draft.model, catalog);
+  const vendorChoices = allowedVendors
+    ? VENDORS.filter((v) => allowedVendors.includes(v.id))
+    : VENDORS;
   const effortText = effortRowLabel(effortLabel ?? draft.effort);
   const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor);
@@ -997,6 +1024,39 @@ export function ChatComposer({
         </button>
         <div className="right">
           {accountSlot}
+          <div className={`sel vendor-sel ${vendorOpen ? "open" : ""}`} ref={vendorRef}>
+            <button
+              type="button"
+              className="model-btn vendor-btn"
+              data-testid="vendor-btn"
+              aria-haspopup="menu"
+              aria-expanded={vendorOpen}
+              onClick={(e) => {
+                e.stopPropagation();
+                setMenuOpen(false);
+                setVendorOpen((o) => !o);
+              }}
+            >
+              <span className={`dot ${spec.id}`} />
+              <span>{spec.label}</span>
+            </button>
+            <div className="sel-menu drop-up align-right" style={{ minWidth: 180 }} data-testid="vendor-menu" role="menu">
+              {vendorChoices.map((v) => (
+                <button
+                  key={v.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={draft.vendor === v.id}
+                  className={`sel-item ${draft.vendor === v.id ? "selected" : ""}`}
+                  onClick={() => pickVendor(v.id)}
+                >
+                  <span className={`dot ${v.id}`} />
+                  {v.label}
+                  <span className="check">✓</span>
+                </button>
+              ))}
+            </div>
+          </div>
           <div className={`sel model-sel ${menuOpen ? "open" : ""}`} ref={selRef}>
             <button
               type="button"
@@ -1004,34 +1064,34 @@ export function ChatComposer({
               data-testid="model-btn"
               onClick={(e) => {
                 e.stopPropagation();
+                setVendorOpen(false);
                 setMenuOpen((o) => !o);
               }}
             >
-              <span className={`dot ${spec.id}`} />
-              <span className="model-label">{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
+              <span className="model-label">{modelText}</span>
               <span className="eff">{effortText}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
-              {(allowedVendors
-                ? VENDORS.filter((v) => allowedVendors.includes(v.id))
-                : VENDORS
-              ).map((v) => (
-                <div key={v.id}>
-                  <div className="sel-group">{v.label}</div>
-                  {modelRowsFor(v.id, catalog).map((m) => (
-                    <button
-                      key={`${v.id}-${m}`}
-                      type="button"
-                      className={`sel-item ${draft.vendor === v.id && draft.model === m ? "selected" : ""}`}
-                      onClick={() => pickModel(v.id, m)}
-                    >
-                      <span className={`dot ${v.id}`} />
-                      {m}
-                      <span className="check">✓</span>
-                    </button>
-                  ))}
-                </div>
-              ))}
+              <div className="sel-group">{`${t("model")}(${spec.label})`}</div>
+              {modelRowsFor(draft.vendor, catalog).map((m) => {
+                const display = catalog?.[spec.id]?.models.find((entry) => entry.id === m)?.display_name;
+                return (
+                  <button
+                    key={`${draft.vendor}-${m}`}
+                    type="button"
+                    className={`sel-item ${draft.model === m ? "selected" : ""}`}
+                    onClick={() => pickModel(draft.vendor, m)}
+                  >
+                    {modelRowLabel(draft.vendor, m, catalog)}
+                    {m === MODEL_DEFAULT
+                      ? catalog?.[spec.id]?.defaultModel
+                        ? <span className="sub">{lang === "en" ? "default" : "默认"}</span>
+                        : null
+                      : display && display !== m ? <span className="sub">{display}</span> : null}
+                    <span className="check">✓</span>
+                  </button>
+                );
+              })}
               {efforts.length > 1 ? (
                 <>
                   {/* One interpolated string, not adjacent children: the

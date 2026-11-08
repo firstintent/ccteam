@@ -39,11 +39,11 @@ describe("optional cswap account selection", () => {
 
   it("picks an account from its own menu and closes on outside press", async () => {
     const onChange = vi.fn();
-    const account = { id: "a".repeat(64), slot: "2", label: "work (t***@example.test)", active: false };
+    const account = { id: "a".repeat(64), slot: "2", label: "work", active: false };
     const { container, root, button, menu } = await mount({ available: true, accounts: [account] }, onChange);
     await act(() => button.click());
     const items = container.querySelectorAll<HTMLButtonElement>("[role=menuitemradio]");
-    expect(items[1].textContent).toContain("cswap 2 · work");
+    expect(items[1].textContent).toContain("#2 work");
     await act(() => items[1].click());
     expect(onChange).toHaveBeenCalledWith(account.id);
     expect(menu().classList.contains("open")).toBe(false);
@@ -51,6 +51,24 @@ describe("optional cswap account selection", () => {
     expect(menu().classList.contains("open")).toBe(true);
     await act(() => { document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })); });
     expect(menu().classList.contains("open")).toBe(false);
+    await act(() => root.unmount());
+    container.remove();
+  });
+
+  it("shows number, name and the quota windows the plan has, never an email domain", async () => {
+    const { container, root, button } = await mount({ available: true, accounts: [
+      { id: "a".repeat(64), slot: "1", label: "cloud", active: false, five_hour_pct: 11, seven_day_pct: 100 },
+      { id: "b".repeat(64), slot: "5", label: "sddenter", active: true, seven_day_pct: 100 },
+      { id: "c".repeat(64), slot: "6", label: "sudongdong", active: false, usage_status: "relogin_required" },
+      { id: "d".repeat(64), slot: "7", label: "stale", active: false, five_hour_pct: 3, seven_day_pct: 9, usage_status: "unavailable" },
+    ] });
+    await act(() => button.click());
+    const rows = [...container.querySelectorAll("[role=menuitemradio]")].slice(1).map((row) => row.textContent);
+    expect(rows[0]).toBe("#1 cloud5h:11%7d:100%✓");
+    expect(rows[1]).toBe("#5 sddenter7d:100%当前默认✓");
+    expect(rows[2]).toBe("#6 sudongdong需重新登录✓");
+    expect(rows[3]).toContain("7d:9%上次");
+    expect(container.textContent).not.toContain("@");
     await act(() => root.unmount());
     container.remove();
   });

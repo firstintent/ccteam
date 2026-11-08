@@ -210,6 +210,7 @@ impl KimiAcpAdapter {
         transport: &AcpTransport,
         cwd: &std::path::Path,
         mcp_servers: Vec<Value>,
+        requested_model: Option<&str>,
     ) -> Result<(String, ModelInfo), HarnessError> {
         Self::handshake_initialize(transport).await?;
         let new_result = transport
@@ -226,7 +227,9 @@ impl KimiAcpAdapter {
         let session_id = pluck_session_id(&new_result).ok_or_else(|| {
             HarnessError::SpawnFailed("kimi session/new missing sessionId".into())
         })?;
-        Ok((session_id, pluck_model_info(&new_result)))
+        let info = pluck_model_info(&new_result);
+        crate::execution::acp::record_fresh_default_model("kimi", requested_model, &info);
+        Ok((session_id, info))
     }
 
     /// Prefer `session/resume` (no history replay). Fall back to
@@ -610,8 +613,13 @@ impl HarnessAdapter for KimiAcpAdapter {
                             HarnessError::SpawnFailed(format!("spawn kimi after resume fail: {e}"))
                         })?;
                         let transport = Arc::new(transport);
-                        let (sid, info) =
-                            Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                        let (sid, info) = Self::handshake_and_new(
+                            &transport,
+                            &cwd,
+                            mcp_servers.clone(),
+                            ctx.model_id.as_deref(),
+                        )
+                        .await?;
                         (transport, sid, info)
                     }
                 }
@@ -630,8 +638,13 @@ impl HarnessAdapter for KimiAcpAdapter {
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
                 let transport = Arc::new(transport);
-                let (sid, info) =
-                    Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                let (sid, info) = Self::handshake_and_new(
+                    &transport,
+                    &cwd,
+                    mcp_servers.clone(),
+                    ctx.model_id.as_deref(),
+                )
+                .await?;
                 (transport, sid, info)
             }
         };

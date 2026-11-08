@@ -74,6 +74,7 @@ import {
   type SessionView as SessionSummary,
   type ScheduledItem,
   type TurnStatus,
+  accountName,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
@@ -867,7 +868,7 @@ export default function SessionView({
           title={session.claude_account.active
             ? (lang === "en" ? "Default login; may follow cswap auto" : "默认登录，可能跟随 cswap auto 切换")
             : session.claude_account.label}>
-          {session.claude_account.active ? (lang === "en" ? "Default login" : "默认登录") : `cswap ${session.claude_account.slot}`}
+          {session.claude_account.active ? (lang === "en" ? "Default login" : "默认登录") : accountName(session.claude_account)}
         </span> : null}
         <span className="session-model" data-testid="session-model" title={displayStatusModel ?? vendor}>
           {displayStatusModel ?? vendor}

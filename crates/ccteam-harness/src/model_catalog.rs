@@ -38,6 +38,12 @@ pub struct VendorModelCatalog {
     /// Vendor models, kept in vendor order.
     #[serde(default)]
     pub models: Vec<CatalogModel>,
+    /// The concrete model id this vendor runs when ccteam requests no model
+    /// (the picker's "default" row). Observed on a fresh session spawned
+    /// without an explicit model, or declared by the vendor (codex
+    /// `isDefault`). Advisory like the rest of this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 /// Per-vendor cache. Transparent serialization produces the owner-approved
@@ -91,16 +97,61 @@ pub fn record_vendor_models_in(
     std::fs::create_dir_all(root)
         .with_context(|| format!("create ccteam root {}", root.display()))?;
     let mut catalog = load_model_catalog_in(root);
+    // A model-list refresh must not forget the separately observed default.
+    let default_model = catalog
+        .0
+        .get(vendor)
+        .and_then(|entry| entry.default_model.clone());
     catalog.0.insert(
         vendor.to_string(),
         VendorModelCatalog {
             observed_at: chrono::Utc::now().to_rfc3339(),
             source: source.to_string(),
             models,
+            default_model,
         },
     );
     let bytes = serde_json::to_vec_pretty(&catalog).context("serialize model catalog")?;
     atomic_write_durable(&model_catalog_path_in(root), &bytes)
+}
+
+/// Record the concrete model a vendor ran when no model was requested.
+/// Callers pass `None`/blank when they do not know (explicit model, resume),
+/// which is a no-op so a later observation never erases a good one.
+pub fn record_vendor_default_model_in(
+    root: &Path,
+    vendor: &str,
+    model: Option<&str>,
+) -> Result<()> {
+    let vendor = vendor.trim();
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    if vendor.is_empty() {
+        return Ok(());
+    }
+    let lock = CATALOG_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("model catalog write lock poisoned"))?;
+    let mut catalog = load_model_catalog_in(root);
+    let entry = catalog.0.entry(vendor.to_string()).or_default();
+    if entry.default_model.as_deref() == Some(model) {
+        return Ok(());
+    }
+    entry.default_model = Some(model.to_string());
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create ccteam root {}", root.display()))?;
+    let bytes = serde_json::to_vec_pretty(&catalog).context("serialize model catalog")?;
+    atomic_write_durable(&model_catalog_path_in(root), &bytes)
+}
+
+/// Environment-resolved twin of [`record_vendor_default_model_in`]; errors
+/// are swallowed like every other catalog write.
+pub fn record_vendor_default_model_best_effort(vendor: &str, model: Option<&str>) {
+    if let Some(root) = ccteam_root_from_env() {
+        let _ = record_vendor_default_model_in(&root, vendor, model);
+    }
 }
 
 /// Environment-resolved adapter seam. Every error is intentionally swallowed:
@@ -176,6 +227,24 @@ fn pinned_efforts(vendor: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_observed_default_survives_model_refreshes_and_blank_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_vendor_models_in(tmp.path(), "codex", "t", vec![model("a")]).unwrap();
+        record_vendor_default_model_in(tmp.path(), "codex", Some("gpt-x")).unwrap();
+        record_vendor_models_in(tmp.path(), "codex", "t", vec![model("b")]).unwrap();
+        record_vendor_default_model_in(tmp.path(), "codex", None).unwrap();
+        record_vendor_default_model_in(tmp.path(), "codex", Some("  ")).unwrap();
+        let entry = load_model_catalog_in(tmp.path()).0.remove("codex").unwrap();
+        assert_eq!(entry.default_model.as_deref(), Some("gpt-x"));
+        assert_eq!(entry.models, vec![model("b")]);
+        // A vendor seen only through its default still gets an entry.
+        record_vendor_default_model_in(tmp.path(), "grok", Some("grok-9")).unwrap();
+        let grok = load_model_catalog_in(tmp.path()).0.remove("grok").unwrap();
+        assert_eq!(grok.default_model.as_deref(), Some("grok-9"));
+        assert!(grok.models.is_empty());
+    }
 
     fn model(id: &str) -> CatalogModel {
         CatalogModel {

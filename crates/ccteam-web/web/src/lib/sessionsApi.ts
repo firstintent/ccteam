@@ -513,15 +513,25 @@ export function createSession(
 export interface CswapAccount {
   id: string;
   slot: string;
+  /** cswap alias, else the email's local part (never the domain). */
   label: string;
   /** Discovery: currently the default login. Session: default fallback mode. */
   active: boolean;
+  /** Whole-percent quota windows; absent when the plan has none (Max has no
+   *  5h) or cswap has no reading. Discovery only. */
+  five_hour_pct?: number;
+  seven_day_pct?: number;
+  /** cswap `usageStatus` when not `ok`; with percentages, they are its last good reading. */
+  usage_status?: string;
 }
 export interface CswapAccounts {
   available: boolean;
   accounts: CswapAccount[];
   message?: string;
 }
+/** `#<slot> <name>` — how an account reads everywhere (no email domain). */
+export const accountName = (account: Pick<CswapAccount, "slot" | "label">) =>
+  `#${account.slot} ${account.label}`;
 export const getCswapAccounts = () =>
   getJson<CswapAccounts>("/api/v1/vendors/claude/accounts");
 

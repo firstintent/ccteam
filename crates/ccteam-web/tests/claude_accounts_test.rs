@@ -73,8 +73,8 @@ async fn every_identity_discovers_every_local_account_without_a_grant() {
             "tenants and the admin see the same local accounts"
         );
         assert!(
-            !listed.to_string().contains("one@"),
-            "labels are masked; raw emails never leave the daemon"
+            !listed.to_string().contains("example.test"),
+            "labels carry the local part only; the email domain never leaves the daemon"
         );
     }
     assert_eq!(

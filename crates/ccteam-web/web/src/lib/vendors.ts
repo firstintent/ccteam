@@ -200,14 +200,29 @@ export interface ComposerDraft {
   hitl: boolean;
 }
 
+/** What a fresh pick of `vendor` starts on. Owner 2026-11-08: Claude opens
+ *  on `opus` at `high`; every other vendor on its own default (wire nothing). */
+export function vendorStartingTuning(vendor: string): Pick<ComposerDraft, "model" | "effort"> {
+  return vendorSpec(vendor).id === "claude"
+    ? { model: "opus", effort: "high" }
+    : { model: MODEL_DEFAULT, effort: "" };
+}
+
 export function defaultDraft(): ComposerDraft {
   return {
     vendor: "claude",
-    model: MODEL_DEFAULT,
-    effort: "",
+    ...vendorStartingTuning("claude"),
     protocol: VENDORS[0]!.protocols[0]!.id,
     hitl: false,
   };
+}
+
+/** How a model row / the model button reads: the default row names the
+ *  concrete id the daemon observed for this vendor (falls back to 默认 until
+ *  one has been seen); every other row is the vendor's own id verbatim. */
+export function modelRowLabel(vendor: string, model: string, catalog?: VendorCatalog | null): string {
+  if (model !== MODEL_DEFAULT) return model;
+  return catalog?.[vendorSpec(vendor).id]?.defaultModel ?? MODEL_DEFAULT;
 }
 
 /** Resolve the draft's wire protocol; unknown/hidden ids fall back to the
@@ -255,8 +270,7 @@ export function switchDraftVendor(draft: ComposerDraft, vendor: string): Compose
   if (draft.vendor === spec.id) return normalizeDraft(draft);
   return {
     vendor: spec.id,
-    model: MODEL_DEFAULT,
-    effort: "",
+    ...vendorStartingTuning(spec.id),
     protocol: spec.protocols[0]!.id,
     hitl: !!draft.hitl,
   };

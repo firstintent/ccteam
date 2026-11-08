@@ -561,6 +561,16 @@ button { font-family: inherit; cursor: pointer; }
 .account-menu { width: max-content; max-width: min(420px, calc(100vw - 48px)); }
 .account-menu .sel-item { white-space: nowrap; }
 .account-menu .sel-item .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* name | 5h | 7d | marker | ✓ — fixed quota columns so rows line up. */
+.account-menu .sel-item.account-row {
+  display: grid; grid-template-columns: minmax(6em, 1fr) 4.6em minmax(5.2em, auto) auto auto;
+  align-items: center; column-gap: 10px;
+}
+.account-row .quota { display: inline-flex; gap: 4px; color: var(--text-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.account-row .quota .v { min-width: 4ch; text-align: right; color: var(--text); }
+.account-row .quota-status { grid-column: 2 / 4; color: var(--text-faint); font-size: 12px; }
+.account-row .quota-stale { color: var(--text-faint); font-size: 11px; }
+.account-row .sub, .account-row .check { margin-left: 0; padding-left: 0; }
 .account-menu .account-note { margin: 4px 10px 6px; max-width: 18rem; font-size: 11.5px; line-height: 1.45; color: var(--text-muted); white-space: normal; }
 .account-menu .account-retry { color: #0E7490; }
 html.dark .account-menu .account-retry { color: #67e8f9; }

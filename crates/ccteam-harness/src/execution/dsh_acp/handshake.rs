@@ -180,7 +180,9 @@ pub async fn session_new(
 
     let session_id = pluck_session_id(&result)
         .ok_or_else(|| HarnessError::SpawnFailed("dsh session/new missing sessionId".into()))?;
-    Ok((session_id, pluck_model_info(&result)))
+    let info = pluck_model_info(&result);
+    crate::execution::acp::record_fresh_default_model("dsh", agent_options.model.as_deref(), &info);
+    Ok((session_id, info))
 }
 
 pub async fn session_load(

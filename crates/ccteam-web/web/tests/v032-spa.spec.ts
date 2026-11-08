@@ -499,7 +499,7 @@ for (const state of ["missing", "installed"] as const) {
     await page.route("**/api/v1/vendors/claude/accounts", route => {
       discoveries++;
       return route.fulfill({ json: state === "installed"
-        ? { available: true, accounts: [{ id: account, slot: "2", label: "work (t***@example.test)", active: false }] }
+        ? { available: true, accounts: [{ id: account, slot: "2", label: "work", active: false, five_hour_pct: 11, seven_day_pct: 100 }] }
         : { available: false, accounts: [] } });
     });
     await page.goto("/app/");
@@ -518,9 +518,10 @@ for (const state of ["missing", "installed"] as const) {
     await expect(menu).toBeVisible();
     await expect.poll(() => discoveries).toBe(1);
     if (state === "installed") {
-      await menu.getByRole("menuitemradio", { name: /cswap 2/ }).click();
+      await expect(menu.getByRole("menuitemradio", { name: /#2 work/ })).toContainText("5h:11%");
+      await menu.getByRole("menuitemradio", { name: /#2 work/ }).click();
       await expect(menu).toBeHidden();
-      await expect(accountBtn).toContainText("cswap 2");
+      await expect(accountBtn).toContainText("#2 work");
     } else {
       await expect(menu).toContainText("cswap 不可用");
       await expect(menu.getByRole("menuitemradio", { name: "默认登录" })).toHaveAttribute("aria-checked", "true");
@@ -575,6 +576,9 @@ test("home lazy-create: first message POSTs session without a host override, the
     vendor: "claude",
     protocol: "stream-json",
     permission_mode: "hitl",
+    // Owner 2026-11-08: a fresh composer starts on opus at high effort.
+    model: "opus",
+    effort: "high",
   });
   expect(create?.body).not.toHaveProperty("host");
 
@@ -598,13 +602,17 @@ test("Pi picker keeps role, uses provider/model-id, and exposes strict-HITL trad
   await page.getByTestId("ctx-role").getByRole("button").first().click();
   await page.getByRole("button", { name: /cto/ }).click();
 
+  // Vendor and model are separate dropdowns: pick the harness, then its model.
+  await page.getByTestId("vendor-btn").click();
+  await page.getByTestId("vendor-menu").getByRole("menuitemradio", { name: "Pi" }).click();
+  await expect(page.getByTestId("vendor-btn")).toContainText("Pi");
+  await expect(page.getByTestId("vendor-menu")).toBeHidden();
   await page.getByTestId("model-btn").click();
+  await expect(page.getByTestId("model-menu")).toContainText("模型(Pi)");
   await page
     .getByRole("button", { name: /anthropic\/claude-opus-4-6/ })
     .click();
-  await expect(page.getByTestId("model-btn")).toContainText(
-    "Pi · anthropic/claude-opus-4-6",
-  );
+  await expect(page.getByTestId("model-btn")).toContainText("anthropic/claude-opus-4-6");
   await page.getByTestId("model-btn").click();
   await page.getByRole("button", { name: "xhigh", exact: true }).click();
 

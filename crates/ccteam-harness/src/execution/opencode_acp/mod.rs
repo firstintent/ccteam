@@ -138,6 +138,7 @@ impl OpencodeAcpAdapter {
         transport: &AcpTransport,
         cwd: &std::path::Path,
         mcp_servers: Vec<serde_json::Value>,
+        requested_model: Option<&str>,
     ) -> Result<(String, ModelInfo), HarnessError> {
         Self::handshake_initialize(transport).await?;
         let new_result = transport
@@ -154,7 +155,9 @@ impl OpencodeAcpAdapter {
         let session_id = pluck_session_id(&new_result).ok_or_else(|| {
             HarnessError::SpawnFailed("opencode session/new missing sessionId".into())
         })?;
-        Ok((session_id, pluck_model_info(&new_result)))
+        let info = pluck_model_info(&new_result);
+        crate::execution::acp::record_fresh_default_model("opencode", requested_model, &info);
+        Ok((session_id, info))
     }
 
     /// Prefer `session/resume` (no history replay). Fall back to `session/load`
@@ -537,8 +540,13 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                             ))
                         })?;
                         let transport = Arc::new(transport);
-                        let (sid, info) =
-                            Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                        let (sid, info) = Self::handshake_and_new(
+                            &transport,
+                            &cwd,
+                            mcp_servers.clone(),
+                            ctx.model_id.as_deref(),
+                        )
+                        .await?;
                         (transport, sid, info)
                     }
                 }
@@ -557,8 +565,13 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn opencode acp: {e}")))?;
                 let transport = Arc::new(transport);
-                let (sid, info) =
-                    Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                let (sid, info) = Self::handshake_and_new(
+                    &transport,
+                    &cwd,
+                    mcp_servers.clone(),
+                    ctx.model_id.as_deref(),
+                )
+                .await?;
                 (transport, sid, info)
             }
         };

@@ -2111,6 +2111,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 catalog_models(&catalog),
             );
         }
+        // `thread/start` carries no model (an explicit pick rides turn/start
+        // overrides), so a fresh thread's `model` is the configured default.
+        if !resumed {
+            crate::model_catalog::record_vendor_default_model_best_effort(
+                "codex",
+                result.get("model").and_then(Value::as_str),
+            );
+        }
         // The started / resumed thread is now resident + subscribed on this
         // connection — record it so subsequent turns skip the resume.
         self.mark_loaded(&thread_id).await;

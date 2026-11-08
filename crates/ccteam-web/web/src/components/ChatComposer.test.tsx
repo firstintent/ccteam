@@ -174,36 +174,49 @@ describe("model button label", () => {
       />,
     );
 
-  it("new-session draft: the vendor prefixes the default/picked model", () => {
-    expect(renderBtn()).toContain("<span class=\"model-label\">claude · 默认</span>");
-    expect(renderBtn({ draft: { ...defaultDraft(), model: "opus" } })).toContain(
-      "<span class=\"model-label\">claude · opus</span>",
-    );
-    expect(
-      renderBtn({
-        draft: { ...defaultDraft(), vendor: "codex", model: "默认", protocol: "app-server" },
-      }),
-    ).toContain("<span class=\"model-label\">codex · 默认</span>");
+  const vendorBtn = (html: string) =>
+    /data-testid="vendor-btn"[^>]*><span class="dot [a-z]+"><\/span><span>([^<]*)<\/span>/.exec(html)?.[1];
+  const modelBtn = (html: string) => /<span class="model-label">([^<]*)<\/span>/.exec(html)?.[1];
+
+  it("new-session draft: vendor and model are separate buttons; claude opens on opus · high", () => {
+    const html = renderBtn();
+    expect(vendorBtn(html)).toBe("claude");
+    expect(modelBtn(html)).toBe("opus");
+    expect(html).toContain('<span class="eff">high</span>');
+    const codex = renderBtn({
+      draft: { ...defaultDraft(), vendor: "codex", model: "默认", effort: "", protocol: "app-server" },
+    });
+    expect(vendorBtn(codex)).toBe("codex");
+    expect(modelBtn(codex)).toBe("默认");
   });
 
-  it("conversation: the live model rides after the vendor; an unreported model leaves the vendor alone", () => {
-    expect(
-      renderBtn({
-        modelLabel: "gpt-5.5",
-        draft: { ...defaultDraft(), vendor: "codex", model: "", protocol: "app-server" },
-      }),
-    ).toContain("<span class=\"model-label\">codex · gpt-5.5</span>");
-    const html = renderBtn({ modelLabel: "" });
-    expect(html).toContain("<span class=\"model-label\">claude</span>");
-    expect(html).not.toContain("<span class=\"model-label\">claude · ");
+  it("the vendor-default model names the concrete id the daemon observed", () => {
+    const html = renderBtn({
+      catalog: { codex: { models: [], efforts: ["low", "high"], defaultModel: "gpt-5.5" } },
+      draft: { ...defaultDraft(), vendor: "codex", model: "默认", effort: "", protocol: "app-server" },
+    });
+    expect(modelBtn(html)).toBe("gpt-5.5");
+    // The default row in the menu reads the id too, tagged as the default.
+    expect(html).toContain('gpt-5.5<span class="sub">默认</span>');
   });
 
-  it("conversation: a live kimi session shows the same vendor · model · effort shape", () => {
+  it("conversation: the live model fills the model button; an unreported model reads 默认", () => {
+    const html = renderBtn({
+      modelLabel: "gpt-5.5",
+      draft: { ...defaultDraft(), vendor: "codex", model: "", protocol: "app-server" },
+    });
+    expect(vendorBtn(html)).toBe("codex");
+    expect(modelBtn(html)).toBe("gpt-5.5");
+    expect(modelBtn(renderBtn({ modelLabel: "" }))).toBe("默认");
+  });
+
+  it("conversation: a live kimi session shows vendor, model and effort", () => {
     const html = renderBtn({
       modelLabel: "kimi-code/k3",
-      draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
+      draft: { ...defaultDraft(), vendor: "kimi", model: "", effort: "", protocol: "acp" },
     });
-    expect(html).toContain("<span class=\"model-label\">Kimi · kimi-code/k3</span>");
+    expect(vendorBtn(html)).toBe("Kimi");
+    expect(modelBtn(html)).toBe("kimi-code/k3");
     // Effort renders as the vendor's own token, never a translated word —
     // identical in zh and en. Nothing reported ⇒ `default`.
     expect(html).toContain('<span class="eff">default</span>');
@@ -282,7 +295,7 @@ describe("model menu (rows come from the vendor, never from a ccteam ladder)", (
 
   it("a live catalog supersedes the static rows for models AND efforts", () => {
     const html = renderMenu({
-      draft: { ...defaultDraft(), vendor: "kimi", protocol: "acp" },
+      draft: { ...defaultDraft(), vendor: "kimi", model: "默认", effort: "", protocol: "acp" },
       catalog: {
         kimi: {
           models: [{ id: "kimi-code/k3" }, { id: "kimi-code/k3-256k" }],
@@ -292,7 +305,10 @@ describe("model menu (rows come from the vendor, never from a ccteam ladder)", (
       },
     });
     expect(html).toContain("kimi-code/k3-256k");
-    expect(html).toContain("openai/gpt-5.5");
+    // The model menu is the selected vendor's only; other vendors live in
+    // the vendor menu, not as model rows.
+    expect(html).not.toContain("openai/gpt-5.5");
+    expect(html).toContain('data-testid="vendor-menu"');
     // The catalog said low|max — `high` (static) is gone.
     expect(html).toContain(">low<");
     expect(html).not.toContain(">high<");

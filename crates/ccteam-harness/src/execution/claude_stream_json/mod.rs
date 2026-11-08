@@ -420,6 +420,9 @@ fn spawn_status_tap(
     cells: StatusTapCells,
     project_dir: PathBuf,
     sid: String,
+    // Spawned with no model at all (no pick, no role `model:`): the first
+    // API-reported model is claude's own default for the picker's default row.
+    mut record_default_model: bool,
 ) -> tokio::task::JoinHandle<()> {
     let StatusTapCells {
         status,
@@ -490,6 +493,14 @@ fn spawn_status_tap(
                         if let Some(m) = api_model {
                             if let Ok(mut s) = status.lock() {
                                 s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                            }
+                            // First observation only: a later `/model` switch
+                            // is the user's pick, not the default.
+                            if std::mem::take(&mut record_default_model) {
+                                crate::model_catalog::record_vendor_default_model_best_effort(
+                                    "claude",
+                                    Some(m),
+                                );
                             }
                         }
                         // v0.8.20 — ALSO refresh the live context window mid-turn
@@ -2131,6 +2142,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             },
             ctx.project_dir.clone(),
             ctx.sid.clone(),
+            ctx.model_id
+                .as_deref()
+                .is_none_or(|model| model.trim().is_empty()),
         ));
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that

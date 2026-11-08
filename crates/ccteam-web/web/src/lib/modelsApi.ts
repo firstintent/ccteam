@@ -43,6 +43,8 @@ export interface VendorModels {
   source?: string | null;
   models: VendorModelEntry[];
   efforts: string[];
+  /** Concrete id the vendor runs when no model is requested; null until seen. */
+  default_model?: string | null;
 }
 
 export interface ModelsResponse {
@@ -54,7 +56,15 @@ export interface ModelsResponse {
  *  takes this structural view so it never imports a fetch module. A vendor
  *  missing from the map (or with an empty list) means "nothing observed" and
  *  the static registry answers instead. */
-export type VendorCatalog = Record<string, { models: CatalogModelEntry[]; efforts: string[] }>;
+export type VendorCatalog = Record<
+  string,
+  {
+    models: CatalogModelEntry[];
+    efforts: string[];
+    /** Concrete id behind the picker's default row, once the daemon saw it. */
+    defaultModel?: string;
+  }
+>;
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, {
@@ -122,6 +132,8 @@ export function indexCatalog(res: ModelsResponse | null | undefined): VendorCata
     if (!vendor) continue;
     const models = cleanModels(entry.models);
     catalog[vendor] = { models, efforts: cleanTokens(entry.efforts) };
+    const fallback = typeof entry.default_model === "string" ? entry.default_model.trim() : "";
+    if (fallback) catalog[vendor]!.defaultModel = fallback;
   }
   return catalog;
 }
