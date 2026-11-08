@@ -149,6 +149,9 @@ impl ManagedBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// Private cswap binding, including the actual profile selected at exec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<super::claude_accounts::ClaudeAccountBinding>,
     pub sid: String,
     pub slug: String,
     pub vendor: AgentVendor,
@@ -707,6 +710,7 @@ mod title_tests {
 
     fn blank_meta() -> SessionMeta {
         SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             tool_face: None,
@@ -747,6 +751,7 @@ mod title_tests {
     fn rescans_see_every_rewrite_addition_and_removal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let meta = |sid: &str, title: &str| SessionMeta {
+            claude_account: None,
             sid: sid.into(),
             title: Some(title.into()),
             ..blank_meta()
@@ -794,6 +799,7 @@ mod title_tests {
         for _ in 0..50 {
             let tmp = tempfile::TempDir::new().unwrap();
             let meta = |title: &str| SessionMeta {
+                claude_account: None,
                 title: Some(title.into()),
                 ..blank_meta()
             };
@@ -818,6 +824,7 @@ mod title_tests {
     fn an_unchanged_stamp_on_a_fresh_file_is_not_trusted() {
         let tmp = tempfile::TempDir::new().unwrap();
         let meta = |title: &str| SessionMeta {
+            claude_account: None,
             title: Some(title.into()),
             ..blank_meta()
         };

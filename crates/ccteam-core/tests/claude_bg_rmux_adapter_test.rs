@@ -107,6 +107,7 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
         role: "tester".into(),
     };
     let ctx = SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: "rmuxbg".into(),

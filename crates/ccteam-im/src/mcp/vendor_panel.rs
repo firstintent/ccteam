@@ -1038,6 +1038,7 @@ mod tests {
                         efforts: Vec::new(),
                     })
                     .collect(),
+                default_model: None,
             },
         )]));
         let hub = crate::hub::HubModelsState::Available(crate::hub::HubModelsSnapshot {

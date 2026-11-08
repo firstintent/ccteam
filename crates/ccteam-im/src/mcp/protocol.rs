@@ -302,9 +302,10 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "description": "Harness for a new session (default claude)."
                 },
                 "wait": { "type": "integer", "description": "Seconds to block inline, 0-240 (default 0 = async)." },
-                "model": { "type": "string", "description": "Model id, passed to the vendor verbatim." },
-                "effort": { "type": "string", "description": "Reasoning-effort token, passed verbatim to the vendor." },
-                "role": { "type": "string", "description": "Work-role `.claude/agents/<role>.md`; omit for roleless." },
+                "model": { "type": "string", "description": "Vendor model id." },
+                "effort": { "type": "string", "description": "Vendor effort token." },
+                "claude_account": { "type": "string", "description": "Local cswap account id." },
+                "role": { "type": "string", "description": "Project role; omit for roleless." },
                 "project": { "type": "string", "description": "Workspace slug. Required on an enrolled client's first call." },
                 "title": { "type": "string", "description": "Ledger label (<=80 chars); never sent to the agent." },
                 "notify": {
@@ -934,6 +935,7 @@ mod tests {
             "wait",
             "model",
             "effort",
+            "claude_account",
             "role",
             "project",
             "title",

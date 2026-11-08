@@ -166,7 +166,13 @@ DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi·DSH / Pi 自己的 RPC)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless。建好回句柄 `s<N>`。
+本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。每行显示 `#<编号> <名字>`（cswap 别名，否则邮箱 @ 前的部分，不显示域名）和 cswap 最近读到的 5h / 7d 额度（Max 套餐没有 5h 窗口，只显示 7d；需要重新登录的账号会注明）。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，会话按「默认登录」运行，可继续跟随外部 `cswap auto`；其他账号使用各自的 cswap profile（凭据按账号隔离），恢复时保持原身份，不能静默退回默认号；已隔离的会话遇到账号移除、slot 换绑或目录变化会报错并保留历史。ccteam 用 cswap 的共享历史启动账号（`cswap run --share-history`），所以会话记录对每个账号都可读。
+
+进行中的 Claude 会话，输入框模型按钮旁同样有「Claude 账号」按钮（IM 里用 `/account`）：它显示会话当前用的账号——默认登录时显示此刻默认号是哪个（`默认 · #2 cloud`）——选另一个账号（或「默认登录」）即切换：当前空闲进程结束，下一条消息在同一会话里按新账号继续，历史不丢（提示缓存会重建，换号必然如此）。有 turn 在跑、在等你确认或后台任务未结束时拒绝切换；会话历史还只在当前账号自己的 profile 里（共享历史之前启动的会话）时也拒绝：cswap 会在该会话下次在原账号上运行、且该账号没有其他 Claude 在用时把历史合并进共享历史，之后即可切换。没装 cswap 时，未绑定账号的会话不显示这个按钮。
+
+账号列表由 `GET /api/v1/vendors/claude/accounts` 返回，创建请求的 `claude_account` 使用其中的稳定 id；已有会话用 `PUT /api/v1/sessions/{sid}/claude-account` 传 `{"claude_account": "<id>"}`（`null` = 默认登录）切换。所有已登录身份（管理员 token、个人链接用户、IM 会话）都可选择执行端 cswap 管理的任一账号，与大家本来就共用默认登录一致，不需要逐账号授权。远程项目、其他 vendor 与 terminal 协议不支持这个选项。ccteam 不代装 cswap，也不会自动换号。若 cswap 提供 `usage.headerProbe`，必须保持关闭，避免账号发现触发额度推理探针。
+
+- **新建会话**:输入框里 vendor 与模型是两个下拉:vendor 下拉选 Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi,旁边的模型下拉放该 vendor 的模型、思考强度与协议(stream-json / terminal 仅 Claude / ACP=Grok·OpenCode·Kimi·DSH / Pi 自己的 RPC);spawn 前设 HITL。新输入框默认 Claude · `opus` · `high`,切到其他 vendor 时用该 vendor 的默认。模型菜单按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 不显示强度菜单。**默认**行什么都不发、由 vendor 自己定;ccteam 见过一次新会话以 vendor 默认运行后,该行直接显示它实际解析到的具体模型 id。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放;Codex / Grok / OpenCode / Kimi / DSH / Pi 都是 chat-only。
@@ -179,7 +185,7 @@ DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、
 
 **团队**页是多 vendor 调度的驾驶舱,三个 tab:
 
-- **拓扑** —— 跨项目、跨主机的实时委派树:每会话一行(vendor 徽章、live 模型(live 会话显示真正在跑的模型)、状态点、成本、轮次),KPI 条下有 per-vendor 小计(live 数 + 花费,点击过滤)、最近委派滚动条,跨机时行上带 host 徽章。每个会话都是**真超链接** —— 右键/中键「打开 ↗」把父子会话开在两个浏览器 tab 里对照看。点行打开详情面板(模型/主机/父会话/深度/成本/实时活动/最近对话)。
+- **拓扑** —— 跨项目、跨主机的实时委派树:每会话一行(vendor 徽章、live 模型(live 会话显示真正在跑的模型)、实时上下文占比(`ctx 63%`,≥85% 带 `⚠`;仅驻留会话有,已释放的显示 `—`)、状态点、成本、轮次),KPI 条下有 per-vendor 小计(live 数 + 花费,点击过滤)、最近委派滚动条,跨机时行上带 host 徽章。每个会话都是**真超链接** —— 右键/中键「打开 ↗」把父子会话开在两个浏览器 tab 里对照看。点行打开详情面板(模型/主机/父会话/深度/成本/实时活动/最近对话)。
 - **分工** —— 团队的分工管理:**vendor 名册按主机分组**(local 在前、在线优先、离线卫星默认折叠并显示已离线多久 —— 超 7 天名册会建议清理 —— 且带「移除」按钮;主机 id 恒显,两台机器 OS hostname 撞名也能分清;每家 vendor 列 installed/版本/就绪态与修复提示,npm 目录有新版时低调提示「↑ 可更新」,外加 live 会话数与花费 —— **点 vendor 卡直接跳到按该家过滤的拓扑**)+ **宪章编辑器** —— 就是 agent 经 `status` 工具读的那份项目级 `routing.md`。选项目、markdown 编辑/预览、保存;项目没有宪章时只读展示全局 `~/.ccteam/routing.md`,可一键「拷入起稿」(web 只写项目文件,全局文件的写入口仍在 CLI/文件系统)。诚实语义不变:宪章是 agent 主动 PULL 的建议文本(绝不注入),超 ~4k 字符在 `status` 里节选并给全文指针。
 - **编排** —— daemon 记到账本上的每一次 `ccteam flow run`,跨你可见的项目按新到旧排:名字、描述、状态(运行中 / 完成 / 出错 / 刹车 —— 刹车是护栏拒绝再雇新 agent,不是崩溃)、雇佣 agent 数、成本、耗时;展开一行看它真正雇了哪些会话(真链接)和触发它的会话。还没有 run 时这个 tab 就是上手入口:发起第一次 run 的三条命令,可复制。flow 只在 shell 里(或由任意会话)编写与启动,web 不启动 run;详见 [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md)。
 - **编队起手** —— 分工 tab 上的六张卡(总控-工班 / 主力-顾问 / 交叉互审 / 并行竞标 / 调研三角 / 金字塔用工),点「起手」跳到首页 launcher 预填 vendor 阵容 —— 编排本身发生在你 spawn 的会话里。完整编队目录(含监工/值守/跨机三式)见 [orchestration-cn.md](orchestration-cn.md)。
@@ -347,6 +353,10 @@ bot 在群聊/频道里是每条都回、还是只在被 @ 时才回,是同一�
 /use <id>                  切到会话 s<N>(已停止的会话会自动从磁盘冷恢复)
 /role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)
 /interrupt [id]            打断正在跑的回合,保留会话(省略 id = 当前)
+/account [<编号>|default]  本机 Claude 会话:裸命令 = 看当前 cswap 账号(默认登录会写明此刻是哪个号)
+                             和所有账号的 5h / 7d 额度(Telegram 上是按钮);带编号(或别名/名字)
+                             = 切换,default = 回默认登录;下一条消息在同一会话里按新账号继续。
+                             `/status` 也会显示绑定的账号
 /stop <id>                 销毁一个会话
 
 # 查看 / 接入

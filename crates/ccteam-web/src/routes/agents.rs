@@ -12,7 +12,7 @@
 //! under the same lock, awaited after it drops — the SAME statusline source
 //! `GET /sessions/{sid}/status` serves, via
 //! [`super::sessions_api::resolved_thread_status`] ⇒ `nodes[].model` +
-//! `nodes[].effort`) ⋈
+//! `nodes[].effort` + `nodes[].context_pct`) ⋈
 //! [`ccteam_im::gateway::Gateway::armed_delegation_watch_sids`] (a
 //! best-effort seed for `edges[].active`, corrected live by the SSE
 //! `dispatched`/`completed` frames — see `AgentsView`'s reducer).
@@ -91,6 +91,15 @@ pub struct AgentNode {
     /// on idle nodes and on vendors/models with no effort axis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// How full the session's context window is RIGHT NOW (0-100, rounded),
+    /// from the same live statusline join as `model` — the vendor's own
+    /// accounting (claude refreshes it mid-turn, so a long working turn's
+    /// growth shows up between turns too). Only a session ccteam holds a
+    /// process for has a live window, so every other node is `null`: no
+    /// per-node transcript read on a fleet-wide snapshot that is polled, and
+    /// no number older than "now" passed off as current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pct: Option<u64>,
     pub host: String,
     /// What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
     /// `detached` for a body that outlived the daemon. See the module doc.
@@ -146,7 +155,7 @@ pub(crate) struct AgentsGraphQuery {
 }
 
 /// How long ONE live session gets to report its statusline before the graph
-/// gives up on it and reports the node without `model`/`effort`. The snapshot
+/// gives up on it and reports the node without `model`/`effort`/`context_pct`. The snapshot
 /// is a fleet overview, not a per-session probe: a node's model is a nicety,
 /// while a stalled response blocks the whole team view. Per-session (not
 /// global) so one slow vendor never costs the others their model.
@@ -247,6 +256,10 @@ pub(crate) fn build_agents_graph(
                 effort: live
                     .and_then(|s| s.effort.clone())
                     .or_else(|| m.effort.clone()),
+                context_pct: live
+                    .and_then(|s| s.context.as_ref())
+                    .and_then(|context| context.pct())
+                    .map(|pct| pct.round() as u64),
                 host,
                 status,
                 residency,
@@ -517,6 +530,7 @@ mod tests {
         depth: u32,
     ) {
         let mut m = ccteam_harness::SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             tool_face: None,
@@ -630,6 +644,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                claude_account: None,
                 driveable: true,
                 detached: None,
                 context_pct: None,
@@ -694,10 +709,11 @@ mod tests {
         assert_eq!(graph.nodes[0].residency, "resident");
     }
 
-    /// TEAM-4 — `nodes[].model` + `nodes[].effort` come from the caller's
-    /// post-lock statusline join (`live_status`), never from `meta.json`: the
-    /// live sid carries its reported model/effort, the idle sid stays honestly
-    /// `None`.
+    /// TEAM-4 — `nodes[].model` + `nodes[].effort` + `nodes[].context_pct`
+    /// come from the caller's post-lock statusline join (`live_status`), never
+    /// from `meta.json`: the live sid carries its reported model/effort and its
+    /// window occupancy (the vendor's own numbers, rounded), the idle sid stays
+    /// honestly `None`.
     #[test]
     fn build_agents_graph_joins_live_model_only_for_live_nodes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -723,6 +739,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                claude_account: None,
                 driveable: true,
                 detached: None,
                 context_pct: None,
@@ -754,6 +771,11 @@ mod tests {
             ThreadStatus {
                 model: Some("fable-5".to_string()),
                 effort: Some("high".to_string()),
+                context: Some(ccteam_harness::ContextUsage::known(
+                    126_500,
+                    200_000,
+                    ccteam_harness::ContextSource::Reported,
+                )),
                 ..Default::default()
             },
         )]
@@ -771,12 +793,43 @@ mod tests {
         let by_sid = |sid: &str| graph.nodes.iter().find(|n| n.sid == sid).unwrap();
         assert_eq!(by_sid("s1").model.as_deref(), Some("fable-5"));
         assert_eq!(by_sid("s1").effort.as_deref(), Some("high"));
+        assert_eq!(by_sid("s1").context_pct, Some(63), "126.5k / 200k, rounded");
         assert_eq!(
             by_sid("s2").model,
             None,
             "a released node has nothing live to report"
         );
         assert_eq!(by_sid("s2").effort, None);
+        assert_eq!(by_sid("s2").context_pct, None);
+    }
+
+    /// A live session whose vendor knows the window but not its occupancy
+    /// (no turn reported yet) has no percentage — never a fabricated 0%.
+    #[test]
+    fn a_window_without_occupancy_reports_no_context_pct() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        meta(&dir, "s1", "", ccteam_harness::AgentVendor::Claude, None, 0);
+        let live_status: HashMap<String, ThreadStatus> = [(
+            "s1".to_string(),
+            ThreadStatus {
+                context: Some(ccteam_harness::ContextUsage::window_only(200_000)),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let graph = build_agents_graph(
+            |_| dir.clone(),
+            &["demo".to_string()],
+            &HashMap::new(),
+            &live_status,
+            &HashSet::new(),
+            &empty_projection(tmp.path()),
+            &HashMap::new(),
+        );
+        assert_eq!(graph.nodes[0].context_pct, None);
     }
 
     #[test]

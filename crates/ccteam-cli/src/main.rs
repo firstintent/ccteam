@@ -693,6 +693,16 @@ enum HookCommand {
 }
 
 fn main() -> Result<()> {
+    // cswap's PATH entry must remain a transparent stdio exec, including for
+    // auth probes. Intercept before clap, logging, runtime and global setup.
+    let relay_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if relay_args.get(1).is_some_and(|arg| arg == "internal")
+        && relay_args
+            .get(2)
+            .is_some_and(|arg| arg == "claude-account-launch")
+    {
+        return ccteam_harness::execution::claude_accounts::run_relay(&relay_args[3..]);
+    }
     // V0.8 W2a — rmux SDK daemon spawn protocol. BEFORE clap parses
     // argv, intercept the `--__internal-daemon <socket>` form emitted
     // by `rmux_sdk::Rmux::connect_or_start` so the same ccteam binary

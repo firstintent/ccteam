@@ -147,6 +147,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
 /// same-(project,role) sessions stay distinct).
 fn make_ctx_sid(slug: &str, sid: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),
@@ -167,6 +168,7 @@ fn make_ctx_sid(slug: &str, sid: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
 /// the hitl spawn drops the skip flag and carries `--permission-mode default`.
 fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),

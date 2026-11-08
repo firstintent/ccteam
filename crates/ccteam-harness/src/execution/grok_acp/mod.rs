@@ -161,7 +161,7 @@ fn parse_grok_billing(response: &serde_json::Value) -> Option<crate::AccountUsag
         credits_pct,
         ..Default::default()
     };
-    (usage != crate::AccountUsage::default()).then_some(usage)
+    usage.has_window().then_some(usage)
 }
 
 struct LiveSession {
@@ -215,6 +215,7 @@ impl GrokAcpAdapter {
         transport: &AcpTransport,
         cwd: &std::path::Path,
         mcp_servers: Vec<Value>,
+        requested_model: Option<&str>,
     ) -> Result<(String, ModelInfo), HarnessError> {
         let _init = transport
             .call(
@@ -257,7 +258,9 @@ impl GrokAcpAdapter {
         let session_id = pluck_session_id(&new_result).ok_or_else(|| {
             HarnessError::SpawnFailed("grok session/new missing sessionId".into())
         })?;
-        Ok((session_id, pluck_model_info(&new_result)))
+        let info = pluck_model_info(&new_result);
+        crate::execution::acp::record_fresh_default_model("grok", requested_model, &info);
+        Ok((session_id, info))
     }
 
     async fn handshake_and_load(
@@ -754,8 +757,13 @@ impl HarnessAdapter for GrokAcpAdapter {
                             HarnessError::SpawnFailed(format!("spawn grok after load fail: {e}"))
                         })?;
                         let transport = Arc::new(transport);
-                        let (sid, info) =
-                            Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                        let (sid, info) = Self::handshake_and_new(
+                            &transport,
+                            &cwd,
+                            mcp_servers.clone(),
+                            ctx.model_id.as_deref(),
+                        )
+                        .await?;
                         (transport, sid, info)
                     }
                 }
@@ -774,8 +782,13 @@ impl HarnessAdapter for GrokAcpAdapter {
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
                 let transport = Arc::new(transport);
-                let (sid, info) =
-                    Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                let (sid, info) = Self::handshake_and_new(
+                    &transport,
+                    &cwd,
+                    mcp_servers.clone(),
+                    ctx.model_id.as_deref(),
+                )
+                .await?;
                 (transport, sid, info)
             }
         };

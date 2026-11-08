@@ -71,6 +71,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ),
         // VENDOR-QUOTA-1 — vendor subscription-quota snapshot (admin).
         ("GET", "/api/v1/vendors/quota"),
+        // #229 — optional cswap discovery.
+        ("GET", "/api/v1/vendors/claude/accounts"),
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),
@@ -155,6 +157,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/sessions/{sid}"),
         // v0.8.22 P1 — session-title system: rename a session's title.
         ("PATCH", "/api/v1/sessions/{sid}"),
+        // #236 — switch the session's Claude account (cswap) / default login.
+        ("PUT", "/api/v1/sessions/{sid}/claude-account"),
         // live statusline (model + context-window usage) for the SPA top bar.
         ("GET", "/api/v1/sessions/{sid}/status"),
         // issue #21 — context composition for the session's context sidebar.

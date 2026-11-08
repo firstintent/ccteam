@@ -102,7 +102,19 @@ while True:
           "session_id":sid})
 "#;
 
+/// Pin `HOME` + `CCTEAM_HOME` to one process-wide temp dir. The adapter
+/// records the fake claude's `initialize.models` into the model catalog under
+/// `ccteam_root_from_env()`; unpinned, `fake-model` landed in the developer's
+/// real `~/.ccteam/model-catalog.json` (#235).
+fn isolate_state_home() {
+    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = STATE.get_or_init(|| tempfile::TempDir::new().unwrap());
+    std::env::set_var("HOME", dir.path());
+    std::env::set_var("CCTEAM_HOME", dir.path().join(".ccteam"));
+}
+
 fn write_fake(tmp: &Path) -> PathBuf {
+    isolate_state_home();
     let p = tmp.join("fake-claude-sj-remote.py");
     std::fs::write(&p, FAKE_PY).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -117,6 +129,7 @@ fn ctx_remote(
     target: RemoteExecTarget,
 ) -> SpawnCtx {
     SpawnCtx {
+        claude_account: None,
         generation: 0,
         mode: None,
         slug: slug.to_string(),

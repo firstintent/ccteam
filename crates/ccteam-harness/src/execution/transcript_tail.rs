@@ -181,6 +181,21 @@ pub fn anthropic_project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(resolve_project_dir_in(&base, cwd))
 }
 
+/// Resolve a managed sid's bound Claude profile for reads that outlive its
+/// process (recovery, titles). A confirmed profile is read as recorded. A
+/// binding no launch has confirmed yet (a new session, or one that just
+/// switched accounts) reads cswap's shared history: switching is only allowed
+/// once the transcript is there (#236).
+pub fn anthropic_bound_project_dir(
+    cwd: &Path,
+    account: Option<&super::claude_accounts::ClaudeAccountBinding>,
+) -> Option<PathBuf> {
+    match account.and_then(|account| account.config_dir.as_ref()) {
+        Some(config_dir) => Some(anthropic_project_dir_in(&config_dir.join("projects"), cwd)),
+        None => anthropic_project_dir(cwd),
+    }
+}
+
 /// [`anthropic_project_dir`] against an explicitly supplied Claude projects
 /// root — the injection seam (same shape as [`discover_active_session_in`]) so
 /// tests never touch the real `~/.claude/projects/`.

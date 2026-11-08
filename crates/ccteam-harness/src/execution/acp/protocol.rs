@@ -327,6 +327,19 @@ fn effort_config_entry(opts: &[Value]) -> Option<&Value> {
     })
 }
 
+/// A fresh `session/new` that ccteam asked for no model reports the vendor's
+/// own default — record it so the picker's default row can name the id.
+/// Resumed sessions and explicit picks never count.
+pub fn record_fresh_default_model(vendor: &str, requested_model: Option<&str>, info: &ModelInfo) {
+    if requested_model
+        .map(str::trim)
+        .is_some_and(|m| !m.is_empty())
+    {
+        return;
+    }
+    crate::model_catalog::record_vendor_default_model_best_effort(vendor, info.model.as_deref());
+}
+
 /// Pull model info from a `session/new` / `session/load` / `session/resume`
 /// result — or from a `config_option_update` payload, which carries the same
 /// `configOptions[]` snapshot.

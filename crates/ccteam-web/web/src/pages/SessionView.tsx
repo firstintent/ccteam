@@ -37,8 +37,10 @@ import {
   X,
 } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import { CswapAccountPicker } from "../components/CswapAccountPicker";
+import { toastBus } from "../lib/toastBus";
 import { ContextPanel } from "../components/ContextPanel";
-import type { FileTarget } from "../lib/filesApi";
+import { createFilePreviewResolver, type FileTarget } from "../lib/filesApi";
 import "../components/fileWorkspace.css";
 import { InlineRename } from "../components/InlineRename";
 import { copyText } from "../lib/clipboard";
@@ -70,10 +72,13 @@ import {
   projectUploadUrl,
   resolveApproval as apiResolveApproval,
   submitTurn,
+  switchSessionClaudeAccount,
+  type CswapAccount,
   type OutboundAttachmentRef,
   type SessionView as SessionSummary,
   type ScheduledItem,
   type TurnStatus,
+  accountName,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
@@ -263,6 +268,11 @@ export default function SessionView({
   onRename?: (sid: string, title: string) => void | Promise<void>;
 }) {
   const t = makeT(lang);
+  const previewProject = session?.project;
+  const resolveFilePreview = useMemo(
+    () => previewProject ? createFilePreviewResolver(previewProject) : undefined,
+    [previewProject],
+  );
   // Inline title edit in the header. `pendingTitle` is the optimistic value
   // shown only WHILE the shell's rename is in flight — without it the header
   // visibly snaps back to the old title for a beat after Enter. It is cleared
@@ -784,6 +794,27 @@ export default function SessionView({
   // red connection dot next to the status dot.
   const connLost = gatewayUnavailable || lastError !== null;
 
+  // #236 — the session's Claude account. A switch answers with the new
+  // binding at once; the rail refresh (lifecycle frame) catches up after.
+  const [accountSwitch, setAccountSwitch] = useState<
+    { sid: string; was: CswapAccount | null | undefined; now: CswapAccount | null } | null
+  >(null);
+  const serverAccount = session?.claude_account;
+  const boundAccount = accountSwitch?.sid === sid && accountSwitch.was === serverAccount
+    ? accountSwitch.now
+    : (serverAccount ?? null);
+  const accountCapable = session?.vendor === "claude"
+    && (session?.protocol ?? "stream-json") === "stream-json"
+    && (session?.host ?? "local") === "local";
+  const switchAccount = async (id: string) => {
+    const result = await switchSessionClaudeAccount(sid, id || null);
+    setAccountSwitch({ sid, was: serverAccount, now: result.claude_account });
+    if (result.changed) {
+      const name = result.claude_account ? accountName(result.claude_account) : t("accountDefaultLogin");
+      toastBus.handler?.info(`${t("accountSwitched")} ${name}${result.released ? ` · ${t("accountNextMessage")}` : ""}`);
+    }
+  };
+
   const serverTitle = session?.title || session?.role || sid;
   const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
@@ -858,6 +889,12 @@ export default function SessionView({
           </button>
         ) : null}
         {session?.role ? <span className="chip session-role" data-testid="session-role" title={session.role}>{session.role}</span> : null}
+        {boundAccount ? <span className="chip" data-testid="session-claude-account"
+          title={boundAccount.active
+            ? (lang === "en" ? "Default login; may follow cswap auto" : "默认登录，可能跟随 cswap auto 切换")
+            : boundAccount.label}>
+          {boundAccount.active ? (lang === "en" ? "Default login" : "默认登录") : accountName(boundAccount)}
+        </span> : null}
         <span className="session-model" data-testid="session-model" title={displayStatusModel ?? vendor}>
           {displayStatusModel ?? vendor}
         </span>
@@ -1126,6 +1163,7 @@ export default function SessionView({
                               <Markdown
                                 content={row.content}
                                 onFileOpen={openFile}
+                                resolveFilePreview={resolveFilePreview}
                               />
                             ) : null}
                             <OutboundAttachments
@@ -1262,6 +1300,15 @@ export default function SessionView({
                     modelLabel={displayStatusModel ?? ""}
                     effortLabel={statusEffort ?? ""}
                     uploadSlug={session?.project}
+                    accountSlot={accountCapable ? (
+                      <CswapAccountPicker
+                        key={sid}
+                        value={boundAccount && !boundAccount.active ? boundAccount.id : ""}
+                        onChange={switchAccount}
+                        lang={lang}
+                        session={{ sid, bound: boundAccount }}
+                      />
+                    ) : undefined}
                     onSchedule={scheduleText}
                     scheduleTimezone={daemonTimezone}
                   />

@@ -776,10 +776,17 @@ impl CodexAppServerAdapter {
                         }
                         // Account-scoped rate-limit snapshot (no thread_id) —
                         // cache the latest so `account_usage()` reports THIS
-                        // vendor's own 5h/weekly windows.
+                        // vendor's own 5h/weekly windows. Codex pushes one
+                        // snapshot per metered bucket (`limitId` `codex`,
+                        // `premium` …) and a bucket the plan does not meter
+                        // arrives with every window null; such a snapshot says
+                        // nothing about headroom, so it must not displace one
+                        // that did (it blanked the `/status` row).
                         if notif.method == "account/rateLimits/updated" {
                             if let Some(snap) =
-                                pluck_val(&notif.params, "rate_limits", "rateLimits")
+                                pluck_val(&notif.params, "rate_limits", "rateLimits").filter(
+                                    |snap| account_usage_from_codex_snapshot(snap).is_some(),
+                                )
                             {
                                 *rate_limits.lock().await = Some(snap);
                             }
@@ -1865,19 +1872,31 @@ impl CodexAppServerAdapter {
 }
 
 /// Map a codex `account/rateLimits/updated` snapshot (the inner `rateLimits`
-/// object) → the vendor-neutral [`crate::AccountUsage`]. Codex's `primary`
-/// window is the 5-hour limit and `secondary` the weekly (per the codex
-/// protocol `windowDurationMins` 300 / 10080), mirroring Claude's two windows.
+/// object) → the vendor-neutral [`crate::AccountUsage`].
+///
+/// Each window is placed by its OWN declared length (`windowDurationMins`,
+/// snake `window_minutes`), never by its position: `primary` is merely codex's
+/// first-listed window. On a plan with a 5-hour limit it is that 300-minute
+/// window with the weekly 10080 in `secondary`; on a plan WITHOUT one, the
+/// weekly window is `primary` and `secondary` is null (observed live,
+/// 2026-11-06) — read positionally, a 89%-used WEEK rendered as `5h 89%`.
+/// A window shorter than a day fills the short (5h) slot, a day or longer the
+/// weekly one; only a window that declares no length falls back to its
+/// position (primary = short, secondary = weekly).
+///
 /// `resetsAt` is an absolute Unix epoch (seconds) → ISO-8601 for the renderer;
 /// `planType` → subscription tier; a non-null `rateLimitReachedType` ⇒ weekly
 /// ⚠. `credits_pct` stays `None` — codex's `credits` is a balance object, not a
 /// utilization %, so the `/status` line correctly omits 额度 for codex.
-/// All-`None` ⇒ `None`.
+/// No window ⇒ `None` ([`crate::AccountUsage::has_window`]).
 fn account_usage_from_codex_snapshot(snapshot: &Value) -> Option<crate::AccountUsage> {
     // dual-key (camelCase wire / snake_case) numeric lookup within a window.
+    // Integer or float: the app-server wire sends `usedPercent: 89`, codex's
+    // core protocol `used_percent: 89.0` — an integer-only read dropped the
+    // latter as "no window".
     let win_i64 = |w: Option<&Value>, snake: &str, camel: &str| -> Option<i64> {
         w.and_then(|x| x.get(camel).or_else(|| x.get(snake)))
-            .and_then(|v| v.as_i64())
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
     };
     let pct = |w: Option<&Value>| {
         win_i64(w, "used_percent", "usedPercent").map(|n| n.clamp(0, 100) as u8)
@@ -1887,8 +1906,25 @@ fn account_usage_from_codex_snapshot(snapshot: &Value) -> Option<crate::AccountU
             .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
             .map(|dt| dt.to_rfc3339())
     };
-    let primary = snapshot.get("primary");
-    let secondary = snapshot.get("secondary");
+    const DAY_MINS: i64 = 24 * 60;
+    // `Some(true)` = a short (sub-day) window, `Some(false)` = day-or-longer,
+    // `None` = no declared length (position decides).
+    let is_short = |w: &Value| {
+        win_i64(Some(w), "window_minutes", "windowDurationMins").map(|mins| mins < DAY_MINS)
+    };
+    let present = |key: &str| snapshot.get(key).filter(|w| w.is_object());
+    let (mut short, mut weekly) = (None, None);
+    for (window, positional_short) in [(present("primary"), true), (present("secondary"), false)] {
+        let Some(window) = window else { continue };
+        let slot = if is_short(window).unwrap_or(positional_short) {
+            &mut short
+        } else {
+            &mut weekly
+        };
+        // First window of a length wins; a second of the same length is not
+        // folded into it.
+        slot.get_or_insert(window);
+    }
     let weekly_severity = snapshot
         .get("rate_limit_reached_type")
         .or_else(|| snapshot.get("rateLimitReachedType"))
@@ -1901,21 +1937,17 @@ fn account_usage_from_codex_snapshot(snapshot: &Value) -> Option<crate::AccountU
         .map(str::to_string);
     let usage = crate::AccountUsage {
         subscription,
-        five_hour_pct: pct(primary),
-        five_hour_resets_at: reset_iso(primary),
-        weekly_pct: pct(secondary),
-        weekly_resets_at: reset_iso(secondary),
+        five_hour_pct: pct(short),
+        five_hour_resets_at: reset_iso(short),
+        weekly_pct: pct(weekly),
+        weekly_resets_at: reset_iso(weekly),
         weekly_severity,
         credits_pct: None,
         // Codex meters one pool across models — no per-model windows on the
         // wire, so none are reported (never derived).
         model_windows: Vec::new(),
     };
-    if usage == crate::AccountUsage::default() {
-        None
-    } else {
-        Some(usage)
-    }
+    usage.has_window().then_some(usage)
 }
 
 #[async_trait]
@@ -2077,6 +2109,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 "codex",
                 "codex model/list",
                 catalog_models(&catalog),
+            );
+        }
+        // `thread/start` carries no model (an explicit pick rides turn/start
+        // overrides), so a fresh thread's `model` is the configured default.
+        if !resumed {
+            crate::model_catalog::record_vendor_default_model_best_effort(
+                "codex",
+                result.get("model").and_then(Value::as_str),
             );
         }
         // The started / resumed thread is now resident + subscribed on this
@@ -6023,6 +6063,55 @@ mod tests {
                 .five_hour_pct,
             Some(5)
         );
+    }
+
+    /// A codex plan with no 5-hour limit lists its WEEKLY window as `primary`
+    /// and `secondary` null (live rollout, 2026-11-06). Read positionally that
+    /// week rendered as `5h 89%`; each window goes where its declared length
+    /// says, in either key spelling.
+    #[test]
+    fn codex_windows_are_placed_by_their_declared_length() {
+        let weekly_only = json!({
+            "limitId": "codex",
+            "primary": { "usedPercent": 89, "windowDurationMins": 10080, "resetsAt": 1_794_192_127_i64 },
+            "secondary": null,
+            "planType": null,
+        });
+        let u = account_usage_from_codex_snapshot(&weekly_only).expect("a weekly window");
+        assert_eq!(u.five_hour_pct, None);
+        assert_eq!(u.five_hour_resets_at, None);
+        assert_eq!(u.weekly_pct, Some(89));
+        assert!(u.weekly_resets_at.is_some());
+
+        let snake = json!({
+            "primary": { "used_percent": 89.0, "window_minutes": 10080, "resets_at": 1_794_192_127_i64 },
+            "secondary": null,
+        });
+        let u = account_usage_from_codex_snapshot(&snake).unwrap();
+        assert_eq!((u.five_hour_pct, u.weekly_pct), (None, Some(89)));
+
+        // A sub-day window is the short one even when listed second.
+        let swapped = json!({
+            "primary": { "usedPercent": 40, "windowDurationMins": 10080 },
+            "secondary": { "usedPercent": 7, "windowDurationMins": 300 },
+        });
+        let u = account_usage_from_codex_snapshot(&swapped).unwrap();
+        assert_eq!((u.five_hour_pct, u.weekly_pct), (Some(7), Some(40)));
+    }
+
+    /// A bucket the plan does not meter (`limitId: "premium"`, every window
+    /// null) is not an observation — so it cannot displace the snapshot that
+    /// carried the real windows.
+    #[test]
+    fn a_windowless_codex_bucket_is_not_an_observation() {
+        let premium = json!({
+            "limitId": "premium",
+            "primary": null,
+            "secondary": null,
+            "credits": { "hasCredits": false, "unlimited": false, "balance": "0" },
+            "planType": "plus",
+        });
+        assert_eq!(account_usage_from_codex_snapshot(&premium), None);
     }
 
     #[test]

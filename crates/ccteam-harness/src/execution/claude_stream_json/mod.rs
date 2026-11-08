@@ -48,12 +48,15 @@ use futures::stream::BoxStream;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::execution::claude_accounts::CswapLaunch;
 use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
 use crate::execution::session_status::{read_status_file, write_context_file, write_status_file};
-use crate::execution::transcript_tail::anthropic_project_dir;
+use crate::execution::transcript_tail::{
+    anthropic_bound_project_dir, anthropic_project_dir, anthropic_project_dir_in,
+};
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, DetachedActivity,
     Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn,
@@ -417,6 +420,9 @@ fn spawn_status_tap(
     cells: StatusTapCells,
     project_dir: PathBuf,
     sid: String,
+    // Spawned with no model at all (no pick, no role `model:`): the first
+    // API-reported model is claude's own default for the picker's default row.
+    mut record_default_model: bool,
 ) -> tokio::task::JoinHandle<()> {
     let StatusTapCells {
         status,
@@ -487,6 +493,14 @@ fn spawn_status_tap(
                         if let Some(m) = api_model {
                             if let Ok(mut s) = status.lock() {
                                 s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                            }
+                            // First observation only: a later `/model` switch
+                            // is the user's pick, not the default.
+                            if std::mem::take(&mut record_default_model) {
+                                crate::model_catalog::record_vendor_default_model_best_effort(
+                                    "claude",
+                                    Some(m),
+                                );
                             }
                         }
                         // v0.8.20 — ALSO refresh the live context window mid-turn
@@ -1209,9 +1223,24 @@ async fn get_context_breakdown(transport: &StreamJsonTransport) -> Option<crate:
 /// array (group·severity) + `extra_usage` (credits). `None` on timeout / error /
 /// a CLI without the subtype (probed: `get_usage` is the real subtype;
 /// `rate_limits`/`usage` error). Short timeout — must never stall the dashboard.
+///
+/// `skip_behaviors: true` is load-bearing. By default claude ALSO computes
+/// `behaviors` (the "what's contributing to your usage" recommendations) by
+/// scanning the account's local transcript history, which ccteam never reads.
+/// That scan grows with history: on a well-used host it took ~3.9s (probed,
+/// claude 2.1.318) against ~1ms with the flag, so every ask blew the deadline
+/// below — the live read AND the release-time capture both came back `None`,
+/// and the IM `⚡ 用量` row froze on the last snapshot that had ever made it
+/// (an old account's, kept "valid" until its weekly reset). The rate-limit
+/// half is untouched by the flag: claude still answers it from the account
+/// the process is signed in as. A CLI predating the flag ignores the field.
 async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::AccountUsage> {
     let body = transport
-        .request_control("get_usage", json!({}), Duration::from_secs(3))
+        .request_control(
+            "get_usage",
+            json!({ "skip_behaviors": true }),
+            Duration::from_secs(3),
+        )
         .await
         .ok()?;
     if body.subtype != "success" {
@@ -1261,11 +1290,15 @@ fn parse_get_usage_response(resp: &serde_json::Value) -> Option<crate::AccountUs
         credits_pct: pct(extra),
         model_windows: model_windows(rl),
     };
-    if usage == crate::AccountUsage::default() {
-        None
-    } else {
-        Some(usage)
-    }
+    // An answer is an observation only if it carries at least one WINDOW. The
+    // tier alone (`rate_limits: null` — claude could not reach its usage
+    // endpoint, or the account is not metered) says nothing about headroom,
+    // so it must not stand in for one: the caller then asks the next session
+    // or falls back to the last real observation instead of overwriting it
+    // with a row that renders as nothing. Which windows exist is the
+    // account's business — a plan without a 5-hour window (only `seven_day`)
+    // is a full observation, as is one reporting only per-model buckets.
+    usage.has_window().then_some(usage)
 }
 
 /// Per-model weekly windows out of the `rate_limits` object.
@@ -1721,7 +1754,14 @@ impl ClaudeStreamJsonAdapter {
                 );
             }
         }
-        let init = Self::init_transport(transport).await;
+        let timeout = if env.iter().any(|(key, _)| key == "CCTEAM_CSWAP_LAUNCH")
+            && std::env::var_os("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS").is_none()
+        {
+            Duration::from_secs(60)
+        } else {
+            init_timeout()
+        };
+        let init = Self::init_transport(transport, timeout).await;
         if init.is_err() {
             // The failed handshake already killed the child: a record left
             // behind would read as a body that exited unobserved, and the
@@ -1747,7 +1787,7 @@ impl ClaudeStreamJsonAdapter {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("ccteam-exec.v1 connect: {e:#}")))?;
         let transport = StreamJsonTransport::spawn_from_io(reader, writer, None);
-        Self::init_transport(transport).await
+        Self::init_transport(transport, init_timeout()).await
     }
 
     /// Shared `initialize` control_request handshake — see
@@ -1755,9 +1795,10 @@ impl ClaudeStreamJsonAdapter {
     /// the capability handshake stream-json uses.
     async fn init_transport(
         transport: StreamJsonTransport,
+        timeout: Duration,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         match transport
-            .request_control("initialize", json!({}), init_timeout())
+            .request_control("initialize", json!({}), timeout)
             .await
         {
             Ok(body) if body.subtype == "success" => Ok((
@@ -1881,7 +1922,22 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // a local resume failure — same contract, just optimistic instead
         // of fs-checked (tech-design §4.4: satellite `--resume` is how a
         // remote rebuild continues context, PRD F3.4).
-        let resume = ctx.remote.is_some() || Self::session_jsonl_exists(&ctx.cwd, &uuid);
+        if ctx.claude_account.is_some() && ctx.remote.is_some() {
+            return Err(HarnessError::SpawnFailed(
+                "cswap accounts are not supported on remote projects".into(),
+            ));
+        }
+        let resume = ctx.remote.is_some()
+            || ctx
+                .claude_account
+                .as_ref()
+                .and_then(|account| account.config_dir.as_ref())
+                .map(|dir| {
+                    anthropic_project_dir_in(&dir.join("projects"), &ctx.cwd)
+                        .join(format!("{uuid}.jsonl"))
+                        .exists()
+                })
+                .unwrap_or_else(|| Self::session_jsonl_exists(&ctx.cwd, &uuid));
 
         // v0.8.24 C1 / v0.9.0 W3 — curated per-session MCP. `--mcp-config`
         // is a RELATIVE path (`.ccteam/chat/<sid>/mcp.json`, cwd = project
@@ -1930,6 +1986,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // `ccteam-exec.v1` WS bridge — tech-design §0.4: execution location
         // is a transport parameter); everything after this `match` is
         // identical for both.
+        let mut effective_account = ctx.claude_account.clone();
         let (transport, init) = if let Some(remote) = ctx.remote.as_ref() {
             let build_spec = |resume: bool| {
                 Self::build_exec_spec(ctx, make_argv(resume), &env, ship_mcp, &mcp_relpath)
@@ -1960,6 +2017,21 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             }
         } else {
             let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
+            let launch = match ctx.claude_account.as_ref() {
+                Some(account) => Some(
+                    CswapLaunch::prepare(
+                        account,
+                        &make_argv(resume),
+                        &env,
+                        &ctx.cwd,
+                        &crate::execution::turns_mirror::chat_dir(&ctx.project_dir, &ctx.sid),
+                        &uuid,
+                    )
+                    .await
+                    .map_err(|error| HarnessError::SpawnFailed(format!("cswap: {error:#}")))?,
+                ),
+                None => None,
+            };
             // `resume` here means the transcript `<uuid>.jsonl` is on disk, and
             // claude refuses `--session-id <uuid>` for an existing transcript
             // ("Session ID … is already in use", exit 1): a fresh fallback on
@@ -1967,9 +2039,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // resume into a second, misleading failure. Surface the resume
             // failure itself. Nothing sticks: the transcript is untouched and
             // the next message tries `--resume` again (docs-local issue #211).
-            Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body)
+            let result = Self::spawn_and_init(
+                &launch.as_ref().map(|launch| launch.argv.clone()).unwrap_or_else(|| make_argv(resume)),
+                launch.as_ref().map(|launch| launch.env.as_slice()).unwrap_or(&env), &ctx.cwd, body)
                 .await
                 .map_err(|err| {
+                    // A relay refusal (profile/identity drift, history not
+                    // visible yet, auth override) is the real reason.
+                    let err = match launch.as_ref().and_then(CswapLaunch::failure) {
+                        Some(reason) => HarnessError::SpawnFailed(format!("cswap: {reason}")),
+                        None => err,
+                    };
                     if !resume {
                         return err;
                     }
@@ -1983,7 +2063,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         "claude --resume {uuid} failed: {err}. The conversation is intact on \
                          disk; the next resume retries it"
                     ))
-                })?
+                })?;
+            if let Some(launch) = launch {
+                match launch.binding() {
+                    Ok(binding) => effective_account = Some(binding),
+                    Err(error) => {
+                        let _ = result.0.shutdown().await;
+                        return Err(HarnessError::SpawnFailed(format!(
+                            "cswap profile confirmation failed: {error:#}"
+                        )));
+                    }
+                }
+            }
+            result
         };
 
         let identity = SessionIdentity {
@@ -2056,6 +2148,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             },
             ctx.project_dir.clone(),
             ctx.sid.clone(),
+            ctx.model_id
+                .as_deref()
+                .is_none_or(|model| model.trim().is_empty()),
         ));
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
@@ -2173,6 +2268,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 "role": spec.role,
                 "project_dir": ctx.project_dir.to_string_lossy(),
                 "cwd": ctx.cwd.to_string_lossy(),
+                "claude_account": effective_account,
             }),
         })
     }
@@ -2549,7 +2645,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         if ctx.vendor_uuid.is_empty() {
             return None;
         }
-        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        let path = anthropic_bound_project_dir(&ctx.cwd, ctx.claude_account.as_ref())?
+            .join(format!("{}.jsonl", ctx.vendor_uuid));
         let observed_until = ctx.observed_until;
         let last = ctx.last_observed_assistant.clone();
         tokio::task::spawn_blocking(move || {
@@ -2564,7 +2661,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         if ctx.vendor_uuid.is_empty() {
             return None;
         }
-        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        let path = anthropic_bound_project_dir(&ctx.cwd, ctx.claude_account.as_ref())?
+            .join(format!("{}.jsonl", ctx.vendor_uuid));
         tokio::task::spawn_blocking(move || recovery::activity(&path, std::time::SystemTime::now()))
             .await
             .ok()
@@ -2853,9 +2951,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // it belongs.
         if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
             let (cwd, uuid) = (PathBuf::from(cwd), h.identity.clone());
-            let gating = tokio::task::spawn_blocking(move || turn_gating::read(&cwd, &uuid))
-                .await
-                .unwrap_or(None);
+            let config_dir = h
+                .raw_extras
+                .get("claude_account")
+                .and_then(|value| value.get("config_dir"))
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from);
+            let gating = tokio::task::spawn_blocking(move || {
+                turn_gating::read(&cwd, &uuid, config_dir.as_deref())
+            })
+            .await
+            .unwrap_or(None);
             status.goal = gating.as_ref().and_then(|gating| gating.goal.clone());
             status.stop_hook_blocks = gating.map(|gating| gating.stop_hook_blocks);
         }
@@ -3249,8 +3355,89 @@ mod deferred_queue_tests {
 
 #[cfg(test)]
 mod account_usage_tests {
-    use super::parse_get_usage_response;
+    use super::{get_account_usage, parse_get_usage_response, StreamJsonTransport};
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// The 2026-11-06 freeze. Without `skip_behaviors`, claude first scans the
+    /// account's local transcript history to build usage recommendations —
+    /// ~3.9s on a well-used host, past the 3s deadline — so every live read
+    /// AND every release-time capture came back `None` and the IM row showed
+    /// a days-old snapshot of a since-replaced account. The peer here answers
+    /// the way that claude did for an ask WITHOUT the flag (only after the
+    /// deadline), so leaving the flag out fails this test.
+    #[tokio::test]
+    async fn get_usage_skips_the_slow_behaviors_scan() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client);
+        let transport = StreamJsonTransport::spawn_from_io(client_read, client_write, None);
+        tokio::spawn(async move {
+            let (peer_read, mut peer_write) = tokio::io::split(&mut peer);
+            let mut line = String::new();
+            BufReader::new(peer_read)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request["request"]["subtype"], "get_usage");
+            if request["request"]["skip_behaviors"] != json!(true) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let reply = json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request["request_id"],
+                    "response": {
+                        "subscription_type": "team",
+                        "rate_limits": {
+                            "five_hour": {"utilization": 34, "resets_at": "2026-11-06T13:50:00Z"},
+                            "seven_day": {"utilization": 35, "resets_at": "2026-11-10T13:00:00Z"}
+                        }
+                    }
+                }
+            });
+            peer_write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            peer_write.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let usage = tokio::time::timeout(Duration::from_secs(10), get_account_usage(&transport))
+            .await
+            .expect("the ask is bounded by its own deadline")
+            .expect("answered inside the deadline");
+        assert_eq!(usage.subscription.as_deref(), Some("team"));
+        assert_eq!(usage.five_hour_pct, Some(34));
+        assert_eq!(usage.weekly_pct, Some(35));
+    }
+
+    /// A plan with NO 5-hour window (live shape, claude 2.1.318: `five_hour`
+    /// is `null`) is a complete observation: the weekly window and the tier,
+    /// and no 5-hour figure from anywhere.
+    #[test]
+    fn a_plan_without_a_five_hour_window_reports_only_its_weekly_one() {
+        let usage = parse_get_usage_response(&json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": null,
+                "seven_day": {"utilization": 20, "resets_at": "2026-11-09T18:59:59Z"},
+                "limits": [
+                    {"kind": "weekly_all", "group": "weekly", "percent": 20, "severity": "normal"}
+                ]
+            }
+        }))
+        .expect("a weekly window alone is an observation");
+        assert_eq!(usage.five_hour_pct, None);
+        assert_eq!(usage.five_hour_resets_at, None);
+        assert_eq!(usage.weekly_pct, Some(20));
+        assert_eq!(usage.weekly_severity.as_deref(), Some("normal"));
+        assert_eq!(usage.subscription.as_deref(), Some("max"));
+    }
 
     /// The `get_usage` response for a Max account whose server DOES send the
     /// declared per-model array. Key set pinned against a live claude 2.1.245.
@@ -3370,6 +3557,15 @@ mod account_usage_tests {
     fn refuses_to_invent_rows_from_an_empty_answer() {
         assert!(parse_get_usage_response(&json!({})).is_none());
         assert!(parse_get_usage_response(&json!({"rate_limits": {}})).is_none());
+        // The tier with no windows (claude could not reach its usage endpoint)
+        // says nothing about headroom: not an observation either, so it can
+        // never overwrite the last one that did.
+        assert!(parse_get_usage_response(&json!({
+            "subscription_type": "team",
+            "rate_limits_available": false,
+            "rate_limits": null
+        }))
+        .is_none());
         assert!(parse_get_usage_response(&json!({
             "rate_limits": {"seven_day_opus": {}, "model_scoped": [{"utilization": 5.0}]}
         }))

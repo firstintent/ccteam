@@ -1,7 +1,7 @@
 //! One JSON shape for "where does this vendor account stand", shared by every
 //! machine-readable surface.
 //!
-//! [`Gateway::account_usage_snapshot`](crate::gateway::Gateway::account_usage_snapshot)
+//! [`Gateway::account_usage_probes`](crate::gateway::Gateway::account_usage_probes)
 //! answers WHAT is known; this module decides how that is spelled on the wire,
 //! once, for both readers of it — the MCP `status{detail:"usage"}` body an
 //! agent calls and the `GET /api/v1/usage` a script calls. Two spellings of one

@@ -22,6 +22,7 @@ import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ChatComposer } from "../components/ChatComposer";
+import { CswapAccountPicker } from "../components/CswapAccountPicker";
 import { useVendorCatalog } from "../hooks/useVendorCatalog";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
@@ -52,7 +53,9 @@ export interface ProjectHostIdentity {
   online: boolean;
 }
 
-const MODEL_DRAFT_KEY = "ccteam.home.model.v1";
+// v2: the default became claude · opus · high (owner 2026-11-08); a v1
+// draft would keep pinning the old vendor-default pick.
+const MODEL_DRAFT_KEY = "ccteam.home.model.v2";
 
 /** Load the persisted draft without consulting the advisory live catalog.
  * Render-time structural normalization drops retired keys and repairs the
@@ -211,6 +214,7 @@ export default function HomeView({
   const [hostDetails, setHostDetails] = useState<Record<string, HostDetail | null>>({});
   const [host, setHost] = useState<string>("local");
   const [draft, setDraft] = useState<ComposerDraft>(() => loadModelDraft());
+  const [claudeAccount, setClaudeAccount] = useState("");
   // What each installed vendor actually declares (models + effort tokens);
   // `{}` until it loads / on an older daemon → the static registry answers.
   const catalog = useVendorCatalog();
@@ -383,6 +387,8 @@ export default function HomeView({
         protocol: wireProtocol(effectiveDraft),
         model: modelSwitchFor(effectiveDraft, catalog) ?? undefined,
         effort: effortSwitchFor(effectiveDraft, catalog) ?? undefined,
+        claude_account: effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
+          ? claudeAccount || undefined : undefined,
       });
       await submitTurn(sid, text, attachments);
       return sid;
@@ -571,6 +577,8 @@ export default function HomeView({
             disabled={pending}
             draft={effectiveDraft}
             onDraftChange={setDraft}
+            accountSlot={effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
+              ? <CswapAccountPicker value={claudeAccount} onChange={setClaudeAccount} lang={lang} /> : undefined}
             catalog={catalog}
             allowedVendors={hostVendors ?? undefined}
             onSend={launch}

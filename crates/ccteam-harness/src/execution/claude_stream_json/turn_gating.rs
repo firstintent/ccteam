@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::execution::journal::{FoldCache, LineFold};
-use crate::execution::transcript_tail::anthropic_project_dir;
+use crate::execution::transcript_tail::{anthropic_project_dir, anthropic_project_dir_in};
 
 /// The session's current `/goal` + recent Stop-hook refusals. Read together
 /// because they are one answer: a goal whose condition is not met yet is
@@ -155,8 +155,12 @@ impl GatingScan {
 /// met}}` record on the user turn. `None` when the transcript is absent or
 /// unreadable, which is what makes "cannot tell" distinguishable from
 /// "nothing refused".
-pub(super) fn read(cwd: &Path, uuid: &str) -> Option<TurnGating> {
-    let path = anthropic_project_dir(cwd)?.join(format!("{uuid}.jsonl"));
+pub(super) fn read(cwd: &Path, uuid: &str, config_dir: Option<&Path>) -> Option<TurnGating> {
+    let directory = match config_dir {
+        Some(dir) => anthropic_project_dir_in(&dir.join("projects"), cwd),
+        None => anthropic_project_dir(cwd)?,
+    };
+    let path = directory.join(format!("{uuid}.jsonl"));
     read_path(&path, chrono::Utc::now())
 }
 

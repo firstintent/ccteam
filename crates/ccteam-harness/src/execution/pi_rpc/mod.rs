@@ -581,6 +581,14 @@ impl PiRpcAdapter {
                 HarnessError::SpawnFailed("Pi get_state returned no absolute sessionFile".into())
             })?;
         let effective_model = ready.state.model.as_ref().map(PiModel::canonical_id);
+        // Fresh session, nothing requested (no pick, sidecar or role model):
+        // what Pi chose is its own default.
+        if model.is_none() && expected_session_file.is_none() {
+            crate::model_catalog::record_vendor_default_model_best_effort(
+                "pi",
+                effective_model.as_deref(),
+            );
+        }
         let effective_effort = Some(ready.state.thinking_level.clone());
         let config = LiveConfig {
             role: role.role.clone(),

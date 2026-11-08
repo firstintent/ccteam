@@ -64,6 +64,119 @@ pub struct RoleNotFound {
     pub role: String,
 }
 
+/// The frozen terminal protocol and remote projects do not support cswap.
+#[derive(Debug, thiserror::Error)]
+#[error("cswap accounts require a local Claude stream-json session")]
+pub struct CswapAccountUnsupported;
+
+/// Why a session's Claude account switch was refused (#236). None of these
+/// touched the session: binding, process and history are as they were.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeAccountSwitchError {
+    /// No session with this sid.
+    #[error("unknown session: {0}")]
+    UnknownSession(String),
+    /// Not a local Claude stream-json session.
+    #[error(transparent)]
+    Unsupported(#[from] CswapAccountUnsupported),
+    /// The process is doing something releasing it would cut short.
+    #[error("{0}")]
+    Busy(String),
+    /// Switching would lose the conversation or misdescribe the session.
+    #[error("{0}")]
+    Refused(String),
+    /// Bookkeeping failed (meta write, release).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// A session's account after [`Gateway::switch_claude_account_shared`].
+#[derive(Debug, Clone)]
+pub struct ClaudeAccountSwitch {
+    /// The new binding as any frontend may show it; `None` = default login.
+    pub claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+    /// The binding actually changed (picking the current account is a no-op).
+    pub changed: bool,
+    /// A resident process was released; the next message resumes the sid.
+    pub released: bool,
+}
+
+/// One deadline for every live account-usage ask in a single read (#234). A
+/// live answer is an in-memory read on the vendor side (claude `get_usage`
+/// with `skip_behaviors` answers in milliseconds); past this, the vendor's
+/// last recorded observation answers instead.
+const ACCOUNT_USAGE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long a `/status` usage prefetch stays valid for the render that follows.
+const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
+
+/// The live sessions to ask for each vendor's account windows, captured
+/// under the gateway lock (cheap handle clones) so that the asking itself
+/// never holds it. #234: `/status` awaited every live session in turn under
+/// the lock, 3 s each; once claude's answer slowed down, one card held the
+/// whole daemon for up to a minute and stalled web, IM and MCP with it.
+pub struct AccountUsageProbes {
+    root: Option<PathBuf>,
+    by_vendor: Vec<(AgentVendor, Vec<UsageAsker>)>,
+}
+
+/// One live session to ask: its adapter and thread, cloned out of the lock.
+type UsageAsker = (Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle);
+
+impl AccountUsageProbes {
+    /// Ask every captured session at once, all against one deadline. Per
+    /// vendor the first answer in capture order wins (a `/status` card
+    /// captures its own focus first: across a login switch processes can
+    /// disagree on the account), and is recorded; a vendor nobody answered
+    /// for reads its last observation from
+    /// [`ccteam_harness::usage_catalog`], which drops each window at the
+    /// vendor's declared reset. A vendor with neither is absent — never an
+    /// "unknown" row to misread as plenty left. Keyed by vendor token.
+    pub async fn resolve(self) -> BTreeMap<String, VendorAccountUsage> {
+        let deadline = tokio::time::Instant::now() + ACCOUNT_USAGE_DEADLINE;
+        let root = self.root;
+        let per_vendor = self.by_vendor.into_iter().map(|(vendor, askers)| {
+            let root = root.clone();
+            async move {
+                let answers = futures::future::join_all(askers.iter().map(|(adapter, thread)| {
+                    tokio::time::timeout_at(deadline, adapter.account_usage(thread))
+                }))
+                .await;
+                let entry = match answers.into_iter().find_map(|answer| answer.ok().flatten()) {
+                    Some(usage) => {
+                        if let Some(root) = root.as_deref() {
+                            ccteam_harness::usage_catalog::record_vendor_usage_best_effort(
+                                root,
+                                vendor_str(vendor),
+                                "status card",
+                                &usage,
+                            );
+                        }
+                        Some(VendorAccountUsage {
+                            observed_at: chrono::Utc::now().to_rfc3339(),
+                            source: "status card".to_string(),
+                            usage,
+                        })
+                    }
+                    None => root.as_deref().and_then(|root| {
+                        ccteam_harness::usage_catalog::last_known_entry_in(
+                            root,
+                            vendor_str(vendor),
+                            chrono::Utc::now(),
+                        )
+                    }),
+                };
+                entry.map(|entry| (vendor_str(vendor).to_string(), entry))
+            }
+        });
+        futures::future::join_all(per_vendor)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
     channel: String,
@@ -717,6 +830,9 @@ enum ReleaseReason {
     Capacity,
     /// Nobody spoke to it for its harness's `sessions.idle_release_secs`.
     Idle,
+    /// The user moved the session to another Claude account (#236); the next
+    /// message resumes the same sid under it.
+    AccountSwitch,
 }
 
 impl ReleaseReason {
@@ -724,6 +840,7 @@ impl ReleaseReason {
         match self {
             ReleaseReason::Capacity => "capacity",
             ReleaseReason::Idle => "idle",
+            ReleaseReason::AccountSwitch => "account_switch",
         }
     }
 }
@@ -928,6 +1045,9 @@ pub struct Gateway {
     /// no longer the chat's focus, which otherwise masquerade as the current
     /// session in the single IM stream (v0.8.10 routing-isolation fix).
     current_session: FocusRoutes,
+    /// `/status` usage asked for WITHOUT the gateway lock by the shared IM
+    /// entry, parked for the `handle_message` render that follows (#234).
+    status_usage_prefetch: BTreeMap<ChatKey, (Instant, AgentVendor, Option<VendorAccountUsage>)>,
     sessions: BTreeMap<String, GatewaySession>,
     /// Process-wide allocator for [`GatewaySession::generation`]. It is not a
     /// persisted identity; it only fences races within this daemon lifetime.
@@ -1022,6 +1142,9 @@ pub struct Gateway {
     /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
     /// never held under the gateway's own mutex for longer than a map lookup.
     spawn_claims: Arc<SpawnClaims>,
+    /// Optional cswap discovery (#236 IM `/account`), shared with the web
+    /// picker so both read one cache.
+    cswap_accounts: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
     /// The `(sid, secret)` authority behind every managed session's tool face
     /// — see [`crate::principals`]. Separate from `sessions` because a
     /// principal has to work BEFORE its session is live (the vendor uses it
@@ -2487,6 +2610,9 @@ pub struct SessionInventory {
 // `assert_eq!`/`==`, which only need `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionView {
+    /// Display-only account facts; private profile paths stay in meta.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
     /// Gateway session id (`s{n}`) — the network-API session namespace.
     pub sid: String,
     /// Project slug the session runs in.
@@ -2750,6 +2876,8 @@ pub struct StartOutcome {
 /// exist so a caller can pick well; they are never a gate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnTuning {
+    /// Stable identity reference returned by optional cswap discovery.
+    pub claude_account: Option<String>,
     /// Explicit model id; overrides the role's `model:` frontmatter.
     pub model: Option<String>,
     /// Explicit reasoning-effort token (vendor-specific value set — the
@@ -2765,6 +2893,7 @@ impl SpawnTuning {
     fn normalized(self) -> Self {
         let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         Self {
+            claude_account: clean(self.claude_account),
             model: clean(self.model),
             effort: clean(self.effort),
             mode: clean(self.mode),
@@ -3102,6 +3231,7 @@ struct RoutingState {
 /// stale session's `system:init` — while the on-demand resume path runs the
 /// same core under its already-held lock. One construction site, no drift.
 struct MetaRebuildPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     generation: u64,
     sid: String,
     slug: String,
@@ -3154,6 +3284,7 @@ struct MetaRebuildPlan {
 /// construction site (`plan_new_session`), no drift between the inline and
 /// lock-dropping callers.
 struct NewSessionPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     generation: u64,
     id: String,
     /// Canonical resource owner used by session ACL and persisted meta.
@@ -3214,6 +3345,7 @@ struct NewSessionPlan {
 /// marker from the OLD thread (`identity@started_at`); apply discards the
 /// freshly spawned thread if the session vanished or was replaced meanwhile.
 struct ResumeDeadPlan {
+    claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
     session_id: String,
     project: String,
     role: String,
@@ -3423,6 +3555,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/account",
+        arg_hint: Some("[<n> | default]"),
+        help: "show or switch the current Claude session's account (cswap); bare = list",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>"),
         help: "stop (destroy) a session by id",
@@ -3533,7 +3671,7 @@ impl NextStep {
 
 fn command_next_step(cmd: &str) -> Option<NextStep> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => NextStep::Session,
+        "/new" | "/use" | "/role" | "/interrupt" | "/account" => NextStep::Session,
         "/stop" | "/rename" | "/cd" | "/newproject" => NextStep::Sessions,
         "/status" => NextStep::SessionControls,
         "/help" => NextStep::Menu,
@@ -3552,6 +3690,16 @@ fn button_action_command(action: &str) -> Option<String> {
         "help" => "/help",
         "model" => "/model",
         "interrupt" => "/interrupt",
+        _ if action.starts_with("account:") => {
+            // `account:<slot>` / `account:default` — the `/account` picker.
+            let target = action.strip_prefix("account:")?;
+            if target != "default"
+                && (target.is_empty() || !target.chars().all(|c| c.is_ascii_digit()))
+            {
+                return None;
+            }
+            return Some(format!("/account {target}"));
+        }
         _ => {
             // `new-effort:<effort>:<vendor>[:<model>]` — the effort leads
             // because it never contains a `:` while a model id may.
@@ -3684,6 +3832,7 @@ impl Gateway {
             next_session_presets: BTreeMap::new(),
             current_project: FocusRoutes::new(FocusScope::Conversation),
             current_session: FocusRoutes::new(FocusScope::Thread),
+            status_usage_prefetch: BTreeMap::new(),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
             rebuild_reservations: BTreeMap::new(),
@@ -3710,6 +3859,7 @@ impl Gateway {
             progress_projection: None,
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
+            cswap_accounts: Default::default(),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
@@ -3930,6 +4080,13 @@ impl Gateway {
             BodyGate::PostMortem(body) => Some(body),
         };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
+        if meta.claude_account.is_some()
+            && (meta.vendor != AgentVendor::Claude
+                || meta.protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
+        }
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         // Both tuning axes, one precedence — see `respawn_tuning`.
         let (model_id, effort) = respawn_tuning(
@@ -3973,6 +4130,7 @@ impl Gateway {
         self.rebuild_reservations
             .insert(meta.sid.clone(), generation);
         Ok(MetaRebuildPlan {
+            claude_account: meta.claude_account.clone(),
             generation,
             sid: meta.sid.clone(),
             slug: slug.to_string(),
@@ -4054,6 +4212,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.slug.clone(),
                     sid: plan.sid.clone(),
@@ -5009,6 +5168,7 @@ impl Gateway {
         };
         let activity = adapter
             .detached_activity(&UnobservedTurnCtx {
+                claude_account: meta.claude_account.clone(),
                 sid: d.sid.clone(),
                 slug: d.slug.clone(),
                 cwd: d.cwd.clone(),
@@ -5304,6 +5464,7 @@ impl Gateway {
         };
         let recovered = adapter
             .recover_unobserved_turn(&UnobservedTurnCtx {
+                claude_account: meta.claude_account.clone(),
                 sid: sid.to_string(),
                 slug: slug.to_string(),
                 cwd: cwd.to_path_buf(),
@@ -5716,7 +5877,23 @@ impl Gateway {
     /// `&mut Gateway` (the claim is always taken before the gateway lock).
     /// The daemon asks this so a `/stop` never reaches the inline path.
     pub fn inbound_needs_shared_entry(text: &str) -> bool {
-        text.split_whitespace().next() == Some("/stop")
+        matches!(text.split_whitespace().next(), Some("/stop" | "/account"))
+            || Self::is_status_command(text)
+    }
+
+    /// A button that stands for a command needing the shared entry (an
+    /// `act:` click on `/account <n>` or `/status`) enters through it too.
+    pub fn selection_needs_shared_entry(selection: Option<&ChoiceReply>) -> bool {
+        selection
+            .and_then(|reply| reply.data.strip_prefix("act:"))
+            .and_then(button_action_command)
+            .is_some_and(|command| Self::inbound_needs_shared_entry(&command))
+    }
+
+    /// `/status` — routed through the shared entry so its account-usage asks
+    /// run without the gateway lock (#234).
+    fn is_status_command(text: &str) -> bool {
+        text.split_whitespace().next() == Some("/status")
     }
 
     /// True when `text` is one of the gateway-owned slash commands.
@@ -6026,12 +6203,52 @@ impl Gateway {
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id).with_thread(thread);
+        // A button standing for a shared-entry command runs exactly as if it
+        // had been typed — through this entry, not the inline one.
+        if let Some(command) = selection
+            .and_then(|reply| reply.data.strip_prefix("act:"))
+            .and_then(button_action_command)
+            .filter(|command| Self::inbound_needs_shared_entry(command))
+        {
+            return Box::pin(Self::handle_message_shared(
+                gateway,
+                channel,
+                chat_id,
+                user_id,
+                thread,
+                message_id,
+                &command,
+                &[],
+                None,
+            ))
+            .await;
+        }
+        // `/account` lists accounts (cswap runs) and switches through the
+        // per-sid claim: both without the gateway lock (#236).
+        if let Some(result) = Self::handle_account_command_shared(&gateway, &chat, text).await {
+            return result;
+        }
         // `/stop` before anything else: it is the one gateway command that has
         // to take a per-child claim, which means it cannot run inside a
         // `&mut Gateway` (issue #197 E). Handled here, where the lock can be
         // dropped between resolving the target and stopping it.
         if let Some(result) = Self::handle_stop_command_shared(&gateway, &chat, text).await {
             return result;
+        }
+        // `/status` asks live sessions for their account windows — vendor
+        // I/O that must not run under the daemon-wide lock (#234). Ask here
+        // with the lock dropped and park the answer for the render below.
+        if Self::is_status_command(text) {
+            let probes = crate::latency::gateway_lock(&gateway, "im.status.probes")
+                .await
+                .status_usage_probes(&chat);
+            if let Some((vendor, probes)) = probes {
+                let usage = probes.resolve().await.remove(vendor_str(vendor));
+                crate::latency::gateway_lock(&gateway, "im.status.prefetch")
+                    .await
+                    .status_usage_prefetch
+                    .insert(chat.clone(), (Instant::now(), vendor, usage));
+            }
         }
         // Re-derive the "implicit spawn candidate" decision authoritatively
         // (the daemon's `inbound_may_spawn` call is only a hint to decide
@@ -6165,6 +6382,152 @@ impl Gateway {
         })
     }
 
+    /// IM `/account [<n>|default]` (#236): show the chat's current Claude
+    /// session's account and the cswap accounts it can switch to, or switch
+    /// it. Same rules as the web picker — the switch is
+    /// [`Self::switch_claude_account_shared`]. cswap discovery and the switch
+    /// both run without the gateway lock. `None` = not an `/account` message.
+    async fn handle_account_command_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        text: &str,
+    ) -> Option<Result<Vec<String>>> {
+        let mut parts = text.split_whitespace();
+        if parts.next() != Some("/account") {
+            return None;
+        }
+        let reference = parts.next().map(str::to_string);
+        Some(Self::account_command(gateway, chat, reference.as_deref()).await)
+    }
+
+    async fn account_command(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        reference: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let planned = {
+            let g = crate::latency::gateway_lock(gateway, "im.account.plan").await;
+            g.current_session.get(chat).map(|sid| {
+                let meta = g
+                    .session_catalog
+                    .find_or_load(&sid, &g.projects)
+                    .map(|entry| entry.meta);
+                (
+                    sid,
+                    meta,
+                    Arc::clone(&g.cswap_accounts),
+                    g.channel_supports_buttons(&chat.channel),
+                )
+            })
+        };
+        let Some((sid, meta, service, buttons)) = planned else {
+            return Ok(vec![
+                "这里现在没有会话 —— 发条消息或 /new claude 开一个,再用 /account".to_string(),
+            ]);
+        };
+        let Some(meta) = meta else {
+            return Ok(vec![format!("找不到会话 {sid} 的记录")]);
+        };
+        let local = meta.host.trim().is_empty() || meta.host == ccteam_core::LOCAL_HOST;
+        if meta.vendor != AgentVendor::Claude
+            || meta.protocol != SessionProtocol::StreamJson
+            || !local
+        {
+            return Ok(vec![format!(
+                "会话 {sid} 不是本机 Claude stream-json 会话,不能用 cswap 账号"
+            )]);
+        }
+        let bound = meta
+            .claude_account
+            .as_ref()
+            .map(|binding| binding.display());
+
+        let Some(reference) = reference else {
+            let listed = service.accounts().await;
+            let text = render_account_list(&sid, bound.as_ref(), &listed, !buttons);
+            let accounts = listed.unwrap_or_default();
+            if buttons && !accounts.is_empty() {
+                let current = bound.as_ref().filter(|b| !b.active).map(|b| b.id.as_str());
+                let mark = |on: bool| if on { " ✓" } else { "" };
+                let mut options = vec![action_option(
+                    "account:default",
+                    &format!("默认登录{}", mark(current.is_none())),
+                    OptionWeight::Normal,
+                )];
+                options.extend(accounts.iter().map(|account| {
+                    action_option(
+                        &format!("account:{}", account.slot),
+                        &format!(
+                            "{}{}",
+                            ccteam_harness::execution::claude_accounts::display_name(account),
+                            mark(current == Some(account.id.as_str()))
+                        ),
+                        OptionWeight::Normal,
+                    )
+                }));
+                crate::latency::gateway_lock(gateway, "im.account.picker")
+                    .await
+                    .emit_list_options(chat, text, options);
+                return Ok(Vec::new());
+            }
+            return Ok(vec![text]);
+        };
+
+        let target = if matches!(reference, "default" | "默认" | "默认登录") {
+            None
+        } else {
+            let accounts = match service.accounts().await {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    return Ok(vec![format!(
+                        "cswap 不可用,没有切换:{error:#}\n回默认登录不需要 cswap:/account default"
+                    )])
+                }
+            };
+            match ccteam_harness::execution::claude_accounts::find_account(&accounts, reference) {
+                Some(account) => Some(account.clone()),
+                None => {
+                    return Ok(vec![format!(
+                        "没有编号或名字为「{reference}」的账号 —— /account 看列表"
+                    )])
+                }
+            }
+        };
+        let name = |account: Option<&ccteam_harness::execution::claude_accounts::CswapAccount>| {
+            account.map_or_else(
+                || "默认登录".to_string(),
+                ccteam_harness::execution::claude_accounts::display_name,
+            )
+        };
+        use ClaudeAccountSwitchError as SwitchError;
+        let reply = match Self::switch_claude_account_shared(gateway, &sid, target).await {
+            Ok(switch) if !switch.changed => {
+                format!(
+                    "会话 {sid} 已经在用 {}",
+                    name(switch.claude_account.as_ref())
+                )
+            }
+            Ok(switch) => format!(
+                "已把会话 {sid} 切到 {}{}",
+                name(switch.claude_account.as_ref()),
+                if switch.released {
+                    ";当前进程已结束,下一条消息在同一会话里按新账号继续(提示缓存会重建)"
+                } else {
+                    ",下一条消息起生效"
+                }
+            ),
+            Err(
+                error @ (SwitchError::Busy(_)
+                | SwitchError::Refused(_)
+                | SwitchError::Unsupported(_)),
+            ) => format!("没有切换:{error}"),
+            Err(SwitchError::UnknownSession(_)) => format!("找不到会话 {sid}"),
+            Err(SwitchError::Internal(error)) => return Err(error),
+        };
+        let g = crate::latency::gateway_lock(gateway, "im.account.next_step").await;
+        Ok(g.reply_with_next_step(chat, reply, command_next_step("/account")))
+    }
+
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
@@ -6181,8 +6544,17 @@ impl Gateway {
                     role,
                     permission_mode,
                     protocol,
-                    tuning,
+                    mut tuning,
                 } = parse_new_command_args(&args)?;
+                if vendor == AgentVendor::Claude && tuning.claude_account.is_none() {
+                    tuning.claude_account = self
+                        .current_session
+                        .get(chat)
+                        .and_then(|sid| self.session_catalog.find_or_load(&sid, &self.projects))
+                        .and_then(|entry| entry.meta.claude_account)
+                        .filter(|binding| !binding.default_login)
+                        .map(|binding| binding.id);
+                }
                 let project = self.require_current_project(chat)?;
                 let handle = role.clone();
                 let outcome = self
@@ -6284,6 +6656,11 @@ impl Gateway {
                     ),
                 }))
             }
+            "/account" => Ok(Some(
+                "/account must be routed through the shared entry point (cswap discovery and \
+                 the switch run without the gateway lock)"
+                    .to_string(),
+            )),
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
                 // destroying it — the context survives, so the user can then
@@ -6378,7 +6755,14 @@ impl Gateway {
                     Ok(Some(text))
                 }
             }
-            "/status" => Ok(Some(self.render_status(chat).await)),
+            "/status" => {
+                let prefetched = self
+                    .status_usage_prefetch
+                    .remove(chat)
+                    .filter(|(at, _, _)| at.elapsed() < STATUS_USAGE_PREFETCH_TTL)
+                    .map(|(_, vendor, usage)| (vendor, usage));
+                Ok(Some(self.render_status_with(chat, prefetched).await))
+            }
             "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
             "/projects" => {
                 // Button-capable channel (Telegram) → a text header + one inline
@@ -7608,6 +7992,18 @@ impl Gateway {
         // v0.8.24 A-U3 — an explicit composer choice beats the role's
         // `model:` frontmatter; effort has no role-level default.
         let tuning = tuning.normalized();
+        let claude_account = tuning
+            .claude_account
+            .map(|id| {
+                if vendor != AgentVendor::Claude
+                    || protocol != SessionProtocol::StreamJson
+                    || host != ccteam_core::LOCAL_HOST
+                {
+                    return Err(CswapAccountUnsupported.into());
+                }
+                ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(id)
+            })
+            .transpose()?;
         let model_id = tuning.model.or_else(|| {
             // Pi owns a vendor-specific `pi.model` frontmatter key. Passing
             // the generic role model through SpawnCtx would make it look like
@@ -7669,6 +8065,7 @@ impl Gateway {
             .tenant_project_owner(&project)
             .unwrap_or_else(|| canonical_owner(&reply_to));
         Ok(NewSessionPlan {
+            claude_account,
             generation,
             id,
             owner,
@@ -7768,6 +8165,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.id.clone(),
@@ -7810,6 +8208,12 @@ impl Gateway {
             }
         });
         let mut meta = SessionMeta {
+            claude_account: thread
+                .raw_extras
+                .get("claude_account")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .or_else(|| plan.claude_account.clone()),
             model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -7872,6 +8276,7 @@ impl Gateway {
         let meta =
             prepared_meta.unwrap_or_else(|| Self::meta_for_new_session(&plan, &thread, trigger));
         let NewSessionPlan {
+            claude_account: _,
             generation,
             id,
             owner,
@@ -8060,6 +8465,20 @@ impl Gateway {
                 ));
             }
         };
+        let claude_account = self
+            .session_catalog
+            .find_or_load(&sid, &self.projects)
+            .and_then(|entry| entry.meta.claude_account);
+        if claude_account.is_none()
+            && old_thread
+                .raw_extras
+                .get("claude_account")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(anyhow!(
+                "session account metadata is unavailable; the current process was kept"
+            ));
+        }
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
         // the retired transcript.
@@ -8111,6 +8530,7 @@ impl Gateway {
                 model_id.clone(),
                 effort.clone(),
                 mode.clone(),
+                claude_account,
                 permission_mode,
                 secret.clone(),
                 &host,
@@ -11122,6 +11542,11 @@ impl Gateway {
         let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
+        let had_account = s
+            .thread
+            .raw_extras
+            .get("claude_account")
+            .is_some_and(|value| !value.is_null());
         let fenced_generation = s.generation;
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
@@ -11139,6 +11564,19 @@ impl Gateway {
             .find_or_load(session_id, &self.projects)
             .map(|entry| entry.meta);
         let mode = meta.as_ref().and_then(|m| m.mode.clone());
+        let claude_account = meta.as_ref().and_then(|meta| meta.claude_account.clone());
+        if had_account && claude_account.is_none() {
+            return Err(anyhow!(
+                "session account metadata is unavailable; refusing to resume with default login"
+            ));
+        }
+        if claude_account.is_some()
+            && (vendor != AgentVendor::Claude
+                || protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST)
+        {
+            return Err(CswapAccountUnsupported.into());
+        }
         let (model_id, effort) = respawn_tuning(
             &cwd,
             session_id,
@@ -11160,6 +11598,7 @@ impl Gateway {
         // apply installs this same value on the live entry (issue #14②).
         let generation = self.next_live_generation();
         Ok(Some(ResumeDeadPlan {
+            claude_account,
             session_id: session_id.to_string(),
             project,
             role,
@@ -11204,6 +11643,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    claude_account: plan.claude_account.clone(),
                     generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.session_id.clone(),
@@ -11233,6 +11673,7 @@ impl Gateway {
         thread: ThreadHandle,
     ) -> Result<()> {
         let ResumeDeadPlan {
+            claude_account: _,
             session_id,
             project,
             role,
@@ -11333,6 +11774,7 @@ impl Gateway {
         effort: Option<String>,
         // Replayed from `meta.mode`, same contract.
         mode: Option<String>,
+        claude_account: Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding>,
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
@@ -11364,6 +11806,7 @@ impl Gateway {
                     role: role.to_string(),
                 },
                 &SpawnCtx {
+                    claude_account,
                     generation,
                     slug: slug.to_string(),
                     sid: sid.to_string(),
@@ -13243,7 +13686,14 @@ impl Gateway {
     /// released case stopped after the resume line, silently dropping the
     /// account-usage row and the `/sessions` + `/projects` footer. There is
     /// no second renderer any more.)
-    async fn render_status(&self, chat: &ChatKey) -> String {
+    /// The `/status` card. `prefetched` is the focus vendor's account usage
+    /// already asked outside the lock by the shared IM entry (#234); `None`
+    /// (or a prefetch for another vendor, the focus having moved) asks here.
+    async fn render_status_with(
+        &self,
+        chat: &ChatKey,
+        prefetched: Option<(AgentVendor, Option<VendorAccountUsage>)>,
+    ) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
@@ -13293,7 +13743,38 @@ impl Gateway {
                 };
             }
         };
-        self.status_card(chat, &focus, &visible).await.render()
+        self.status_card(chat, &focus, &visible, prefetched)
+            .await
+            .render()
+    }
+
+    /// Who `/status` would ask for its focus vendor's account, focus first —
+    /// the same order [`Gateway::status_card`] uses. `None` when the chat has
+    /// no focus (that card shows no usage). Captured under the lock, resolved
+    /// without it by [`Gateway::handle_message_shared`].
+    fn status_usage_probes(&self, chat: &ChatKey) -> Option<(AgentVendor, AccountUsageProbes)> {
+        let mut memo = ProjectPrincipalMemo::new();
+        let visible: Vec<&GatewaySession> = self
+            .sessions
+            .values()
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
+            .collect();
+        let sid = self.current_session.get(chat)?;
+        if let Some(focus) = visible.iter().copied().find(|s| s.id == sid) {
+            let vendor = focus.vendor;
+            let askers: Vec<&GatewaySession> = std::iter::once(focus)
+                .chain(visible.iter().copied().filter(|s| s.id != focus.id))
+                .collect();
+            return Some((
+                vendor,
+                self.account_usage_probes_from(Some(vendor), &askers),
+            ));
+        }
+        let (_, meta) = self.released_focus(chat, &sid, &mut memo)?;
+        Some((
+            meta.vendor,
+            self.account_usage_probes_from(Some(meta.vendor), &visible),
+        ))
     }
 
     /// The `/status` focus when the chat's current sid is one ccteam holds no
@@ -13316,98 +13797,45 @@ impl Gateway {
             .then_some((slug, meta))
     }
 
-    /// The vendor account's rate-limit windows — the ONE way any surface asks
-    /// for them, and the reason a `/status` card no longer has to care whether
-    /// its session is resident.
+    /// Capture who to ask for each vendor's account windows — every live
+    /// session, or only `vendor`'s. The ONE way any surface reads account
+    /// usage (IM `/status`, MCP `status{detail:"usage"}`, the hook phase,
+    /// `GET /api/v1/usage`): take this under the gateway lock, drop the lock,
+    /// then [`AccountUsageProbes::resolve`] (#234).
     ///
-    /// Usage is ACCOUNT-scoped but only READABLE through a live session, so it
-    /// used to exist only while some process happened to be resident: the card
-    /// went scavenging through whatever sessions were alive and simply showed
-    /// nothing when none were — which is exactly when the focused session has
-    /// been idle-released (2026-08-30 IM report: the `⚡ 用量` row vanished from
-    /// a released card, and after a daemon restart from every card).
-    ///
-    /// So the fact gets a home. Any live session of `vendor` is asked (they all
-    /// report the same account, so the first answer wins) and what it says is
-    /// recorded; when none answers, the vendor's last observation is read back
-    /// from [`ccteam_harness::usage_catalog`], which drops each window at the
-    /// vendor's own declared reset so nothing stale is ever presented as
-    /// current. Callers get one `Option` and never branch on residency.
-    ///
-    /// `sessions` is the caller's ACL-scoped set (unchanged from the live-only
-    /// read this replaces); the catalog is keyed by vendor alone, which is the
-    /// same host-agnostic scope that read already had.
-    async fn account_usage_for(
-        &self,
-        vendor: AgentVendor,
-        sessions: &[&GatewaySession],
-    ) -> Option<AccountUsage> {
-        self.account_usage_entry_for(vendor, sessions)
-            .await
-            .map(|entry| entry.usage)
+    /// Usage is ACCOUNT-scoped but only READABLE through a live session; the
+    /// resolver records each live answer and falls back to the last recorded
+    /// observation, so callers never branch on residency. Scope is the
+    /// DAEMON's own vendor accounts (every session of that vendor spends from
+    /// them), not any one caller's data.
+    pub fn account_usage_probes(&self, vendor: Option<AgentVendor>) -> AccountUsageProbes {
+        let live: Vec<&GatewaySession> = self.sessions.values().collect();
+        self.account_usage_probes_from(vendor, &live)
     }
 
-    /// [`Gateway::account_usage_for`] plus the PROVENANCE of the answer (when
-    /// it was observed, and what observed it).
-    ///
-    /// The IM card renders one line and has nowhere to put "as of when", but a
-    /// machine-readable surface must publish it: a scheduler deciding whom to
-    /// hire needs to know whether a 92% weekly window was read a minute ago or
-    /// is a cached snapshot from an hour ago. So this is the primitive and the
-    /// percentage-only accessor above is its projection — one live-ask path,
-    /// one cache path, one expiry rule, two shapes.
-    async fn account_usage_entry_for(
-        &self,
-        vendor: AgentVendor,
-        sessions: &[&GatewaySession],
-    ) -> Option<VendorAccountUsage> {
-        for session in sessions.iter().filter(|s| s.adapter.vendor() == vendor) {
-            if let Some(usage) = session.adapter.account_usage(&session.thread).await {
-                self.record_account_usage(vendor, "status card", &usage);
-                return Some(VendorAccountUsage {
-                    observed_at: chrono::Utc::now().to_rfc3339(),
-                    source: "status card".to_string(),
-                    usage,
-                });
-            }
-        }
-        let root = self.state_root.as_deref()?;
-        ccteam_harness::usage_catalog::last_known_entry_in(
-            root,
-            vendor_str(vendor),
-            chrono::Utc::now(),
-        )
-    }
-
-    /// Every vendor whose ACCOUNT ccteam currently knows something about,
-    /// keyed by vendor token — the one read behind the MCP
-    /// `status{detail:"usage"}` body and `GET /api/v1/usage`.
-    ///
-    /// HONEST ABSENCE: a vendor with no live session and no unexpired
-    /// observation is simply not in the map. There is no "unknown" row to
-    /// misread as "plenty left", and no probing engine — the live half asks
-    /// adapters that already hold the answer in memory (never a turn), the
-    /// cached half reads [`ccteam_harness::usage_catalog`]. Nothing here polls
-    /// or schedules; the map is built when a caller asks for it.
-    ///
-    /// Scope is the DAEMON's own vendor accounts (every session of that vendor
-    /// spends from them), not any one caller's data — the same host-agnostic
-    /// scope the IM `/status` card has always shown. `vendor` narrows it to one.
-    pub async fn account_usage_snapshot(
+    /// [`Gateway::account_usage_probes`] over the caller's ACL-scoped,
+    /// caller-ordered `sessions` (the first answer per vendor wins).
+    fn account_usage_probes_from(
         &self,
         vendor: Option<AgentVendor>,
-    ) -> BTreeMap<String, VendorAccountUsage> {
-        let live: Vec<&GatewaySession> = self.sessions.values().collect();
-        let mut out = BTreeMap::new();
-        for candidate in AgentVendor::ALL.iter().copied() {
-            if vendor.is_some_and(|want| want != candidate) {
-                continue;
-            }
-            if let Some(entry) = self.account_usage_entry_for(candidate, &live).await {
-                out.insert(vendor_str(candidate).to_string(), entry);
-            }
+        sessions: &[&GatewaySession],
+    ) -> AccountUsageProbes {
+        AccountUsageProbes {
+            root: self.state_root.clone(),
+            by_vendor: AgentVendor::ALL
+                .iter()
+                .copied()
+                .filter(|candidate| vendor.is_none_or(|want| want == *candidate))
+                .map(|candidate| {
+                    let askers = sessions
+                        .iter()
+                        .filter(|s| s.adapter.vendor() == candidate)
+                        .map(|s| (Arc::clone(&s.adapter), s.thread.clone()))
+                        .collect();
+                    (candidate, askers)
+                })
+                .collect(),
         }
-        out
     }
 
     /// Persist one account-usage observation. Best-effort by construction: a
@@ -13462,6 +13890,7 @@ impl Gateway {
         chat: &ChatKey,
         focus: &SessionRowSource<'_>,
         visible: &[&GatewaySession],
+        prefetched: Option<(AgentVendor, Option<VendorAccountUsage>)>,
     ) -> StatusCard {
         let slug = focus.slug_of(&self.default_project).to_string();
         let sid = focus.sid().to_string();
@@ -13486,7 +13915,29 @@ impl Gateway {
             }
             SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new(), None),
         };
-        let account = self.account_usage_for(vendor, visible).await;
+        // A resident focus is asked FIRST: the card describes the account THIS
+        // session spends from. Every live process of a vendor normally reports
+        // the same account, but not across a login switch — a process started
+        // before it can still be signed in as the old account — and `visible`
+        // has no stable order, so "first answer wins" over it alone could show
+        // either account and flip between them from one `/status` to the next.
+        let askers: Vec<&GatewaySession> = match focus {
+            SessionRowSource::Resident(s) => std::iter::once(*s)
+                .chain(visible.iter().copied().filter(|v| v.id != s.id))
+                .collect(),
+            SessionRowSource::Released(..) => visible.to_vec(),
+        };
+        // Asked outside the lock when the shared IM entry prefetched it; the
+        // inline path asks here, bounded by one deadline for all askers.
+        let account = match prefetched {
+            Some((asked, usage)) if asked == vendor => usage,
+            _ => self
+                .account_usage_probes_from(Some(vendor), &askers)
+                .resolve()
+                .await
+                .remove(vendor_str(vendor)),
+        }
+        .map(|entry| entry.usage);
 
         // The ledger half — title / turn / cost / tokens and the spawn-time
         // model + effort picks — lives in `meta.json` for both residencies:
@@ -13569,7 +14020,12 @@ impl Gateway {
             .count();
         let visible_projects = self.visible_project_slugs(chat).len();
 
+        let claude_account = meta
+            .as_ref()
+            .and_then(|m| m.claude_account.as_ref())
+            .map(|binding| binding.display());
         StatusCard {
+            claude_account,
             title: meta.and_then(|m| m.title),
             // Project working-tree PATH — resolved from the loaded project map
             // (slug → dir) for both residencies; omitted if the project isn't
@@ -13719,6 +14175,10 @@ impl Gateway {
                     .map(|guard| guard.pending_for_sid(&s.id).is_some())
                     .unwrap_or(false);
                 SessionView {
+                    claude_account: meta
+                        .as_ref()
+                        .and_then(|meta| meta.claude_account.as_ref())
+                        .map(|account| account.display()),
                     sid: s.id.clone(),
                     project: s.project.clone(),
                     role: s.role.clone(),
@@ -14235,6 +14695,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -14339,6 +14800,7 @@ impl Gateway {
             let sid = format!("s{}", guard.next_session);
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
+                claude_account: None,
                 model_pinned_generation: None,
                 managed_by: Default::default(),
                 stopped_at: None,
@@ -14580,6 +15042,21 @@ impl Gateway {
         if let Err(error) = adapter.close_thread(thread).await {
             tracing::warn!(%sid, %error, "failed to close uninstalled vendor thread");
         }
+    }
+
+    /// The cswap discovery service; the web state shares it (one cache).
+    pub fn cswap_accounts(
+        &self,
+    ) -> Arc<ccteam_harness::execution::claude_accounts::CswapAccountService> {
+        Arc::clone(&self.cswap_accounts)
+    }
+
+    /// Replace the cswap discovery service (tests inject a fixed list).
+    pub fn set_cswap_accounts(
+        &mut self,
+        service: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
+    ) {
+        self.cswap_accounts = service;
     }
 
     /// Handle to the `(sid, secret)` registry, so a front door can verify a
@@ -15037,6 +15514,21 @@ impl Gateway {
         let Some((slug, adapter, thread)) = fenced else {
             return Ok(false);
         };
+        Self::finish_release_shared(gateway, sid, slug, adapter, thread, reason).await?;
+        Ok(true)
+    }
+
+    /// The part of a release after the session is fenced out of the live map:
+    /// every caller (both residency policies and an account switch) ends a
+    /// process the same way.
+    async fn finish_release_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        slug: String,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        thread: ThreadHandle,
+        reason: ReleaseReason,
+    ) -> Result<()> {
         // Last chance to read an ACCOUNT-scoped fact from this session: the
         // windows belong to the vendor account, not to the process, so they are
         // captured before the process that can report them goes away. Without
@@ -15071,7 +15563,186 @@ impl Gateway {
             .await
             .emit_session_evicted(sid, &slug, reason);
         tracing::info!(sid, %slug, reason = reason.as_str(), "ccteam-im: released session");
-        Ok(true)
+        Ok(())
+    }
+
+    /// Move a session to another cswap account, or back to the default login
+    /// (#236). Only the binding changes — the sid, its focus routes and its
+    /// history stay — and a resident process is released exactly like an
+    /// idle release, so the next message resumes the SAME sid under the new
+    /// account (the vendor prompt cache is rebuilt, as any account change
+    /// requires). A user-explicit command, never a daemon decision.
+    ///
+    /// Refused, with nothing changed, while the process is mid-turn, waiting
+    /// on the user or running background work, and whenever the transcript
+    /// would not be readable from the new account (history still private to
+    /// the current account's profile): resuming there would silently start
+    /// the conversation over.
+    pub async fn switch_claude_account_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        target: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+    ) -> std::result::Result<ClaudeAccountSwitch, ClaudeAccountSwitchError> {
+        use ccteam_harness::execution::claude_accounts::{
+            history_follows_switch, ClaudeAccountBinding,
+        };
+        let next = match &target {
+            Some(account) => {
+                let mut binding = ClaudeAccountBinding::requested(account.id.clone())
+                    .map_err(|error| ClaudeAccountSwitchError::Refused(error.to_string()))?;
+                // Display only until the launch confirms the profile; the
+                // spawn re-resolves the slot from the identity.
+                binding.slot = account.slot.clone();
+                binding.label = account.label.clone();
+                Some(binding)
+            }
+            None => None,
+        };
+        // The per-sid claim every lock-free resume takes (acquired before the
+        // gateway lock): a cold start planned from the OLD binding can neither
+        // overlap this switch nor land after it and overwrite it.
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _claim = claims.lock_for_sid(sid).await;
+
+        let (slug, cwd, meta, live) = {
+            let guard = gateway.lock().await;
+            let (slug, cwd, meta) = guard
+                .find_meta_for_sid(sid)
+                .map_err(|_| ClaudeAccountSwitchError::UnknownSession(sid.to_string()))?;
+            if meta.managed_by == ccteam_harness::execution::session_meta::ManagedBy::External {
+                return Err(ClaudeAccountSwitchError::Refused(
+                    "this agent was started by hand; ccteam does not launch it".into(),
+                ));
+            }
+            let host = guard.ensure_session_host_binding(&slug, &meta.host)?.0;
+            if meta.vendor != AgentVendor::Claude
+                || meta.protocol != SessionProtocol::StreamJson
+                || host != ccteam_core::LOCAL_HOST
+            {
+                return Err(CswapAccountUnsupported.into());
+            }
+            if guard.detached.contains_key(sid) {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "this session's process from before the daemon restart is still running; \
+                     interrupt or stop it first"
+                        .into(),
+                ));
+            }
+            let live = guard
+                .sessions
+                .get(sid)
+                .map(|s| (s.generation, Arc::clone(&s.adapter), s.thread.clone()));
+            (slug, cwd, meta, live)
+        };
+        let current = meta.claude_account.clone();
+        let unchanged = match (&current, &next) {
+            (None, None) => true,
+            (Some(current), None) => current.default_login,
+            (Some(current), Some(next)) => !current.default_login && current.id == next.id,
+            (None, Some(_)) => false,
+        };
+        if unchanged {
+            return Ok(ClaudeAccountSwitch {
+                claude_account: current.as_ref().map(ClaudeAccountBinding::display),
+                changed: false,
+                released: false,
+            });
+        }
+
+        // Slow checks without the gateway lock: an adapter round-trip and fs.
+        if let Some((_, adapter, thread)) = &live {
+            if adapter
+                .running_tasks(thread)
+                .await
+                .iter()
+                .any(|task| task.outlives_turn())
+            {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "background work is still running in this session; wait for it or stop it \
+                     first"
+                        .into(),
+                ));
+            }
+        }
+        let uuid = if meta.vendor_uuid.is_empty() {
+            ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid(
+                &slug, sid,
+            )
+        } else {
+            meta.vendor_uuid.clone()
+        };
+        let (history_cwd, from) = (cwd.clone(), current.clone());
+        let portable = tokio::task::spawn_blocking(move || {
+            history_follows_switch(&history_cwd, &uuid, from.as_ref())
+        })
+        .await
+        .unwrap_or(false);
+        if !portable {
+            return Err(ClaudeAccountSwitchError::Refused(
+                "this conversation's history is still private to the current account's profile. \
+                 cswap moves it into the shared history the next time this session runs on that \
+                 account while no other Claude uses it; switch after that"
+                    .into(),
+            ));
+        }
+
+        let fenced = {
+            let mut guard = gateway.lock().await;
+            let generation = guard.sessions.get(sid).map(|s| s.generation);
+            if generation != live.as_ref().map(|(generation, ..)| *generation) {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "the session just started or stopped; try again".into(),
+                ));
+            }
+            if let Some(session) = guard.sessions.get(sid) {
+                let in_flight = session
+                    .turn_started_at
+                    .lock()
+                    .map(|started| started.is_some())
+                    .unwrap_or(true);
+                if in_flight {
+                    return Err(ClaudeAccountSwitchError::Busy(
+                        "a turn is running; wait for it to finish or interrupt it first".into(),
+                    ));
+                }
+            }
+            if guard.pending.lock().await.pending_for_sid(sid).is_some() {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "the session is waiting for your decision; answer it first".into(),
+                ));
+            }
+            // Re-read under the lock so a concurrent rename is not lost.
+            let mut meta = guard
+                .session_catalog
+                .find_or_load(sid, &guard.projects)
+                .map(|entry| entry.meta)
+                .ok_or_else(|| ClaudeAccountSwitchError::UnknownSession(sid.to_string()))?;
+            meta.claude_account = next.clone();
+            guard.persist_session_meta(&cwd, &meta)?;
+            let fenced = generation.and_then(|generation| guard.fence_out_session(sid, generation));
+            if fenced.is_none() {
+                guard.emit_session_account_changed(sid, &slug);
+            }
+            fenced
+        };
+        let released = fenced.is_some();
+        if let Some((slug, adapter, thread)) = fenced {
+            Self::finish_release_shared(
+                gateway,
+                sid,
+                slug,
+                adapter,
+                thread,
+                ReleaseReason::AccountSwitch,
+            )
+            .await?;
+        }
+        tracing::info!(sid, %slug, released, "ccteam-im: switched Claude account");
+        Ok(ClaudeAccountSwitch {
+            claude_account: next.as_ref().map(ClaudeAccountBinding::display),
+            changed: true,
+            released,
+        })
     }
 
     /// How long a releasing session may take to report its account usage
@@ -15611,6 +16282,23 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
+        if plan.vendor == AgentVendor::Claude && plan.claude_account.is_none() {
+            if let Some(binding) = parent_sid
+                .as_ref()
+                .and_then(|sid| self.session_catalog.find_or_load(sid, &self.projects))
+                .and_then(|entry| entry.meta.claude_account)
+                .filter(|account| !account.default_login)
+            {
+                if plan.protocol != SessionProtocol::StreamJson
+                    || plan.host != ccteam_core::LOCAL_HOST
+                {
+                    anyhow::bail!(
+                        "inherited cswap account requires a local Claude stream-json session"
+                    );
+                }
+                plan.claude_account = Some(binding);
+            }
+        }
         plan.parent_sid = parent_sid.clone();
         plan.spawned_by_role = spawned_by_role;
         plan.delegation_depth = child_depth;
@@ -15780,6 +16468,23 @@ impl Gateway {
                 tuning,
             )?;
             plan.remote = host_target.remote;
+            if plan.vendor == AgentVendor::Claude && plan.claude_account.is_none() {
+                if let Some(binding) = parent_sid
+                    .as_ref()
+                    .and_then(|sid| guard.session_catalog.find_or_load(sid, &guard.projects))
+                    .and_then(|entry| entry.meta.claude_account)
+                    .filter(|account| !account.default_login)
+                {
+                    if plan.protocol != SessionProtocol::StreamJson
+                        || plan.host != ccteam_core::LOCAL_HOST
+                    {
+                        anyhow::bail!(
+                            "inherited cswap account requires a local Claude stream-json session"
+                        );
+                    }
+                    plan.claude_account = Some(binding);
+                }
+            }
             plan.parent_sid = parent_sid.clone();
             plan.spawned_by_role = spawned_by_role;
             plan.delegation_depth = child_depth;
@@ -18875,6 +19580,7 @@ impl Gateway {
         self.persist_session_meta(&dir, &meta)?;
 
         let target = SessionTitleTarget {
+            claude_account: meta.claude_account.clone(),
             sid: sid.to_string(),
             vendor_uuid: meta.vendor_uuid.clone(),
             project_dir: dir,
@@ -18904,6 +19610,29 @@ impl Gateway {
     /// twin is `meta.json` itself, already written by the caller). Same frame
     /// family as [`Self::emit_session_evicted`], so the SPA's existing
     /// `session_lifecycle` listener refreshes the rail with no client change.
+    /// Lifecycle twin of an account switch on a session with no resident
+    /// process (a released one emits `evicted` instead); refreshes the rail
+    /// and the session header like a rename.
+    fn emit_session_account_changed(&self, sid: &str, slug: &str) {
+        self.emit_user_signal(GatewayEvent {
+            interim: false,
+            id: format!("session-account-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session account changed: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "account_changed".to_string(),
+                reason: "user".to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            status: None,
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
+    }
+
     fn emit_session_renamed(&self, sid: &str, slug: &str) {
         self.emit_user_signal(GatewayEvent {
             interim: false,
@@ -18959,6 +19688,9 @@ fn detached_body_view(
 ) -> SessionView {
     let m = |f: &dyn Fn(&SessionMeta) -> String| meta.map(f).unwrap_or_default();
     SessionView {
+        claude_account: meta
+            .and_then(|meta| meta.claude_account.as_ref())
+            .map(|account| account.display()),
         sid: d.sid.clone(),
         project: d.slug.clone(),
         role: m(&|m| m.role.clone()),
@@ -19137,6 +19869,10 @@ fn released_session_view(
     current: &std::collections::HashSet<String>,
 ) -> SessionView {
     SessionView {
+        claude_account: meta
+            .claude_account
+            .as_ref()
+            .map(|account| account.display()),
         sid: meta.sid.clone(),
         project: slug.to_string(),
         role: meta.role.clone(),
@@ -19180,6 +19916,10 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
                 .max(0) as u64
         });
     SessionView {
+        claude_account: meta
+            .claude_account
+            .as_ref()
+            .map(|account| account.display()),
         sid: meta.sid.clone(),
         project: meta.slug.clone(),
         role: String::new(),
@@ -19275,6 +20015,92 @@ fn activity_marker(activity: &str) -> &'static str {
 /// leading `s<N>` token counts as a TARGET only when a title follows it, so
 /// `/rename s3` still titles the current session `s3` rather than trying to
 /// rename `s3` to nothing. Pure — unit-tested directly.
+/// The IM `/account` listing (#236): which account the session runs on — a
+/// default-login session names the account that login is right now — then
+/// every cswap account with its quota windows. `typed` adds the commands to
+/// type; a button channel offers buttons instead.
+fn render_account_list(
+    sid: &str,
+    bound: Option<&ccteam_harness::execution::claude_accounts::CswapAccount>,
+    listed: &Result<Vec<ccteam_harness::execution::claude_accounts::CswapAccount>>,
+    typed: bool,
+) -> String {
+    use ccteam_harness::execution::claude_accounts::display_name;
+    let accounts = listed.as_ref().map(Vec::as_slice).unwrap_or_default();
+    let pinned = bound.filter(|account| !account.active);
+    let current = match pinned {
+        Some(account) => display_name(account),
+        None => match accounts.iter().find(|account| account.active) {
+            Some(default) => format!("默认登录(此刻是 {},跟随 cswap auto)", display_name(default)),
+            None => "默认登录".to_string(),
+        },
+    };
+    let mut out = format!("👤 会话 {sid} · Claude 账号:{current}");
+    match listed {
+        Err(error) => {
+            out.push_str(&format!("\ncswap 不可用:{error:#}"));
+            if pinned.is_some() && typed {
+                out.push_str("\n回默认登录:/account default");
+            }
+            return out;
+        }
+        Ok(accounts) if accounts.is_empty() => {
+            out.push_str("\ncswap 里还没有账号");
+            return out;
+        }
+        Ok(_) => {}
+    }
+    out.push_str("\n可切换的账号:");
+    for account in accounts {
+        let mut line = format!("\n  {}", display_name(account));
+        let quota = account_quota_text(account);
+        if !quota.is_empty() {
+            line.push_str(&format!("  {quota}"));
+        }
+        if account.active {
+            line.push_str("  (当前默认)");
+        }
+        if pinned.is_some_and(|bound| bound.id == account.id) {
+            line.push_str("  ✓");
+        }
+        out.push_str(&line);
+    }
+    if typed {
+        out.push_str("\n切换:/account <编号>    回默认登录:/account default");
+    }
+    out.push_str("\n切换会结束当前进程,下一条消息在同一会话里按新账号继续。");
+    out
+}
+
+/// `5h 11% · 7d 100%`, a plan without a 5h window shows only 7d, no reading
+/// shows cswap's status (`需重新登录`); a non-ok status beside numbers marks
+/// them as cswap's last good reading.
+fn account_quota_text(
+    account: &ccteam_harness::execution::claude_accounts::CswapAccount,
+) -> String {
+    let status = account.usage_status.as_deref().map(|status| match status {
+        "relogin_required" => "需重新登录",
+        "token_expired" => "令牌过期",
+        "no_credentials" => "无凭据",
+        "keychain_unavailable" => "钥匙串不可用",
+        "foreign_credential" => "凭据不符",
+        "unavailable" => "额度暂不可读",
+        other => other,
+    });
+    let windows: Vec<String> = [("5h", account.five_hour_pct), ("7d", account.seven_day_pct)]
+        .into_iter()
+        .filter_map(|(window, pct)| pct.map(|pct| format!("{window} {pct}%")))
+        .collect();
+    if windows.is_empty() {
+        return status.unwrap_or_default().to_string();
+    }
+    let mut text = windows.join(" · ");
+    if status.is_some() {
+        text.push_str("(上次)");
+    }
+    text
+}
+
 fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
     let (head, tail) = rest.split_once(char::is_whitespace)?;
     let looks_like_sid = head
@@ -20762,6 +21588,9 @@ struct StatusCard {
     /// finish. `None` when the channel cannot report it.
     stop_hook_blocks: Option<u32>,
     account: Option<AccountUsage>,
+    /// The cswap account a Claude session is bound to (#236); `None` for an
+    /// unbound session (`/account` names what its default login is).
+    claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
     children: Vec<StatusChild>,
     /// Descendants below the direct children, collapsed to a count.
     deeper_descendants: usize,
@@ -20810,6 +21639,16 @@ impl StatusCard {
         }
         if !self.role.is_empty() {
             identity.push_str(&format!(" · {}", self.role));
+        }
+        if let Some(account) = &self.claude_account {
+            if account.active {
+                identity.push_str(" · 👤 默认登录");
+            } else {
+                identity.push_str(&format!(
+                    " · 👤 {}",
+                    ccteam_harness::execution::claude_accounts::display_name(account)
+                ));
+            }
         }
         let mut out = format!("{head}\n📍 {second}\n   {identity}");
 
@@ -21387,6 +22226,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
                 "model" | "m" => tuning.model = Some(value.to_string()),
                 "effort" | "e" => tuning.effort = Some(value.to_string()),
                 "mode" => tuning.mode = Some(value.to_string()),
+                "claude_account" => tuning.claude_account = Some(value.to_string()),
                 other => {
                     return Err(anyhow!(
                         "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=, mode=<mode>)\nsyntax: {NEW_COMMAND_SYNTAX}"
@@ -21579,6 +22419,7 @@ mod tests {
             assert_eq!(
                 parsed.tuning,
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("kimi-code/k3".to_string()),
                     effort: Some("max".to_string()),
@@ -22076,6 +22917,91 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
     }
 
+    /// #234 — `/status` asked every live session for account usage one after
+    /// another while holding the daemon-wide gateway lock (3 s each), so a
+    /// slow vendor answer held web, IM and MCP for up to a minute. The asks
+    /// now share one deadline and run concurrently, and the shared IM entry
+    /// runs them with the lock dropped.
+    #[tokio::test]
+    async fn status_usage_asks_run_concurrently_and_outside_the_gateway_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..3 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        fake.set_account_usage_delay(std::time::Duration::from_millis(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        // Concurrent: the #234 shape — no session has an answer, so every one
+        // is asked. Three 600 ms asks finish together, not in 1.8 s.
+        let started = std::time::Instant::now();
+        gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1400),
+            "asks ran one after another: {:?}",
+            started.elapsed()
+        );
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(7),
+            ..Default::default()
+        }))
+        .await;
+
+        // Lock-free: while the shared entry is asking, the lock is free.
+        assert!(Gateway::inbound_needs_shared_entry("/status"));
+        let shared = Arc::clone(&gateway);
+        let status = tokio::spawn(async move {
+            Gateway::handle_message_shared(
+                shared,
+                "mock",
+                "chat-1",
+                "alice",
+                None,
+                "m-1",
+                "/status",
+                &[],
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let waited = std::time::Instant::now();
+        drop(gateway.lock().await);
+        assert!(
+            waited.elapsed() < std::time::Duration::from_millis(250),
+            "the usage asks held the gateway lock for {:?}",
+            waited.elapsed()
+        );
+        let replies = status.await.unwrap().unwrap();
+        assert!(replies[0].contains("5h 7%"), "{replies:?}");
+
+        // Bounded: a stuck vendor costs one deadline, not 3 × its delay.
+        fake.set_account_usage_delay(std::time::Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < ACCOUNT_USAGE_DEADLINE + std::time::Duration::from_millis(800),
+            "a stuck vendor was waited out: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// `/status` on a focus that points at a released session must render the
     /// session — the SAME card as a resident one, with `💤 released` in place
     /// of the run state and the same footer — not "无当前会话".
@@ -22264,6 +23190,87 @@ mod tests {
         );
     }
 
+    /// 2026-11-06 IM report: after the host's claude login moved from a plan
+    /// with no 5-hour window (`max`) to one with it (`team`), the `⚡ 用量` row
+    /// kept showing the old account. Across a login switch two live processes
+    /// can be signed in as different accounts, so the card must report the
+    /// account its OWN session spends from — not whichever live session the
+    /// fleet happens to list first (`s1` here, always, in sid order).
+    #[tokio::test]
+    async fn status_reports_the_focused_sessions_own_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let week = Some((now + chrono::Duration::days(3)).to_rfc3339());
+        // s1 started before the switch: the old plan, no 5-hour window at all.
+        fake.set_thread_account_usage(
+            &gateway.sessions["s1"].thread.identity,
+            AccountUsage {
+                subscription: Some("max".into()),
+                weekly_pct: Some(20),
+                weekly_resets_at: week.clone(),
+                ..Default::default()
+            },
+        );
+        // s2 started after it: the new plan, with both windows.
+        fake.set_thread_account_usage(
+            &gateway.sessions["s2"].thread.identity,
+            AccountUsage {
+                subscription: Some("team".into()),
+                five_hour_pct: Some(34),
+                five_hour_resets_at: Some((now + chrono::Duration::hours(2)).to_rfc3339()),
+                weekly_pct: Some(35),
+                weekly_resets_at: week,
+                ..Default::default()
+            },
+        );
+        let usage_row = |card: &str| {
+            card.lines()
+                .find(|line| line.contains("⚡ 用量"))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        // The focus is s2 (the last `/new`): its own account, both windows.
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        let row = usage_row(&card);
+        assert!(
+            row.starts_with("⚡ 用量: 5h 34% (→") && row.ends_with(" · team"),
+            "s2's card shows s2's account, not the first-listed s1's: {row}"
+        );
+
+        // Back on s1: its own plan — no 5-hour segment, nothing borrowed.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        let row = usage_row(&card);
+        assert!(
+            row.starts_with("⚡ 用量: 周 20% (→") && row.ends_with(" · max"),
+            "s1's card shows s1's account, with no 5h window: {row}"
+        );
+    }
+
     /// The card layout is one function of the facts: every optional block is
     /// keyed on its fact being present — never on residency — in this order.
     /// Locks the shape once so no state-specific twin can drift from it.
@@ -22305,6 +23312,7 @@ mod tests {
                 weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
                 ..Default::default()
             }),
+            claude_account: None,
             children: vec![StatusChild {
                 sid: "s8".into(),
                 vendor: AgentVendor::Codex,
@@ -22371,6 +23379,7 @@ mod tests {
             goal: None,
             stop_hook_blocks: None,
             account: None,
+            claude_account: None,
             children: Vec::new(),
             deeper_descendants: 0,
             same_project_others: 0,
@@ -24338,6 +25347,531 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cswap_role_switch_never_defaults_after_metadata_loss() {
+        for corrupt in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            seed_role_with_model(tmp.path(), "reviewer", None);
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+            let id = ccteam_harness::execution::claude_accounts::account_id("two@example.test", "");
+            let created = gateway
+                .create_session_api_tuned(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning {
+                        claude_account: Some(id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut binding =
+                ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(id)
+                    .unwrap();
+            binding.config_dir = Some(tmp.path().join("account-profile"));
+            gateway
+                .sessions
+                .get_mut(&created.sid)
+                .unwrap()
+                .thread
+                .raw_extras["claude_account"] = serde_json::to_value(binding).unwrap();
+            let meta_path = ccteam_harness::execution::session_meta::session_meta_path(
+                tmp.path(),
+                &created.sid,
+            );
+            if corrupt {
+                std::fs::write(&meta_path, "invalid-json").unwrap();
+            } else {
+                std::fs::remove_file(&meta_path).unwrap();
+            }
+            gateway.session_catalog = Default::default();
+            let started = fake.starts.load(Ordering::SeqCst);
+            let result = gateway
+                .switch_current_role(
+                    &ChatKey::new("web", "web-api", "web-api"),
+                    "reviewer".into(),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "missing/corrupt account metadata must not trigger a default spawn"
+            );
+            assert_eq!(fake.starts.load(Ordering::SeqCst), started);
+            assert!(gateway.sessions.contains_key(&created.sid));
+        }
+    }
+
+    fn cswap_account(
+        slot: &str,
+        label: &str,
+    ) -> ccteam_harness::execution::claude_accounts::CswapAccount {
+        ccteam_harness::execution::claude_accounts::CswapAccount {
+            id: ccteam_harness::execution::claude_accounts::account_id(
+                &format!("{label}@example.test"),
+                "",
+            ),
+            slot: slot.into(),
+            label: label.into(),
+            active: false,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            usage_status: None,
+        }
+    }
+
+    async fn account_session(
+        tmp: &std::path::Path,
+        vendor: AgentVendor,
+        account: Option<String>,
+    ) -> (Arc<FakeAdapter>, Arc<tokio::sync::Mutex<Gateway>>, String) {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp);
+        let created = gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                String::new(),
+                vendor,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    claude_account: account,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        (
+            fake,
+            Arc::new(tokio::sync::Mutex::new(gateway)),
+            created.sid,
+        )
+    }
+
+    async fn stored_account(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        sid: &str,
+    ) -> Option<ccteam_harness::execution::claude_accounts::ClaudeAccountBinding> {
+        let guard = gateway.lock().await;
+        guard
+            .session_catalog
+            .find_or_load(sid, &guard.projects)
+            .unwrap()
+            .meta
+            .claude_account
+    }
+
+    /// #236 — a switch rebinds the SAME sid and releases its process; the
+    /// next resume runs under the new account, and back to the default login.
+    #[tokio::test]
+    async fn claude_account_switch_rebinds_the_sid_and_resumes_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+
+        let same = Gateway::switch_claude_account_shared(&gateway, &sid, Some(one.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !same.changed && !same.released,
+            "the current account is a no-op"
+        );
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        let switched = Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone()))
+            .await
+            .unwrap();
+        assert!(switched.changed && switched.released);
+        let shown = switched.claude_account.unwrap();
+        assert_eq!((shown.slot.as_str(), shown.label.as_str()), ("2", "work"));
+        assert!(
+            !gateway.lock().await.sessions.contains_key(&sid),
+            "the process is released, the session is not"
+        );
+        let stored = stored_account(&gateway, &sid).await.unwrap();
+        assert_eq!(stored.id, two.id);
+        assert_eq!(
+            stored.config_dir, None,
+            "the next launch confirms the profile"
+        );
+
+        Gateway::resume_stopped_session_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "user:web-api",
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.spawn_accounts.lock().await.last().cloned(),
+            Some(Some(two.id.clone())),
+            "the same sid resumes under the new account"
+        );
+
+        let default = Gateway::switch_claude_account_shared(&gateway, &sid, None)
+            .await
+            .unwrap();
+        assert!(default.changed && default.released && default.claude_account.is_none());
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+        // Not resident any more: a further switch only rebinds.
+        let again = Gateway::switch_claude_account_shared(&gateway, &sid, Some(one.clone()))
+            .await
+            .unwrap();
+        assert!(again.changed && !again.released);
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+    }
+
+    /// The fake vendor never ends a turn; end it as a real one would.
+    fn end_turn(gw: &Gateway, sid: &str) {
+        *gw.sessions[sid].turn_started_at.lock().unwrap() = None;
+    }
+
+    async fn im_send(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        text: &str,
+        tap: Option<&str>,
+    ) -> Vec<String> {
+        let selection = tap.map(|data| ChoiceReply {
+            data: data.to_string(),
+        });
+        Gateway::handle_message_shared(
+            Arc::clone(gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            None,
+            "m-1",
+            text,
+            &[],
+            selection.as_ref(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// #236 IM `/account`: names the session's account (a default-login
+    /// session names the cswap account that login is right now), lists the
+    /// accounts with their quota, and switches by number, name or `default`
+    /// through the same door as the web picker.
+    #[tokio::test]
+    async fn im_account_command_lists_and_switches_the_current_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let mut cloud = cswap_account("1", "cloud");
+        cloud.active = true;
+        cloud.five_hour_pct = Some(11);
+        cloud.seven_day_pct = Some(100);
+        let mut work = cswap_account("2", "work");
+        work.seven_day_pct = Some(40);
+        gw.set_cswap_accounts(Arc::new(
+            ccteam_harness::execution::claude_accounts::CswapAccountService::fixed(vec![
+                cloud.clone(),
+                work.clone(),
+            ]),
+        ));
+        assert!(
+            im_send(
+                &Arc::new(tokio::sync::Mutex::new(Gateway::new(
+                    fake.clone(),
+                    "alpha",
+                    tmp.path()
+                ))),
+                "/account",
+                None
+            )
+            .await[0]
+                .contains("没有会话"),
+            "no session yet: say how to get one"
+        );
+        gw.handle_text("telegram", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        let sid = gw
+            .current_session
+            .get(&ChatKey::new("telegram", "chat-1", "alice"))
+            .unwrap();
+        end_turn(&gw, &sid);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        let listing = im_send(&gateway, "/account", None).await.join("\n");
+        assert!(
+            listing.contains(&format!(
+                "会话 {sid} · Claude 账号:默认登录(此刻是 #1 cloud"
+            )),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("#1 cloud  5h 11% · 7d 100%  (当前默认)"),
+            "{listing}"
+        );
+        assert!(listing.contains("#2 work  7d 40%"), "{listing}");
+        assert!(listing.contains("/account <编号>"), "{listing}");
+
+        let switched = im_send(&gateway, "/account 2", None).await.join("\n");
+        assert!(
+            switched.contains(&format!("已把会话 {sid} 切到 #2 work")),
+            "{switched}"
+        );
+        assert!(
+            switched.contains("下一条消息在同一会话里按新账号继续"),
+            "{switched}"
+        );
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, work.id);
+        let listing = im_send(&gateway, "/account", None).await.join("\n");
+        assert!(listing.contains("Claude 账号:#2 work"), "{listing}");
+        assert!(listing.contains("#2 work  7d 40%  ✓"), "{listing}");
+
+        let again = im_send(&gateway, "/account work", None).await.join("\n");
+        assert!(again.contains("已经在用 #2 work"), "{again}");
+        let unknown = im_send(&gateway, "/account 9", None).await.join("\n");
+        assert!(unknown.contains("没有编号或名字为「9」的账号"), "{unknown}");
+
+        // The next message resumes the same sid under the new account.
+        im_send(&gateway, "continue", None).await;
+        end_turn(&*gateway.lock().await, &sid);
+        assert_eq!(
+            fake.spawn_accounts.lock().await.last().cloned(),
+            Some(Some(work.id.clone()))
+        );
+        let status = im_send(&gateway, "/status", None).await.join("\n");
+        assert!(status.contains("👤 #2 work"), "{status}");
+
+        let back = im_send(&gateway, "/account default", None).await.join("\n");
+        assert!(back.contains("切到 默认登录"), "{back}");
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+    }
+
+    /// #236 — on a button channel `/account` offers one button per account,
+    /// and a tap runs `/account <n>` through the shared entry.
+    #[tokio::test]
+    async fn im_account_buttons_switch_through_the_shared_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let work = cswap_account("2", "work");
+        gw.set_cswap_accounts(Arc::new(
+            ccteam_harness::execution::claude_accounts::CswapAccountService::fixed(vec![
+                cswap_account("1", "cloud"),
+                work.clone(),
+            ]),
+        ));
+        gw.bind_channel_buttons("telegram", true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        gw.handle_text("telegram", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        let sid = gw
+            .current_session
+            .get(&ChatKey::new("telegram", "chat-1", "alice"))
+            .unwrap();
+        end_turn(&gw, &sid);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+        while rx.try_recv().is_ok() {}
+
+        assert!(im_send(&gateway, "/account", None).await.is_empty());
+        let picker = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|event| !event.options.is_empty())
+            .expect("the listing carries buttons");
+        let taps: Vec<_> = picker.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            taps,
+            ["act:account:default", "act:account:1", "act:account:2"]
+        );
+        assert!(
+            picker.options[0].label.ends_with('✓'),
+            "default login is current"
+        );
+
+        assert!(Gateway::selection_needs_shared_entry(Some(&ChoiceReply {
+            data: "act:account:2".into()
+        })));
+        // A button channel gets the receipt as a message with next-step buttons.
+        assert!(im_send(&gateway, "", Some("act:account:2"))
+            .await
+            .is_empty());
+        let receipt = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| event.content)
+            .find(|content| content.contains("切到"))
+            .expect("the switch receipt");
+        assert!(receipt.contains("切到 #2 work"), "{receipt}");
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, work.id);
+        assert_eq!(button_action_command("account:x"), None);
+        assert_eq!(button_action_command("account:2 3"), None);
+    }
+
+    /// #236 — refusals leave the binding and the process exactly as they were.
+    #[tokio::test]
+    async fn claude_account_switch_refuses_without_touching_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let two = cswap_account("2", "work");
+        let (_fake, gateway, sid) = account_session(tmp.path(), AgentVendor::Claude, None).await;
+
+        // Mid-turn: releasing would cut the turn short.
+        let started = {
+            let guard = gateway.lock().await;
+            let session = guard.sessions.get(&sid).unwrap();
+            *session.turn_started_at.lock().unwrap() = Some(Instant::now());
+            Arc::clone(&session.turn_started_at)
+        };
+        let busy = Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone())).await;
+        assert!(
+            matches!(busy, Err(ClaudeAccountSwitchError::Busy(_))),
+            "{busy:?}"
+        );
+        *started.lock().unwrap() = None;
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+
+        // History only in the current account's private profile: another
+        // account would resume nothing and start the conversation over.
+        let mut private =
+            ccteam_harness::execution::claude_accounts::ClaudeAccountBinding::requested(
+                cswap_account("3", "solo").id,
+            )
+            .unwrap();
+        private.config_dir = Some(tmp.path().join("profile-3"));
+        let uuid = {
+            let guard = gateway.lock().await;
+            let mut meta = guard
+                .session_catalog
+                .find_or_load(&sid, &guard.projects)
+                .unwrap()
+                .meta;
+            meta.claude_account = Some(private.clone());
+            guard.persist_session_meta(tmp.path(), &meta).unwrap();
+            if meta.vendor_uuid.is_empty() {
+                ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid(
+                    "alpha", &sid,
+                )
+            } else {
+                meta.vendor_uuid
+            }
+        };
+        let transcript = ccteam_harness::execution::transcript_tail::anthropic_project_dir_in(
+            &tmp.path().join("profile-3/projects"),
+            tmp.path(),
+        );
+        std::fs::create_dir_all(&transcript).unwrap();
+        std::fs::write(transcript.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+        let private_history =
+            Gateway::switch_claude_account_shared(&gateway, &sid, Some(two.clone())).await;
+        assert!(
+            matches!(private_history, Err(ClaudeAccountSwitchError::Refused(_))),
+            "{private_history:?}"
+        );
+        assert_eq!(stored_account(&gateway, &sid).await, Some(private));
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        // Only a local Claude stream-json session runs through cswap.
+        let other = tempfile::tempdir().unwrap();
+        let (_fake, codex, codex_sid) =
+            account_session(other.path(), AgentVendor::Codex, None).await;
+        let unsupported =
+            Gateway::switch_claude_account_shared(&codex, &codex_sid, Some(two)).await;
+        assert!(
+            matches!(unsupported, Err(ClaudeAccountSwitchError::Unsupported(_))),
+            "{unsupported:?}"
+        );
+        assert!(matches!(
+            Gateway::switch_claude_account_shared(&codex, "s404", None).await,
+            Err(ClaudeAccountSwitchError::UnknownSession(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cswap_selection_needs_no_grant_but_only_runs_local_stream_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let id = ccteam_harness::execution::claude_accounts::account_id("two@example.test", "");
+        let tuning = SpawnTuning {
+            claude_account: Some(id.clone()),
+            ..Default::default()
+        };
+        for (vendor, protocol) in [
+            (AgentVendor::Codex, SessionProtocol::StreamJson),
+            (AgentVendor::Claude, SessionProtocol::Terminal),
+        ] {
+            let denied = gateway.plan_new_session(
+                ChatKey::new("web", "web-api", "web-api"),
+                "alpha".into(),
+                vendor,
+                String::new(),
+                String::new(),
+                PermissionMode::Skip,
+                protocol,
+                tuning.clone(),
+            );
+            assert!(denied.err().unwrap().is::<CswapAccountUnsupported>());
+        }
+        assert_eq!(
+            gateway.next_session, 0,
+            "a rejected choice allocates no sid"
+        );
+        // Owner decision 2026-11-06: no per-identity grant — a per-user web
+        // login (Tenant) uses any local account exactly like the admin.
+        let plan = gateway
+            .plan_new_session(
+                ChatKey::new("web", "tenant", "tenant"),
+                "alpha".into(),
+                AgentVendor::Claude,
+                String::new(),
+                String::new(),
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                tuning,
+            )
+            .unwrap();
+        assert_eq!(plan.claude_account.as_ref().unwrap().id, id);
+        let mut binding = plan.claude_account.clone().unwrap();
+        binding.config_dir = Some(tmp.path().join("private-account"));
+        binding.slot = "2".into();
+        binding.label = "work".into();
+        let thread = ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ccteam_harness::ExecutionMode::Chat,
+            identity: "vendor-id".into(),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({"vendor_uuid":"vendor-id","claude_account":binding}),
+        };
+        let meta = Gateway::meta_for_new_session(&plan, &thread, None);
+        assert_eq!(
+            meta.claude_account.as_ref().unwrap().config_dir,
+            Some(tmp.path().join("private-account"))
+        );
+        ccteam_harness::execution::session_meta::write_session_meta(tmp.path(), &meta).unwrap();
+        assert_eq!(
+            ccteam_harness::execution::transcript_tail::anthropic_bound_project_dir(
+                tmp.path(),
+                meta.claude_account.as_ref()
+            ),
+            Some(
+                ccteam_harness::execution::transcript_tail::anthropic_project_dir_in(
+                    &tmp.path().join("private-account/projects"),
+                    tmp.path()
+                )
+            )
+        );
+        let public =
+            serde_json::to_string(&released_session_view(&meta, "alpha", &Default::default()))
+                .unwrap();
+        assert!(
+            !public.contains("private-account"),
+            "private profile paths must not escape through session DTOs"
+        );
+        assert!(!public.contains("config_dir"));
+    }
+
     /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)
     /// reaches the adapter's `SpawnCtx`, and the explicit model beats the
     /// role's `model:` frontmatter; without tuning the role default holds
@@ -24359,6 +25893,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("future-model-from-vendor".into()),
                     effort: Some("max".into()),
@@ -24392,6 +25927,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("  ".into()),
                     effort: Some("".into()),
@@ -24433,6 +25969,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("opus".into()),
                     effort: Some("xhigh".into()),
@@ -24524,6 +26061,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("claude-sonnet-5".into()),
                     effort: Some("xhigh".into()),
@@ -24589,6 +26127,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: None,
                     effort: None,
@@ -24659,6 +26198,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("opus".into()),
                     effort: Some("xhigh".into()),
@@ -24849,6 +26389,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    claude_account: None,
                     mode: None,
                     model: Some("claude-sonnet-5".into()),
                     effort: Some("xhigh".into()),
@@ -25420,6 +26961,8 @@ mod tests {
         /// `SpawnCtx::generation` captured per start_thread, so a test can assert
         /// the thread was stamped with the generation the live map installs.
         spawn_generations: Arc<Mutex<Vec<u64>>>,
+        /// #236 — the cswap account id (`None` = default login) per start_thread.
+        spawn_accounts: Arc<Mutex<Vec<Option<String>>>>,
         /// #203 — when set, every `start_thread` reports this id as
         /// `raw_extras.vendor_uuid` (a vendor whose resume ladder fell back to
         /// a fresh thread). `None` = no vendor id (the default `{}` extras).
@@ -25491,6 +27034,13 @@ mod tests {
         /// trait default). Account-scoped: every session sharing this fake
         /// answers with the same windows, exactly like one vendor account.
         account_usage: Arc<Mutex<Option<AccountUsage>>>,
+        /// Per-thread override of `account_usage`, keyed by thread identity:
+        /// one process still signed in as a DIFFERENT account than the rest
+        /// (a login switch it started before).
+        account_usage_by_thread: Arc<std::sync::Mutex<HashMap<String, AccountUsage>>>,
+        /// How long each `account_usage` ask takes — a slow or stuck vendor
+        /// (#234). Zero = immediate.
+        account_usage_delay: Arc<std::sync::Mutex<std::time::Duration>>,
         /// Monotone submission counter, so every accepted message gets its OWN
         /// execution-turn id. One id per THREAD was enough while nothing
         /// correlated a completion with the message that asked for it; a
@@ -25570,6 +27120,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 spawn_generations: Arc::new(Mutex::new(Vec::new())),
+                spawn_accounts: Arc::new(Mutex::new(Vec::new())),
                 next_vendor_uuid: Arc::new(std::sync::Mutex::new(None)),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
@@ -25587,6 +27138,8 @@ mod tests {
                 panic_recover_for: Arc::default(),
                 recovered_for: Arc::default(),
                 account_usage: Arc::new(Mutex::new(None)),
+                account_usage_by_thread: Arc::default(),
+                account_usage_delay: Arc::default(),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -25837,6 +27390,17 @@ mod tests {
             *self.account_usage.lock().await = usage;
         }
 
+        fn set_account_usage_delay(&self, delay: std::time::Duration) {
+            *self.account_usage_delay.lock().unwrap() = delay;
+        }
+
+        fn set_thread_account_usage(&self, identity: &str, usage: AccountUsage) {
+            self.account_usage_by_thread
+                .lock()
+                .unwrap()
+                .insert(identity.to_string(), usage);
+        }
+
         fn new_with_event_delay(vendor: AgentVendor, event_delay: std::time::Duration) -> Self {
             Self {
                 event_delay,
@@ -25936,6 +27500,11 @@ mod tests {
                 .await
                 .push((ctx.model_id.clone(), ctx.effort.clone()));
             self.spawn_generations.lock().await.push(ctx.generation);
+            self.spawn_accounts.lock().await.push(
+                ctx.claude_account
+                    .as_ref()
+                    .map(|account| account.id.clone()),
+            );
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
             let raw_extras = match self.next_vendor_uuid.lock().unwrap().as_deref() {
@@ -26139,8 +27708,21 @@ mod tests {
             None
         }
 
-        async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
-            self.account_usage.lock().await.clone()
+        async fn account_usage(&self, h: &ThreadHandle) -> Option<AccountUsage> {
+            let delay = *self.account_usage_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let own = self
+                .account_usage_by_thread
+                .lock()
+                .unwrap()
+                .get(&h.identity)
+                .cloned();
+            match own {
+                Some(usage) => Some(usage),
+                None => self.account_usage.lock().await.clone(),
+            }
         }
 
         async fn handle_directive(
@@ -29451,7 +31033,7 @@ mod tests {
             gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
             "a LIVE session in a tenant-owned project belongs to that tenant"
         );
-        let status = gateway.render_status(&tenant).await;
+        let status = gateway.render_status_with(&tenant, None).await;
         assert!(
             status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
             "the tenant's /status must list its project's delegated children: {status}"
@@ -34165,6 +35747,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
@@ -34244,6 +35827,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            claude_account: None,
             model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),

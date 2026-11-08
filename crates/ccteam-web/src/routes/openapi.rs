@@ -156,6 +156,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // spawn-tuning discovery — the affordance side of `POST .../sessions`
         // taking `model` + `effort` (no project named, so no project ACL).
         .routes(routes!(super::models::handle_models))
+        .routes(routes!(super::claude_accounts::handle_claude_accounts))
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp)
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
@@ -275,6 +276,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_session_history,
             super::sessions_api::handle_patch_session
         ))
+        // #236 — move a session to another cswap account / the default login.
+        .routes(routes!(super::sessions_api::handle_switch_claude_account))
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_context))
         .routes(routes!(super::sessions_api::handle_session_turn))

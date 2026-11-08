@@ -322,6 +322,10 @@ fn apply_progress_activity_status(
 /// Accepts form or JSON via [`FormOrJson`].
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionForm {
+    /// Optional stable cswap account id returned by GET /vendors/claude/accounts.
+    /// Only local Claude stream-json supports account selection.
+    #[serde(default)]
+    pub claude_account: Option<String>,
     pub role: String,
     #[serde(default)]
     pub vendor: Option<String>,
@@ -384,6 +388,7 @@ fn spawn_tuning_from_form(
     mode: Option<String>,
 ) -> ccteam_im::gateway::SpawnTuning {
     ccteam_im::gateway::SpawnTuning {
+        claude_account: None,
         model,
         effort,
         mode,
@@ -466,12 +471,25 @@ pub(crate) async fn handle_create_session(
     };
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
-    let tuning = spawn_tuning_from_form(
+    let mut tuning = spawn_tuning_from_form(
         vendor,
         form.model.clone(),
         form.effort.clone(),
         form.mode.clone(),
     );
+    tuning.claude_account = form
+        .claude_account
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    if tuning.claude_account.is_some()
+        && (vendor != AgentVendor::Claude || protocol != SessionProtocol::StreamJson)
+    {
+        return create_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cswap accounts require local Claude stream-json".into(),
+            mode,
+        );
+    }
     let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
         Arc::clone(gw),
         slug.clone(),
@@ -486,6 +504,9 @@ pub(crate) async fn handle_create_session(
     .await;
     match created {
         Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
+        Err(error) if error.is::<ccteam_im::gateway::CswapAccountUnsupported>() => {
+            create_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string(), mode)
+        }
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
         // role has no `.claude/agents/<role>.md`) from a real internal failure
         // (adapter spawn / fs error). A bad role is a client error → 422
@@ -660,6 +681,97 @@ pub(crate) async fn handle_patch_session(
         Err(err) => {
             tracing::warn!(%sid, %err, "rename_session failed");
             unknown_session(&sid)
+        }
+    }
+}
+
+/// PUT body for `PUT /api/v1/sessions/{sid}/claude-account` (#236).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SwitchClaudeAccountRequest {
+    /// A stable account id from `GET /api/v1/vendors/claude/accounts`;
+    /// `null` returns the session to the default login.
+    #[serde(default)]
+    pub claude_account: Option<String>,
+}
+
+/// `PUT /api/v1/sessions/{sid}/claude-account`
+///
+/// Move a local Claude stream-json session to another cswap account, or back
+/// to the default login (#236). Only the session's account binding changes:
+/// a resident process is released and the next message resumes the SAME sid
+/// under the new account (cswap's shared history keeps the transcript
+/// readable from every account). Picking the current account is a no-op.
+///
+/// 200 `{sid, claude_account, changed, released}` (`claude_account: null` =
+/// default login). 404 unknown/inaccessible session (`gate_sid`). 409 the
+/// session is mid-turn, waiting on the user, running background work, or
+/// still has a process from before a daemon restart. 422 not a local Claude
+/// stream-json session, an account cswap does not list (or cswap is
+/// unavailable), or history still private to the current account. 503 no
+/// gateway.
+#[utoipa::path(
+    put,
+    path = "/api/v1/sessions/{sid}/claude-account",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body = SwitchClaudeAccountRequest,
+    responses(
+        (status = 200, description = "`{sid, claude_account, changed, released}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 409, description = "Busy: mid-turn, awaiting the user, background work or a pre-restart process"),
+        (status = 422, description = "Unsupported session, unlisted account / cswap unavailable, or history not shared yet"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_switch_claude_account(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+    Json(body): Json<SwitchClaudeAccountRequest>,
+) -> Response {
+    use ccteam_im::gateway::ClaudeAccountSwitchError as SwitchError;
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let refuse = |status: StatusCode, error: String| {
+        (status, Json(json!({ "error": error }))).into_response()
+    };
+    let target = match body.claude_account.filter(|id| !id.trim().is_empty()) {
+        None => None,
+        // The id must be one cswap lists right now: that both validates it
+        // and supplies the `#slot name` the session shows until it resumes.
+        Some(id) => match app.cswap_accounts.accounts().await {
+            Ok(accounts) => match accounts.into_iter().find(|account| account.id == id) {
+                Some(account) => Some(account),
+                None => {
+                    return refuse(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "cswap does not list this account; choose one from the account list".into(),
+                    )
+                }
+            },
+            Err(error) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")),
+        },
+    };
+    match ccteam_im::gateway::Gateway::switch_claude_account_shared(gw, &sid, target).await {
+        Ok(switch) => Json(json!({
+            "sid": sid,
+            "claude_account": switch.claude_account,
+            "changed": switch.changed,
+            "released": switch.released,
+        }))
+        .into_response(),
+        Err(SwitchError::UnknownSession(_)) => unknown_session(&sid),
+        Err(SwitchError::Busy(message)) => refuse(StatusCode::CONFLICT, message),
+        Err(error @ (SwitchError::Unsupported(_) | SwitchError::Refused(_))) => {
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        Err(SwitchError::Internal(error)) => {
+            tracing::warn!(%sid, error = %format!("{error:#}"), "switch_claude_account failed");
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
         }
     }
 }
@@ -2955,6 +3067,7 @@ mod tests {
 
     fn view(sid: &str) -> SessionView {
         SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3036,6 +3149,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3090,6 +3204,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![
             SessionView {
+                claude_account: None,
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
@@ -3116,6 +3231,7 @@ mod tests {
                 delegation_depth: 0,
             },
             SessionView {
+                claude_account: None,
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
@@ -3177,6 +3293,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
@@ -3225,6 +3342,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
+            claude_account: None,
             driveable: true,
             residency: "resident".to_string(),
             detached: None,

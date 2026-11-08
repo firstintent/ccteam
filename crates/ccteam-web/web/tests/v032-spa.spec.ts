@@ -491,6 +491,91 @@ test("conversation posts a turn; sidebar hover-stop stops the session", async ({
   );
 });
 
+for (const state of ["missing", "installed"] as const) {
+  test(`optional cswap account picker beside the model menu: ${state}`, async ({ page }) => {
+    const captured = await mockCcteamApi(page);
+    let discoveries = 0;
+    const account = "a".repeat(64);
+    await page.route("**/api/v1/vendors/claude/accounts", route => {
+      discoveries++;
+      return route.fulfill({ json: state === "installed"
+        ? { available: true, accounts: [{ id: account, slot: "2", label: "work", active: false, five_hour_pct: 11, seven_day_pct: 100 }] }
+        : { available: false, accounts: [] } });
+    });
+    await page.goto("/app/");
+    await expect(page.getByTestId("home-view")).toBeVisible();
+    // The account control is its own composer button, not a model-menu section.
+    await page.getByTestId("model-btn").click();
+    await expect(page.getByTestId("model-menu")).toBeVisible();
+    await expect(page.getByTestId("model-menu")).not.toContainText("Claude 账号");
+    await expect(page.getByTestId("model-menu")).not.toContainText("高级选项");
+    expect(discoveries).toBe(0);
+    const accountBtn = page.getByTestId("claude-account-btn");
+    await expect(accountBtn).toContainText("默认登录");
+    await accountBtn.click();
+    await expect(page.getByTestId("model-menu")).toBeHidden();
+    const menu = page.getByTestId("claude-account-menu");
+    await expect(menu).toBeVisible();
+    await expect.poll(() => discoveries).toBe(1);
+    if (state === "installed") {
+      await expect(menu.getByRole("menuitemradio", { name: /#2 work/ })).toContainText("5h:11%");
+      await menu.getByRole("menuitemradio", { name: /#2 work/ }).click();
+      await expect(menu).toBeHidden();
+      await expect(accountBtn).toContainText("#2 work");
+    } else {
+      await expect(menu).toContainText("cswap 不可用");
+      await expect(menu.getByRole("menuitemradio", { name: "默认登录" })).toHaveAttribute("aria-checked", "true");
+      await accountBtn.click();
+    }
+    await page.getByTestId("composer-textarea").fill("Use the selected login");
+    await page.getByTestId("home-send").click();
+    await expect.poll(() => captured.some(row => row.url.endsWith("/projects/dev-team/sessions"))).toBe(true);
+    const create = captured.find(row => row.url.endsWith("/projects/dev-team/sessions"));
+    if (state === "installed") expect(create?.body).toHaveProperty("claude_account", account);
+    else expect(create?.body).not.toHaveProperty("claude_account");
+    await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
+  });
+}
+
+test("a running Claude session names its account and switches it in place (#236)", async ({ page }) => {
+  const captured = await mockCcteamApi(page);
+  const cloud = { id: "a".repeat(64), slot: "1", label: "cloud", active: true, seven_day_pct: 40 };
+  const work = { id: "b".repeat(64), slot: "2", label: "work", active: false, five_hour_pct: 11, seven_day_pct: 100 };
+  await page.route("**/api/v1/vendors/claude/accounts", route =>
+    route.fulfill({ json: { available: true, accounts: [cloud, work] } }));
+  await page.route("**/api/v1/sessions/s1/claude-account", route => {
+    captured.push({ url: route.request().url(), method: route.request().method(), body: route.request().postDataJSON() });
+    return route.fulfill({ json: { sid: "s1", claude_account: { ...work, five_hour_pct: undefined, seven_day_pct: undefined },
+      changed: true, released: true } });
+  });
+  await page.goto("/app/chat/s/s1");
+  await expect(page.getByTestId("conversation-view")).toBeVisible();
+  const accountBtn = page.getByTestId("claude-account-btn");
+  // A default-login session says which cswap account that login is now.
+  await expect(accountBtn).toHaveText("默认 · #1 cloud");
+  await expect(page.getByTestId("session-claude-account")).toHaveCount(0);
+  await accountBtn.click();
+  const menu = page.getByTestId("claude-account-menu");
+  await expect(menu).toContainText("下一条消息在同一会话里按新账号继续");
+  await menu.getByRole("menuitemradio", { name: /#2 work/ }).click();
+  await expect(menu).toBeHidden();
+  const put = captured.find(row => row.url.endsWith("/api/v1/sessions/s1/claude-account"));
+  expect(put).toMatchObject({ method: "PUT", body: { claude_account: work.id } });
+  await expect(accountBtn).toHaveText("#2 work");
+  await expect(page.getByTestId("session-claude-account")).toHaveText("#2 work");
+});
+
+test("cswap account control fits the composer row on a phone", async ({ page }) => {
+  await mockCcteamApi(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/app/");
+  const accountBtn = page.getByTestId("claude-account-btn");
+  await expect(accountBtn).toBeVisible();
+  const send = await page.getByTestId("home-send").boundingBox();
+  expect(send).not.toBeNull();
+  expect(send!.x + send!.width).toBeLessThanOrEqual(390);
+});
+
 test("home lazy-create: first message POSTs session without a host override, then the turn", async ({
   page,
 }) => {
@@ -519,6 +604,9 @@ test("home lazy-create: first message POSTs session without a host override, the
     vendor: "claude",
     protocol: "stream-json",
     permission_mode: "hitl",
+    // Owner 2026-11-08: a fresh composer starts on opus at high effort.
+    model: "opus",
+    effort: "high",
   });
   expect(create?.body).not.toHaveProperty("host");
 
@@ -542,13 +630,17 @@ test("Pi picker keeps role, uses provider/model-id, and exposes strict-HITL trad
   await page.getByTestId("ctx-role").getByRole("button").first().click();
   await page.getByRole("button", { name: /cto/ }).click();
 
+  // Vendor and model are separate dropdowns: pick the harness, then its model.
+  await page.getByTestId("vendor-btn").click();
+  await page.getByTestId("vendor-menu").getByRole("menuitemradio", { name: "Pi" }).click();
+  await expect(page.getByTestId("vendor-btn")).toContainText("Pi");
+  await expect(page.getByTestId("vendor-menu")).toBeHidden();
   await page.getByTestId("model-btn").click();
+  await expect(page.getByTestId("model-menu")).toContainText("模型(Pi)");
   await page
     .getByRole("button", { name: /anthropic\/claude-opus-4-6/ })
     .click();
-  await expect(page.getByTestId("model-btn")).toContainText(
-    "Pi · anthropic/claude-opus-4-6",
-  );
+  await expect(page.getByTestId("model-btn")).toContainText("anthropic/claude-opus-4-6");
   await page.getByTestId("model-btn").click();
   await page.getByRole("button", { name: "xhigh", exact: true }).click();
 
@@ -1005,6 +1097,63 @@ test("file workspace follows repeated line links into the same file", async ({
   await expect
     .poll(() => page.locator(".cm-scroller").evaluate((el) => el.scrollTop))
     .toBeLessThan(readingPosition + 5);
+});
+
+test.describe("touch workspace chat links and code copy", () => {
+  test.use({ hasTouch: true });
+  for (const width of [390, 1360]) {
+    test(`document previews and per-block copy at ${width}px`, async ({ page }) => {
+      await mockCcteamApi(page);
+      await page.setViewportSize({ width, height: 1000 });
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+          writeText: async (text: string) => { (window as typeof window & { copiedCode?: string }).copiedCode = text; },
+        } });
+      });
+      const origin = new URL(page.url() === "about:blank" ? test.info().project.use.baseURL! : page.url()).origin;
+      await page.route("**/api/v1/sessions/s1", route => route.fulfill({ json: {
+        sid: "s1", events: [{ turn_id: "links-copy", role: "reviewer", user: "inspect", assistant:
+          `[issue](/repo/docs/issue.md) [same site](${origin}/repo/docs/issue.md) [external](https://elsewhere.example/issue.md)\n\n` +
+          '```ts\nconst answer = "<hello>";\n```\n\n```\nsecond block\n```',
+        }],
+      } }));
+      await page.route("**/api/v1/projects/dev-team/files", route => route.fulfill({ json: {
+        root: "/repo", paths: ["docs/", "docs/issue.md"], git_status: {}, truncated: false,
+      } }));
+      let minted = 0;
+      await page.route("**/api/v1/projects/dev-team/files/preview", route => {
+        expect(route.request().postDataJSON()).toEqual({ path: "docs/issue.md" });
+        return route.fulfill({ json: {
+          url: `/api/v1/projects/dev-team/files/preview/ticket-${++minted}/docs/issue.md`, expires_in: 3600,
+        } });
+      });
+      await page.context().route("**/files/preview/ticket-*/docs/issue.md", route => route.fulfill({
+        contentType: "text/html", body: "<!doctype html><h1>Issue preview</h1>",
+      }));
+      await page.goto("/app/chat/s/s1");
+      const expected = "/api/v1/projects/dev-team/files/preview/ticket-1/docs/issue.md";
+      await expect(page.getByRole("link", { name: "issue", exact: true })).toHaveAttribute("href", expected);
+      await expect(page.getByRole("link", { name: "same site", exact: true })).toHaveAttribute("href", expected);
+      await expect(page.getByRole("link", { name: "external", exact: true })).toHaveAttribute("href", "https://elsewhere.example/issue.md");
+      expect(minted).toBe(1);
+      const popupEvent = page.waitForEvent("popup");
+      await page.getByRole("link", { name: "same site", exact: true }).tap();
+      const popup = await popupEvent;
+      await expect(popup.getByRole("heading", { name: "Issue preview" })).toBeVisible();
+      expect(new URL(popup.url()).origin).toBe(origin);
+      await popup.close();
+      const buttons = page.locator("pre .code-copy");
+      await expect(buttons).toHaveCount(2);
+      await expect(buttons.first().locator("svg")).toBeVisible();
+      await expect(buttons.first()).toHaveCSS("opacity", "1");
+      await buttons.first().tap();
+      await expect(buttons.first()).toHaveAttribute("aria-label", "已复制");
+      expect(await page.evaluate(() => (window as typeof window & { copiedCode?: string }).copiedCode)).toBe('const answer = "<hello>";\n');
+      await buttons.last().focus();
+      await page.keyboard.press("Enter");
+      expect(await page.evaluate(() => (window as typeof window & { copiedCode?: string }).copiedCode)).toBe("second block\n");
+    });
+  }
 });
 
 test("file workspace previews Markdown and opens the rendered document in a new page", async ({

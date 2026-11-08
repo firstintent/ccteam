@@ -12,6 +12,7 @@ import {
   effortRowLabel,
   effortRowsFor,
   effortSwitchFor,
+  modelRowLabel,
   modelRowsFor,
   modelSwitchFor,
   normalizeDraft,
@@ -258,7 +259,6 @@ describe("effortRowsFor (there is NO global effort ladder)", () => {
 
 describe("modelSwitchFor (create-form `model` field)", () => {
   it("is null for the vendor-default row, for every vendor", () => {
-    expect(modelSwitchFor(defaultDraft())).toBeNull();
     for (const vendor of VENDORS) {
       expect(modelSwitchFor({ vendor: vendor.id, model: MODEL_DEFAULT }, CATALOG)).toBeNull();
       expect(modelSwitchFor({ vendor: vendor.id, model: "" }, CATALOG)).toBeNull();
@@ -292,7 +292,6 @@ describe("effortSwitchFor (create-form `effort` field — pass-through, no remap
     for (const vendor of VENDORS) {
       expect(effortSwitchFor({ vendor: vendor.id, effort: "" }, CATALOG)).toBeNull();
     }
-    expect(effortSwitchFor(defaultDraft())).toBeNull();
   });
 
   it("sends the vendor's own token verbatim for every vendor", () => {
@@ -365,9 +364,25 @@ describe("draft transitions (catalog is advisory, vendor changes are explicit)",
     expect(Object.keys(next).sort()).toEqual(["effort", "hitl", "model", "protocol", "vendor"]);
   });
 
-  it("defaultDraft is the vendor default on both axes", () => {
-    expect(defaultDraft().model).toBe(MODEL_DEFAULT);
-    expect(defaultDraft().effort).toBe("");
+  it("a fresh draft opens on claude · opus · high and wires both (owner 2026-11-08)", () => {
+    const draft = defaultDraft();
+    expect([draft.vendor, draft.model, draft.effort]).toEqual(["claude", "opus", "high"]);
+    expect(modelSwitchFor(draft)).toBe("opus");
+    expect(effortSwitchFor(draft)).toBe("high");
+  });
+
+  it("switching vendor lands on that vendor's starting pick", () => {
+    const codex = switchDraftVendor(defaultDraft(), "codex");
+    expect([codex.model, codex.effort]).toEqual([MODEL_DEFAULT, ""]);
+    const back = switchDraftVendor(codex, "claude");
+    expect([back.model, back.effort]).toEqual(["opus", "high"]);
+  });
+
+  it("the default row names the observed concrete id, else 默认", () => {
+    const catalog = { codex: { models: [], efforts: [], defaultModel: "gpt-5.5" } };
+    expect(modelRowLabel("codex", MODEL_DEFAULT, catalog)).toBe("gpt-5.5");
+    expect(modelRowLabel("grok", MODEL_DEFAULT, catalog)).toBe(MODEL_DEFAULT);
+    expect(modelRowLabel("codex", "o9", catalog)).toBe("o9");
   });
 });
 

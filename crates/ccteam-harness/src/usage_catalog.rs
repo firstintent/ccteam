@@ -76,8 +76,14 @@ pub fn load_usage_catalog_in(root: &Path) -> UsageCatalog {
 }
 
 /// Atomically replace one vendor's last-seen entry under an injected root.
-/// An all-`None` capture is ignored so a vendor that momentarily answers with
-/// nothing cannot erase a useful prior observation.
+/// A capture with no window ([`AccountUsage::has_window`]) is ignored so a
+/// vendor that momentarily answers with nothing — or with its tier alone —
+/// cannot erase a useful prior observation.
+///
+/// A real capture REPLACES the entry whole, never merges into it: after an
+/// account switch the old account's windows must not survive under the new
+/// account's answer (a plan without a 5-hour window must not inherit the last
+/// account's 5-hour figure).
 pub fn record_vendor_usage_in(
     root: &Path,
     vendor: &str,
@@ -85,7 +91,7 @@ pub fn record_vendor_usage_in(
     usage: &AccountUsage,
 ) -> Result<()> {
     let vendor = vendor.trim();
-    if vendor.is_empty() || usage == &AccountUsage::default() {
+    if vendor.is_empty() || !usage.has_window() {
         return Ok(());
     }
     let lock = USAGE_WRITE_LOCK.get_or_init(|| Mutex::new(()));
@@ -173,12 +179,7 @@ pub fn last_known_entry_in(
     // A surviving subscription tier alone renders no row (it is a tail segment,
     // never a fact on its own), so say so here rather than hand back a usage
     // that formats to nothing.
-    let usage = &entry.usage;
-    let has_window = usage.five_hour_pct.is_some()
-        || usage.weekly_pct.is_some()
-        || usage.credits_pct.is_some()
-        || !usage.model_windows.is_empty();
-    has_window.then_some(entry)
+    entry.usage.has_window().then_some(entry)
 }
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
@@ -377,6 +378,46 @@ mod tests {
         let got = last_known_usage_in(root.path(), "claude", Utc::now()).unwrap();
         assert_eq!(got.model_windows.len(), 1);
         assert_eq!(got.model_windows[0].pct, Some(9));
+    }
+
+    /// The tier alone is no observation: recording it must not erase the
+    /// windows a previous answer carried.
+    #[test]
+    fn a_tier_only_capture_preserves_last_seen_entry() {
+        let root = tempfile::tempdir().unwrap();
+        record_vendor_usage_in(root.path(), "claude", "status card", &usage()).unwrap();
+        record_vendor_usage_in(
+            root.path(),
+            "claude",
+            "session release",
+            &AccountUsage {
+                subscription: Some("team".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let kept = &load_usage_catalog_in(root.path()).0["claude"];
+        assert_eq!(kept.source, "status card");
+        assert_eq!(kept.usage.subscription.as_deref(), Some("max"));
+    }
+
+    /// An account switch replaces the entry WHOLE: the new account's answer
+    /// carries no 5-hour window, so none may survive from the old account.
+    #[test]
+    fn a_new_capture_replaces_the_entry_rather_than_merging_into_it() {
+        let root = tempfile::tempdir().unwrap();
+        record_vendor_usage_in(root.path(), "claude", "status card", &usage()).unwrap();
+        let weekly_only = AccountUsage {
+            subscription: Some("team".into()),
+            weekly_pct: Some(35),
+            weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
+            ..Default::default()
+        };
+        record_vendor_usage_in(root.path(), "claude", "status card", &weekly_only).unwrap();
+        assert_eq!(
+            last_known_usage_in(root.path(), "claude", at("2026-08-31T09:00:00Z")),
+            Some(weekly_only)
+        );
     }
 
     /// A vendor answering with nothing must not erase what it said before —

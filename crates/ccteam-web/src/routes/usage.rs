@@ -7,7 +7,7 @@
 //! spelling, so a script and an agent can never be told different numbers.
 //!
 //! **Not a probe.** Nothing here polls, and nothing here logs into a vendor:
-//! [`Gateway::account_usage_snapshot`](ccteam_im::gateway::Gateway::account_usage_snapshot)
+//! [`Gateway::account_usage_probes`](ccteam_im::gateway::Gateway::account_usage_probes)
 //! asks live same-vendor adapters for state they already hold in memory (never
 //! a turn) and otherwise reads the recorded observation from
 //! [`ccteam_harness::usage_catalog`], which drops each window at the vendor's
@@ -87,9 +87,13 @@ pub(crate) async fn handle_usage(
 
     let usage: Map<String, Value> = match app.gateway.as_ref() {
         Some(gw) => {
-            let guard = ccteam_im::latency::gateway_lock(gw, "web.usage").await;
-            guard
-                .account_usage_snapshot(filter)
+            // Capture under the lock, ask the live sessions after it is
+            // dropped (#234).
+            let probes = ccteam_im::latency::gateway_lock(gw, "web.usage")
+                .await
+                .account_usage_probes(filter);
+            probes
+                .resolve()
                 .await
                 .iter()
                 .map(|(vendor, entry)| {
