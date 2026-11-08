@@ -1142,6 +1142,9 @@ pub struct Gateway {
     /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
     /// never held under the gateway's own mutex for longer than a map lookup.
     spawn_claims: Arc<SpawnClaims>,
+    /// Optional cswap discovery (#236 IM `/account`), shared with the web
+    /// picker so both read one cache.
+    cswap_accounts: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
     /// The `(sid, secret)` authority behind every managed session's tool face
     /// — see [`crate::principals`]. Separate from `sessions` because a
     /// principal has to work BEFORE its session is live (the vendor uses it
@@ -3552,6 +3555,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/account",
+        arg_hint: Some("[<n> | default]"),
+        help: "show or switch the current Claude session's account (cswap); bare = list",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>"),
         help: "stop (destroy) a session by id",
@@ -3662,7 +3671,7 @@ impl NextStep {
 
 fn command_next_step(cmd: &str) -> Option<NextStep> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => NextStep::Session,
+        "/new" | "/use" | "/role" | "/interrupt" | "/account" => NextStep::Session,
         "/stop" | "/rename" | "/cd" | "/newproject" => NextStep::Sessions,
         "/status" => NextStep::SessionControls,
         "/help" => NextStep::Menu,
@@ -3681,6 +3690,16 @@ fn button_action_command(action: &str) -> Option<String> {
         "help" => "/help",
         "model" => "/model",
         "interrupt" => "/interrupt",
+        _ if action.starts_with("account:") => {
+            // `account:<slot>` / `account:default` — the `/account` picker.
+            let target = action.strip_prefix("account:")?;
+            if target != "default"
+                && (target.is_empty() || !target.chars().all(|c| c.is_ascii_digit()))
+            {
+                return None;
+            }
+            return Some(format!("/account {target}"));
+        }
         _ => {
             // `new-effort:<effort>:<vendor>[:<model>]` — the effort leads
             // because it never contains a `:` while a model id may.
@@ -3840,6 +3859,7 @@ impl Gateway {
             progress_projection: None,
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
+            cswap_accounts: Default::default(),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
@@ -5857,7 +5877,17 @@ impl Gateway {
     /// `&mut Gateway` (the claim is always taken before the gateway lock).
     /// The daemon asks this so a `/stop` never reaches the inline path.
     pub fn inbound_needs_shared_entry(text: &str) -> bool {
-        text.split_whitespace().next() == Some("/stop") || Self::is_status_command(text)
+        matches!(text.split_whitespace().next(), Some("/stop" | "/account"))
+            || Self::is_status_command(text)
+    }
+
+    /// A button that stands for a command needing the shared entry (an
+    /// `act:` click on `/account <n>` or `/status`) enters through it too.
+    pub fn selection_needs_shared_entry(selection: Option<&ChoiceReply>) -> bool {
+        selection
+            .and_then(|reply| reply.data.strip_prefix("act:"))
+            .and_then(button_action_command)
+            .is_some_and(|command| Self::inbound_needs_shared_entry(&command))
     }
 
     /// `/status` — routed through the shared entry so its account-usage asks
@@ -6173,6 +6203,31 @@ impl Gateway {
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id).with_thread(thread);
+        // A button standing for a shared-entry command runs exactly as if it
+        // had been typed — through this entry, not the inline one.
+        if let Some(command) = selection
+            .and_then(|reply| reply.data.strip_prefix("act:"))
+            .and_then(button_action_command)
+            .filter(|command| Self::inbound_needs_shared_entry(command))
+        {
+            return Box::pin(Self::handle_message_shared(
+                gateway,
+                channel,
+                chat_id,
+                user_id,
+                thread,
+                message_id,
+                &command,
+                &[],
+                None,
+            ))
+            .await;
+        }
+        // `/account` lists accounts (cswap runs) and switches through the
+        // per-sid claim: both without the gateway lock (#236).
+        if let Some(result) = Self::handle_account_command_shared(&gateway, &chat, text).await {
+            return result;
+        }
         // `/stop` before anything else: it is the one gateway command that has
         // to take a per-child claim, which means it cannot run inside a
         // `&mut Gateway` (issue #197 E). Handled here, where the lock can be
@@ -6327,6 +6382,152 @@ impl Gateway {
         })
     }
 
+    /// IM `/account [<n>|default]` (#236): show the chat's current Claude
+    /// session's account and the cswap accounts it can switch to, or switch
+    /// it. Same rules as the web picker — the switch is
+    /// [`Self::switch_claude_account_shared`]. cswap discovery and the switch
+    /// both run without the gateway lock. `None` = not an `/account` message.
+    async fn handle_account_command_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        text: &str,
+    ) -> Option<Result<Vec<String>>> {
+        let mut parts = text.split_whitespace();
+        if parts.next() != Some("/account") {
+            return None;
+        }
+        let reference = parts.next().map(str::to_string);
+        Some(Self::account_command(gateway, chat, reference.as_deref()).await)
+    }
+
+    async fn account_command(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        reference: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let planned = {
+            let g = crate::latency::gateway_lock(gateway, "im.account.plan").await;
+            g.current_session.get(chat).map(|sid| {
+                let meta = g
+                    .session_catalog
+                    .find_or_load(&sid, &g.projects)
+                    .map(|entry| entry.meta);
+                (
+                    sid,
+                    meta,
+                    Arc::clone(&g.cswap_accounts),
+                    g.channel_supports_buttons(&chat.channel),
+                )
+            })
+        };
+        let Some((sid, meta, service, buttons)) = planned else {
+            return Ok(vec![
+                "这里现在没有会话 —— 发条消息或 /new claude 开一个,再用 /account".to_string(),
+            ]);
+        };
+        let Some(meta) = meta else {
+            return Ok(vec![format!("找不到会话 {sid} 的记录")]);
+        };
+        let local = meta.host.trim().is_empty() || meta.host == ccteam_core::LOCAL_HOST;
+        if meta.vendor != AgentVendor::Claude
+            || meta.protocol != SessionProtocol::StreamJson
+            || !local
+        {
+            return Ok(vec![format!(
+                "会话 {sid} 不是本机 Claude stream-json 会话,不能用 cswap 账号"
+            )]);
+        }
+        let bound = meta
+            .claude_account
+            .as_ref()
+            .map(|binding| binding.display());
+
+        let Some(reference) = reference else {
+            let listed = service.accounts().await;
+            let text = render_account_list(&sid, bound.as_ref(), &listed, !buttons);
+            let accounts = listed.unwrap_or_default();
+            if buttons && !accounts.is_empty() {
+                let current = bound.as_ref().filter(|b| !b.active).map(|b| b.id.as_str());
+                let mark = |on: bool| if on { " ✓" } else { "" };
+                let mut options = vec![action_option(
+                    "account:default",
+                    &format!("默认登录{}", mark(current.is_none())),
+                    OptionWeight::Normal,
+                )];
+                options.extend(accounts.iter().map(|account| {
+                    action_option(
+                        &format!("account:{}", account.slot),
+                        &format!(
+                            "{}{}",
+                            ccteam_harness::execution::claude_accounts::display_name(account),
+                            mark(current == Some(account.id.as_str()))
+                        ),
+                        OptionWeight::Normal,
+                    )
+                }));
+                crate::latency::gateway_lock(gateway, "im.account.picker")
+                    .await
+                    .emit_list_options(chat, text, options);
+                return Ok(Vec::new());
+            }
+            return Ok(vec![text]);
+        };
+
+        let target = if matches!(reference, "default" | "默认" | "默认登录") {
+            None
+        } else {
+            let accounts = match service.accounts().await {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    return Ok(vec![format!(
+                        "cswap 不可用,没有切换:{error:#}\n回默认登录不需要 cswap:/account default"
+                    )])
+                }
+            };
+            match ccteam_harness::execution::claude_accounts::find_account(&accounts, reference) {
+                Some(account) => Some(account.clone()),
+                None => {
+                    return Ok(vec![format!(
+                        "没有编号或名字为「{reference}」的账号 —— /account 看列表"
+                    )])
+                }
+            }
+        };
+        let name = |account: Option<&ccteam_harness::execution::claude_accounts::CswapAccount>| {
+            account.map_or_else(
+                || "默认登录".to_string(),
+                ccteam_harness::execution::claude_accounts::display_name,
+            )
+        };
+        use ClaudeAccountSwitchError as SwitchError;
+        let reply = match Self::switch_claude_account_shared(gateway, &sid, target).await {
+            Ok(switch) if !switch.changed => {
+                format!(
+                    "会话 {sid} 已经在用 {}",
+                    name(switch.claude_account.as_ref())
+                )
+            }
+            Ok(switch) => format!(
+                "已把会话 {sid} 切到 {}{}",
+                name(switch.claude_account.as_ref()),
+                if switch.released {
+                    ";当前进程已结束,下一条消息在同一会话里按新账号继续(提示缓存会重建)"
+                } else {
+                    ",下一条消息起生效"
+                }
+            ),
+            Err(
+                error @ (SwitchError::Busy(_)
+                | SwitchError::Refused(_)
+                | SwitchError::Unsupported(_)),
+            ) => format!("没有切换:{error}"),
+            Err(SwitchError::UnknownSession(_)) => format!("找不到会话 {sid}"),
+            Err(SwitchError::Internal(error)) => return Err(error),
+        };
+        let g = crate::latency::gateway_lock(gateway, "im.account.next_step").await;
+        Ok(g.reply_with_next_step(chat, reply, command_next_step("/account")))
+    }
+
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
@@ -6455,6 +6656,11 @@ impl Gateway {
                     ),
                 }))
             }
+            "/account" => Ok(Some(
+                "/account must be routed through the shared entry point (cswap discovery and \
+                 the switch run without the gateway lock)"
+                    .to_string(),
+            )),
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
                 // destroying it — the context survives, so the user can then
@@ -13814,7 +14020,12 @@ impl Gateway {
             .count();
         let visible_projects = self.visible_project_slugs(chat).len();
 
+        let claude_account = meta
+            .as_ref()
+            .and_then(|m| m.claude_account.as_ref())
+            .map(|binding| binding.display());
         StatusCard {
+            claude_account,
             title: meta.and_then(|m| m.title),
             // Project working-tree PATH — resolved from the loaded project map
             // (slug → dir) for both residencies; omitted if the project isn't
@@ -14831,6 +15042,21 @@ impl Gateway {
         if let Err(error) = adapter.close_thread(thread).await {
             tracing::warn!(%sid, %error, "failed to close uninstalled vendor thread");
         }
+    }
+
+    /// The cswap discovery service; the web state shares it (one cache).
+    pub fn cswap_accounts(
+        &self,
+    ) -> Arc<ccteam_harness::execution::claude_accounts::CswapAccountService> {
+        Arc::clone(&self.cswap_accounts)
+    }
+
+    /// Replace the cswap discovery service (tests inject a fixed list).
+    pub fn set_cswap_accounts(
+        &mut self,
+        service: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
+    ) {
+        self.cswap_accounts = service;
     }
 
     /// Handle to the `(sid, secret)` registry, so a front door can verify a
@@ -19789,6 +20015,92 @@ fn activity_marker(activity: &str) -> &'static str {
 /// leading `s<N>` token counts as a TARGET only when a title follows it, so
 /// `/rename s3` still titles the current session `s3` rather than trying to
 /// rename `s3` to nothing. Pure — unit-tested directly.
+/// The IM `/account` listing (#236): which account the session runs on — a
+/// default-login session names the account that login is right now — then
+/// every cswap account with its quota windows. `typed` adds the commands to
+/// type; a button channel offers buttons instead.
+fn render_account_list(
+    sid: &str,
+    bound: Option<&ccteam_harness::execution::claude_accounts::CswapAccount>,
+    listed: &Result<Vec<ccteam_harness::execution::claude_accounts::CswapAccount>>,
+    typed: bool,
+) -> String {
+    use ccteam_harness::execution::claude_accounts::display_name;
+    let accounts = listed.as_ref().map(Vec::as_slice).unwrap_or_default();
+    let pinned = bound.filter(|account| !account.active);
+    let current = match pinned {
+        Some(account) => display_name(account),
+        None => match accounts.iter().find(|account| account.active) {
+            Some(default) => format!("默认登录(此刻是 {},跟随 cswap auto)", display_name(default)),
+            None => "默认登录".to_string(),
+        },
+    };
+    let mut out = format!("👤 会话 {sid} · Claude 账号:{current}");
+    match listed {
+        Err(error) => {
+            out.push_str(&format!("\ncswap 不可用:{error:#}"));
+            if pinned.is_some() && typed {
+                out.push_str("\n回默认登录:/account default");
+            }
+            return out;
+        }
+        Ok(accounts) if accounts.is_empty() => {
+            out.push_str("\ncswap 里还没有账号");
+            return out;
+        }
+        Ok(_) => {}
+    }
+    out.push_str("\n可切换的账号:");
+    for account in accounts {
+        let mut line = format!("\n  {}", display_name(account));
+        let quota = account_quota_text(account);
+        if !quota.is_empty() {
+            line.push_str(&format!("  {quota}"));
+        }
+        if account.active {
+            line.push_str("  (当前默认)");
+        }
+        if pinned.is_some_and(|bound| bound.id == account.id) {
+            line.push_str("  ✓");
+        }
+        out.push_str(&line);
+    }
+    if typed {
+        out.push_str("\n切换:/account <编号>    回默认登录:/account default");
+    }
+    out.push_str("\n切换会结束当前进程,下一条消息在同一会话里按新账号继续。");
+    out
+}
+
+/// `5h 11% · 7d 100%`, a plan without a 5h window shows only 7d, no reading
+/// shows cswap's status (`需重新登录`); a non-ok status beside numbers marks
+/// them as cswap's last good reading.
+fn account_quota_text(
+    account: &ccteam_harness::execution::claude_accounts::CswapAccount,
+) -> String {
+    let status = account.usage_status.as_deref().map(|status| match status {
+        "relogin_required" => "需重新登录",
+        "token_expired" => "令牌过期",
+        "no_credentials" => "无凭据",
+        "keychain_unavailable" => "钥匙串不可用",
+        "foreign_credential" => "凭据不符",
+        "unavailable" => "额度暂不可读",
+        other => other,
+    });
+    let windows: Vec<String> = [("5h", account.five_hour_pct), ("7d", account.seven_day_pct)]
+        .into_iter()
+        .filter_map(|(window, pct)| pct.map(|pct| format!("{window} {pct}%")))
+        .collect();
+    if windows.is_empty() {
+        return status.unwrap_or_default().to_string();
+    }
+    let mut text = windows.join(" · ");
+    if status.is_some() {
+        text.push_str("(上次)");
+    }
+    text
+}
+
 fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
     let (head, tail) = rest.split_once(char::is_whitespace)?;
     let looks_like_sid = head
@@ -21276,6 +21588,9 @@ struct StatusCard {
     /// finish. `None` when the channel cannot report it.
     stop_hook_blocks: Option<u32>,
     account: Option<AccountUsage>,
+    /// The cswap account a Claude session is bound to (#236); `None` for an
+    /// unbound session (`/account` names what its default login is).
+    claude_account: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
     children: Vec<StatusChild>,
     /// Descendants below the direct children, collapsed to a count.
     deeper_descendants: usize,
@@ -21324,6 +21639,16 @@ impl StatusCard {
         }
         if !self.role.is_empty() {
             identity.push_str(&format!(" · {}", self.role));
+        }
+        if let Some(account) = &self.claude_account {
+            if account.active {
+                identity.push_str(" · 👤 默认登录");
+            } else {
+                identity.push_str(&format!(
+                    " · 👤 {}",
+                    ccteam_harness::execution::claude_accounts::display_name(account)
+                ));
+            }
         }
         let mut out = format!("{head}\n📍 {second}\n   {identity}");
 
@@ -22987,6 +23312,7 @@ mod tests {
                 weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
                 ..Default::default()
             }),
+            claude_account: None,
             children: vec![StatusChild {
                 sid: "s8".into(),
                 vendor: AgentVendor::Codex,
@@ -23053,6 +23379,7 @@ mod tests {
             goal: None,
             stop_hook_blocks: None,
             account: None,
+            claude_account: None,
             children: Vec::new(),
             deeper_descendants: 0,
             same_project_others: 0,
@@ -25200,6 +25527,186 @@ mod tests {
             .unwrap();
         assert!(again.changed && !again.released);
         assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+    }
+
+    /// The fake vendor never ends a turn; end it as a real one would.
+    fn end_turn(gw: &Gateway, sid: &str) {
+        *gw.sessions[sid].turn_started_at.lock().unwrap() = None;
+    }
+
+    async fn im_send(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        text: &str,
+        tap: Option<&str>,
+    ) -> Vec<String> {
+        let selection = tap.map(|data| ChoiceReply {
+            data: data.to_string(),
+        });
+        Gateway::handle_message_shared(
+            Arc::clone(gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            None,
+            "m-1",
+            text,
+            &[],
+            selection.as_ref(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// #236 IM `/account`: names the session's account (a default-login
+    /// session names the cswap account that login is right now), lists the
+    /// accounts with their quota, and switches by number, name or `default`
+    /// through the same door as the web picker.
+    #[tokio::test]
+    async fn im_account_command_lists_and_switches_the_current_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let mut cloud = cswap_account("1", "cloud");
+        cloud.active = true;
+        cloud.five_hour_pct = Some(11);
+        cloud.seven_day_pct = Some(100);
+        let mut work = cswap_account("2", "work");
+        work.seven_day_pct = Some(40);
+        gw.set_cswap_accounts(Arc::new(
+            ccteam_harness::execution::claude_accounts::CswapAccountService::fixed(vec![
+                cloud.clone(),
+                work.clone(),
+            ]),
+        ));
+        assert!(
+            im_send(
+                &Arc::new(tokio::sync::Mutex::new(Gateway::new(
+                    fake.clone(),
+                    "alpha",
+                    tmp.path()
+                ))),
+                "/account",
+                None
+            )
+            .await[0]
+                .contains("没有会话"),
+            "no session yet: say how to get one"
+        );
+        gw.handle_text("telegram", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        let sid = gw
+            .current_session
+            .get(&ChatKey::new("telegram", "chat-1", "alice"))
+            .unwrap();
+        end_turn(&gw, &sid);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        let listing = im_send(&gateway, "/account", None).await.join("\n");
+        assert!(
+            listing.contains(&format!(
+                "会话 {sid} · Claude 账号:默认登录(此刻是 #1 cloud"
+            )),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("#1 cloud  5h 11% · 7d 100%  (当前默认)"),
+            "{listing}"
+        );
+        assert!(listing.contains("#2 work  7d 40%"), "{listing}");
+        assert!(listing.contains("/account <编号>"), "{listing}");
+
+        let switched = im_send(&gateway, "/account 2", None).await.join("\n");
+        assert!(
+            switched.contains(&format!("已把会话 {sid} 切到 #2 work")),
+            "{switched}"
+        );
+        assert!(
+            switched.contains("下一条消息在同一会话里按新账号继续"),
+            "{switched}"
+        );
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, work.id);
+        let listing = im_send(&gateway, "/account", None).await.join("\n");
+        assert!(listing.contains("Claude 账号:#2 work"), "{listing}");
+        assert!(listing.contains("#2 work  7d 40%  ✓"), "{listing}");
+
+        let again = im_send(&gateway, "/account work", None).await.join("\n");
+        assert!(again.contains("已经在用 #2 work"), "{again}");
+        let unknown = im_send(&gateway, "/account 9", None).await.join("\n");
+        assert!(unknown.contains("没有编号或名字为「9」的账号"), "{unknown}");
+
+        // The next message resumes the same sid under the new account.
+        im_send(&gateway, "continue", None).await;
+        end_turn(&*gateway.lock().await, &sid);
+        assert_eq!(
+            fake.spawn_accounts.lock().await.last().cloned(),
+            Some(Some(work.id.clone()))
+        );
+        let status = im_send(&gateway, "/status", None).await.join("\n");
+        assert!(status.contains("👤 #2 work"), "{status}");
+
+        let back = im_send(&gateway, "/account default", None).await.join("\n");
+        assert!(back.contains("切到 默认登录"), "{back}");
+        assert_eq!(stored_account(&gateway, &sid).await, None);
+    }
+
+    /// #236 — on a button channel `/account` offers one button per account,
+    /// and a tap runs `/account <n>` through the shared entry.
+    #[tokio::test]
+    async fn im_account_buttons_switch_through_the_shared_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let work = cswap_account("2", "work");
+        gw.set_cswap_accounts(Arc::new(
+            ccteam_harness::execution::claude_accounts::CswapAccountService::fixed(vec![
+                cswap_account("1", "cloud"),
+                work.clone(),
+            ]),
+        ));
+        gw.bind_channel_buttons("telegram", true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        gw.handle_text("telegram", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        let sid = gw
+            .current_session
+            .get(&ChatKey::new("telegram", "chat-1", "alice"))
+            .unwrap();
+        end_turn(&gw, &sid);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+        while rx.try_recv().is_ok() {}
+
+        assert!(im_send(&gateway, "/account", None).await.is_empty());
+        let picker = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|event| !event.options.is_empty())
+            .expect("the listing carries buttons");
+        let taps: Vec<_> = picker.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            taps,
+            ["act:account:default", "act:account:1", "act:account:2"]
+        );
+        assert!(
+            picker.options[0].label.ends_with('✓'),
+            "default login is current"
+        );
+
+        assert!(Gateway::selection_needs_shared_entry(Some(&ChoiceReply {
+            data: "act:account:2".into()
+        })));
+        // A button channel gets the receipt as a message with next-step buttons.
+        assert!(im_send(&gateway, "", Some("act:account:2"))
+            .await
+            .is_empty());
+        let receipt = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| event.content)
+            .find(|content| content.contains("切到"))
+            .expect("the switch receipt");
+        assert!(receipt.contains("切到 #2 work"), "{receipt}");
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, work.id);
+        assert_eq!(button_action_command("account:x"), None);
+        assert_eq!(button_action_command("account:2 3"), None);
     }
 
     /// #236 — refusals leave the binding and the process exactly as they were.

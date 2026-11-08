@@ -1739,7 +1739,12 @@ async fn route_inbound_message(
     // reason: it has to take the stopped child's delegation claim, and
     // a claim is never taken while the gateway lock is held (issue #197
     // E). `handle_message_shared` is where the lock can be dropped.
-    if may_spawn || Gateway::inbound_needs_shared_entry(&clean_payload) {
+    // `/account` (#236) runs cswap and the account switch without the lock;
+    // a button standing for such a command takes the same entry.
+    if may_spawn
+        || Gateway::inbound_needs_shared_entry(&clean_payload)
+        || Gateway::selection_needs_shared_entry(msg.selection.as_ref())
+    {
         let gateway = Arc::clone(gateway);
         let channel = Arc::clone(&channel);
         let msg = msg.clone();

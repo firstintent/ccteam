@@ -279,6 +279,8 @@ impl AppState {
                 debug_assert!(Arc::ptr_eq(&self.progress_projection, &projection));
                 self.progress_projection = projection;
             }
+            // One cswap discovery cache for the web picker and IM `/account`.
+            self.cswap_accounts = guard.cswap_accounts();
         }
         self.progress_projection.start_hydration();
         self.session_principals = Some(Arc::clone(&principals));

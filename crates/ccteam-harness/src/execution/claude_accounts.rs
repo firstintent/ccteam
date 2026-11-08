@@ -121,6 +121,11 @@ pub fn history_follows_switch_in(
         })
 }
 
+/// `#<slot> <name>` — how an account reads on every surface (no email domain).
+pub fn display_name(account: &CswapAccount) -> String {
+    format!("#{} {}", account.slot, account.label)
+}
+
 pub fn account_id(email: &str, organization: &str) -> String {
     let identity = serde_json::to_vec(&(email, organization)).expect("string pair serializes");
     format!("{:x}", Sha256::digest(identity))
@@ -253,11 +258,36 @@ async fn cswap_output(args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Resolve what a person typed (`2`, `#2`, an alias / name, or a stable id)
+/// to one listed account (#236, IM `/account`). A name matching several
+/// accounts resolves to none: the slot number is the unambiguous handle.
+pub fn find_account<'a>(accounts: &'a [CswapAccount], reference: &str) -> Option<&'a CswapAccount> {
+    let reference = reference.trim();
+    let slot = reference.strip_prefix('#').unwrap_or(reference);
+    if let Some(account) = accounts
+        .iter()
+        .find(|account| account.slot == slot || account.id == reference)
+    {
+        return Some(account);
+    }
+    let mut named = accounts
+        .iter()
+        .filter(|account| account.label.eq_ignore_ascii_case(reference));
+    match (named.next(), named.next()) {
+        (Some(account), None) => Some(account),
+        _ => None,
+    }
+}
+
 /// Discovery is explicit and isolated from readiness/status. Coalesce open
 /// picker requests and briefly cache failures as well as successful results.
+/// One instance serves both web and IM (the daemon hands the gateway's to
+/// the web state), so they share one cache.
 #[derive(Default)]
 pub struct CswapAccountService {
     cache: tokio::sync::Mutex<Option<CachedAccounts>>,
+    /// Test seam: answer with these accounts instead of running cswap.
+    fixed: Option<Vec<CswapAccount>>,
 }
 
 struct CachedAccounts {
@@ -266,7 +296,18 @@ struct CachedAccounts {
 }
 
 impl CswapAccountService {
+    /// A service that lists `accounts` without running cswap (tests).
+    pub fn fixed(accounts: Vec<CswapAccount>) -> Self {
+        Self {
+            cache: Default::default(),
+            fixed: Some(accounts),
+        }
+    }
+
     pub async fn accounts(&self) -> Result<Vec<CswapAccount>> {
+        if let Some(accounts) = &self.fixed {
+            return Ok(accounts.clone());
+        }
         let mut cache = self.cache.lock().await;
         if let Some(cached) = &*cache {
             let ttl = if cached.result.is_ok() { 30 } else { 5 };
@@ -798,6 +839,33 @@ mod tests {
         )
         .unwrap();
         assert!(verify_subscription_settings(&profile, &project).is_ok());
+    }
+
+    #[test]
+    fn typed_account_references_resolve_by_slot_name_or_id() {
+        let account = |slot: &str, label: &str| CswapAccount {
+            id: account_id(&format!("{label}@x"), ""),
+            slot: slot.into(),
+            label: label.into(),
+            active: false,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            usage_status: None,
+        };
+        let accounts = [
+            account("1", "cloud"),
+            account("2", "Work"),
+            account("3", "work"),
+        ];
+        assert_eq!(find_account(&accounts, "2").unwrap().slot, "2");
+        assert_eq!(find_account(&accounts, " #1 ").unwrap().slot, "1");
+        assert_eq!(find_account(&accounts, "CLOUD").unwrap().slot, "1");
+        assert_eq!(find_account(&accounts, &accounts[2].id).unwrap().slot, "3");
+        assert!(
+            find_account(&accounts, "work").is_none(),
+            "an ambiguous name picks nothing"
+        );
+        assert!(find_account(&accounts, "9").is_none());
     }
 
     #[test]
