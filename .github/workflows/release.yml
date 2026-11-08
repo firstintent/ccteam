@@ -55,7 +55,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             suffix: linux-arm64
             ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             suffix: macos-arm64
             ext: tar.gz
