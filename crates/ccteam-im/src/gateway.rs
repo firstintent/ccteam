@@ -69,6 +69,82 @@ pub struct RoleNotFound {
 #[error("cswap accounts require a local Claude stream-json session")]
 pub struct CswapAccountUnsupported;
 
+/// One deadline for every live account-usage ask in a single read (#234). A
+/// live answer is an in-memory read on the vendor side (claude `get_usage`
+/// with `skip_behaviors` answers in milliseconds); past this, the vendor's
+/// last recorded observation answers instead.
+const ACCOUNT_USAGE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long a `/status` usage prefetch stays valid for the render that follows.
+const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
+
+/// The live sessions to ask for each vendor's account windows, captured
+/// under the gateway lock (cheap handle clones) so that the asking itself
+/// never holds it. #234: `/status` awaited every live session in turn under
+/// the lock, 3 s each; once claude's answer slowed down, one card held the
+/// whole daemon for up to a minute and stalled web, IM and MCP with it.
+pub struct AccountUsageProbes {
+    root: Option<PathBuf>,
+    by_vendor: Vec<(AgentVendor, Vec<UsageAsker>)>,
+}
+
+/// One live session to ask: its adapter and thread, cloned out of the lock.
+type UsageAsker = (Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle);
+
+impl AccountUsageProbes {
+    /// Ask every captured session at once, all against one deadline. Per
+    /// vendor the first answer in capture order wins (a `/status` card
+    /// captures its own focus first: across a login switch processes can
+    /// disagree on the account), and is recorded; a vendor nobody answered
+    /// for reads its last observation from
+    /// [`ccteam_harness::usage_catalog`], which drops each window at the
+    /// vendor's declared reset. A vendor with neither is absent — never an
+    /// "unknown" row to misread as plenty left. Keyed by vendor token.
+    pub async fn resolve(self) -> BTreeMap<String, VendorAccountUsage> {
+        let deadline = tokio::time::Instant::now() + ACCOUNT_USAGE_DEADLINE;
+        let root = self.root;
+        let per_vendor = self.by_vendor.into_iter().map(|(vendor, askers)| {
+            let root = root.clone();
+            async move {
+                let answers = futures::future::join_all(askers.iter().map(|(adapter, thread)| {
+                    tokio::time::timeout_at(deadline, adapter.account_usage(thread))
+                }))
+                .await;
+                let entry = match answers.into_iter().find_map(|answer| answer.ok().flatten()) {
+                    Some(usage) => {
+                        if let Some(root) = root.as_deref() {
+                            ccteam_harness::usage_catalog::record_vendor_usage_best_effort(
+                                root,
+                                vendor_str(vendor),
+                                "status card",
+                                &usage,
+                            );
+                        }
+                        Some(VendorAccountUsage {
+                            observed_at: chrono::Utc::now().to_rfc3339(),
+                            source: "status card".to_string(),
+                            usage,
+                        })
+                    }
+                    None => root.as_deref().and_then(|root| {
+                        ccteam_harness::usage_catalog::last_known_entry_in(
+                            root,
+                            vendor_str(vendor),
+                            chrono::Utc::now(),
+                        )
+                    }),
+                };
+                entry.map(|entry| (vendor_str(vendor).to_string(), entry))
+            }
+        });
+        futures::future::join_all(per_vendor)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChatKey {
     channel: String,
@@ -933,6 +1009,9 @@ pub struct Gateway {
     /// no longer the chat's focus, which otherwise masquerade as the current
     /// session in the single IM stream (v0.8.10 routing-isolation fix).
     current_session: FocusRoutes,
+    /// `/status` usage asked for WITHOUT the gateway lock by the shared IM
+    /// entry, parked for the `handle_message` render that follows (#234).
+    status_usage_prefetch: BTreeMap<ChatKey, (Instant, AgentVendor, Option<VendorAccountUsage>)>,
     sessions: BTreeMap<String, GatewaySession>,
     /// Process-wide allocator for [`GatewaySession::generation`]. It is not a
     /// persisted identity; it only fences races within this daemon lifetime.
@@ -3698,6 +3777,7 @@ impl Gateway {
             next_session_presets: BTreeMap::new(),
             current_project: FocusRoutes::new(FocusScope::Conversation),
             current_session: FocusRoutes::new(FocusScope::Thread),
+            status_usage_prefetch: BTreeMap::new(),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
             rebuild_reservations: BTreeMap::new(),
@@ -5741,7 +5821,13 @@ impl Gateway {
     /// `&mut Gateway` (the claim is always taken before the gateway lock).
     /// The daemon asks this so a `/stop` never reaches the inline path.
     pub fn inbound_needs_shared_entry(text: &str) -> bool {
-        text.split_whitespace().next() == Some("/stop")
+        text.split_whitespace().next() == Some("/stop") || Self::is_status_command(text)
+    }
+
+    /// `/status` — routed through the shared entry so its account-usage asks
+    /// run without the gateway lock (#234).
+    fn is_status_command(text: &str) -> bool {
+        text.split_whitespace().next() == Some("/status")
     }
 
     /// True when `text` is one of the gateway-owned slash commands.
@@ -6057,6 +6143,21 @@ impl Gateway {
         // dropped between resolving the target and stopping it.
         if let Some(result) = Self::handle_stop_command_shared(&gateway, &chat, text).await {
             return result;
+        }
+        // `/status` asks live sessions for their account windows — vendor
+        // I/O that must not run under the daemon-wide lock (#234). Ask here
+        // with the lock dropped and park the answer for the render below.
+        if Self::is_status_command(text) {
+            let probes = crate::latency::gateway_lock(&gateway, "im.status.probes")
+                .await
+                .status_usage_probes(&chat);
+            if let Some((vendor, probes)) = probes {
+                let usage = probes.resolve().await.remove(vendor_str(vendor));
+                crate::latency::gateway_lock(&gateway, "im.status.prefetch")
+                    .await
+                    .status_usage_prefetch
+                    .insert(chat.clone(), (Instant::now(), vendor, usage));
+            }
         }
         // Re-derive the "implicit spawn candidate" decision authoritatively
         // (the daemon's `inbound_may_spawn` call is only a hint to decide
@@ -6412,7 +6513,14 @@ impl Gateway {
                     Ok(Some(text))
                 }
             }
-            "/status" => Ok(Some(self.render_status(chat).await)),
+            "/status" => {
+                let prefetched = self
+                    .status_usage_prefetch
+                    .remove(chat)
+                    .filter(|(at, _, _)| at.elapsed() < STATUS_USAGE_PREFETCH_TTL)
+                    .map(|(_, vendor, usage)| (vendor, usage));
+                Ok(Some(self.render_status_with(chat, prefetched).await))
+            }
             "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
             "/projects" => {
                 // Button-capable channel (Telegram) → a text header + one inline
@@ -13336,7 +13444,14 @@ impl Gateway {
     /// released case stopped after the resume line, silently dropping the
     /// account-usage row and the `/sessions` + `/projects` footer. There is
     /// no second renderer any more.)
-    async fn render_status(&self, chat: &ChatKey) -> String {
+    /// The `/status` card. `prefetched` is the focus vendor's account usage
+    /// already asked outside the lock by the shared IM entry (#234); `None`
+    /// (or a prefetch for another vendor, the focus having moved) asks here.
+    async fn render_status_with(
+        &self,
+        chat: &ChatKey,
+        prefetched: Option<(AgentVendor, Option<VendorAccountUsage>)>,
+    ) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
@@ -13386,7 +13501,38 @@ impl Gateway {
                 };
             }
         };
-        self.status_card(chat, &focus, &visible).await.render()
+        self.status_card(chat, &focus, &visible, prefetched)
+            .await
+            .render()
+    }
+
+    /// Who `/status` would ask for its focus vendor's account, focus first —
+    /// the same order [`Gateway::status_card`] uses. `None` when the chat has
+    /// no focus (that card shows no usage). Captured under the lock, resolved
+    /// without it by [`Gateway::handle_message_shared`].
+    fn status_usage_probes(&self, chat: &ChatKey) -> Option<(AgentVendor, AccountUsageProbes)> {
+        let mut memo = ProjectPrincipalMemo::new();
+        let visible: Vec<&GatewaySession> = self
+            .sessions
+            .values()
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
+            .collect();
+        let sid = self.current_session.get(chat)?;
+        if let Some(focus) = visible.iter().copied().find(|s| s.id == sid) {
+            let vendor = focus.vendor;
+            let askers: Vec<&GatewaySession> = std::iter::once(focus)
+                .chain(visible.iter().copied().filter(|s| s.id != focus.id))
+                .collect();
+            return Some((
+                vendor,
+                self.account_usage_probes_from(Some(vendor), &askers),
+            ));
+        }
+        let (_, meta) = self.released_focus(chat, &sid, &mut memo)?;
+        Some((
+            meta.vendor,
+            self.account_usage_probes_from(Some(meta.vendor), &visible),
+        ))
     }
 
     /// The `/status` focus when the chat's current sid is one ccteam holds no
@@ -13409,99 +13555,45 @@ impl Gateway {
             .then_some((slug, meta))
     }
 
-    /// The vendor account's rate-limit windows — the ONE way any surface asks
-    /// for them, and the reason a `/status` card no longer has to care whether
-    /// its session is resident.
+    /// Capture who to ask for each vendor's account windows — every live
+    /// session, or only `vendor`'s. The ONE way any surface reads account
+    /// usage (IM `/status`, MCP `status{detail:"usage"}`, the hook phase,
+    /// `GET /api/v1/usage`): take this under the gateway lock, drop the lock,
+    /// then [`AccountUsageProbes::resolve`] (#234).
     ///
-    /// Usage is ACCOUNT-scoped but only READABLE through a live session, so it
-    /// used to exist only while some process happened to be resident: the card
-    /// went scavenging through whatever sessions were alive and simply showed
-    /// nothing when none were — which is exactly when the focused session has
-    /// been idle-released (2026-08-30 IM report: the `⚡ 用量` row vanished from
-    /// a released card, and after a daemon restart from every card).
-    ///
-    /// So the fact gets a home. Live sessions of `vendor` are asked in the
-    /// caller's order (the first answer wins — the `/status` card puts its own
-    /// focus first, since across a login switch processes can disagree on the
-    /// account) and what it says is recorded; when none answers, the vendor's last observation is read back
-    /// from [`ccteam_harness::usage_catalog`], which drops each window at the
-    /// vendor's own declared reset so nothing stale is ever presented as
-    /// current. Callers get one `Option` and never branch on residency.
-    ///
-    /// `sessions` is the caller's ACL-scoped set (unchanged from the live-only
-    /// read this replaces); the catalog is keyed by vendor alone, which is the
-    /// same host-agnostic scope that read already had.
-    async fn account_usage_for(
-        &self,
-        vendor: AgentVendor,
-        sessions: &[&GatewaySession],
-    ) -> Option<AccountUsage> {
-        self.account_usage_entry_for(vendor, sessions)
-            .await
-            .map(|entry| entry.usage)
+    /// Usage is ACCOUNT-scoped but only READABLE through a live session; the
+    /// resolver records each live answer and falls back to the last recorded
+    /// observation, so callers never branch on residency. Scope is the
+    /// DAEMON's own vendor accounts (every session of that vendor spends from
+    /// them), not any one caller's data.
+    pub fn account_usage_probes(&self, vendor: Option<AgentVendor>) -> AccountUsageProbes {
+        let live: Vec<&GatewaySession> = self.sessions.values().collect();
+        self.account_usage_probes_from(vendor, &live)
     }
 
-    /// [`Gateway::account_usage_for`] plus the PROVENANCE of the answer (when
-    /// it was observed, and what observed it).
-    ///
-    /// The IM card renders one line and has nowhere to put "as of when", but a
-    /// machine-readable surface must publish it: a scheduler deciding whom to
-    /// hire needs to know whether a 92% weekly window was read a minute ago or
-    /// is a cached snapshot from an hour ago. So this is the primitive and the
-    /// percentage-only accessor above is its projection — one live-ask path,
-    /// one cache path, one expiry rule, two shapes.
-    async fn account_usage_entry_for(
-        &self,
-        vendor: AgentVendor,
-        sessions: &[&GatewaySession],
-    ) -> Option<VendorAccountUsage> {
-        for session in sessions.iter().filter(|s| s.adapter.vendor() == vendor) {
-            if let Some(usage) = session.adapter.account_usage(&session.thread).await {
-                self.record_account_usage(vendor, "status card", &usage);
-                return Some(VendorAccountUsage {
-                    observed_at: chrono::Utc::now().to_rfc3339(),
-                    source: "status card".to_string(),
-                    usage,
-                });
-            }
-        }
-        let root = self.state_root.as_deref()?;
-        ccteam_harness::usage_catalog::last_known_entry_in(
-            root,
-            vendor_str(vendor),
-            chrono::Utc::now(),
-        )
-    }
-
-    /// Every vendor whose ACCOUNT ccteam currently knows something about,
-    /// keyed by vendor token — the one read behind the MCP
-    /// `status{detail:"usage"}` body and `GET /api/v1/usage`.
-    ///
-    /// HONEST ABSENCE: a vendor with no live session and no unexpired
-    /// observation is simply not in the map. There is no "unknown" row to
-    /// misread as "plenty left", and no probing engine — the live half asks
-    /// adapters that already hold the answer in memory (never a turn), the
-    /// cached half reads [`ccteam_harness::usage_catalog`]. Nothing here polls
-    /// or schedules; the map is built when a caller asks for it.
-    ///
-    /// Scope is the DAEMON's own vendor accounts (every session of that vendor
-    /// spends from them), not any one caller's data — the same host-agnostic
-    /// scope the IM `/status` card has always shown. `vendor` narrows it to one.
-    pub async fn account_usage_snapshot(
+    /// [`Gateway::account_usage_probes`] over the caller's ACL-scoped,
+    /// caller-ordered `sessions` (the first answer per vendor wins).
+    fn account_usage_probes_from(
         &self,
         vendor: Option<AgentVendor>,
-    ) -> BTreeMap<String, VendorAccountUsage> {
-        let live: Vec<&GatewaySession> = self.sessions.values().collect();
-        let mut out = BTreeMap::new();
-        for candidate in AgentVendor::ALL.iter().copied() {
-            if vendor.is_some_and(|want| want != candidate) {
-                continue;
-            }
-            if let Some(entry) = self.account_usage_entry_for(candidate, &live).await {
-                out.insert(vendor_str(candidate).to_string(), entry);
-            }
+        sessions: &[&GatewaySession],
+    ) -> AccountUsageProbes {
+        AccountUsageProbes {
+            root: self.state_root.clone(),
+            by_vendor: AgentVendor::ALL
+                .iter()
+                .copied()
+                .filter(|candidate| vendor.is_none_or(|want| want == *candidate))
+                .map(|candidate| {
+                    let askers = sessions
+                        .iter()
+                        .filter(|s| s.adapter.vendor() == candidate)
+                        .map(|s| (Arc::clone(&s.adapter), s.thread.clone()))
+                        .collect();
+                    (candidate, askers)
+                })
+                .collect(),
         }
-        out
     }
 
     /// Persist one account-usage observation. Best-effort by construction: a
@@ -13556,6 +13648,7 @@ impl Gateway {
         chat: &ChatKey,
         focus: &SessionRowSource<'_>,
         visible: &[&GatewaySession],
+        prefetched: Option<(AgentVendor, Option<VendorAccountUsage>)>,
     ) -> StatusCard {
         let slug = focus.slug_of(&self.default_project).to_string();
         let sid = focus.sid().to_string();
@@ -13592,7 +13685,17 @@ impl Gateway {
                 .collect(),
             SessionRowSource::Released(..) => visible.to_vec(),
         };
-        let account = self.account_usage_for(vendor, &askers).await;
+        // Asked outside the lock when the shared IM entry prefetched it; the
+        // inline path asks here, bounded by one deadline for all askers.
+        let account = match prefetched {
+            Some((asked, usage)) if asked == vendor => usage,
+            _ => self
+                .account_usage_probes_from(Some(vendor), &askers)
+                .resolve()
+                .await
+                .remove(vendor_str(vendor)),
+        }
+        .map(|entry| entry.usage);
 
         // The ledger half — title / turn / cost / tokens and the spawn-time
         // model + effort picks — lives in `meta.json` for both residencies:
@@ -22236,6 +22339,91 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
     }
 
+    /// #234 — `/status` asked every live session for account usage one after
+    /// another while holding the daemon-wide gateway lock (3 s each), so a
+    /// slow vendor answer held web, IM and MCP for up to a minute. The asks
+    /// now share one deadline and run concurrently, and the shared IM entry
+    /// runs them with the lock dropped.
+    #[tokio::test]
+    async fn status_usage_asks_run_concurrently_and_outside_the_gateway_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..3 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        fake.set_account_usage_delay(std::time::Duration::from_millis(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        // Concurrent: the #234 shape — no session has an answer, so every one
+        // is asked. Three 600 ms asks finish together, not in 1.8 s.
+        let started = std::time::Instant::now();
+        gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1400),
+            "asks ran one after another: {:?}",
+            started.elapsed()
+        );
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(7),
+            ..Default::default()
+        }))
+        .await;
+
+        // Lock-free: while the shared entry is asking, the lock is free.
+        assert!(Gateway::inbound_needs_shared_entry("/status"));
+        let shared = Arc::clone(&gateway);
+        let status = tokio::spawn(async move {
+            Gateway::handle_message_shared(
+                shared,
+                "mock",
+                "chat-1",
+                "alice",
+                None,
+                "m-1",
+                "/status",
+                &[],
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let waited = std::time::Instant::now();
+        drop(gateway.lock().await);
+        assert!(
+            waited.elapsed() < std::time::Duration::from_millis(250),
+            "the usage asks held the gateway lock for {:?}",
+            waited.elapsed()
+        );
+        let replies = status.await.unwrap().unwrap();
+        assert!(replies[0].contains("5h 7%"), "{replies:?}");
+
+        // Bounded: a stuck vendor costs one deadline, not 3 × its delay.
+        fake.set_account_usage_delay(std::time::Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < ACCOUNT_USAGE_DEADLINE + std::time::Duration::from_millis(800),
+            "a stuck vendor was waited out: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// `/status` on a focus that points at a released session must render the
     /// session — the SAME card as a resident one, with `💤 released` in place
     /// of the run state and the same footer — not "无当前会话".
@@ -25886,6 +26074,9 @@ mod tests {
         /// one process still signed in as a DIFFERENT account than the rest
         /// (a login switch it started before).
         account_usage_by_thread: Arc<std::sync::Mutex<HashMap<String, AccountUsage>>>,
+        /// How long each `account_usage` ask takes — a slow or stuck vendor
+        /// (#234). Zero = immediate.
+        account_usage_delay: Arc<std::sync::Mutex<std::time::Duration>>,
         /// Monotone submission counter, so every accepted message gets its OWN
         /// execution-turn id. One id per THREAD was enough while nothing
         /// correlated a completion with the message that asked for it; a
@@ -25983,6 +26174,7 @@ mod tests {
                 recovered_for: Arc::default(),
                 account_usage: Arc::new(Mutex::new(None)),
                 account_usage_by_thread: Arc::default(),
+                account_usage_delay: Arc::default(),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -26231,6 +26423,10 @@ mod tests {
         /// Set the account usage this fake reports from `account_usage`.
         async fn set_account_usage(&self, usage: Option<AccountUsage>) {
             *self.account_usage.lock().await = usage;
+        }
+
+        fn set_account_usage_delay(&self, delay: std::time::Duration) {
+            *self.account_usage_delay.lock().unwrap() = delay;
         }
 
         fn set_thread_account_usage(&self, identity: &str, usage: AccountUsage) {
@@ -26543,6 +26739,10 @@ mod tests {
         }
 
         async fn account_usage(&self, h: &ThreadHandle) -> Option<AccountUsage> {
+            let delay = *self.account_usage_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let own = self
                 .account_usage_by_thread
                 .lock()
@@ -29863,7 +30063,7 @@ mod tests {
             gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
             "a LIVE session in a tenant-owned project belongs to that tenant"
         );
-        let status = gateway.render_status(&tenant).await;
+        let status = gateway.render_status_with(&tenant, None).await;
         assert!(
             status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
             "the tenant's /status must list its project's delegated children: {status}"

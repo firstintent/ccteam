@@ -1771,8 +1771,9 @@ async fn route_inbound_message(
         return;
     }
 
-    let replies = gateway
-        .lock()
+    // Instrumented: a long inline hold now logs `gateway mutex held too long`
+    // with this site (it was invisible during #234).
+    let replies = crate::latency::gateway_lock(gateway, "im.inline.handle")
         .await
         .handle_message(
             &msg.channel,

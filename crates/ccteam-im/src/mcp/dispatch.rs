@@ -1628,7 +1628,7 @@ async fn execute_status(
 /// is the whole reason this tier exists.
 ///
 /// No probing engine and no polling: the map is
-/// [`Gateway::account_usage_snapshot`](crate::gateway::Gateway::account_usage_snapshot),
+/// [`Gateway::account_usage_probes`](crate::gateway::Gateway::account_usage_probes),
 /// which asks live same-vendor adapters for state they already hold (never a
 /// turn) and otherwise reads the recorded observation. A vendor nobody has
 /// heard from is absent rather than zeroed.
@@ -1644,13 +1644,14 @@ async fn append_usage_sections(
     let Some(gateway) = gateway else {
         return;
     };
-    // Both reads under one guard: the snapshot is async (it may ask a live
-    // adapter), the sid resolution is a cheap in-memory lookup.
-    let (usage, own_project_dir) = {
+    // Only cheap in-memory reads under the guard; the live adapter asks run
+    // after it is dropped (#234).
+    let (probes, own_project_dir) = {
         let gw = gateway.lock().await;
         let dir = caller_sid.and_then(|sid| gw.session_resolve_any(sid).map(|r| r.project_dir));
-        (gw.account_usage_snapshot(None).await, dir)
+        (gw.account_usage_probes(None), dir)
     };
+    let usage = probes.resolve().await;
     if let Some(sid) = caller_sid {
         let mut you = serde_json::Map::new();
         you.insert("sid".into(), serde_json::json!(sid));
@@ -2391,10 +2392,8 @@ async fn pre_agent_policy_gate(
     };
 
     // ---- Phase 2: the facts that cost something, for a real hook only ----
-    let usage = {
-        let gw = gateway.lock().await;
-        gw.account_usage_snapshot(None).await
-    };
+    let probes = gateway.lock().await.account_usage_probes(None);
+    let usage = probes.resolve().await;
     let usage = (!usage.is_empty()).then(|| {
         serde_json::Value::Object(
             usage
