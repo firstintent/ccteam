@@ -466,7 +466,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
+`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。一个目录 = 一个项目:在已经是项目的目录上再创建,得到的是那个项目,不会多出第二个 slug(Web 直接返回它,IM `/newproject` 切换过去,`ccteam init` 原地刷新,`--slug` 指向别的项目时拒绝);目录属于你看不到的项目时拒绝。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
 
 ### `project`(项目生命周期)
 

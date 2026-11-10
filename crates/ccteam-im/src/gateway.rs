@@ -7640,7 +7640,7 @@ impl Gateway {
         // v0.8.18 柱2 — the creating chat is recorded as owner (explicit field;
         // NOT path-derived). One shared creation path (issue #222): scaffold,
         // owner stamp and config.yaml registration happen together.
-        create_project(
+        let created = create_project(
             &paths,
             &NewProject {
                 slug: &slug,
@@ -7648,8 +7648,25 @@ impl Gateway {
                 team: None,
                 owner,
             },
-        )
-        .with_context(|| format!("create project {slug} at {}", abs.display()))?;
+        );
+        if let Err(err) = created {
+            // One directory is one project (#239): a directory this chat can
+            // already see is where it wanted to work, so switch there; another
+            // owner's reads like any refusal and names nothing.
+            let Some(taken) = err.downcast_ref::<ccteam_core::ProjectDirTaken>() else {
+                return Err(err.context(format!("create project {slug} at {}", abs.display())));
+            };
+            let existing = taken.slug.clone();
+            self.ensure_project_loaded(&existing);
+            if !self.can_see_project(chat, &existing) {
+                return Err(anyhow!("{} 已被其他项目使用,不能再建项目", abs.display()));
+            }
+            let switched = self.change_project(chat, &existing)?;
+            return Ok(format!(
+                "📁 {} 已是项目 {existing},没有再建新项目\n   {switched}",
+                abs.display()
+            ));
+        }
         self.register_project(slug.clone(), abs.clone());
         // Switch the creating chat INTO the new project (mirror `/cd`): point its
         // `current_project` at the fresh slug and clear the active session — a
@@ -37814,6 +37831,90 @@ mod tests {
             .expect_err("expected not-configured error");
         assert!(format!("{err:#}").contains("not configured"));
         assert!(Gateway::is_gateway_command("/newproject demo /x"));
+    }
+
+    /// #239 — `/newproject` on a directory that already is a project never
+    /// registers a second one: a project the chat can see is switched to; a
+    /// directory owned by someone else is refused without naming its project.
+    /// Both outcomes return before anything is written (no trust entry, no
+    /// `state.json` rewrite), so the seeds go straight into the registry.
+    #[tokio::test]
+    async fn gateway_newproject_on_a_registered_directory_reuses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let seed = |slug: &str, dir_name: &str, owner: Option<&str>| {
+            let dir = tmp.path().join(dir_name);
+            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+            state.owner = owner.map(str::to_string);
+            state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+            ccteam_core::config::upsert_project(
+                &paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: slug.to_string(),
+                    path: dir.clone(),
+                    host: "local".into(),
+                    remote_slug: None,
+                    remote_path: None,
+                    team: "dev".into(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+            dir
+        };
+        let mine = seed("sdk", "work-a", None);
+        let theirs = seed("bobs", "work-b", Some("user:ubob"));
+        let state_before = std::fs::read(CcteamPaths::project_state_in(&mine)).unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let home = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", home.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.enable_project_creation(paths.clone());
+
+        let reply = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                &format!("/newproject sdk2 {}/", mine.display()),
+            )
+            .await
+            .unwrap();
+        assert!(reply[0].contains("已是项目 sdk"), "{reply:?}");
+        assert!(reply[0].contains("project set to sdk"), "{reply:?}");
+        let chat = ChatKey::new("mock", "chat-1", "alice");
+        assert_eq!(gateway.current_project.get(&chat).as_deref(), Some("sdk"));
+        assert_eq!(
+            std::fs::read(CcteamPaths::project_state_in(&mine)).unwrap(),
+            state_before,
+            "the existing project's state.json is untouched"
+        );
+
+        let err = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                &format!("/newproject mine {}", theirs.display()),
+            )
+            .await
+            .expect_err("another owner's directory is refused");
+        let err = format!("{err:#}");
+        assert!(err.contains("已被其他项目使用"), "{err}");
+        assert!(!err.contains("bobs"), "names nothing: {err}");
+
+        let slugs: Vec<String> = ccteam_core::config::load(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, ["sdk", "bobs"]);
     }
 
     #[test]

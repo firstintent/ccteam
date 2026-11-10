@@ -370,6 +370,11 @@ fn initialize_satellite_project(
         anyhow::bail!("project path must be absolute on the satellite");
     }
     let requested_slug = ccteam_core::validate_slug_format(requested_slug)?;
+    // One directory is one project (#239): a directory this machine already
+    // has answers with that project, so the daemon catalogs it once.
+    if let Some(existing) = ccteam_core::local_project_at(&paths.root, &path)? {
+        return Ok((existing.slug, existing.path));
+    }
     let slug = ccteam_core::pick_unused_project_slug(&paths.root, &requested_slug)?;
     ccteam_core::create_project(
         paths,

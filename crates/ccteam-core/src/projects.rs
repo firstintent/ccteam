@@ -258,7 +258,22 @@ pub struct NewProjectReport {
 /// It writes no role (`.claude/agents/` stays the project's), no Claude
 /// settings (and strips the hooks an older ccteam wrote there), no
 /// `workflow.yaml`, and never overwrites an existing project file.
+///
+/// One directory is one project (docs-local issue #239): a directory already
+/// registered under another slug is refused with [`ProjectDirTaken`] before
+/// anything is written, so no entry can register a second project over the
+/// same `.ccteam/` (or restamp another owner's `state.json`). Callers resolve
+/// it to the existing project (see [`local_project_at`]).
 pub fn create_project(paths: &CcteamPaths, new: &NewProject<'_>) -> Result<NewProjectReport> {
+    if let Some(existing) = local_project_at(&paths.root, new.dir)? {
+        if existing.slug != new.slug {
+            return Err(ProjectDirTaken {
+                slug: existing.slug,
+                dir: existing.path,
+            }
+            .into());
+        }
+    }
     let report = scaffold_project(paths, new)?;
     crate::config::upsert_project(
         &paths.root,
@@ -274,6 +289,38 @@ pub fn create_project(paths: &CcteamPaths, new: &NewProject<'_>) -> Result<NewPr
     )
     .context("register project in ~/.ccteam/config.yaml")?;
     Ok(report)
+}
+
+/// [`create_project`] refused a second slug for a directory that already is a
+/// project (#239). Callers downcast to it to resolve to that project.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{} is already project `{slug}` (one directory is one project)", dir.display())]
+pub struct ProjectDirTaken {
+    /// The project registered at the directory.
+    pub slug: String,
+    /// Its registered path.
+    pub dir: PathBuf,
+}
+
+/// The local project registered at `dir`, if any (#239). Paths compare by
+/// canonical form (symlinks, `..`, a trailing `/`); one that does not exist
+/// compares by its normalized components. Remote projects (whose `path` is
+/// the daemon-side data home) never match.
+pub fn local_project_at(
+    ccteam_root: &Path,
+    dir: &Path,
+) -> Result<Option<crate::config::ProjectEntry>> {
+    let wanted = dir_identity(dir);
+    Ok(crate::config::load(ccteam_root)?
+        .projects
+        .into_iter()
+        .find(|entry| {
+            entry.host == crate::host_registry::LOCAL_HOST && dir_identity(&entry.path) == wanted
+        }))
+}
+
+fn dir_identity(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.components().collect())
 }
 
 /// Test-fixture shorthand: scaffold `<projects_root>/<slug>/` WITHOUT touching
@@ -1568,6 +1615,69 @@ mod tests {
         .unwrap();
         assert_eq!(taken.team, "dev");
         assert_eq!(taken.owner.as_deref(), Some("user:bob"));
+    }
+
+    /// #239 — a directory that already is a project cannot become a second
+    /// one: the create is refused before it writes anything, so the first
+    /// project's `state.json` (slug, owner) and the registry stay as they were.
+    #[test]
+    fn create_project_refuses_a_second_slug_for_the_same_directory() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("repo");
+        let new = |slug, dir| NewProject {
+            slug,
+            dir,
+            team: None,
+            owner: Some("user:alice"),
+        };
+        create_project(&paths, &new("repo", &project_dir)).unwrap();
+        let state_path = CcteamPaths::project_state_in(&project_dir);
+        let state_before = std::fs::read(&state_path).unwrap();
+
+        // The same directory spelled differently (trailing `/`, `..`).
+        let trailing = PathBuf::from(format!("{}/", project_dir.display()));
+        let dotted = project_dir.join("..").join("repo");
+        for spelling in [&project_dir, &trailing, &dotted] {
+            let err = create_project(&paths, &new("repo2", spelling)).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<ProjectDirTaken>(),
+                Some(&ProjectDirTaken {
+                    slug: "repo".into(),
+                    dir: project_dir.clone(),
+                }),
+                "{}",
+                spelling.display()
+            );
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        let slugs: Vec<String> = crate::config::load(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, ["repo"]);
+
+        // Its own slug still refreshes in place; another directory with the
+        // same name is a different project.
+        create_project(&paths, &new("repo", &project_dir)).unwrap();
+        let other = tmp.path().join("elsewhere").join("repo");
+        create_project(&paths, &new("repo2", &other)).unwrap();
+        assert_eq!(
+            local_project_at(&paths.root, &other)
+                .unwrap()
+                .map(|p| p.slug),
+            Some("repo2".into())
+        );
+        assert_eq!(
+            local_project_at(&paths.root, &tmp.path().join("nowhere")).unwrap(),
+            None
+        );
     }
 
     #[test]

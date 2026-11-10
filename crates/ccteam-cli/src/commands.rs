@@ -112,7 +112,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // When the slug was derived from the install-dir basename (no
     // `--slug`), point the user at `--slug` instead of failing opaquely
     // — a dir like `AgentServe` (caps) can't be a slug verbatim.
-    let target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
+    let mut target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
         if slug_was_explicit {
             format!("ccteam init: invalid slug {derived_slug:?}")
         } else {
@@ -142,7 +142,25 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
     // -- 3b. Refuse sensitive paths (HOME / filesystem root) ---------
     refuse_sensitive_install_target(&target, opts.force)?;
-    // -- 3c. Fail-loud slug collision against config.yaml -----------
+    // -- 3c. One directory is one project (#239) ---------------------
+    // Re-running init in a registered directory refreshes THAT project; an
+    // explicit `--slug` naming another project is refused rather than
+    // registering a second one over the same `.ccteam/`.
+    if let Some(existing) = ccteam_core::local_project_at(&paths.root, &target)? {
+        if existing.slug != target_slug {
+            if slug_was_explicit {
+                return Err(anyhow::anyhow!(
+                    "{dir} is already project `{existing}`; one directory is one project. \
+                     Re-run without `--slug` to refresh it, or remove it first \
+                     (`ccteam project rm {existing}`).",
+                    dir = target.display(),
+                    existing = existing.slug,
+                ));
+            }
+            target_slug = existing.slug;
+        }
+    }
+    // -- 3d. Fail-loud slug collision against config.yaml -----------
     if let Some(existing) = ccteam_core::lookup_project_in_config(&paths.root, &target_slug)? {
         let same_target = std::fs::canonicalize(&existing.path)
             .ok()
@@ -4869,6 +4887,57 @@ mod tests {
             msg.contains("already registered"),
             "expected slug-collision error; got: {msg}",
         );
+    }
+
+    /// #239 — one directory is one project: re-running init in a registered
+    /// directory refreshes THAT project (even when its basename would derive
+    /// another slug), and an explicit `--slug` naming a second project is
+    /// refused.
+    #[test]
+    fn run_init_in_a_registered_directory_keeps_its_project() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("sdk");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("sdk-main".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let err = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("sdk2".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already project `sdk-main`"), "{msg}");
+
+        let slugs: Vec<String> = ccteam_core::load_ccteam_config(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, ["sdk-main"]);
+        let state =
+            ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&target)).unwrap();
+        assert_eq!(state.slug, "sdk-main");
     }
 
     /// Re-running on the SAME path with the same slug is a legitimate

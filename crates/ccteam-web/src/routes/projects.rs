@@ -84,8 +84,9 @@ pub struct ImportProjectForm {
     request_body(content = CreateProjectForm, description = "Project to create (JSON or x-www-form-urlencoded)"),
     responses(
         (status = 201, description = "Project created + registered", body = CreatedProject),
+        (status = 200, description = "The directory already is a project the caller can see; that project is returned (one directory is one project)", body = CreatedProject),
         (status = 400, description = "Invalid slug or path"),
-        (status = 409, description = "Slug already registered"),
+        (status = 409, description = "The directory already belongs to a project the caller cannot see"),
         (status = 500, description = "Scaffold or registry write failed"),
     ),
 )]
@@ -189,6 +190,18 @@ pub(crate) async fn handle_create_project(
             }
         }
         Ok(Err(err)) => {
+            // One directory is one project (#239): a retry or a second create
+            // on the same directory gets the project already there.
+            if let Some(taken) = err.downcast_ref::<ccteam_core::ProjectDirTaken>() {
+                return existing_project_response(
+                    &identity,
+                    &taken.slug,
+                    ccteam_core::LOCAL_HOST,
+                    &taken.dir,
+                    DIR_TAKEN,
+                    mode,
+                );
+            }
             tracing::error!(%slug, %err, "create_project scaffold/register failed");
             create_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -300,6 +313,31 @@ async fn create_remote_project(
         );
     }
 
+    // The satellite answers a directory it already has with that project's
+    // slug (#239); a remote project already in the catalog is returned, not
+    // cataloged twice.
+    match ccteam_core::load_ccteam_config(&app.paths.root) {
+        Ok(config) => {
+            if let Some(existing) = cataloged_remote(&config, &host, &remote_slug) {
+                return existing_project_response(
+                    identity,
+                    &existing.slug,
+                    &existing.host,
+                    &existing.path,
+                    DIR_TAKEN,
+                    mode,
+                );
+            }
+        }
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry read failed: {err}"),
+                mode,
+            )
+        }
+    }
+
     let data_home = app.paths.projects_root.join(&slug);
     let owner = identity.owner_tag();
     let root = app.paths.root.clone();
@@ -390,30 +428,18 @@ pub(crate) async fn handle_import_project(
             )
         }
     };
-    if let Some(existing) = config.projects.iter().find(|entry| {
-        entry.host == host && entry.remote_slug.as_deref() == Some(remote_slug.as_str())
-    }) {
-        let owner = ccteam_core::ProjectState::load(&ccteam_core::CcteamPaths::project_state_in(
+    if let Some(existing) = cataloged_remote(&config, host, &remote_slug) {
+        return existing_project_response(
+            &identity,
+            &existing.slug,
+            &existing.host,
             &existing.path,
-        ))
-        .ok()
-        .and_then(|state| state.owner);
-        if !identity.can_see_owner(owner.as_deref()) {
-            return create_error(
+            (
                 StatusCode::NOT_FOUND,
-                "remote project is already cataloged by another owner".to_string(),
-                mode,
-            );
-        }
-        return (
-            StatusCode::OK,
-            Json(CreatedProject {
-                slug: existing.slug.clone(),
-                host: existing.host.clone(),
-                path: existing.path.display().to_string(),
-            }),
-        )
-            .into_response();
+                "remote project is already cataloged by another owner",
+            ),
+            mode,
+        );
     }
 
     let registry = match ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
@@ -584,6 +610,53 @@ pub(crate) async fn handle_delete_project(
         "sessions_stopped": stopped,
     }))
     .into_response()
+}
+
+/// The refusal for a directory that already belongs to a project the caller
+/// cannot see. It names nothing about that project.
+const DIR_TAKEN: (StatusCode, &str) = (
+    StatusCode::CONFLICT,
+    "this directory already belongs to another project",
+);
+
+/// The catalog entry for satellite `host`'s project `remote_slug`, if any.
+fn cataloged_remote<'a>(
+    config: &'a ccteam_core::CcteamConfig,
+    host: &str,
+    remote_slug: &str,
+) -> Option<&'a ProjectEntry> {
+    config
+        .projects
+        .iter()
+        .find(|entry| entry.host == host && entry.remote_slug.as_deref() == Some(remote_slug))
+}
+
+/// A create or import that lands on a project already in the catalog answers
+/// idempotently: `200` with that project when the caller can see it (same
+/// ownership policy as every project read), `denied` otherwise.
+fn existing_project_response(
+    identity: &crate::auth::Identity,
+    slug: &str,
+    host: &str,
+    path: &std::path::Path,
+    denied: (StatusCode, &str),
+    mode: InputMode,
+) -> Response {
+    let owner = ccteam_core::ProjectState::load(&ccteam_core::CcteamPaths::project_state_in(path))
+        .ok()
+        .and_then(|state| state.owner);
+    if !identity.can_see_owner(owner.as_deref()) {
+        return create_error(denied.0, denied.1.to_string(), mode);
+    }
+    (
+        StatusCode::OK,
+        Json(CreatedProject {
+            slug: slug.to_string(),
+            host: host.to_string(),
+            path: path.display().to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// Shared POST error responder honoring the [`FormOrJson`] mode

@@ -313,6 +313,17 @@ export function SkillMenuSections({
  *  switch (the conversation view is keyed by sid and remounts on switch). */
 const draftStorageKey = (key: string) => `ccteam.draft.v1.${key}`;
 
+/** Seed another surface's draft — e.g. a just-started session whose first
+ *  message did not go out (#239), so it waits in that session's composer. */
+// eslint-disable-next-line react-refresh/only-export-components -- storage helper shared with HomeView.
+export function saveComposerDraft(key: string, text: string): void {
+  try {
+    localStorage.setItem(draftStorageKey(key), text);
+  } catch {
+    /* storage disabled */
+  }
+}
+
 /** What a send handler reports back to the composer:
  *  - `false` — keep the draft (validation failed upstream);
  *  - a promise — the draft (text, attachments and its localStorage copy)

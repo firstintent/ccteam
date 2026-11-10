@@ -177,6 +177,33 @@ async fn reverse_connection_exec_round_trips_bytes_end_to_end() {
         .await;
     }
 
+    // #239 — creating again on the same satellite directory (a retry after a
+    // failed launch) returns the cataloged project; neither side registers a
+    // second one.
+    let again = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects"))
+        .bearer_auth(format!("ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({
+            "slug": "remote-demo-again",
+            "path": satellite_new_path.display().to_string(),
+            "host": "sat-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["slug"], "remote-demo");
+    for root in [&paths_daemon.root, &paths_sat.root] {
+        assert!(
+            ccteam_core::lookup_project_in_config(root, "remote-demo-again")
+                .unwrap()
+                .is_none(),
+            "{}",
+            root.display()
+        );
+    }
+
     // ── exec: open → dial-back → byte round trip over /bin/cat ──────────
     let target = RemoteExecTarget {
         host_id: "sat-1".into(),

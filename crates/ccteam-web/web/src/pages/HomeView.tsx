@@ -21,9 +21,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ChatComposer, type SendOutcome } from "../components/ChatComposer";
+import { ChatComposer, saveComposerDraft, type SendOutcome } from "../components/ChatComposer";
 import { CswapAccountPicker } from "../components/CswapAccountPicker";
 import { useVendorCatalog } from "../hooks/useVendorCatalog";
+import { projectsStore } from "../hooks/useProjectsStore";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
@@ -171,6 +172,15 @@ export function NewProjectFields({
   );
 }
 
+/** The launch's session started but its first message did not land. */
+class FirstMessageNotSent extends Error {
+  readonly sid: string;
+  constructor(sid: string, cause: unknown) {
+    super("first message not sent", { cause });
+    this.sid = sid;
+  }
+}
+
 export default function HomeView({
   lang,
   projects,
@@ -197,8 +207,12 @@ export default function HomeView({
   // an explicit pick wins while valid; else the sidebar's 「在此工作区新建」
   // pre-pick; else the first project. No validity-sync effect needed.
   const [picked, setPicked] = useState<string | null>(initialProject ?? null);
+  // The project a launch from this page just created (or found already at
+  // that directory): pickable before the shared list catches up, so a retry
+  // after a failed session start reuses it instead of creating it again (#239).
+  const [launchedProject, setLaunchedProject] = useState<{ slug: string; host: string } | null>(null);
   const project =
-    picked && projects.includes(picked)
+    picked && (projects.includes(picked) || picked === launchedProject?.slug)
       ? picked
       : initialProject && projects.includes(initialProject)
         ? initialProject
@@ -304,7 +318,9 @@ export default function HomeView({
   }, []);
 
   const isNewProject = newProjOpen;
-  const boundHost = projectHosts[project]?.host ?? "local";
+  const boundHost =
+    projectHosts[project]?.host ??
+    (project === launchedProject?.slug ? launchedProject.host : "local");
 
   // Existing projects inherit exactly their bound host. A new project can be
   // created on any online host with at least one installed harness.
@@ -361,6 +377,9 @@ export default function HomeView({
       return false;
     }
     setPending(true);
+    // The funnel is three steps (project → session → first message); each
+    // one that succeeds is settled at once, so a failure retries only what
+    // failed (#239).
     const run = async () => {
       let slug = project;
       if (isNewProject) {
@@ -373,6 +392,17 @@ export default function HomeView({
         }
         const created = await apiCreateProject(derived, newProjectPath.trim(), { host: effectiveHost });
         slug = created.slug;
+        setLaunchedProject({ slug, host: effectiveHost });
+        setPicked(slug);
+        cancelNewProject();
+        projectsStore.refresh();
+        if (created.existing) {
+          toastBus.handler?.info(
+            lang === "en"
+              ? `That directory already is project ${slug}; using it`
+              : `该目录已是项目 ${slug},直接使用`,
+          );
+        }
       }
       // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
       // (vendor-native spawn seam), replacing the old post-spawn `/model`
@@ -390,7 +420,11 @@ export default function HomeView({
         claude_account: effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
           ? claudeAccount || undefined : undefined,
       });
-      await submitTurn(sid, text, attachments);
+      try {
+        await submitTurn(sid, text, attachments);
+      } catch (cause) {
+        throw new FirstMessageNotSent(sid, cause);
+      }
       return sid;
     };
     // The composer keeps the prompt until this resolves `true` (#237): a
@@ -404,6 +438,23 @@ export default function HomeView({
       })
       .catch((e) => {
         setPending(false);
+        if (e instanceof FirstMessageNotSent) {
+          // The session exists: open it with the prompt waiting in its own
+          // composer, rather than strand an empty session and retry into a
+          // second one (#239).
+          saveComposerDraft(e.sid, text);
+          const detail = e.cause instanceof Error ? e.cause.message : "unknown";
+          const lostAttachments = attachments.length > 0;
+          // An expired login is the token gate's to explain.
+          if (detail !== "UNAUTHENTICATED") toastBus.handler?.error(
+            lang === "en"
+              ? `Session started, but the message did not go out: ${detail} (it is back in that session's input${lostAttachments ? "; re-attach files" : ""})`
+              : `会话已启动,但消息没发出去:${detail}(已放回该会话的输入框${lostAttachments ? ",附件需重新添加" : ""})`,
+          );
+          cancelNewProject();
+          onLaunched(e.sid);
+          return true;
+        }
         if (e instanceof Error && e.message === "UNAUTHENTICATED") return false;
         const detail = e instanceof Error ? e.message : "unknown";
         toastBus.handler?.error(
