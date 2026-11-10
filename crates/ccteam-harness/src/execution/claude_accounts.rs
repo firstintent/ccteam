@@ -396,10 +396,7 @@ impl CswapLaunch {
             &launch.directory.join("request.json"),
             &serde_json::to_vec(&request)?,
         )?;
-        let relay = std::env::var_os("CCTEAM_CSWAP_RELAY_BIN")
-            .map(PathBuf::from)
-            .map(Ok)
-            .unwrap_or_else(std::env::current_exe)?;
+        let relay = relay_bin()?;
         let quoted = relay.to_string_lossy().replace('\'', "'\\''");
         let script = format!("#!/bin/sh\nexec '{quoted}' internal claude-account-launch \"$@\"\n");
         let entry = bin_dir.join("claude");
@@ -468,6 +465,38 @@ impl CswapLaunch {
         serde_json::from_slice(&std::fs::read(self.directory.join("binding.json"))?)
             .context("cswap launch did not confirm its profile")
     }
+}
+
+/// The ccteam binary the launch entry script execs as the relay
+/// (`CCTEAM_CSWAP_RELAY_BIN` overrides it for integration tests, whose
+/// current exe is the test runner).
+///
+/// The relay only runs while the daemon is spawning the session, so it is
+/// the daemon's own running image, `/proc/<pid>/exe` on Linux: the kernel
+/// keeps that link executable after an upgrade unlinks the file, and the
+/// relay reading the launch request is exactly the version that wrote it.
+/// Raw `current_exe()` there names `<path> (deleted)` once the binary is
+/// replaced, so every account launch died with a bare "child exited" until
+/// the daemon restarted (docs-local issue #238). Unlike
+/// `ccteam_core::current_ccteam_bin`, this path dies with the daemon: never
+/// persist it.
+fn relay_bin() -> Result<PathBuf> {
+    if let Some(bin) = std::env::var_os("CCTEAM_CSWAP_RELAY_BIN") {
+        return Ok(PathBuf::from(bin));
+    }
+    match process_image(std::process::id()) {
+        Some(image) => Ok(image),
+        None => Ok(std::env::current_exe()?),
+    }
+}
+
+/// `/proc/<pid>/exe` where the platform exposes it.
+fn process_image(pid: u32) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let image = PathBuf::from(format!("/proc/{pid}/exe"));
+    image.exists().then_some(image)
 }
 
 /// Hidden CLI entry: do not initialize daemon state or consume stdin. cswap
@@ -738,6 +767,77 @@ fn exec(mut command: std::process::Command, args: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #238: after an upgrade unlinks a running binary, its image still runs
+    /// through `/proc/<pid>/exe`, while the `current_exe()` spelling
+    /// (`<path> (deleted)`) does not. A copied `sleep` stands in for the
+    /// daemon, so the test runner's own ELF is never touched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_image_runs_after_the_binary_is_deleted() {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("daemon-standin");
+        std::fs::copy("/bin/sleep", &bin).unwrap();
+        let mut running = Command::new(&bin).arg("30").spawn().unwrap();
+        std::fs::remove_file(&bin).unwrap();
+
+        let reported = std::fs::read_link(format!("/proc/{}/exe", running.id())).unwrap();
+        let version = |path: &Path| {
+            Command::new(path)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .status()
+        };
+        let deleted = version(&reported);
+        let image = process_image(running.id()).expect("linux exposes /proc/<pid>/exe");
+        let through_image = version(&image);
+        let _ = running.kill();
+        let _ = running.wait();
+
+        assert!(reported.to_string_lossy().ends_with(" (deleted)"));
+        assert!(deleted.is_err(), "the (deleted) spelling must not run");
+        assert!(through_image.unwrap().success(), "{}", image.display());
+    }
+
+    /// #238: the launch entry script must exec the daemon's running image,
+    /// not `current_exe()` — after an upgrade the latter is `<path>
+    /// (deleted)` and the launch dies before Claude starts. A default-login
+    /// binding prepares without running cswap discovery.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn launch_entry_execs_the_running_image() {
+        if std::env::var_os("CCTEAM_CSWAP_RELAY_BIN").is_some() {
+            return; // explicit override wins; nothing to assert here
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let binding = ClaudeAccountBinding {
+            id: "0".repeat(64),
+            slot: String::new(),
+            label: String::new(),
+            config_dir: None,
+            directory_identity: None,
+            default_login: true,
+        };
+        let argv = vec!["claude".to_string(), "--verbose".to_string()];
+        let launch = CswapLaunch::prepare(
+            &binding,
+            &argv,
+            &[],
+            dir.path(),
+            &dir.path().join("chat"),
+            "uuid",
+        )
+        .await
+        .unwrap();
+        let script = std::fs::read_to_string(&launch.argv[0]).unwrap();
+        let image = format!("/proc/{}/exe", std::process::id());
+        assert!(
+            script.contains(&format!("exec '{image}' internal claude-account-launch")),
+            "{script}"
+        );
+        assert_eq!(&launch.argv[1..], &argv[1..]);
+    }
 
     #[test]
     fn account_references_are_identity_based_and_labels_drop_the_domain() {
