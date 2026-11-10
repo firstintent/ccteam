@@ -21,7 +21,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ChatComposer } from "../components/ChatComposer";
+import { ChatComposer, type SendOutcome } from "../components/ChatComposer";
 import { CswapAccountPicker } from "../components/CswapAccountPicker";
 import { useVendorCatalog } from "../hooks/useVendorCatalog";
 import type { TurnAttachment } from "../lib/attachmentsApi";
@@ -352,7 +352,7 @@ export default function HomeView({
   };
 
   // ---- lazy-create funnel ---------------------------------------------------
-  const launch = (text: string, attachments: TurnAttachment[] = []): boolean => {
+  const launch = (text: string, attachments: TurnAttachment[] = []): SendOutcome => {
     if (pending) return false;
     if (!project && !isNewProject) {
       toastBus.handler?.error(
@@ -393,20 +393,26 @@ export default function HomeView({
       await submitTurn(sid, text, attachments);
       return sid;
     };
-    run()
+    // The composer keeps the prompt until this resolves `true` (#237): a
+    // failed project/session start leaves it in place to retry.
+    return run()
       .then((sid) => {
         setPending(false);
         cancelNewProject();
         onLaunched(sid);
+        return true;
       })
       .catch((e) => {
         setPending(false);
-        if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") return false;
+        const detail = e instanceof Error ? e.message : "unknown";
         toastBus.handler?.error(
-          `${lang === "en" ? "Launch failed" : "启动失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+          lang === "en"
+            ? `Launch failed: ${detail} (your message is kept)`
+            : `启动失败: ${detail}(输入内容已保留)`,
         );
+        return false;
       });
-    return true;
   };
 
   const projLabel = isNewProject ? (

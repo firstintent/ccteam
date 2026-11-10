@@ -644,16 +644,20 @@ export default function SessionView({
   }, []);
 
   const scheduleText = useCallback(
-    (content: string, when: string) => {
+    // Resolves the composer's draft (#237): it is kept unless the row landed.
+    (content: string, when: string) =>
       createScheduled(sid, content, when)
-        .then(() => reloadScheduled())
+        .then(() => {
+          reloadScheduled();
+          return true;
+        })
         .catch((error) => {
           pushRow({
             kind: "system",
             content: `${t("scheduleFailed")}: ${error instanceof Error ? error.message : "unknown"}`,
           });
-        });
-    },
+          return false;
+        }),
     [sid, reloadScheduled, pushRow, t],
   );
 
@@ -689,17 +693,23 @@ export default function SessionView({
       // would anchor behind a boundary already on screen (ending busy at once).
       setTurnMark({ after: events[events.length - 1] ?? null });
       setBusySince(Date.now());
-      submitTurn(sid, content, attachments).catch((e) => {
-        setTurnMark(null);
-        setBusySince(null);
-        const detail = e instanceof Error ? e.message : "unknown";
-        pushRow({
-          kind: "system",
-          content: detail.startsWith("发送失败")
-            ? detail
-            : `发送失败: ${detail}`,
-        });
-      });
+      // Resolves the composer's draft (#237): a failed send leaves the text
+      // in the composer to retry instead of only in the optimistic row.
+      return submitTurn(sid, content, attachments).then(
+        () => true,
+        (e) => {
+          setTurnMark(null);
+          setBusySince(null);
+          const detail = e instanceof Error ? e.message : "unknown";
+          pushRow({
+            kind: "system",
+            content: detail.startsWith("发送失败")
+              ? detail
+              : `发送失败: ${detail}`,
+          });
+          return false;
+        },
+      );
     },
     [sid, pushRow, events],
   );
