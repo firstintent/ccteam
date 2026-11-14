@@ -828,9 +828,22 @@ mod tests {
         let bin = dir.path().join("daemon-standin");
         std::fs::copy("/bin/sleep", &bin).unwrap();
         let mut running = Command::new(&bin).arg("30").spawn().unwrap();
+        // `spawn` can return a moment before the child's exec has replaced
+        // its image: the kernel wakes a vfork parent while the child still
+        // points at the image it was cloned from, so `/proc/<pid>/exe` names
+        // this test binary until the exec lands. Wait for the stand-in.
+        let exe = format!("/proc/{}/exe", running.id());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_link(&exe).ok().as_deref() != Some(bin.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never started"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         std::fs::remove_file(&bin).unwrap();
 
-        let reported = std::fs::read_link(format!("/proc/{}/exe", running.id())).unwrap();
+        let reported = std::fs::read_link(&exe).unwrap();
         let version = |path: &Path| {
             Command::new(path)
                 .arg("--version")
@@ -843,7 +856,11 @@ mod tests {
         let _ = running.kill();
         let _ = running.wait();
 
-        assert!(reported.to_string_lossy().ends_with(" (deleted)"));
+        assert!(
+            reported.to_string_lossy().ends_with(" (deleted)"),
+            "{}",
+            reported.display()
+        );
         assert!(deleted.is_err(), "the (deleted) spelling must not run");
         assert!(through_image.unwrap().success(), "{}", image.display());
     }
