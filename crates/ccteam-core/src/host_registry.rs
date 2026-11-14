@@ -122,7 +122,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "@anthropic-ai/claude-code@latest"]),
         manual_install_url: None,
-        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::ClaudeOauthUsage),
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::ClaudeRecordedUsage),
     },
     AgentProbeSpec {
         vendor: "codex",

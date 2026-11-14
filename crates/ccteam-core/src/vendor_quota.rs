@@ -10,10 +10,9 @@
 //! vendor is one registry entry + one parser, zero UI change.
 //!
 //! Probe surfaces (verified against the vendor source references):
-//! - claude: `GET https://api.anthropic.com/api/oauth/usage`, Bearer = OAuth
-//!   `accessToken` from `~/.claude/.credentials.json` (`claudeAiOauth`,
-//!   `user:profile` scope required) + `anthropic-beta: oauth-2025-04-20`.
-//!   API-key accounts get `{}` → [`QuotaVerdict::NotSubscription`].
+//! - claude: NO request — see [`QuotaProbeKind::ClaudeRecordedUsage`]. The
+//!   plan comes from `~/.claude/.credentials.json` (`claudeAiOauth`); a file
+//!   without that block (API-key account) → [`QuotaVerdict::NotSubscription`].
 //! - codex: `GET https://chatgpt.com/backend-api/wham/usage`, Bearer =
 //!   `tokens.access_token` from `~/.codex/auth.json` + `ChatGPT-Account-Id:
 //!   tokens.account_id`. ApiKey auth (no `tokens`) → NotSubscription.
@@ -34,8 +33,13 @@ use crate::host_registry::AgentProbeSpec;
 /// dispatch matches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaProbeKind {
-    /// claude — `GET https://api.anthropic.com/api/oauth/usage`.
-    ClaudeOauthUsage,
+    /// claude — the account usage ccteam recorded from claude's own rate-limit
+    /// headers (`~/.ccteam/account-usage.json`, written as sessions run). No
+    /// request: `/api/oauth/usage` allows each token about 30 reads an hour,
+    /// shared with every claude process on the account and with cswap, and
+    /// reading it here helped spend the default login's allowance into 429s
+    /// (#244).
+    ClaudeRecordedUsage,
     /// codex — `GET https://chatgpt.com/backend-api/wham/usage`.
     CodexWhamUsage,
     /// kimi — `GET https://api.kimi.com/coding/v1/usages`.
@@ -152,30 +156,23 @@ impl QuotaVerdict {
 
 // ── credential extractors (pure — the HTTP layer reads the files) ───────────
 
-/// claude: the OAuth bearer + plan from `~/.claude/.credentials.json`.
-/// Requires the `user:profile` scope (the usage endpoint's minimum, per the
-/// claude codebase's own gate); an API-key-only file has no `claudeAiOauth`
-/// block at all → `None` → NotSubscription.
-pub fn claude_oauth_from_credentials(body: &str) -> Option<(String, Option<String>)> {
+/// claude: whether `~/.claude/.credentials.json` holds a subscription login
+/// (a `claudeAiOauth` block with a token), and its plan. An API-key-only file
+/// has no such block → `None` → NotSubscription.
+pub fn claude_plan_from_credentials(body: &str) -> Option<Option<String>> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let oauth = v.get("claudeAiOauth")?;
     let token = oauth.get("accessToken")?.as_str()?;
     if token.is_empty() {
         return None;
     }
-    let has_profile_scope = oauth
-        .get("scopes")
-        .and_then(|s| s.as_array())
-        .is_some_and(|scopes| scopes.iter().any(|s| s.as_str() == Some("user:profile")));
-    if !has_profile_scope {
-        return None;
-    }
-    let plan = oauth
-        .get("subscriptionType")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    Some((token.to_string(), plan))
+    Some(
+        oauth
+            .get("subscriptionType")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    )
 }
 
 /// codex: the ChatGPT bearer + account id from `~/.codex/auth.json`. ApiKey
@@ -233,30 +230,6 @@ fn window(
         used_percent: clamp_percent(used_percent),
         resets_at,
     }
-}
-
-/// claude `GET /api/oauth/usage`: `{five_hour?: {utilization, resets_at},
-/// seven_day?: same, …}`. An API-key account gets `{}` → NotSubscription.
-pub fn parse_claude_usage(body: &str, plan: Option<String>) -> QuotaVerdict {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return QuotaVerdict::NotSubscription;
-    };
-    let mut windows = Vec::new();
-    for (key, kind) in [
-        ("five_hour", QuotaWindowKind::FiveHour),
-        ("seven_day", QuotaWindowKind::Weekly),
-    ] {
-        let Some(rate) = v.get(key) else { continue };
-        let Some(utilization) = rate.get("utilization").and_then(|u| u.as_f64()) else {
-            continue;
-        };
-        let resets_at = parse_iso(rate.get("resets_at").and_then(|r| r.as_str()));
-        windows.push(window(kind, utilization, resets_at));
-    }
-    if windows.is_empty() {
-        return QuotaVerdict::NotSubscription;
-    }
-    QuotaVerdict::Available { plan, windows }
 }
 
 /// codex `GET /backend-api/wham/usage`: `{plan_type, rate_limit:
@@ -377,22 +350,20 @@ mod tests {
     // ── credential extractors ────────────────────────────────────────────
 
     #[test]
-    fn claude_credentials_require_oauth_token_and_profile_scope() {
+    fn claude_credentials_give_the_plan_of_a_subscription_login() {
         let ok = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"r",
             "expiresAt":1893456000000,"scopes":["user:profile","user:inference"],
             "subscriptionType":"max"}}"#;
-        let (token, plan) = claude_oauth_from_credentials(ok).unwrap();
-        assert_eq!(token, "sk-ant-oat01-x");
-        assert_eq!(plan.as_deref(), Some("max"));
+        assert_eq!(claude_plan_from_credentials(ok), Some(Some("max".into())));
+        // A login without a recorded plan is still a subscription.
+        let no_plan = r#"{"claudeAiOauth":{"accessToken":"t"}}"#;
+        assert_eq!(claude_plan_from_credentials(no_plan), Some(None));
 
         // API-key-only account: no claudeAiOauth block at all.
-        assert!(claude_oauth_from_credentials(r#"{"installMethod":"native"}"#).is_none());
-        // OAuth login without the usage endpoint's minimum scope.
-        let no_scope = r#"{"claudeAiOauth":{"accessToken":"t","scopes":["user:inference"]}}"#;
-        assert!(claude_oauth_from_credentials(no_scope).is_none());
+        assert!(claude_plan_from_credentials(r#"{"installMethod":"native"}"#).is_none());
         // Garbage / empty token.
-        assert!(claude_oauth_from_credentials("not json").is_none());
-        assert!(claude_oauth_from_credentials(r#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
+        assert!(claude_plan_from_credentials("not json").is_none());
+        assert!(claude_plan_from_credentials(r#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
     }
 
     #[test]
@@ -420,58 +391,6 @@ mod tests {
         );
         assert!(kimi_managed_token_from_credentials(r#"{"refresh_token":"krt"}"#).is_none());
         assert!(kimi_managed_token_from_credentials("not json").is_none());
-    }
-
-    // ── claude usage parse ───────────────────────────────────────────────
-
-    #[test]
-    fn claude_usage_parses_both_windows() {
-        let body = r#"{"five_hour":{"utilization":42.0,"resets_at":"2026-08-17T18:00:00Z"},
-            "seven_day":{"utilization":15.5,"resets_at":"2026-08-20T00:00:00Z"},
-            "seven_day_opus":{"utilization":3.0,"resets_at":"2026-08-20T00:00:00Z"}}"#;
-        let QuotaVerdict::Available { plan, windows } =
-            parse_claude_usage(body, Some("max".into()))
-        else {
-            panic!("expected available");
-        };
-        assert_eq!(plan.as_deref(), Some("max"));
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].kind, QuotaWindowKind::FiveHour);
-        assert_eq!(windows[0].used_percent, 42.0);
-        assert_eq!(
-            windows[0].resets_at.unwrap().to_rfc3339(),
-            "2026-08-17T18:00:00+00:00"
-        );
-        assert_eq!(windows[1].kind, QuotaWindowKind::Weekly);
-        assert_eq!(windows[1].used_percent, 15.5);
-    }
-
-    #[test]
-    fn claude_usage_empty_object_is_not_subscription() {
-        // The API-key account response.
-        assert_eq!(
-            parse_claude_usage("{}", None),
-            QuotaVerdict::NotSubscription
-        );
-        // Null windows (subscriber with no active limits) also normalize away.
-        assert_eq!(
-            parse_claude_usage(r#"{"five_hour":null,"seven_day":null}"#, None),
-            QuotaVerdict::NotSubscription
-        );
-        assert_eq!(
-            parse_claude_usage("not json", None),
-            QuotaVerdict::NotSubscription
-        );
-    }
-
-    #[test]
-    fn claude_usage_clamps_and_tolerates_missing_reset() {
-        let body = r#"{"five_hour":{"utilization":137.0,"resets_at":null}}"#;
-        let QuotaVerdict::Available { windows, .. } = parse_claude_usage(body, None) else {
-            panic!("expected available");
-        };
-        assert_eq!(windows[0].used_percent, 100.0);
-        assert_eq!(windows[0].resets_at, None);
     }
 
     // ── codex wham parse ─────────────────────────────────────────────────
@@ -575,7 +494,7 @@ mod tests {
     fn quota_probe_registry_matches_the_shipped_stance() {
         use QuotaProbeKind::*;
         let probe = |vendor: &str| AgentProbeSpec::by_vendor(vendor).unwrap().quota_probe;
-        assert_eq!(probe("claude"), Some(ClaudeOauthUsage));
+        assert_eq!(probe("claude"), Some(ClaudeRecordedUsage));
         assert_eq!(probe("codex"), Some(CodexWhamUsage));
         assert_eq!(probe("kimi"), Some(KimiManagedUsages));
         assert_eq!(probe("grok"), Some(GrokBillingUnavailable));

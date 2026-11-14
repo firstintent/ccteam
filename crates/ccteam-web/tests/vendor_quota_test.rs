@@ -12,7 +12,7 @@
 //! The env mutation (HOME + the three vendor home overrides) is why this
 //! lives in an integration test binary (own process) and serializes on
 //! ENV_LOCK — the daemon process on a real machine would otherwise read the
-//! host's true `~/.claude/.credentials.json` and make a LIVE network call,
+//! host's true codex / kimi credentials and make a LIVE network call,
 //! which tests must never do.
 
 use std::net::SocketAddr;
@@ -148,4 +148,72 @@ async fn empty_credential_homes_yield_local_only_rows_and_cache_repeats() {
         .map(|q| q["vendor"].as_str().unwrap())
         .collect();
     assert_eq!(order, vec!["claude", "codex", "grok", "kimi"]);
+}
+
+/// #244 — the claude row asks no endpoint: a subscription login's plan from
+/// its credential file, the windows from the usage ccteam recorded from
+/// claude's own rate-limit headers (`account-usage.json`). Offline by
+/// construction — there is no claude request left to make.
+#[tokio::test]
+async fn claude_row_reads_the_recorded_usage_without_a_request() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sandbox = tmp.path().join("homes");
+    std::fs::create_dir_all(sandbox.join(".claude")).unwrap();
+    std::env::set_var("HOME", &sandbox);
+    std::env::set_var("CLAUDE_CONFIG_HOME", sandbox.join(".claude"));
+    std::env::set_var("CODEX_HOME", sandbox.join(".codex"));
+    std::env::set_var("KIMI_CODE_HOME", sandbox.join(".kimi-code"));
+    std::fs::write(
+        sandbox.join(".claude").join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-sandbox","subscriptionType":"team"}}"#,
+    )
+    .unwrap();
+
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let in_two_hours = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+    let in_three_days = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+    std::fs::write(
+        paths.root.join("account-usage.json"),
+        serde_json::json!({
+            "claude": {
+                "observed_at": chrono::Utc::now().to_rfc3339(),
+                "source": "status card",
+                "usage": {
+                    "five_hour_pct": 33,
+                    "five_hour_resets_at": in_two_hours,
+                    "weekly_pct": 62,
+                    "weekly_resets_at": in_three_days
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: serde_json::Value = client()
+        .get(format!("http://{addr}/api/v1/vendors/quota"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claude = body["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["vendor"] == "claude")
+        .unwrap()
+        .clone();
+    assert_eq!(claude["state"], "available", "{claude}");
+    assert_eq!(claude["plan"], "team");
+    assert_eq!(claude["windows"][0]["kind"], "five_hour");
+    assert_eq!(claude["windows"][0]["used_percent"], 33.0);
+    assert_eq!(claude["windows"][1]["kind"], "weekly");
+    assert_eq!(claude["windows"][1]["used_percent"], 62.0);
 }
