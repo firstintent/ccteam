@@ -1536,8 +1536,9 @@ pub struct ContextRequestUsage {
     pub reasoning_output_tokens: Option<u64>,
 }
 
-/// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
-/// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
+/// Account-level usage / rate-limits (Claude: the rate-limit headers its turns
+/// report; Codex: its rate-limit notifications; Grok: `x.ai/billing`),
+/// vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
 /// credits), NOT a per-session property — the gateway queries it once on any
 /// live session. Percentages are 0-100; `*_resets_at` is the vendor's ISO-8601
@@ -2128,7 +2129,8 @@ pub trait HarnessAdapter: Send + Sync {
     /// Report ACCOUNT-level usage / rate-limits (5-hour + weekly windows + extra
     /// credits) for the IM `/status` operator dashboard. Unlike `thread_status`
     /// this is OPTIONAL (a default `None`): only adapters with a usage channel
-    /// implement it (Claude stream-json via the `get_usage` control_request).
+    /// implement it (Claude stream-json from the `rate_limit_event`s its turns
+    /// print, so reading it asks claude nothing — #244).
     /// It is account-, not session-, scoped — the gateway queries it once on any
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {

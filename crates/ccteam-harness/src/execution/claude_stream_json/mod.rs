@@ -30,6 +30,7 @@
 pub mod bridge;
 mod context;
 pub mod protocol;
+mod rate_limits;
 pub mod recovery;
 pub mod spawn_spec;
 pub mod translate;
@@ -1215,186 +1216,6 @@ async fn get_context_breakdown(transport: &StreamJsonTransport) -> Option<crate:
         return None;
     }
     context::parse_context_usage(body.response.as_ref()?, Utc::now())
-}
-
-/// `get_usage` control_request → ACCOUNT-level usage / rate-limits
-/// ([`crate::AccountUsage`]). The vendor response carries `subscription_type`
-/// and `rate_limits.{five_hour,seven_day}.{utilization,resets_at}` + a `limits[]`
-/// array (group·severity) + `extra_usage` (credits). `None` on timeout / error /
-/// a CLI without the subtype (probed: `get_usage` is the real subtype;
-/// `rate_limits`/`usage` error). Short timeout — must never stall the dashboard.
-///
-/// `skip_behaviors: true` is load-bearing. By default claude ALSO computes
-/// `behaviors` (the "what's contributing to your usage" recommendations) by
-/// scanning the account's local transcript history, which ccteam never reads.
-/// That scan grows with history: on a well-used host it took ~3.9s (probed,
-/// claude 2.1.318) against ~1ms with the flag, so every ask blew the deadline
-/// below — the live read AND the release-time capture both came back `None`,
-/// and the IM `⚡ 用量` row froze on the last snapshot that had ever made it
-/// (an old account's, kept "valid" until its weekly reset). The rate-limit
-/// half is untouched by the flag: claude still answers it from the account
-/// the process is signed in as. A CLI predating the flag ignores the field.
-async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::AccountUsage> {
-    let body = transport
-        .request_control(
-            "get_usage",
-            json!({ "skip_behaviors": true }),
-            Duration::from_secs(3),
-        )
-        .await
-        .ok()?;
-    if body.subtype != "success" {
-        return None;
-    }
-    parse_get_usage_response(body.response.as_ref()?)
-}
-
-/// The `get_usage` response body → [`crate::AccountUsage`]. Pure, so the wire
-/// shape is testable without a live child (the transport half above is the
-/// only part that needs one).
-fn parse_get_usage_response(resp: &serde_json::Value) -> Option<crate::AccountUsage> {
-    let rl = resp.get("rate_limits");
-    let five = rl.and_then(|r| r.get("five_hour"));
-    let seven = rl.and_then(|r| r.get("seven_day"));
-    let extra = rl.and_then(|r| r.get("extra_usage"));
-    // Weekly severity (e.g. "warning") is in the `limits[]` entry grouped "weekly".
-    let weekly_severity = rl
-        .and_then(|r| r.get("limits"))
-        .and_then(|l| l.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|x| x.get("group").and_then(|g| g.as_str()) == Some("weekly"))
-        })
-        .and_then(|x| x.get("severity").and_then(|s| s.as_str()))
-        .map(str::to_string);
-    let pct = |o: Option<&serde_json::Value>| {
-        o.and_then(|x| x.get("utilization"))
-            .and_then(|v| v.as_f64())
-            .map(|f| f.round() as u8)
-    };
-    let resets = |o: Option<&serde_json::Value>| {
-        o.and_then(|x| x.get("resets_at"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
-    let usage = crate::AccountUsage {
-        subscription: resp
-            .get("subscription_type")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        five_hour_pct: pct(five),
-        five_hour_resets_at: resets(five),
-        weekly_pct: pct(seven),
-        weekly_resets_at: resets(seven),
-        weekly_severity,
-        credits_pct: pct(extra),
-        model_windows: model_windows(rl),
-    };
-    // An answer is an observation only if it carries at least one WINDOW. The
-    // tier alone (`rate_limits: null` — claude could not reach its usage
-    // endpoint, or the account is not metered) says nothing about headroom,
-    // so it must not stand in for one: the caller then asks the next session
-    // or falls back to the last real observation instead of overwriting it
-    // with a row that renders as nothing. Which windows exist is the
-    // account's business — a plan without a 5-hour window (only `seven_day`)
-    // is a full observation, as is one reporting only per-model buckets.
-    usage.has_window().then_some(usage)
-}
-
-/// Per-model weekly windows out of the `rate_limits` object.
-///
-/// Claude meters some models on their OWN weekly clock, and spells that three
-/// different ways depending on build + server feature flag. All three are read,
-/// most-specific first, and the first that yields rows wins — they describe the
-/// same fact, so merging them would double-count it:
-///
-/// 1. `rate_limits.model_scoped: [{display_name, utilization, resets_at}]` —
-///    the current, server-gated shape. `resets_at` is already ISO-8601 (the CLI
-///    converts the epoch before emitting) and `utilization` is 0-100.
-/// 2. Fixed siblings `rate_limits.seven_day_{opus,sonnet}` — the same
-///    `{utilization, resets_at}` shape as the shared `seven_day` window.
-/// 3. `rate_limits.limits[]` entries with `kind == "weekly_scoped"`:
-///    `{scope: {model: {display_name}}, percent, resets_at}`.
-///
-/// The model name is whatever the vendor called it (`display_name`, e.g.
-/// `"Fable"`), passed through verbatim — ccteam never maps a vendor bucket onto
-/// a model id, because they are not the same namespace.
-fn model_windows(rate_limits: Option<&serde_json::Value>) -> Vec<crate::ModelWindow> {
-    let Some(rl) = rate_limits else {
-        return Vec::new();
-    };
-    let row = |model: Option<&str>, pct: Option<u8>, resets_at: Option<String>| {
-        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
-        // A bucket the vendor named but reported nothing about is not a fact.
-        (pct.is_some() || resets_at.is_some()).then(|| crate::ModelWindow {
-            model: model.to_string(),
-            pct,
-            resets_at,
-        })
-    };
-    let pct_of = |v: &serde_json::Value, key: &str| {
-        v.get(key)
-            .and_then(|v| v.as_f64())
-            .map(|f| f.round().clamp(0.0, 100.0) as u8)
-    };
-    let resets_of = |v: &serde_json::Value| {
-        v.get("resets_at")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
-
-    // (1) the declared per-model array.
-    if let Some(entries) = rl.get("model_scoped").and_then(|v| v.as_array()) {
-        let rows: Vec<_> = entries
-            .iter()
-            .filter_map(|entry| {
-                row(
-                    entry.get("display_name").and_then(|v| v.as_str()),
-                    pct_of(entry, "utilization"),
-                    resets_of(entry),
-                )
-            })
-            .collect();
-        if !rows.is_empty() {
-            return rows;
-        }
-    }
-
-    // (2) the fixed per-model siblings of the shared weekly window.
-    let rows: Vec<_> = [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")]
-        .iter()
-        .filter_map(|(key, model)| {
-            let window = rl.get(key)?;
-            row(
-                Some(model),
-                pct_of(window, "utilization"),
-                resets_of(window),
-            )
-        })
-        .collect();
-    if !rows.is_empty() {
-        return rows;
-    }
-
-    // (3) the raw `limits[]` feed, model-scoped entries only.
-    rl.get("limits")
-        .and_then(|v| v.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped"))
-                .filter_map(|entry| {
-                    row(
-                        entry
-                            .pointer("/scope/model/display_name")
-                            .and_then(|v| v.as_str()),
-                        pct_of(entry, "percent"),
-                        resets_of(entry),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The reasoning-effort levels claude accepts (Opus 4.6+), low→high. Mirrors
@@ -2969,11 +2790,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
     }
 
     async fn account_usage(&self, h: &ThreadHandle) -> Option<crate::AccountUsage> {
-        // Account-level usage (5h / weekly / credits) — query `get_usage` on this
-        // live session's transport. It is account-scoped, so the gateway calls it
-        // on any ONE live claude session to build the `/status` header.
+        // The account's 5h / weekly windows as this session's own turns last
+        // saw them in the rate-limit headers (#244, see `rate_limits`). Asking
+        // claude (`get_usage`) would make it read `/api/oauth/usage` from the
+        // account's small per-token allowance, so it is not asked.
         let live = self.lookup(&h.identity)?;
-        get_account_usage(&live.transport).await
+        live.transport.account_usage()
     }
 
     async fn context_breakdown(&self, h: &ThreadHandle) -> Option<crate::ContextBreakdown> {
@@ -3355,240 +3177,65 @@ mod deferred_queue_tests {
 
 #[cfg(test)]
 mod account_usage_tests {
-    use super::{get_account_usage, parse_get_usage_response, StreamJsonTransport};
+    use super::StreamJsonTransport;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The 2026-11-06 freeze. Without `skip_behaviors`, claude first scans the
-    /// account's local transcript history to build usage recommendations —
-    /// ~3.9s on a well-used host, past the 3s deadline — so every live read
-    /// AND every release-time capture came back `None` and the IM row showed
-    /// a days-old snapshot of a since-replaced account. The peer here answers
-    /// the way that claude did for an ask WITHOUT the flag (only after the
-    /// deadline), so leaving the flag out fails this test.
+    /// #244 — account usage comes from the `rate_limit_event`s claude prints
+    /// about its own responses, and reading it asks claude nothing (a
+    /// `get_usage` ask made claude read `/api/oauth/usage` from the account's
+    /// small allowance). Before any event the answer is `None`.
     #[tokio::test]
-    async fn get_usage_skips_the_slow_behaviors_scan() {
-        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+    async fn account_usage_reads_rate_limit_events_and_asks_nothing() {
+        let (client, peer) = tokio::io::duplex(64 * 1024);
         let (client_read, client_write) = tokio::io::split(client);
         let transport = StreamJsonTransport::spawn_from_io(client_read, client_write, None);
-        tokio::spawn(async move {
-            let (peer_read, mut peer_write) = tokio::io::split(&mut peer);
-            let mut line = String::new();
-            BufReader::new(peer_read)
-                .read_line(&mut line)
-                .await
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request["request"]["subtype"], "get_usage");
-            if request["request"]["skip_behaviors"] != json!(true) {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            let reply = json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request["request_id"],
-                    "response": {
-                        "subscription_type": "team",
-                        "rate_limits": {
-                            "five_hour": {"utilization": 34, "resets_at": "2026-11-06T13:50:00Z"},
-                            "seven_day": {"utilization": 35, "resets_at": "2026-11-10T13:00:00Z"}
-                        }
-                    }
+        let (mut peer_read, mut peer_write) = tokio::io::split(peer);
+        assert!(
+            transport.account_usage().is_none(),
+            "no turn yet, nothing to say"
+        );
+
+        let resets = chrono::Utc::now().timestamp() + 3600;
+        let event = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.33, "resetsAt": resets, "status": "allowed"},
+                    "seven_day": {"utilization": 0.62, "resetsAt": resets + 86400, "status": "allowed_warning"}
                 }
-            });
-            peer_write
-                .write_all(format!("{reply}\n").as_bytes())
-                .await
-                .unwrap();
-            peer_write.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            },
+            "uuid": "u-1",
+            "session_id": "s-1"
         });
-
-        let usage = tokio::time::timeout(Duration::from_secs(10), get_account_usage(&transport))
+        peer_write
+            .write_all(format!("{event}\n").as_bytes())
             .await
-            .expect("the ask is bounded by its own deadline")
-            .expect("answered inside the deadline");
-        assert_eq!(usage.subscription.as_deref(), Some("team"));
-        assert_eq!(usage.five_hour_pct, Some(34));
-        assert_eq!(usage.weekly_pct, Some(35));
-    }
+            .unwrap();
+        peer_write.flush().await.unwrap();
 
-    /// A plan with NO 5-hour window (live shape, claude 2.1.318: `five_hour`
-    /// is `null`) is a complete observation: the weekly window and the tier,
-    /// and no 5-hour figure from anywhere.
-    #[test]
-    fn a_plan_without_a_five_hour_window_reports_only_its_weekly_one() {
-        let usage = parse_get_usage_response(&json!({
-            "subscription_type": "max",
-            "rate_limits_available": true,
-            "rate_limits": {
-                "five_hour": null,
-                "seven_day": {"utilization": 20, "resets_at": "2026-11-09T18:59:59Z"},
-                "limits": [
-                    {"kind": "weekly_all", "group": "weekly", "percent": 20, "severity": "normal"}
-                ]
-            }
-        }))
-        .expect("a weekly window alone is an observation");
-        assert_eq!(usage.five_hour_pct, None);
-        assert_eq!(usage.five_hour_resets_at, None);
-        assert_eq!(usage.weekly_pct, Some(20));
-        assert_eq!(usage.weekly_severity.as_deref(), Some("normal"));
-        assert_eq!(usage.subscription.as_deref(), Some("max"));
-    }
-
-    /// The `get_usage` response for a Max account whose server DOES send the
-    /// declared per-model array. Key set pinned against a live claude 2.1.245.
-    fn live_shaped_response() -> serde_json::Value {
-        json!({
-            "subscription_type": "max",
-            "rate_limits": {
-                "five_hour": {"utilization": 8.2, "resets_at": "2026-08-31T14:00:00Z"},
-                "seven_day": {"utilization": 23.4, "resets_at": "2026-09-03T00:00:00Z"},
-                "model_scoped": [
-                    {"display_name": "Fable", "utilization": 16.0, "resets_at": "2026-09-03T00:00:00Z"},
-                    {"display_name": "Sonnet", "utilization": 4.4, "resets_at": "2026-09-03T00:00:00Z"}
-                ],
-                "extra_usage": {"utilization": 3.0},
-                "limits": [{"group": "weekly", "severity": "warning"}]
+        let usage = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(usage) = transport.account_usage() {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-    }
+        .await
+        .expect("the reader folds the event in");
+        assert_eq!(usage.five_hour_pct, Some(33));
+        assert_eq!(usage.weekly_pct, Some(62));
+        assert_eq!(usage.weekly_severity.as_deref(), Some("warning"));
 
-    #[test]
-    fn reads_every_window_including_the_per_model_ones() {
-        let usage = parse_get_usage_response(&live_shaped_response()).expect("a real observation");
-        assert_eq!(usage.subscription.as_deref(), Some("max"));
-        assert_eq!(usage.five_hour_pct, Some(8));
-        assert_eq!(
-            usage.five_hour_resets_at.as_deref(),
-            Some("2026-08-31T14:00:00Z")
-        );
-        assert_eq!(usage.weekly_pct, Some(23));
-        assert_eq!(usage.credits_pct, Some(3));
-
-        // Per-model rows carry the vendor's OWN display name, verbatim and in
-        // the order it listed them.
-        let rows: Vec<(&str, Option<u8>)> = usage
-            .model_windows
-            .iter()
-            .map(|w| (w.model.as_str(), w.pct))
-            .collect();
-        assert_eq!(rows, vec![("Fable", Some(16)), ("Sonnet", Some(4))]);
-        assert_eq!(
-            usage.model_windows[0].resets_at.as_deref(),
-            Some("2026-09-03T00:00:00Z")
-        );
-    }
-
-    /// Without the server-gated array, the fixed `seven_day_<model>` siblings
-    /// carry the same fact — and only one of the two spellings is ever read, so
-    /// a build that sends both cannot double-count.
-    #[test]
-    fn falls_back_to_the_fixed_per_model_siblings() {
-        let usage = parse_get_usage_response(&json!({
-            "rate_limits": {
-                "seven_day": {"utilization": 23.0},
-                "seven_day_opus": {"utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"},
-                "seven_day_sonnet": {"utilization": 2.0}
-            }
-        }))
-        .unwrap();
-        let rows: Vec<(&str, Option<u8>)> = usage
-            .model_windows
-            .iter()
-            .map(|w| (w.model.as_str(), w.pct))
-            .collect();
-        assert_eq!(rows, vec![("Opus", Some(61)), ("Sonnet", Some(2))]);
-
-        // The declared array wins when both are present.
-        let both = parse_get_usage_response(&json!({
-            "rate_limits": {
-                "model_scoped": [{"display_name": "Fable", "utilization": 9.0}],
-                "seven_day_opus": {"utilization": 61.0}
-            }
-        }))
-        .unwrap();
-        assert_eq!(both.model_windows.len(), 1);
-        assert_eq!(both.model_windows[0].model, "Fable");
-    }
-
-    /// Last resort: the raw `limits[]` feed. Only `weekly_scoped` entries are
-    /// per-model; anything else there describes the shared pool.
-    #[test]
-    fn falls_back_to_the_scoped_limits_feed() {
-        let usage = parse_get_usage_response(&json!({
-            "rate_limits": {
-                "limits": [
-                    {"kind": "weekly", "percent": 23.0},
-                    {
-                        "kind": "weekly_scoped",
-                        "scope": {"model": {"display_name": "Fable"}},
-                        "percent": 71.0,
-                        "resets_at": "2026-09-03T00:00:00Z"
-                    }
-                ]
-            }
-        }))
-        .expect("a scoped entry alone is worth reporting");
-        assert_eq!(usage.model_windows.len(), 1);
-        assert_eq!(usage.model_windows[0].model, "Fable");
-        assert_eq!(usage.model_windows[0].pct, Some(71));
-    }
-
-    /// An account metered as ONE pool reports no per-model rows — the list is
-    /// empty, never invented from the shared weekly window.
-    #[test]
-    fn a_single_pool_account_gets_no_model_rows() {
-        let usage = parse_get_usage_response(&json!({
-            "subscription_type": "pro",
-            "rate_limits": {"five_hour": {"utilization": 1.0}}
-        }))
-        .unwrap();
-        assert!(usage.model_windows.is_empty());
-    }
-
-    /// Fail-closed on every shape that says nothing: a named-but-empty bucket
-    /// is not a row, a nameless one is never emitted, and a response with no
-    /// numbers at all is `None` (the caller keeps whatever it knew before).
-    #[test]
-    fn refuses_to_invent_rows_from_an_empty_answer() {
-        assert!(parse_get_usage_response(&json!({})).is_none());
-        assert!(parse_get_usage_response(&json!({"rate_limits": {}})).is_none());
-        // The tier with no windows (claude could not reach its usage endpoint)
-        // says nothing about headroom: not an observation either, so it can
-        // never overwrite the last one that did.
-        assert!(parse_get_usage_response(&json!({
-            "subscription_type": "team",
-            "rate_limits_available": false,
-            "rate_limits": null
-        }))
-        .is_none());
-        assert!(parse_get_usage_response(&json!({
-            "rate_limits": {"seven_day_opus": {}, "model_scoped": [{"utilization": 5.0}]}
-        }))
-        .is_none());
-        assert!(parse_get_usage_response(&json!({
-            "rate_limits": {"limits": [{"kind": "weekly_scoped", "percent": 5.0}]}
-        }))
-        .is_none());
-    }
-
-    /// A per-model bucket is a real observation on its own: an account whose
-    /// shared windows are absent still reports that model's headroom.
-    #[test]
-    fn a_model_only_answer_is_still_an_observation() {
-        let usage = parse_get_usage_response(&json!({
-            "rate_limits": {"model_scoped": [
-                {"display_name": "Fable", "utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"}
-            ]}
-        }))
-        .expect("a per-model window alone is worth reporting");
-        assert_eq!(usage.weekly_pct, None);
-        assert_eq!(usage.model_windows.len(), 1);
-        assert_eq!(usage.model_windows[0].model, "Fable");
+        // Nothing was written to claude: no control request of any kind.
+        let mut written = vec![0u8; 1024];
+        let read =
+            tokio::time::timeout(Duration::from_millis(200), peer_read.read(&mut written)).await;
+        assert!(read.is_err(), "ccteam wrote to claude: {:?}", read);
     }
 }
 

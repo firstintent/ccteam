@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use super::protocol::{ControlResponseBody, Outbound, SystemMsg};
+use super::rate_limits::RateLimitWindows;
 
 /// Broadcast buffer for outbound messages. Chat cadence is ≤ a few
 /// messages/sec; 256 is comfortable headroom for one slow subscriber.
@@ -63,6 +64,9 @@ pub struct StreamJsonTransport {
     out: mpsc::Sender<String>,
     outbound: broadcast::Sender<Outbound>,
     init: Arc<InitSlot>,
+    /// The account's rate-limit windows as this child's `rate_limit_event`s
+    /// last reported them (#244). Filled by the reader.
+    rate_limits: Arc<StdMutex<RateLimitWindows>>,
     pending: PendingControls,
     close: Arc<CloseSignal>,
     /// Set by [`Self::detach`]: the daemon let go of the body WITHOUT stopping
@@ -156,6 +160,7 @@ impl StreamJsonTransport {
         let (out_tx, out_rx) = mpsc::channel::<String>(WRITER_BUFFER);
         let (bcast_tx, _) = broadcast::channel(OUTBOUND_BUFFER);
         let init = Arc::new(InitSlot::default());
+        let rate_limits = Arc::new(StdMutex::new(RateLimitWindows::default()));
         let pending: PendingControls = Arc::new(Mutex::new(HashMap::new()));
         let close = Arc::new(CloseSignal::default());
 
@@ -163,6 +168,7 @@ impl StreamJsonTransport {
         let reader_task = tokio::spawn(run_reader(
             reader,
             Arc::clone(&init),
+            Arc::clone(&rate_limits),
             Arc::clone(&pending),
             bcast_tx.clone(),
             Arc::clone(&close),
@@ -172,6 +178,7 @@ impl StreamJsonTransport {
             out: out_tx,
             outbound: bcast_tx,
             init,
+            rate_limits,
             pending,
             close,
             detached: AtomicBool::new(false),
@@ -181,6 +188,14 @@ impl StreamJsonTransport {
             stderr_task: StdMutex::new(None),
             status_task: StdMutex::new(None),
         }
+    }
+
+    /// The account usage this child's own turns last saw, from the rate-limit
+    /// headers claude reports as `rate_limit_event`s (#244). Asks the child
+    /// nothing, so it costs no read of the vendor's usage endpoint. `None`
+    /// until a turn has reported a window that has not reset since.
+    pub fn account_usage(&self) -> Option<crate::AccountUsage> {
+        self.rate_limits.lock().ok()?.usage(chrono::Utc::now())
     }
 
     /// Hand the per-session status tap to the transport so `shutdown`/`detach`
@@ -392,6 +407,7 @@ async fn run_writer<W: AsyncWrite + Unpin + Send>(mut writer: W, mut rx: mpsc::R
 async fn run_reader<R: AsyncRead + Unpin + Send>(
     reader: R,
     init: Arc<InitSlot>,
+    rate_limits: Arc<StdMutex<RateLimitWindows>>,
     pending: PendingControls,
     outbound: broadcast::Sender<Outbound>,
     close: Arc<CloseSignal>,
@@ -416,6 +432,11 @@ async fn run_reader<R: AsyncRead + Unpin + Send>(
                     if sys.is_init() {
                         *init.payload.lock().unwrap() = Some((**sys).clone());
                         init.notify.notify_waiters();
+                    }
+                }
+                if let Outbound::RateLimitEvent(ref event) = parsed {
+                    if let Ok(mut windows) = rate_limits.lock() {
+                        windows.observe(&event.rate_limit_info);
                     }
                 }
                 // Route control_response to its waiter BEFORE broadcasting.

@@ -17,9 +17,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// One outbound stdout line. Internally tagged on `type`; unknown /
-/// presentation-only kinds (`stream_event`, `keep_alive`,
-/// `rate_limit_event`, …) collapse to [`Outbound::Other`] and are dropped
-/// by the translator (the final-only contract — partials are delta only).
+/// presentation-only kinds (`stream_event`, `keep_alive`, …) collapse to
+/// [`Outbound::Other`] and are dropped by the translator (the final-only
+/// contract — partials are delta only).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outbound {
@@ -44,7 +44,11 @@ pub enum Outbound {
     ControlRequest(ControlRequestMsg),
     /// Reply to one of *our* control requests (correlated by `request_id`).
     ControlResponse(ControlResponseMsg),
-    /// Everything else (partials, keep-alives, rate-limit notices) — dropped.
+    /// The account's rate-limit state from the headers of claude's latest
+    /// API response — where ccteam reads account usage (#244, see
+    /// [`super::rate_limits`]). Not a turn event.
+    RateLimitEvent(RateLimitEventMsg),
+    /// Everything else (partials, keep-alives) — dropped.
     #[serde(other)]
     Other,
 }
@@ -354,6 +358,14 @@ impl ControlRequestMsg {
     }
 }
 
+/// A `rate_limit_event` line. The info object stays raw:
+/// [`super::rate_limits::RateLimitWindows`] reads the fields it uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitEventMsg {
+    #[serde(default)]
+    pub rate_limit_info: Value,
+}
+
 /// A reply to one of *our* control requests. Per the wire quirk the
 /// `request_id` is nested INSIDE `response`, not at the top level.
 #[derive(Debug, Clone, Deserialize)]
@@ -618,12 +630,23 @@ mod tests {
         for line in [
             r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#,
             r#"{"type":"keep_alive"}"#,
-            r#"{"type":"rate_limit_event","rate":99}"#,
         ] {
             assert!(matches!(
                 serde_json::from_str::<Outbound>(line).unwrap(),
                 Outbound::Other
             ));
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_event_keeps_its_info() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.33}}},"uuid":"u","session_id":"s"}"#;
+        match serde_json::from_str::<Outbound>(line).unwrap() {
+            Outbound::RateLimitEvent(event) => assert_eq!(
+                event.rate_limit_info["unifiedWindows"]["five_hour"]["utilization"],
+                0.33
+            ),
+            other => panic!("expected RateLimitEvent, got {other:?}"),
         }
     }
 

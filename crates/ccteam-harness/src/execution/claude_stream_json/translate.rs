@@ -281,9 +281,10 @@ impl StreamTranslator {
             // text — the turn it opens is recognised by having reserved no id
             // (see [`TurnIdentity::open`]).
             Outbound::User(env) => self.on_tool_results(&env),
-            Outbound::ControlRequest(_) | Outbound::ControlResponse(_) | Outbound::Other => {
-                Vec::new()
-            }
+            Outbound::ControlRequest(_)
+            | Outbound::ControlResponse(_)
+            | Outbound::RateLimitEvent(_)
+            | Outbound::Other => Vec::new(),
         }
     }
 

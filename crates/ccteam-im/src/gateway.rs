@@ -103,9 +103,9 @@ pub struct ClaudeAccountSwitch {
 }
 
 /// One deadline for every live account-usage ask in a single read (#234). A
-/// live answer is an in-memory read on the vendor side (claude `get_usage`
-/// with `skip_behaviors` answers in milliseconds); past this, the vendor's
-/// last recorded observation answers instead.
+/// live answer is normally an in-memory read on the vendor side (claude and
+/// codex answer from rate-limit state their turns already received); past
+/// this, the vendor's last recorded observation answers instead.
 const ACCOUNT_USAGE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// How long a `/status` usage prefetch stays valid for the render that follows.
@@ -114,17 +114,16 @@ const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
 /// How long one live process's account-usage answer stands in for asking that
 /// process again (#244).
 ///
-/// Asking is not free upstream: claude answers `get_usage` from a snapshot it
-/// shares across its processes for only 60 s, and past that it reads
-/// `/api/oauth/usage` with the account's token. That endpoint allows each
-/// token roughly 30 reads an hour, and every claude process on the account,
-/// cswap's poller and ccteam all spend from the same allowance. Once it is
-/// spent the endpoint answers 429 for everyone, and cswap's view of the
-/// default login freezes (`cswap list` / `cswap auto` showing a reading half
-/// an hour old). The windows this feeds move on a 5-hour and weekly clock, so a
-/// five-minute-old answer is as good as a new one for a status card, and
-/// reusing it keeps ccteam's share at no more than 12 reads an hour per
-/// process however often `/status` is asked.
+/// An ask can cost the vendor a read of its own usage API. Claude's did: its
+/// `get_usage` answer read `/api/oauth/usage`, an endpoint that allows each
+/// token about 30 reads an hour shared with every claude process on the
+/// account and with cswap, and ccteam's asks helped spend it into 429s that
+/// froze cswap's view of the default login. Claude now answers from the
+/// rate-limit headers its turns already received and costs nothing (#244),
+/// but grok's `x.ai/billing` still calls its backend. The windows move on a
+/// 5-hour and weekly clock, so a five-minute-old answer is as good as a new
+/// one for a status card, and reusing it bounds any vendor's cost to one ask
+/// per process per five minutes however often `/status` is asked.
 const ACCOUNT_USAGE_REUSE: Duration = Duration::from_secs(300);
 
 /// Recent account-usage answers, one per live process (#244).
@@ -15775,8 +15774,8 @@ impl Gateway {
         // deadline: this is a nicety, and a child too wedged to answer must
         // still be released promptly (the timeout simply means no capture).
         // A process that answered a usage read moments ago is not asked again
-        // (#244): that answer is already recorded, and asking would spend a
-        // read from the account's usage allowance for nothing.
+        // (#244): that answer is already recorded, and for a vendor whose ask
+        // reads its usage API, asking would spend a read for nothing.
         let answers = Arc::clone(&gateway.lock().await.account_usage_answers);
         if answers.recent(&thread).is_none() {
             if let Ok(Some(usage)) = tokio::time::timeout(
