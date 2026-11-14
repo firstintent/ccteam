@@ -496,7 +496,7 @@ enum TurnOrigin {
     Internal,
 }
 
-/// Who asked for a session's turns, in the two shapes the delivery paths need.
+/// Who asked for a session's turns, in the shapes the delivery paths need.
 ///
 /// `by_turn` answers "who asked for turn X" and is consumed at the vendor turn
 /// boundary — only the events that carry a turn id (a failure) can use it.
@@ -504,11 +504,26 @@ enum TurnOrigin {
 /// which is what IM egress needs: an ordinary assistant answer carries no turn
 /// id, and an answer nobody in the chat asked for must not be pushed into that
 /// chat. Both are written by the same `record`, so they cannot drift.
+///
+/// "Now" is the RUNNING turn, never merely the newest submission: an internal
+/// line parked behind a human's turn used to take the session's route the
+/// moment it was accepted, so the human's still-running turn answered into the
+/// owner's web console and never reached the chat that asked (#242). `parked`
+/// holds such a line's route until its own turn opens ([`Self::open`]).
 #[derive(Debug, Default)]
 struct TurnOrigins {
     by_turn: BTreeMap<String, TurnOrigin>,
     latest: TurnOrigin,
+    /// Internal follow-ups waiting behind the running turn, in submission
+    /// order, each with the reply route its own answer takes.
+    parked: std::collections::VecDeque<(String, ChatKey)>,
 }
+
+/// Parked routes kept at most. Every member of a notification batch is parked,
+/// but the batch opens under its FIRST member's id; the rest are dropped by the
+/// next turn that opens after them, and this cap bounds the tail when no such
+/// turn ever comes.
+const PARKED_ROUTES_MAX: usize = 64;
 
 impl Default for TurnOrigin {
     /// A session nobody has submitted to yet has no ccteam-authored question
@@ -577,16 +592,58 @@ impl TurnIntent {
 }
 
 impl TurnOrigins {
-    fn record(&mut self, turn_id: String, origin: TurnOrigin) {
-        // Internal is already the lookup default. Notification batches execute
-        // under one of several accepted ids; storing every internal id would
-        // leave the other members here forever (GitHub #205).
-        if origin == TurnOrigin::Internal {
-            self.by_turn.remove(&turn_id);
-        } else {
-            self.by_turn.insert(turn_id, origin);
+    /// Book one accepted submission and say whether it re-addresses the
+    /// session now: `Some(route)` is the reply route to install at once, `None`
+    /// leaves the current one standing.
+    ///
+    /// A human's line always re-addresses: they are in the conversation now,
+    /// whether their line started a turn or steers the running one. An
+    /// internal line (a delegation completion notification, an A2A task)
+    /// re-addresses only the turn it STARTED. Joined into a running turn, it
+    /// is not that turn's question — whoever asked it is still owed the answer
+    /// — and parked behind one, it takes over when its own turn opens.
+    fn record(
+        &mut self,
+        turn_id: String,
+        origin: TurnOrigin,
+        disposition: TurnDisposition,
+        route: ChatKey,
+    ) -> Option<ChatKey> {
+        match (origin, disposition) {
+            (TurnOrigin::User, _) => {
+                self.by_turn.insert(turn_id, origin);
+                self.latest = origin;
+                Some(route)
+            }
+            (TurnOrigin::Internal, TurnDisposition::Started) => {
+                // Internal is already the lookup default. Notification batches
+                // execute under one of several accepted ids; storing every
+                // internal id would leave the other members here forever
+                // (GitHub #205).
+                self.by_turn.remove(&turn_id);
+                self.latest = origin;
+                Some(route)
+            }
+            (TurnOrigin::Internal, TurnDisposition::Injected) => None,
+            (TurnOrigin::Internal, TurnDisposition::Queued) => {
+                if self.parked.len() >= PARKED_ROUTES_MAX {
+                    self.parked.pop_front();
+                }
+                self.parked.push_back((turn_id, route));
+                None
+            }
         }
-        self.latest = origin;
+    }
+
+    /// A turn opened: if it is a parked internal line, it is now the question
+    /// being answered, so its route becomes the session's. Lines parked before
+    /// it have opened already or rode along in its batch; they are dropped.
+    /// Any other turn (a submitted one, a vendor continuation) changes nothing.
+    fn open(&mut self, turn_id: &str) -> Option<ChatKey> {
+        let at = self.parked.iter().position(|(id, _)| id == turn_id)?;
+        let (_, route) = self.parked.drain(..=at).next_back()?;
+        self.latest = TurnOrigin::Internal;
+        Some(route)
     }
 
     /// Consume the origin of a known execution id. Missing identity is never
@@ -742,6 +799,9 @@ struct UnlockedTurnPlan {
     session_catalog: Arc<crate::session_catalog::SessionCatalog>,
     has_event_sink: bool,
     origin: TurnOrigin,
+    /// Where this line's answer goes once it is the turn being answered —
+    /// installed at plan time or by the commit ([`address_submission`]).
+    reply_route: ChatKey,
     user_text: String,
     start_visible_events: u64,
     requested_routing: TurnRouting,
@@ -9180,6 +9240,11 @@ impl Gateway {
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id, opening } = &evt {
+                            // An internal line parked behind the turn that just
+                            // ended is the question now: its answer takes the
+                            // route it was submitted with, from here and not
+                            // before (#242).
+                            open_turn_route(&session, turn_id);
                             structured_turn_open = true;
                             // What an earlier stretch said outside any turn is
                             // not this turn's answer.
@@ -12056,10 +12121,6 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        // Replies for this turn go back to whoever sent it.
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = chat.clone();
-        }
         // v0.8.19 `/status` — a real Turn is now in flight: stamp its start (the
         // pump clears it on `TurnCompleted`). A same-turn Inject preserves the
         // original timestamp; resetting it here made any long-running turn look
@@ -12067,11 +12128,15 @@ impl Gateway {
         // reach here, so a `/model` switch is not counted as a working turn.
         // v0.9 T5 — if a prior turn was still in flight this is a mid-turn
         // steer; otherwise clear the steered flag for a fresh turn.
-        let was_in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
+        let was_in_flight = session_turn_in_flight(session);
+        // Replies for this turn go back to whoever sent it — unless it is an
+        // internal line arriving mid-turn, which is booked by disposition
+        // after the submit below (#242).
+        if addresses_before_submit(origin, was_in_flight) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = chat.clone();
+            }
+        }
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
         let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
@@ -12215,9 +12280,7 @@ impl Gateway {
             }
         }
         let turn_id = submitted.turn_id.clone();
-        if let Ok(mut origins) = session.turn_origins.lock() {
-            origins.record(turn_id.0.clone(), origin);
-        }
+        address_submission(session, &turn_id.0, origin, submitted.disposition, chat);
         self.mirror_user_turn(session, &user_text, &submitted.input_id);
         // Grok's native interjection path may hold its TurnCompleted boundary
         // until the accepted input is registered above. Release only after
@@ -12251,8 +12314,10 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = chat.clone();
+        if addresses_before_submit(origin, session_turn_in_flight(session)) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = chat.clone();
+            }
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         let submit_wait = gateway_submit_timeout_duration();
@@ -12267,14 +12332,12 @@ impl Gateway {
         .map_err(|_| anyhow!("directive timed out after {submit_wait:?} for {session_id}"))??;
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
-                if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.record(turn_id.0.clone(), origin);
-                }
                 // A directive that resolves to a turn was submitted by the
                 // adapter itself (`/model` re-prompt, grok steer): it is
                 // running, not queued. The turn body is the adapter's own
                 // re-prompt, not user text, so the progress row carries no
                 // excerpt rather than a fabricated one.
+                address_submission(session, &turn_id.0, origin, TurnDisposition::Started, chat);
                 self.after_turn_submitted(
                     session,
                     start_visible_events,
@@ -18533,8 +18596,10 @@ impl Gateway {
                 .cloned()
                 .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
             let chat = guard.owner_reply_target(&session);
-            if let Ok(mut target) = session.reply_to.lock() {
-                *target = chat.clone();
+            if addresses_before_submit(origin, session_turn_in_flight(&session)) {
+                if let Ok(mut target) = session.reply_to.lock() {
+                    *target = chat.clone();
+                }
             }
             (
                 chat,
@@ -18580,9 +18645,14 @@ impl Gateway {
 
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
-                if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.record(turn_id.0.clone(), origin);
-                }
+                // Running, not queued — see `dispatch_directive`.
+                address_submission(
+                    &session,
+                    &turn_id.0,
+                    origin,
+                    TurnDisposition::Started,
+                    &chat,
+                );
                 if !session.protocol.is_terminal() {
                     if let Some(paths) = project_paths.as_ref() {
                         let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
@@ -18673,15 +18743,16 @@ impl Gateway {
         // Owner-derived, with the session's thread kept: an internal turn's
         // answer (a delegation completion notification) belongs in the thread
         // the session lives in, where it is that thread's focus.
-        let reply_to = self.owner_reply_target(&session);
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = reply_to;
+        let reply_route = self.owner_reply_target(&session);
+        let was_in_flight = session_turn_in_flight(&session);
+        // An internal line arriving mid-turn is not installed yet: the running
+        // turn may be someone else's question, and still owes them its answer.
+        // The commit books it by what the adapter did with it (#242).
+        if addresses_before_submit(origin, was_in_flight) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = reply_route.clone();
+            }
         }
-        let was_in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|started| started.is_some())
-            .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
         let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
@@ -18708,6 +18779,7 @@ impl Gateway {
             session_catalog: Arc::clone(&self.session_catalog),
             has_event_sink: self.event_sink.is_some(),
             origin,
+            reply_route,
             user_text,
             requested_routing,
             provisional_inject,
@@ -18745,9 +18817,13 @@ impl Gateway {
                     .steered_this_turn
                     .store(plan.prior_steered, Ordering::SeqCst);
             }
-            if let Ok(mut origins) = current.turn_origins.lock() {
-                origins.record(submitted.turn_id.0.clone(), plan.origin);
-            };
+            address_submission(
+                current,
+                &submitted.turn_id.0,
+                plan.origin,
+                submitted.disposition,
+                &plan.reply_route,
+            );
         }
 
         Self::mirror_unlocked_user_turn(&plan, &submitted.input_id);
@@ -20976,6 +21052,62 @@ fn pump_target(session: &GatewaySession) -> ChatKey {
         .lock()
         .map(|target| target.clone())
         .unwrap_or_else(|_| session.owner.clone())
+}
+
+/// Whether a submission's reply route goes in BEFORE the vendor is handed the
+/// line. A turn it starts can speak before the submit call returns, so its
+/// route must already stand; a human's line re-addresses the session either
+/// way. Only an internal line arriving while a turn runs waits for the
+/// adapter's disposition ([`address_submission`]) — it may not be the running
+/// turn's question at all (#242).
+fn addresses_before_submit(origin: TurnOrigin, turn_in_flight: bool) -> bool {
+    origin == TurnOrigin::User || !turn_in_flight
+}
+
+/// Whether `session` has a vendor turn running (the gateway's own marker:
+/// stamped at submit, opened again by the pump on `TurnStarted`, cleared at
+/// the boundary).
+fn session_turn_in_flight(session: &GatewaySession) -> bool {
+    session
+        .turn_started_at
+        .lock()
+        .map(|started| started.is_some())
+        .unwrap_or(false)
+}
+
+/// Book an accepted submission on `session` and install the reply route it
+/// re-addresses the session to, if any — the one rule every submit path
+/// shares ([`TurnOrigins::record`]).
+fn address_submission(
+    session: &GatewaySession,
+    turn_id: &str,
+    origin: TurnOrigin,
+    disposition: TurnDisposition,
+    route: &ChatKey,
+) {
+    let now = session.turn_origins.lock().ok().and_then(|mut origins| {
+        origins.record(turn_id.to_string(), origin, disposition, route.clone())
+    });
+    if let Some(route) = now {
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = route;
+        }
+    }
+}
+
+/// The pump saw `turn_id` open: a parked internal line now answers to the
+/// route it was submitted with ([`TurnOrigins::open`]).
+fn open_turn_route(session: &GatewaySession, turn_id: &str) {
+    let opened = session
+        .turn_origins
+        .lock()
+        .ok()
+        .and_then(|mut origins| origins.open(turn_id));
+    if let Some(route) = opened {
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = route;
+        }
+    }
 }
 
 fn take_turn_origin(session: &GatewaySession, turn_id: Option<&str>) -> TurnOrigin {
@@ -30542,6 +30674,129 @@ mod tests {
         );
     }
 
+    /// #242 — drive a tenant session from the tenant's own IM chat, then hand it
+    /// an INTERNAL line while the human's turn is still running, by `routing`.
+    /// Returns the answer to the human's line and the answer to the internal
+    /// one, in the shape each reached the delivery sink.
+    async fn answers_around_an_internal_line_mid_turn(
+        routing: TurnRouting,
+    ) -> (GatewayEvent, GatewayEvent) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        // Tenant-owned, like excore: an internal turn's owner route is the
+        // tenant's web console, never the IM chat the human is typing in.
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary(),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let chat = ChatKey::new("telegram@ualice", "chat-1", "chat-1");
+        gateway.focus_session(&chat, sid.clone());
+        let identity = format!("alpha-reviewer-{sid}");
+
+        // A genuinely busy session: nothing reaches the pump until both lines
+        // are in, so the internal one lands while the human's turn runs.
+        fake.events_held.store(true, Ordering::SeqCst);
+        gateway
+            .submit_resolved(
+                &chat,
+                &sid,
+                "",
+                "replan every proposal".into(),
+                TurnIntent::from_origin(TurnOrigin::User),
+                false,
+            )
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::submit_to_sid_receipt_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "s9 done · turn 1\nold news".into(),
+            routing,
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        fake.events_held.store(false, Ordering::SeqCst);
+        fake.wake(&identity);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut human, mut internal) = (None, None);
+            loop {
+                let event = sink.recv().await.expect("gateway sink remains open");
+                if !matches!(event.kind, GatewayEventKind::Answer) {
+                    continue;
+                }
+                // The internal answer first: every status line quotes the
+                // session's title, which is the human's opening line.
+                if event.content.contains("old news") {
+                    internal = Some(event);
+                } else if event.content.contains("replan every proposal") {
+                    human = Some(event);
+                }
+                if let (Some(human), Some(internal)) = (&human, &internal) {
+                    return (human.clone(), internal.clone());
+                }
+            }
+        })
+        .await
+        .expect("both lines are answered")
+    }
+
+    /// #242 — the production loss, verbatim: s1593 (tenant project, driven from
+    /// the tenant's Telegram) was answering "replan every proposal" when a
+    /// child's completion notification parked behind that turn. The notifier
+    /// re-pointed the session at the tenant's web console the moment the line
+    /// was accepted, so the human's answer went to web only — and, being a
+    /// human's turn, was not mirrored back to IM either. The chat that asked
+    /// never saw it. The parked line takes over when ITS turn opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_parked_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
+        let (human, internal) =
+            answers_around_an_internal_line_mid_turn(TurnRouting::Notification).await;
+        assert_eq!(
+            (human.channel.as_str(), human.chat_id.as_str()),
+            ("telegram@ualice", "chat-1"),
+            "the human's answer goes back to the chat that asked: {human:?}"
+        );
+        assert_eq!(
+            internal.channel, "web",
+            "the notification's own turn answers on the owner's route: {internal:?}"
+        );
+    }
+
+    /// #242, the steer shape — an internal line JOINED into a human's running
+    /// turn is not that turn's question, so it re-addresses nothing: the
+    /// human is still owed the answer, in their chat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_internal_steer_into_a_humans_turn_leaves_its_answer_in_their_chat() {
+        let (human, internal) = answers_around_an_internal_line_mid_turn(TurnRouting::Inject).await;
+        for answer in [&human, &internal] {
+            assert_eq!(
+                (answer.channel.as_str(), answer.chat_id.as_str()),
+                ("telegram@ualice", "chat-1"),
+                "{answer:?}"
+            );
+        }
+    }
+
     /// v0.10.1 (issue #184) — a shared IM thread needs an ADDRESSEE. An answer
     /// to a ccteam-authored turn (a delegation completion notification) from a
     /// session that is NOT the chat's focus reaches nobody who asked: the `[sid
@@ -39522,10 +39777,21 @@ mod tests {
 
     #[test]
     fn notification_batch_origins_do_not_retain_unused_member_ids() {
+        let chat = ChatKey::new("telegram", "c1", "u1");
         let mut origins = TurnOrigins::default();
-        origins.record("human".into(), TurnOrigin::User);
+        origins.record(
+            "human".into(),
+            TurnOrigin::User,
+            TurnDisposition::Started,
+            chat.clone(),
+        );
         for n in 0..13 {
-            origins.record(format!("note-{n}"), TurnOrigin::Internal);
+            origins.record(
+                format!("note-{n}"),
+                TurnOrigin::Internal,
+                TurnDisposition::Queued,
+                chat.clone(),
+            );
         }
         assert_eq!(origins.by_turn.len(), 1);
         assert_eq!(
@@ -39540,10 +39806,106 @@ mod tests {
         );
         assert_eq!(origins.take(Some("note-0")), TurnOrigin::Internal);
         assert_eq!(origins.take(Some("human")), TurnOrigin::User);
-        origins.record("steer".into(), TurnOrigin::User);
-        origins.record("steer".into(), TurnOrigin::Internal);
-        assert_eq!(origins.take(Some("steer")), TurnOrigin::Internal);
+        // An internal line that joins a human's running turn is not that
+        // turn's question: the human's claim on its answer stands (#242).
+        origins.record(
+            "steer".into(),
+            TurnOrigin::User,
+            TurnDisposition::Started,
+            chat.clone(),
+        );
+        origins.record(
+            "steer".into(),
+            TurnOrigin::Internal,
+            TurnDisposition::Injected,
+            chat,
+        );
+        assert_eq!(origins.take(Some("steer")), TurnOrigin::User);
         assert!(origins.by_turn.is_empty());
+    }
+
+    /// #242 — a line parked behind a running turn re-addresses the session
+    /// when ITS turn opens, never when it is accepted; a batch opens under its
+    /// first member and the rest leave with the next turn that opens.
+    #[test]
+    fn a_parked_internal_line_takes_the_route_only_when_its_turn_opens() {
+        let im = ChatKey::new("telegram", "c1", "u1");
+        let web = ChatKey::new("web", "tenant", "tenant");
+        let mut origins = TurnOrigins::default();
+        assert_eq!(
+            origins.record(
+                "human".into(),
+                TurnOrigin::User,
+                TurnDisposition::Started,
+                im.clone()
+            ),
+            Some(im.clone()),
+            "a human's line addresses the session at once"
+        );
+        for id in ["note-a", "note-b"] {
+            assert_eq!(
+                origins.record(
+                    id.into(),
+                    TurnOrigin::Internal,
+                    TurnDisposition::Queued,
+                    web.clone()
+                ),
+                None,
+                "a parked line leaves the running turn's route alone"
+            );
+        }
+        assert_eq!(
+            origins.latest,
+            TurnOrigin::User,
+            "the human's turn is still the one being answered"
+        );
+        assert_eq!(
+            origins.open("human"),
+            None,
+            "a submitted turn opening changes nothing"
+        );
+        assert_eq!(origins.open("note-a"), Some(web.clone()));
+        assert_eq!(origins.latest, TurnOrigin::Internal);
+        assert_eq!(origins.parked.len(), 1, "the batch tail waits");
+        origins.record(
+            "task".into(),
+            TurnOrigin::Internal,
+            TurnDisposition::Queued,
+            web.clone(),
+        );
+        assert_eq!(origins.open("task"), Some(web.clone()));
+        assert!(
+            origins.parked.is_empty(),
+            "a turn opening drops every line parked before it"
+        );
+        assert_eq!(
+            origins.record(
+                "joined".into(),
+                TurnOrigin::Internal,
+                TurnDisposition::Injected,
+                web.clone()
+            ),
+            None
+        );
+        assert_eq!(
+            origins.record(
+                "fresh".into(),
+                TurnOrigin::Internal,
+                TurnDisposition::Started,
+                web.clone()
+            ),
+            Some(web.clone()),
+            "an internal line that starts a turn addresses it"
+        );
+        for n in 0..(PARKED_ROUTES_MAX + 10) {
+            origins.record(
+                format!("tail-{n}"),
+                TurnOrigin::Internal,
+                TurnDisposition::Queued,
+                web.clone(),
+            );
+        }
+        assert_eq!(origins.parked.len(), PARKED_ROUTES_MAX);
     }
 
     #[tokio::test]
