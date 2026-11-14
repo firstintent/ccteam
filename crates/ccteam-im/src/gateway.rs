@@ -111,6 +111,73 @@ const ACCOUNT_USAGE_DEADLINE: Duration = Duration::from_secs(1);
 /// How long a `/status` usage prefetch stays valid for the render that follows.
 const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
 
+/// How long one live process's account-usage answer stands in for asking that
+/// process again (#244).
+///
+/// Asking is not free upstream: claude answers `get_usage` from a snapshot it
+/// shares across its processes for only 60 s, and past that it reads
+/// `/api/oauth/usage` with the account's token. That endpoint allows each
+/// token roughly 30 reads an hour, and every claude process on the account,
+/// cswap's poller and ccteam all spend from the same allowance. Once it is
+/// spent the endpoint answers 429 for everyone, and cswap's view of the
+/// default login freezes (`cswap list` / `cswap auto` showing a reading half
+/// an hour old). The windows this feeds move on a 5-hour and weekly clock, so a
+/// five-minute-old answer is as good as a new one for a status card, and
+/// reusing it keeps ccteam's share at no more than 12 reads an hour per
+/// process however often `/status` is asked.
+const ACCOUNT_USAGE_REUSE: Duration = Duration::from_secs(300);
+
+/// Recent account-usage answers, one per live process (#244).
+///
+/// Keyed by the process, not by vendor: with cswap accounts the live sessions
+/// of one vendor can be on different accounts, and a `/status` card reports
+/// its focus's account, so only the same process's own answer may stand in
+/// for asking it. A resumed or rebuilt session is a new process (a new
+/// `started_at`) and is asked afresh, which also covers an account switch.
+#[derive(Default)]
+pub struct AccountUsageAnswers {
+    by_process: std::sync::Mutex<HashMap<UsageProcessKey, (Instant, VendorAccountUsage)>>,
+}
+
+/// One live process: its vendor, the thread identity and when it started.
+type UsageProcessKey = (AgentVendor, String, chrono::DateTime<chrono::Utc>);
+
+fn usage_process_key(thread: &ThreadHandle) -> UsageProcessKey {
+    (thread.vendor, thread.identity.clone(), thread.started_at)
+}
+
+impl AccountUsageAnswers {
+    /// The process's own answer, while it is younger than [`ACCOUNT_USAGE_REUSE`].
+    fn recent(&self, thread: &ThreadHandle) -> Option<VendorAccountUsage> {
+        let map = self.by_process.lock().ok()?;
+        let (at, entry) = map.get(&usage_process_key(thread))?;
+        (at.elapsed() < ACCOUNT_USAGE_REUSE).then(|| entry.clone())
+    }
+
+    fn remember(&self, thread: &ThreadHandle, entry: &VendorAccountUsage) {
+        if let Ok(mut map) = self.by_process.lock() {
+            map.retain(|_, (at, _)| at.elapsed() < ACCOUNT_USAGE_REUSE);
+            map.insert(usage_process_key(thread), (Instant::now(), entry.clone()));
+        }
+    }
+
+    /// The process is going away; its answer can no longer be reused.
+    fn forget(&self, thread: &ThreadHandle) {
+        if let Ok(mut map) = self.by_process.lock() {
+            map.remove(&usage_process_key(thread));
+        }
+    }
+
+    #[cfg(test)]
+    fn backdate(&self, by: Duration) {
+        if let Ok(mut map) = self.by_process.lock() {
+            for (at, _) in map.values_mut() {
+                *at = at.checked_sub(by).unwrap_or(*at);
+            }
+        }
+    }
+}
+
 /// The live sessions to ask for each vendor's account windows, captured
 /// under the gateway lock (cheap handle clones) so that the asking itself
 /// never holds it. #234: `/status` awaited every live session in turn under
@@ -118,6 +185,7 @@ const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
 /// whole daemon for up to a minute and stalled web, IM and MCP with it.
 pub struct AccountUsageProbes {
     root: Option<PathBuf>,
+    answers: Arc<AccountUsageAnswers>,
     by_vendor: Vec<(AgentVendor, Vec<UsageAsker>)>,
 }
 
@@ -125,26 +193,42 @@ pub struct AccountUsageProbes {
 type UsageAsker = (Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle);
 
 impl AccountUsageProbes {
-    /// Ask every captured session at once, all against one deadline. Per
-    /// vendor the first answer in capture order wins (a `/status` card
-    /// captures its own focus first: across a login switch processes can
-    /// disagree on the account), and is recorded; a vendor nobody answered
-    /// for reads its last observation from
+    /// Per vendor, the first answer in capture order (a `/status` card
+    /// captures its own focus first: across a login switch or with cswap
+    /// accounts, processes can be on different accounts), and is recorded; a
+    /// vendor nobody answered for reads its last observation from
     /// [`ccteam_harness::usage_catalog`], which drops each window at the
     /// vendor's declared reset. A vendor with neither is absent — never an
     /// "unknown" row to misread as plenty left. Keyed by vendor token.
+    ///
+    /// Sessions are asked one at a time and the first answer ends the read,
+    /// so one read asks one process (#244). Asking every process at once (as
+    /// #234 did) made each of them read the usage endpoint when claude's
+    /// shared 60 s snapshot was stale, so one `/status` spent one request per
+    /// live session from the token's allowance (see [`ACCOUNT_USAGE_REUSE`]).
+    /// A process that answered within that window is not asked again. All
+    /// asks still share one deadline (#234): a stuck process costs at most
+    /// that, after which the recorded observation answers.
     pub async fn resolve(self) -> BTreeMap<String, VendorAccountUsage> {
         let deadline = tokio::time::Instant::now() + ACCOUNT_USAGE_DEADLINE;
         let root = self.root;
+        let answers = self.answers;
         let per_vendor = self.by_vendor.into_iter().map(|(vendor, askers)| {
             let root = root.clone();
+            let answers = Arc::clone(&answers);
             async move {
-                let answers = futures::future::join_all(askers.iter().map(|(adapter, thread)| {
-                    tokio::time::timeout_at(deadline, adapter.account_usage(thread))
-                }))
-                .await;
-                let entry = match answers.into_iter().find_map(|answer| answer.ok().flatten()) {
-                    Some(usage) => {
+                let mut entry = None;
+                for (adapter, thread) in &askers {
+                    if let Some(recent) = answers.recent(thread) {
+                        entry = Some(recent);
+                        break;
+                    }
+                    let Ok(answer) =
+                        tokio::time::timeout_at(deadline, adapter.account_usage(thread)).await
+                    else {
+                        break;
+                    };
+                    if let Some(usage) = answer {
                         if let Some(root) = root.as_deref() {
                             ccteam_harness::usage_catalog::record_vendor_usage_best_effort(
                                 root,
@@ -153,20 +237,25 @@ impl AccountUsageProbes {
                                 &usage,
                             );
                         }
-                        Some(VendorAccountUsage {
+                        let fresh = VendorAccountUsage {
                             observed_at: chrono::Utc::now().to_rfc3339(),
                             source: "status card".to_string(),
                             usage,
-                        })
+                        };
+                        answers.remember(thread, &fresh);
+                        entry = Some(fresh);
+                        break;
                     }
-                    None => root.as_deref().and_then(|root| {
+                }
+                let entry = entry.or_else(|| {
+                    root.as_deref().and_then(|root| {
                         ccteam_harness::usage_catalog::last_known_entry_in(
                             root,
                             vendor_str(vendor),
                             chrono::Utc::now(),
                         )
-                    }),
-                };
+                    })
+                });
                 entry.map(|entry| (vendor_str(vendor).to_string(), entry))
             }
         });
@@ -1225,6 +1314,9 @@ pub struct Gateway {
     /// Optional cswap discovery (#236 IM `/account`), shared with the web
     /// picker so both read one cache.
     cswap_accounts: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
+    /// Recent account-usage answers per live process, reused by every usage
+    /// read and by the release capture (#244).
+    account_usage_answers: Arc<AccountUsageAnswers>,
     /// Test seam: the identity of Claude's default login, instead of reading
     /// the real `~/.claude.json`.
     claude_default_login_override: Option<Option<String>>,
@@ -3949,6 +4041,7 @@ impl Gateway {
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             cswap_accounts: Default::default(),
+            account_usage_answers: Default::default(),
             claude_default_login_override: None,
             login_moved_releases: HashMap::new(),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
@@ -13920,7 +14013,11 @@ impl Gateway {
     /// DAEMON's own vendor accounts (every session of that vendor spends from
     /// them), not any one caller's data.
     pub fn account_usage_probes(&self, vendor: Option<AgentVendor>) -> AccountUsageProbes {
-        let live: Vec<&GatewaySession> = self.sessions.values().collect();
+        let mut live: Vec<&GatewaySession> = self.sessions.values().collect();
+        // No caller order to honor here (map order is arbitrary anyway), so a
+        // process with a recent answer goes first and the read reuses it
+        // instead of asking another process (#244).
+        live.sort_by_key(|s| self.account_usage_answers.recent(&s.thread).is_none());
         self.account_usage_probes_from(vendor, &live)
     }
 
@@ -13933,6 +14030,7 @@ impl Gateway {
     ) -> AccountUsageProbes {
         AccountUsageProbes {
             root: self.state_root.clone(),
+            answers: Arc::clone(&self.account_usage_answers),
             by_vendor: AgentVendor::ALL
                 .iter()
                 .copied()
@@ -15676,17 +15774,25 @@ impl Gateway {
         // at all. Off the registry lock, like the close below, and on a short
         // deadline: this is a nicety, and a child too wedged to answer must
         // still be released promptly (the timeout simply means no capture).
-        if let Ok(Some(usage)) = tokio::time::timeout(
-            Self::RELEASE_USAGE_CAPTURE_TIMEOUT,
-            adapter.account_usage(&thread),
-        )
-        .await
-        {
-            gateway
-                .lock()
-                .await
-                .record_account_usage(adapter.vendor(), "session release", &usage);
+        // A process that answered a usage read moments ago is not asked again
+        // (#244): that answer is already recorded, and asking would spend a
+        // read from the account's usage allowance for nothing.
+        let answers = Arc::clone(&gateway.lock().await.account_usage_answers);
+        if answers.recent(&thread).is_none() {
+            if let Ok(Some(usage)) = tokio::time::timeout(
+                Self::RELEASE_USAGE_CAPTURE_TIMEOUT,
+                adapter.account_usage(&thread),
+            )
+            .await
+            {
+                gateway.lock().await.record_account_usage(
+                    adapter.vendor(),
+                    "session release",
+                    &usage,
+                );
+            }
         }
+        answers.forget(&thread);
         // Graceful vendor close is the slow half and never occupies the
         // registry lock. The entry is already fenced out, so new work cannot
         // race onto the retiring handle.
@@ -16131,6 +16237,12 @@ impl Gateway {
     #[cfg(test)]
     pub(crate) fn set_replay_grace_for_tests(&mut self, grace: std::time::Duration) {
         self.replay_grace = grace;
+    }
+
+    /// Test seam: age every remembered account-usage answer by `by` (#244).
+    #[cfg(test)]
+    pub(crate) fn backdate_account_usage_answers_for_tests(&self, by: std::time::Duration) {
+        self.account_usage_answers.backdate(by);
     }
 
     /// Test seam: pretend `sid` has been resident and silent for `by`, so an
@@ -23180,10 +23292,11 @@ mod tests {
     /// #234 — `/status` asked every live session for account usage one after
     /// another while holding the daemon-wide gateway lock (3 s each), so a
     /// slow vendor answer held web, IM and MCP for up to a minute. The asks
-    /// now share one deadline and run concurrently, and the shared IM entry
-    /// runs them with the lock dropped.
+    /// now share one deadline, and the shared IM entry runs them with the
+    /// lock dropped. (#244 asks them in turn again — one process per read —
+    /// which the shared deadline keeps bounded.)
     #[tokio::test]
-    async fn status_usage_asks_run_concurrently_and_outside_the_gateway_lock() {
+    async fn status_usage_asks_share_one_deadline_and_run_outside_the_gateway_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let alpha = tmp.path().join("alpha");
         std::fs::create_dir_all(&alpha).unwrap();
@@ -23198,8 +23311,9 @@ mod tests {
         fake.set_account_usage_delay(std::time::Duration::from_millis(600));
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
 
-        // Concurrent: the #234 shape — no session has an answer, so every one
-        // is asked. Three 600 ms asks finish together, not in 1.8 s.
+        // Bounded: the #234 shape — no session has an answer, so they are
+        // asked in turn, and the shared deadline ends the read instead of
+        // three 600 ms asks adding up to 1.8 s.
         let started = std::time::Instant::now();
         gateway
             .lock()
@@ -23209,7 +23323,7 @@ mod tests {
             .unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_millis(1400),
-            "asks ran one after another: {:?}",
+            "the asks outlived the shared deadline: {:?}",
             started.elapsed()
         );
         fake.set_account_usage(Some(AccountUsage {
@@ -23246,7 +23360,12 @@ mod tests {
         let replies = status.await.unwrap().unwrap();
         assert!(replies[0].contains("5h 7%"), "{replies:?}");
 
-        // Bounded: a stuck vendor costs one deadline, not 3 × its delay.
+        // Bounded: a stuck vendor costs one deadline, not 3 × its delay. (The
+        // answer above is reused for a while, so age it out first, #244.)
+        gateway
+            .lock()
+            .await
+            .backdate_account_usage_answers_for_tests(ACCOUNT_USAGE_REUSE);
         fake.set_account_usage_delay(std::time::Duration::from_secs(5));
         let started = std::time::Instant::now();
         gateway
@@ -23260,6 +23379,139 @@ mod tests {
             "a stuck vendor was waited out: {:?}",
             started.elapsed()
         );
+    }
+
+    /// #244 — a usage read asks one live process, not all of them: claude
+    /// answers past its 60 s shared snapshot by reading the usage endpoint, so
+    /// asking every process at once spent one request per live session from
+    /// the token's allowance (~30 an hour, shared with every claude process
+    /// and cswap) and left cswap's view of the account frozen on 429s. A
+    /// process that answered recently is not asked again.
+    #[tokio::test]
+    async fn a_usage_read_asks_one_session_and_reuses_its_recent_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..3 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(7),
+            ..Default::default()
+        }))
+        .await;
+        let focus = gateway.sessions["s3"].thread.identity.clone();
+
+        // One read: the focus answers, nobody else is asked.
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(card.contains("5h 7%"), "{card}");
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone()]);
+
+        // Every surface reads through the same probes: MCP / web / a second
+        // card within the reuse window ask no one.
+        let usage = gateway.account_usage_probes(None).resolve().await;
+        assert_eq!(usage["claude"].usage.five_hour_pct, Some(7));
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone()]);
+
+        // Past the window the focus is asked again — once.
+        gateway.backdate_account_usage_answers_for_tests(ACCOUNT_USAGE_REUSE);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone(), focus]);
+    }
+
+    /// #244 — a process that has no answer is passed over for the next one, in
+    /// capture order, so one read still finds the account's windows when the
+    /// focus cannot say (a vendor without a usage channel, or a stuck one).
+    #[tokio::test]
+    async fn a_usage_read_moves_on_when_a_session_has_no_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        // Only s1 can answer; s2 (the focus) has nothing to say.
+        let s1 = gateway.sessions["s1"].thread.identity.clone();
+        let s2 = gateway.sessions["s2"].thread.identity.clone();
+        fake.set_thread_account_usage(
+            &s1,
+            AccountUsage {
+                weekly_pct: Some(40),
+                ..Default::default()
+            },
+        );
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(card.contains("周 40%"), "{card}");
+        assert_eq!(fake.account_usage_asks(), vec![s2, s1]);
+    }
+
+    /// #244 — releasing a session that answered a usage read moments ago does
+    /// not ask it again: that answer is already recorded. One that has not
+    /// answered recently is still asked, so the account's windows outlive it.
+    #[tokio::test]
+    async fn a_release_reuses_a_recent_usage_answer_instead_of_asking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(9),
+            ..Default::default()
+        }))
+        .await;
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        let s1 = gateway.sessions["s1"].thread.identity.clone();
+        let s2 = gateway.sessions["s2"].thread.identity.clone();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![s2.clone()]);
+
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        gateway.backdate_residency_for_tests("s2", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut released = Gateway::idle_release_tick(&gateway).await;
+        released.sort();
+        assert_eq!(released, vec!["s1", "s2"]);
+        // s2 answered moments ago: not asked again. s1 never answered: asked.
+        assert_eq!(fake.account_usage_asks(), vec![s2, s1]);
     }
 
     /// `/status` on a focus that points at a released session must render the
@@ -27430,6 +27682,8 @@ mod tests {
         /// How long each `account_usage` ask takes — a slow or stuck vendor
         /// (#234). Zero = immediate.
         account_usage_delay: Arc<std::sync::Mutex<std::time::Duration>>,
+        /// Every `account_usage` ask, by thread identity, in order (#244).
+        account_usage_asks: Arc<std::sync::Mutex<Vec<String>>>,
         /// Monotone submission counter, so every accepted message gets its OWN
         /// execution-turn id. One id per THREAD was enough while nothing
         /// correlated a completion with the message that asked for it; a
@@ -27529,6 +27783,7 @@ mod tests {
                 account_usage: Arc::new(Mutex::new(None)),
                 account_usage_by_thread: Arc::default(),
                 account_usage_delay: Arc::default(),
+                account_usage_asks: Arc::default(),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27777,6 +28032,11 @@ mod tests {
         /// Set the account usage this fake reports from `account_usage`.
         async fn set_account_usage(&self, usage: Option<AccountUsage>) {
             *self.account_usage.lock().await = usage;
+        }
+
+        /// Thread identities asked for account usage so far, in order (#244).
+        fn account_usage_asks(&self) -> Vec<String> {
+            self.account_usage_asks.lock().unwrap().clone()
         }
 
         fn set_account_usage_delay(&self, delay: std::time::Duration) {
@@ -28098,6 +28358,10 @@ mod tests {
         }
 
         async fn account_usage(&self, h: &ThreadHandle) -> Option<AccountUsage> {
+            self.account_usage_asks
+                .lock()
+                .unwrap()
+                .push(h.identity.clone());
             let delay = *self.account_usage_delay.lock().unwrap();
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
