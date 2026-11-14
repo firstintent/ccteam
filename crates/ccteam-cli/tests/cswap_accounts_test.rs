@@ -44,16 +44,17 @@ if sys.argv[1:]==['list','--json']:
     print(json.dumps({'schemaVersion':1,'accounts':[{'number':2,'email':os.environ.get('CSWAP_FAKE_ACCOUNT_EMAIL','two@example.test'),'organizationUuid':'','alias':'work','active':os.environ.get('CSWAP_FAKE_ACTIVE')=='1'}]}))
     sys.exit(0)
 if sys.argv[1:]==['run','--help']:
-    print('--share-history --no-share-history --require-session')
+    print('--share-history --no-share-history')
     sys.exit(0)
 if sys.argv[1:]==['config','list','--json']:
     print(json.dumps({'schemaVersion':1,'settings':[]}))
     sys.exit(0)
 assert sys.argv[1:3]==['run','2']
 assert '--share-history' in sys.argv and '--no-share-history' not in sys.argv
+# cswap refuses `--require-session` for the default login's account, which
+# would leave a pinned sid unresumable while its account is the default (#240).
+assert '--require-session' not in sys.argv
 active=os.environ.get('CSWAP_FAKE_ACTIVE')=='1'
-if active and '--require-session' in sys.argv:
-    sys.exit(4)
 env=dict(os.environ)
 if not active:
     # Shared history links the profile's projects/ to ~/.claude/projects;
@@ -290,13 +291,58 @@ async fn account_launches_preserve_protocol_profiles_and_default_optional_behavi
         .is_err());
     std::env::remove_var("CSWAP_FAKE_ACCOUNT_EMAIL");
 
-    // An already isolated sid cannot move into the default profile on resume.
+    // #240 — the account became the default login (`cswap switch 2`). cswap
+    // keeps one live credential copy per account, so it now runs the account
+    // on the default login; the pinned sid follows it there and resumes the
+    // same conversation instead of becoming unresumable.
     std::env::set_var("CSWAP_FAKE_ACTIVE", "1");
-    assert!(adapter
+    let followed_login = adapter
+        .start_thread(&spec, &ctx(root, "s2", Some(binding.clone())))
+        .await
+        .unwrap();
+    let on_login: ClaudeAccountBinding =
+        serde_json::from_value(followed_login.raw_extras["claude_account"].clone()).unwrap();
+    assert!(on_login.default_login);
+    assert_eq!(on_login.config_dir, Some(home.join(".claude")));
+    assert_eq!(on_login.id, binding.id, "still the same account");
+    assert_eq!(
+        log(root)["profile"],
+        home.join(".claude").to_string_lossy().as_ref()
+    );
+    assert!(
+        resumed_with(root),
+        "the default login resumes the transcript"
+    );
+    assert!(binding.launch_profile_moved(&on_login, Some("another account")));
+    adapter.close_thread(&followed_login).await.unwrap();
+    // The default login is somebody else: the pin must not run as them.
+    std::env::set_var("CSWAP_FAKE_DEFAULT_EMAIL", "auto-switched@example.test");
+    let before = log(root);
+    let wrong_account = adapter
+        .start_thread(&spec, &ctx(root, "s2", Some(binding.clone())))
+        .await
+        .expect_err("a pinned sid never runs under another account");
+    assert!(
+        wrong_account.to_string().contains("identity changed"),
+        "{wrong_account}"
+    );
+    assert_eq!(log(root), before, "no Claude process may start");
+    std::env::remove_var("CSWAP_FAKE_DEFAULT_EMAIL");
+    // And back: once another account is the default login, the pinned sid
+    // returns to its own session profile.
+    std::env::remove_var("CSWAP_FAKE_ACTIVE");
+    let returned = adapter
         .start_thread(&spec, &ctx(root, "s2", Some(binding)))
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(
+        log(root)["profile"],
+        home.join("cswap-profiles/two").to_string_lossy().as_ref()
+    );
+    assert!(resumed_with(root));
+    adapter.close_thread(&returned).await.unwrap();
     assert!(transcript.exists());
+    std::env::set_var("CSWAP_FAKE_ACTIVE", "1");
 
     // A NEW selection may fall back to the active/default login (owner choice).
     let fallback = adapter

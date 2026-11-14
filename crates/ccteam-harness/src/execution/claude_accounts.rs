@@ -41,8 +41,20 @@ pub struct CswapAccount {
     pub usage_status: Option<String>,
 }
 
-/// Private session metadata. `config_dir` is the literal path exported by
-/// cswap (its spelling also selects the macOS Keychain service).
+/// Private session metadata. `id` is the account the session is bound to;
+/// `config_dir` / `default_login` record the Claude profile a launch ran in.
+///
+/// The profile is cswap's decision at every launch, not part of the binding
+/// (docs-local issue #240): cswap keeps ONE live credential copy per account,
+/// so an account runs in its own session profile while another account is
+/// the default login and on the default login itself once it becomes the
+/// default. A session therefore follows its account across the two; history
+/// is shared, so the transcript is readable from both.
+///
+/// `config_dir` is the literal path exported by cswap (its spelling also
+/// selects the macOS Keychain service). Persisted `default_login` means the
+/// session was created on the default login (the account picked was the
+/// default one) and follows it from then on, account switches included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeAccountBinding {
     pub id: String,
@@ -52,8 +64,6 @@ pub struct ClaudeAccountBinding {
     pub label: String,
     #[serde(default)]
     pub config_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub directory_identity: Option<String>,
     #[serde(default)]
     pub default_login: bool,
 }
@@ -68,9 +78,34 @@ impl ClaudeAccountBinding {
             slot: String::new(),
             label: String::new(),
             config_dir: None,
-            directory_identity: None,
             default_login: false,
         })
+    }
+
+    /// Whether a process launched as `launched` (what the relay confirmed) is
+    /// no longer in the profile cswap picks for this binding now that the
+    /// default login is `default_login_id` (docs-local issue #240).
+    ///
+    /// Two shapes, both for a session pinned to an account (`self` is the
+    /// persisted binding):
+    /// - the process runs in the account's session profile and the account
+    ///   has become the default login: two live copies of one credential,
+    ///   which is what makes `cswap switch` warn and one copy's token go
+    ///   stale once the server rotates it;
+    /// - the process runs on the default login and that login now belongs to
+    ///   another account: it is spending the wrong account's quota.
+    ///
+    /// Releasing the process fixes either: the next launch asks cswap again.
+    /// An unknown default login (`None`) is never evidence of a move.
+    pub fn launch_profile_moved(
+        &self,
+        launched: &ClaudeAccountBinding,
+        default_login_id: Option<&str>,
+    ) -> bool {
+        if self.default_login || launched.config_dir.is_none() {
+            return false;
+        }
+        default_login_id.is_some_and(|id| launched.default_login != (id == self.id))
     }
 
     pub fn display(&self) -> CswapAccount {
@@ -129,6 +164,36 @@ pub fn display_name(account: &CswapAccount) -> String {
 pub fn account_id(email: &str, organization: &str) -> String {
     let identity = serde_json::to_vec(&(email, organization)).expect("string pair serializes");
     format!("{:x}", Sha256::digest(identity))
+}
+
+/// The [`account_id`] of Claude's default login, or `None` when nobody is
+/// logged in there or its record cannot be read.
+///
+/// Read from the default profile's own `oauthAccount` record, the file cswap
+/// compares against when it decides between a session profile and the
+/// default login. No credential is read, and no cswap call is made: `cswap
+/// list` may fetch quota over the network, which a residency pass must not.
+pub fn default_login_account_id() -> Option<String> {
+    default_login_account_id_in(&dirs::home_dir()?)
+}
+
+/// [`default_login_account_id`] against an explicit home directory.
+pub fn default_login_account_id_in(home: &Path) -> Option<String> {
+    // Claude Code's own choice of global config: the legacy
+    // `~/.claude/.config.json` when it holds anything, else `~/.claude.json`.
+    // `CLAUDE_CONFIG_DIR` is deliberately ignored: it names a session profile.
+    let legacy = home.join(".claude").join(".config.json");
+    let path = match std::fs::metadata(&legacy) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => legacy,
+        _ => home.join(".claude.json"),
+    };
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let account = config.get("oauthAccount")?;
+    let email = account["emailAddress"].as_str().filter(|e| !e.is_empty())?;
+    Some(account_id(
+        email,
+        account["organizationUuid"].as_str().unwrap_or(""),
+    ))
 }
 
 pub fn parse_accounts(bytes: &[u8]) -> Result<Vec<CswapAccount>> {
@@ -212,8 +277,8 @@ pub fn cswap_bin() -> OsString {
 pub async fn discover_accounts() -> Result<Vec<CswapAccount>> {
     let help = cswap_output(&["run", "--help"], Duration::from_secs(5)).await?;
     let help = String::from_utf8_lossy(&help);
-    if !help.contains("--share-history") || !help.contains("--require-session") {
-        bail!("this cswap version lacks shared-history or session options; upgrade cswap or use default login");
+    if !help.contains("--share-history") {
+        bail!("this cswap version lacks shared history; upgrade cswap or use default login");
     }
     // Newer cswap versions optionally infer setup-token quota using a tiny
     // model request. Discovery must not create inference outside a session.
@@ -438,16 +503,19 @@ impl CswapLaunch {
             // switch accounts by sid (#236). Credentials stay per profile.
             // Explicit, so a user-wide `run.shareHistory false` cannot strand
             // a switched session's history in one account.
+            //
+            // No `--require-session`: when the account is the default login
+            // cswap runs it there instead of in its session profile, so the
+            // account never has two live credential copies. Insisting on the
+            // session profile made the sid unresumable for as long as its
+            // account stayed the default (docs-local issue #240).
             launch.argv = vec![
                 cswap_bin().to_string_lossy().into_owned(),
                 "run".into(),
                 binding.slot,
                 "--share-history".into(),
+                "--".into(),
             ];
-            if binding.config_dir.is_some() {
-                launch.argv.push("--require-session".into());
-            }
-            launch.argv.push("--".into());
         }
         launch.argv.extend_from_slice(&argv[1..]);
         Ok(launch)
@@ -543,30 +611,11 @@ fn relay(directory: &Path, args: &[OsString]) -> Result<()> {
     let default_login = std::env::var_os("CLAUDE_CONFIG_DIR").is_none();
     verify_subscription_settings(&config_dir, &request.cwd)?;
     let mut binding = request.binding;
-    #[cfg(unix)]
-    let directory_identity = {
-        use std::os::unix::fs::MetadataExt;
-        let metadata =
-            std::fs::metadata(&config_dir).context("selected Claude profile is unavailable")?;
-        format!("{}:{}", metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    let directory_identity = config_dir.canonicalize()?.to_string_lossy().into_owned();
-    if binding
-        .config_dir
-        .as_ref()
-        .is_some_and(|expected| expected != &config_dir)
-        || (binding.config_dir.is_some() && binding.default_login != default_login)
-    {
-        bail!("cswap profile changed; this session cannot resume in another profile");
-    }
-    if binding
-        .directory_identity
-        .as_ref()
-        .is_some_and(|expected| expected != &directory_identity)
-    {
-        bail!("cswap profile directory was replaced; refusing to resume in another profile");
-    }
+    // Which profile cswap chose is not checked against the previous launch:
+    // an account moves between its session profile and the default login as
+    // the default login changes (docs-local issue #240). What a launch must
+    // never do is run another account or start the conversation over, and
+    // both are checked below against the profile actually in use.
     // A selected subscription must not be hijacked by ambient API credentials,
     // including cswap's default-account fast path which retains the full env.
     for key in [
@@ -621,7 +670,6 @@ fn relay(directory: &Path, args: &[OsString]) -> Result<()> {
         }
     }
     binding.config_dir = Some(config_dir.clone());
-    binding.directory_identity = Some(directory_identity);
     binding.default_login = default_login;
     let transcript = anthropic_project_dir_in(&config_dir.join("projects"), &request.cwd)
         .join(format!("{}.jsonl", request.uuid));
@@ -816,7 +864,6 @@ mod tests {
             slot: String::new(),
             label: String::new(),
             config_dir: None,
-            directory_identity: None,
             default_login: true,
         };
         let argv = vec!["claude".to_string(), "--verbose".to_string()];
@@ -837,6 +884,71 @@ mod tests {
             "{script}"
         );
         assert_eq!(&launch.argv[1..], &argv[1..]);
+    }
+
+    /// #240: the default login's identity is read the way cswap reads it, so
+    /// "is this account the default login" is the same answer on both sides.
+    #[test]
+    fn default_login_identity_comes_from_the_default_profile_record() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        assert_eq!(default_login_account_id_in(home), None, "nobody logged in");
+        let record = |email: &str, org: &str| {
+            format!(r#"{{"oauthAccount":{{"emailAddress":"{email}","organizationUuid":"{org}"}}}}"#)
+        };
+        std::fs::write(home.join(".claude.json"), record("one@x", "org")).unwrap();
+        assert_eq!(
+            default_login_account_id_in(home),
+            Some(account_id("one@x", "org"))
+        );
+        // Logged out (`/logout` drops the record) or unreadable: unknown.
+        std::fs::write(home.join(".claude.json"), r#"{"numStartups":3}"#).unwrap();
+        assert_eq!(default_login_account_id_in(home), None);
+        std::fs::write(home.join(".claude.json"), "not json").unwrap();
+        assert_eq!(default_login_account_id_in(home), None);
+        // Claude Code prefers a non-empty legacy `.config.json`; an empty one
+        // is not a login record.
+        std::fs::write(home.join(".claude.json"), record("one@x", "org")).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/.config.json"), "").unwrap();
+        assert_eq!(
+            default_login_account_id_in(home),
+            Some(account_id("one@x", "org"))
+        );
+        std::fs::write(home.join(".claude/.config.json"), record("two@x", "")).unwrap();
+        assert_eq!(
+            default_login_account_id_in(home),
+            Some(account_id("two@x", ""))
+        );
+    }
+
+    /// #240: a pinned session's process is in the wrong profile exactly when
+    /// the default login has moved onto or off its account since it launched.
+    #[test]
+    fn a_pinned_process_is_stale_when_the_default_login_moves_across_its_account() {
+        let (mine, other) = (account_id("one@x", ""), account_id("two@x", ""));
+        let pinned = ClaudeAccountBinding::requested(mine.clone()).unwrap();
+        let launched = |default_login: bool| ClaudeAccountBinding {
+            config_dir: Some(PathBuf::from("/profile")),
+            default_login,
+            ..pinned.clone()
+        };
+        let in_session_profile = launched(false);
+        let on_default_login = launched(true);
+        // In its session profile: stale once its account is the default login.
+        assert!(pinned.launch_profile_moved(&in_session_profile, Some(&mine)));
+        assert!(!pinned.launch_profile_moved(&in_session_profile, Some(&other)));
+        // On the default login: stale once that login is another account.
+        assert!(pinned.launch_profile_moved(&on_default_login, Some(&other)));
+        assert!(!pinned.launch_profile_moved(&on_default_login, Some(&mine)));
+        // An unreadable default login is not evidence of a move.
+        assert!(!pinned.launch_profile_moved(&in_session_profile, None));
+        assert!(!pinned.launch_profile_moved(&on_default_login, None));
+        // A launch nothing confirmed yet has no profile to be wrong about.
+        assert!(!pinned.launch_profile_moved(&pinned, Some(&mine)));
+        // A session created on the default login follows it, whoever it is.
+        let follower = launched(true);
+        assert!(!follower.launch_profile_moved(&on_default_login, Some(&other)));
     }
 
     #[test]

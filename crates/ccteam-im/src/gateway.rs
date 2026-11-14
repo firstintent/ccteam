@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::CcteamConfig;
 use ccteam_core::projects::{create_project, validate_slug_format, NewProject};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
+use ccteam_harness::execution::claude_accounts::ClaudeAccountBinding;
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::usage_catalog::VendorAccountUsage;
 use ccteam_harness::{
@@ -833,6 +834,11 @@ enum ReleaseReason {
     /// The user moved the session to another Claude account (#236); the next
     /// message resumes the same sid under it.
     AccountSwitch,
+    /// Claude's default login moved onto or off the account this session is
+    /// pinned to (docs-local issue #240), so its process sits in a profile
+    /// cswap no longer picks for that account; the next message resumes the
+    /// same sid in the one it does.
+    LoginMoved,
 }
 
 impl ReleaseReason {
@@ -841,6 +847,7 @@ impl ReleaseReason {
             ReleaseReason::Capacity => "capacity",
             ReleaseReason::Idle => "idle",
             ReleaseReason::AccountSwitch => "account_switch",
+            ReleaseReason::LoginMoved => "login_moved",
         }
     }
 }
@@ -864,6 +871,19 @@ struct ResidencySnapshot {
     last_active: String,
     /// Time since the later of "installed in the live map" and "last event".
     idle_for: std::time::Duration,
+    /// A session pinned to a cswap account: its persisted binding and the
+    /// profile this process launched in (see [`ResidencySnapshot::login_moved`]).
+    pinned_account: Option<(ClaudeAccountBinding, ClaudeAccountBinding)>,
+}
+
+impl ResidencySnapshot {
+    /// Whether this process is no longer in the profile cswap picks for its
+    /// account now that the default login is `default_login`.
+    fn login_moved(&self, default_login: Option<&str>) -> bool {
+        self.pinned_account
+            .as_ref()
+            .is_some_and(|(pinned, launched)| pinned.launch_profile_moved(launched, default_login))
+    }
 }
 
 /// The sids whose vendor reports a turn-OUTLIVING task still running
@@ -1145,6 +1165,15 @@ pub struct Gateway {
     /// Optional cswap discovery (#236 IM `/account`), shared with the web
     /// picker so both read one cache.
     cswap_accounts: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
+    /// Test seam: the identity of Claude's default login, instead of reading
+    /// the real `~/.claude.json`.
+    claude_default_login_override: Option<Option<String>>,
+    /// sid → the default login a [`ReleaseReason::LoginMoved`] release was
+    /// made under. One release per default login: if cswap puts the session
+    /// back in the same profile, that is cswap's decision (it does so when the
+    /// default login holds no usable token) and releasing again would only
+    /// cost a cold resume per message.
+    login_moved_releases: HashMap<String, String>,
     /// The `(sid, secret)` authority behind every managed session's tool face
     /// — see [`crate::principals`]. Separate from `sessions` because a
     /// principal has to work BEFORE its session is live (the vendor uses it
@@ -3860,6 +3889,8 @@ impl Gateway {
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             cswap_accounts: Default::default(),
+            claude_default_login_override: None,
+            login_moved_releases: HashMap::new(),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
@@ -15469,9 +15500,37 @@ impl Gateway {
                     waiting_approval: pending.pending_for_sid(&session.id).is_some(),
                     last_active: self.session_last_active(session),
                     idle_for: now.saturating_duration_since(floor),
+                    pinned_account: self.pinned_account_launch(session),
                 }
             })
             .collect()
+    }
+
+    /// The persisted account binding of a session pinned to a cswap account,
+    /// with the profile its live process was launched in. `None` for a
+    /// default-login session (nothing to follow) and for a process whose
+    /// launch reported no profile.
+    fn pinned_account_launch(
+        &self,
+        session: &GatewaySession,
+    ) -> Option<(ClaudeAccountBinding, ClaudeAccountBinding)> {
+        let pinned = self
+            .session_catalog
+            .get(&session.id)
+            .and_then(|entry| entry.meta.claude_account)
+            .filter(|binding| !binding.default_login)?;
+        let launched = session
+            .thread
+            .raw_extras
+            .get("claude_account")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())?;
+        Some((pinned, launched))
+    }
+
+    /// Answer "which account is Claude's default login" with `id` instead of
+    /// reading the real `~/.claude.json` (deterministic tests).
+    pub fn set_claude_default_login(&mut self, id: Option<String>) {
+        self.claude_default_login_override = Some(id);
     }
 
     /// Fence one sid OUT of the live map without touching chat focus routes.
@@ -15893,28 +15952,78 @@ impl Gateway {
     /// workflow / async agent is real work the session's process is still
     /// carrying — the same `RunningTask::outlives_turn` authority the status
     /// surfaces use), and an idle clock past the harness's TTL.
+    ///
+    /// The same pass lets go of a quiet process whose Claude account moved
+    /// onto or off the default login (docs-local issue #240), whatever its
+    /// idle clock says and even with idle release off: cswap keeps one live
+    /// credential copy per account, so a process left in the profile cswap no
+    /// longer picks either holds a second copy of the default login's
+    /// credential (`cswap switch` warns, and one copy's token goes stale once
+    /// the server rotates it) or spends another account's quota. The session
+    /// is untouched and its next message resumes it in the right profile.
     pub async fn idle_release_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) -> Vec<String> {
-        let (snapshot, config) = {
+        let (snapshot, config, default_login_override) = {
             let guard = gateway.lock().await;
-            (guard.residency_snapshot().await, guard.sessions_config())
+            (
+                guard.residency_snapshot().await,
+                guard.sessions_config(),
+                guard.claude_default_login_override.clone(),
+            )
+        };
+        // One small file read, and only while a pinned session is resident.
+        let default_login = if snapshot.iter().any(|row| row.pinned_account.is_some()) {
+            match default_login_override {
+                Some(id) => id,
+                None => tokio::task::spawn_blocking(
+                    ccteam_harness::execution::claude_accounts::default_login_account_id,
+                )
+                .await
+                .unwrap_or(None),
+            }
+        } else {
+            None
+        };
+        let login_moved: HashSet<&str> = match &default_login {
+            // Nothing pinned is resident, or the default login is unknown.
+            None => HashSet::new(),
+            Some(current) => {
+                let mut guard = gateway.lock().await;
+                // A release remembered under an earlier default login says
+                // nothing about this one.
+                guard
+                    .login_moved_releases
+                    .retain(|_, released_under| released_under == current);
+                snapshot
+                    .iter()
+                    .filter(|row| {
+                        row.login_moved(Some(current))
+                            && !guard.login_moved_releases.contains_key(&row.sid)
+                    })
+                    .map(|row| row.sid.as_str())
+                    .collect()
+            }
         };
         // Candidates first (cheap, in-memory), so the adapter round-trip below
         // is paid only for sessions that are otherwise ready to be released.
-        let ripe: Vec<&ResidencySnapshot> = snapshot
+        let ripe: Vec<(&ResidencySnapshot, ReleaseReason)> = snapshot
             .iter()
-            .filter(|row| {
-                !row.turn_in_flight
-                    && !row.waiting_approval
-                    && config
+            .filter(|row| !row.turn_in_flight && !row.waiting_approval)
+            .filter_map(|row| {
+                if login_moved.contains(row.sid.as_str()) {
+                    Some((row, ReleaseReason::LoginMoved))
+                } else {
+                    config
                         .idle_release_for(&row.vendor)
                         .is_some_and(|ttl| row.idle_for >= ttl)
+                        .then_some((row, ReleaseReason::Idle))
+                }
             })
             .collect();
         if ripe.is_empty() {
             return Vec::new();
         }
         let mut released = Vec::new();
-        for row in ripe {
+        for (row, reason) in ripe {
             // Per session: one release that panics must not skip every
             // session after it on every pass.
             let freed = crate::supervise::contain_panic("idle-release sweeper", &row.sid, async {
@@ -15929,23 +16038,25 @@ impl Gateway {
                 {
                     return false;
                 }
-                match Self::release_session_shared(
-                    gateway,
-                    &row.sid,
-                    row.generation,
-                    ReleaseReason::Idle,
-                )
-                .await
+                match Self::release_session_shared(gateway, &row.sid, row.generation, reason).await
                 {
                     Ok(released) => released,
                     Err(error) => {
-                        tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                        tracing::warn!(sid = %row.sid, %error, reason = reason.as_str(),
+                            "ccteam-im: session release failed");
                         false
                     }
                 }
             })
             .await;
             if freed == Some(true) {
+                if let (ReleaseReason::LoginMoved, Some(current)) = (reason, &default_login) {
+                    gateway
+                        .lock()
+                        .await
+                        .login_moved_releases
+                        .insert(row.sid.clone(), current.clone());
+                }
                 released.push(row.sid.clone());
             }
         }
@@ -25544,6 +25655,135 @@ mod tests {
             .unwrap();
         assert!(again.changed && !again.released);
         assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+    }
+
+    /// #240 — a session pinned to a cswap account follows that account across
+    /// the default login. `cswap switch` onto the account leaves the process
+    /// in the session profile holding a second copy of the now-default
+    /// credential; a switch off it leaves a default-login process spending
+    /// another account's quota. Either way the quiet process is released and
+    /// the same sid resumes, still pinned to its account.
+    #[tokio::test]
+    async fn a_pinned_process_is_released_when_the_default_login_moves_across_its_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        // What the relay confirms for a launch: the profile cswap chose.
+        let launched_on = |gw: &mut Gateway, default_login: bool| {
+            let mut binding = ClaudeAccountBinding::requested(one.id.clone()).unwrap();
+            binding.config_dir = Some(tmp.path().join("profile"));
+            binding.default_login = default_login;
+            gw.sessions.get_mut(&sid).unwrap().thread.raw_extras["claude_account"] =
+                serde_json::to_value(binding).unwrap();
+        };
+        let resume = || async {
+            Gateway::resume_stopped_session_shared(
+                Arc::clone(&gateway),
+                &sid,
+                "user:web-api",
+                None,
+                GatewayDeadline::start(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fake.spawn_accounts.lock().await.last().cloned(),
+                Some(Some(one.id.clone())),
+                "the same sid resumes pinned to the same account"
+            );
+        };
+        {
+            let mut gw = gateway.lock().await;
+            // Not the idle policy: it fires with idle release switched off.
+            gw.set_sessions_config(ccteam_core::SessionsConfig {
+                idle_release_secs: 0,
+                ..Default::default()
+            });
+            launched_on(&mut gw, false);
+            gw.set_claude_default_login(Some(two.id.clone()));
+        }
+        // Another account is the default login: the session profile is right.
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // `cswap switch 1` while a turn runs: the turn is never cut short.
+        {
+            let gw = gateway.lock().await;
+            *gw.sessions[&sid].turn_started_at.lock().unwrap() = Some(Instant::now());
+        }
+        gateway
+            .lock()
+            .await
+            .set_claude_default_login(Some(one.id.clone()));
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        end_turn(&*gateway.lock().await, &sid);
+        let mut events = gateway.lock().await.subscribe_events();
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+        let event = events.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "login_moved"
+        ));
+        assert!(!gateway.lock().await.sessions.contains_key(&sid));
+        assert_eq!(
+            stored_account(&gateway, &sid).await.unwrap().id,
+            one.id,
+            "the pin is untouched"
+        );
+
+        // cswap now runs the account on the default login: nothing to do.
+        resume().await;
+        launched_on(&mut *gateway.lock().await, true);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        // An unreadable default login is not evidence of a move.
+        gateway.lock().await.set_claude_default_login(None);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // The default login moves on to another account: this process would
+        // now run as that account.
+        gateway
+            .lock()
+            .await
+            .set_claude_default_login(Some(two.id.clone()));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+
+        // One release per default login: if cswap launches it in the same
+        // profile again, that is cswap's decision, not a reason to loop.
+        resume().await;
+        launched_on(&mut *gateway.lock().await, true);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+    }
+
+    /// A session created on the default login follows it by design: a default
+    /// login change is not a reason to release it.
+    #[tokio::test]
+    async fn a_default_login_session_is_not_released_when_the_login_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (_fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        {
+            let mut gw = gateway.lock().await;
+            let mut binding = ClaudeAccountBinding::requested(one.id.clone()).unwrap();
+            binding.config_dir = Some(tmp.path().join("default-profile"));
+            binding.default_login = true;
+            gw.sessions.get_mut(&sid).unwrap().thread.raw_extras["claude_account"] =
+                serde_json::to_value(&binding).unwrap();
+            let (_, cwd, mut meta) = gw.find_meta_for_sid(&sid).unwrap();
+            meta.claude_account = Some(binding);
+            gw.persist_session_meta(&cwd, &meta).unwrap();
+            gw.set_claude_default_login(Some(two.id.clone()));
+        }
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
     }
 
     /// The fake vendor never ends a turn; end it as a real one would.
