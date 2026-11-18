@@ -79,8 +79,9 @@ pub struct TurnIdentity {
     /// A flag rather than a count, deliberately. Nothing in the protocol says
     /// how claude batches two queued lines — one replay turn or two — and a
     /// counter that guessed wrong would leave a request bound to a turn that
-    /// never opens. One expected continuation, cleared by the first turn the
-    /// vendor opens by itself, cannot strand anybody.
+    /// never opens. One expected continuation — cleared by the first turn the
+    /// vendor opens by itself, or spent by the `Replay` boundary it held —
+    /// cannot strand anybody.
     replay_pending: bool,
 }
 
@@ -154,9 +155,10 @@ impl TurnIdentity {
         self.active = None;
     }
 
-    /// The stream is gone: nothing will replay anything. Kept separate from
-    /// [`Self::close`], which runs at every ordinary boundary — that is exactly
-    /// where a pending replay still matters.
+    /// Drop the expectation: the stream is gone (nothing will replay anything),
+    /// or the boundary it held has reported `Replay` and spent it. Kept
+    /// separate from [`Self::close`], which runs at every ordinary boundary —
+    /// a `Pending` boundary must keep the expectation alive.
     pub fn forget_replay(&mut self) {
         self.replay_pending = false;
     }
@@ -254,6 +256,13 @@ impl StreamTranslator {
             TurnContinuation::Replay
         } else {
             TurnContinuation::Settled
+        }
+    }
+
+    fn forget_injected_replay(&mut self) {
+        match self.identity.lock() {
+            Ok(mut identity) => identity.forget_replay(),
+            Err(poisoned) => poisoned.into_inner().forget_replay(),
         }
     }
 
@@ -489,6 +498,18 @@ impl StreamTranslator {
         // Read BEFORE the turn is closed: what the vendor still holds decides
         // whether this boundary answers anybody (GitHub #198/#199).
         let continuation = self.continuation();
+        if continuation == TurnContinuation::Replay {
+            // The injected line's expectation is spent on the boundary it held:
+            // a replay, if the CLI runs one, opens as a vendor continuation
+            // and is recognised by that alone. Left set, the flag would hold
+            // every later boundary of this session for the replay grace — the
+            // current CLI reads a mid-turn line once and never re-runs it, so
+            // after one injected completion notification the parent would
+            // never settle again (GitHub #220). A `Pending` boundary keeps it:
+            // the line is answered, if at all, after the background work
+            // wakes the model.
+            self.forget_injected_replay();
+        }
         let turn_id = self.active_turn.take().unwrap_or_default();
         self.close_turn_id();
         let usage = r
@@ -1299,6 +1320,38 @@ mod tests {
         assert_eq!(
             continuation_of(&t.ingest(result_ok("c"))),
             Some(TurnContinuation::Pending)
+        );
+    }
+
+    /// GitHub #220 — the expectation an injected line sets is spent on the one
+    /// boundary it holds. The current CLI never re-runs the line, so the next
+    /// turn is ccteam's own; were the flag still set, that turn (and every
+    /// one after it) would be held for the replay grace too.
+    #[test]
+    fn an_injected_line_holds_one_boundary_not_every_later_one() {
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        t.ingest(assistant(json!([{"type": "text", "text": "working"}])));
+        identity.lock().unwrap().note_injected();
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("working"))),
+            Some(TurnContinuation::Replay)
+        );
+
+        // No replay opens; ccteam submits the next line itself.
+        let next = {
+            let mut ids = identity.lock().unwrap();
+            let id = ids.mint();
+            ids.reserve(&id);
+            id
+        };
+        let opened = t.ingest(assistant(json!([{"type": "text", "text": "next"}])));
+        assert_eq!(opening_of(&opened), Some(TurnOpening::Submitted));
+        let closed = t.ingest(result_ok("next"));
+        assert_eq!(
+            continuation_of(&closed),
+            Some(TurnContinuation::Settled),
+            "turn {next} is ccteam's own and holds nothing"
         );
     }
 

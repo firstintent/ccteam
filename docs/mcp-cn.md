@@ -142,7 +142,7 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 
 省略 `notify` 时**继承**你在该子会话仍未决请求中的最近选择;显式覆盖,无先例才默认 `brief`。布尔仍认(`true`→final,`false`→off),退役的 `all` 报错。通过 `agent{wait}` 或在边界返回的 `agent_read{sid,wait}` 拿到答案,只抑制该请求的通知;等 B 不会抑制 A。普通读取和 `collected` 事件不撤销待投递的通知:截断摘录不是消费确认。
 
-送达需要受管 parent,通知作为一条普通 user 消息、走与人发消息同一条信道:parent 忙时注入它正在跑的那个 turn,在下一个工具边界就被读到,不必等这个 turn 结束;parent 空闲时它开一个新 turn。每条通知自成一行,原样保留请求 id、回答 turn、结果和精确读取引用;每条请求独立记账。相同请求 id + 回答 turn 识别为同一完成:送到一半崩溃,下一个生命可能重发而不是丢掉 —— **跨崩溃至少一次**,不是消费确认。进程间隙的通知在 resume 时投递。
+送达需要受管 parent,通知作为一条普通 user 消息、走与人发消息同一条信道:parent 忙时注入它正在跑的那个 turn,在下一个工具边界就被读到,不必等这个 turn 结束;parent 空闲时它开一个新 turn。每条通知自成一行,原样保留请求 id、回答 turn、结果和精确读取引用;每条请求独立记账。相同请求 id + 回答 turn 识别为同一完成:送到一半崩溃,下一个生命可能重发而不是丢掉 —— **跨崩溃至少一次**,不是消费确认。注入的通知在下一个工具边界之前只在 parent CLI 自己的输入队列里:若 parent 进程先结束(stop、崩溃),模型就读不到它,而请求已记为已通知 —— child 的回答仍可用 `agent_read{sid}` 读到。进程间隙的通知在 resume 时投递。
 
 手起 parent 没有回程:派发回复和初始化都明确说明 `notify_deliverable:false`,用 `agent{wait}` 或 `agent_read{sid,wait}`。派给不是你雇的会话是 handoff:首次接触照跑照记,但不订阅通知,除非显式传 `notify`;在该 peer 点过模式后,续派照常继承。
 
