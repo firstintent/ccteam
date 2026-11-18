@@ -14,12 +14,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Delivery origin and vendor routing are independent. Both survive a cold
-/// queue so a dispatched task never comes back as a batchable notification.
+/// queue so an explicitly queued task never comes back as a steer, and a
+/// notification never comes back as a human's message.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingIntent {
     /// Whether this line came from ccteam rather than a human chat.
     pub internal: bool,
-    /// The requested vendor channel, including notification batch eligibility.
+    /// The requested vendor channel.
     pub routing: ccteam_harness::TurnRouting,
 }
 
@@ -396,7 +397,7 @@ mod tests {
             true,
             PendingIntent {
                 internal: true,
-                routing: ccteam_harness::TurnRouting::Notification,
+                routing: ccteam_harness::TurnRouting::Queue,
             },
             None,
         )

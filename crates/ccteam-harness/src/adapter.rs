@@ -542,18 +542,14 @@ pub enum TurnInput {
 #[serde(rename_all = "snake_case")]
 pub enum TurnRouting {
     /// Merge the message into the active vendor turn at its next safe point —
-    /// a human steering the work they are watching.
+    /// a human steering the work they are watching, an `agent{sid,task}`
+    /// dispatch by default, and every ccteam-authored delegation completion
+    /// notification (GitHub #220: a busy parent reads it mid-turn).
     Inject,
-    /// Preserve the message as a distinct FIFO follow-up turn — a message
-    /// nobody is steering with, such as a ccteam-authored delegation
-    /// completion notification (issue #194: on claude a mid-turn stdin line is
-    /// shown to the model twice, once as a queued-command preview and once as
-    /// the next prompt; a distinct turn is charged once).
+    /// Preserve the message as a distinct FIFO follow-up turn — a dispatcher
+    /// that asked for its task to be answered in a turn of its own
+    /// (`agent{routing:"queue"}`).
     Queue,
-    /// Internal completion delivery. Like Queue, but adjacent notifications
-    /// already parked at a boundary may share a turn (GitHub #205). Explicit
-    /// dispatched tasks keep Queue and their independent execution identities.
-    Notification,
 }
 
 /// What the adapter actually did with one accepted message.

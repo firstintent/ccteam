@@ -607,10 +607,10 @@ struct TurnOrigins {
     parked: std::collections::VecDeque<(String, ChatKey)>,
 }
 
-/// Parked routes kept at most. Every member of a notification batch is parked,
-/// but the batch opens under its FIRST member's id; the rest are dropped by the
-/// next turn that opens after them, and this cap bounds the tail when no such
-/// turn ever comes.
+/// Parked routes kept at most. A queued line normally opens under its own id
+/// and leaves with that turn; this bounds the rows of lines whose turn never
+/// opens in this session entry's life (the body was stopped or released with
+/// them still parked, or an adapter never reports the queued id opening).
 const PARKED_ROUTES_MAX: usize = 64;
 
 impl Default for TurnOrigin {
@@ -621,21 +621,27 @@ impl Default for TurnOrigin {
     }
 }
 
-/// The vendor channel a turn's origin asks for. A human's message joins the
-/// running turn (`Inject`: they are steering work they can see). A
-/// ccteam-authored turn — a delegation completion notification — is a distinct
-/// follow-up (`Notification`, batchable at a boundary): nobody is steering
-/// with it, and on claude a mid-turn
-/// stdin line is shown to the model twice, as a queued-command preview and then
-/// as the next prompt (issue #194: every completion report charged the
-/// orchestrator double). A vendor without a queued-turn channel takes its
-/// mid-turn path and reports the disposition it actually used.
-fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
-    match origin {
-        TurnOrigin::User => TurnRouting::Inject,
-        TurnOrigin::Internal => TurnRouting::Notification,
-    }
-}
+/// The vendor channel of every submission whose caller names none, whatever
+/// its origin: `Inject`. A human's message joins the running turn (they are
+/// steering work they can see), and so does a ccteam-authored delegation
+/// completion notification — an idle parent starts a turn with it, a busy one
+/// reads it inside the turn it is running.
+///
+/// Notifications used to be parked behind the running turn and delivered at
+/// its boundary, on the premise that claude shows a mid-turn stdin line to the
+/// model twice (as a queued-command preview, then again as the next prompt).
+/// The current CLI does not: transcripts show every mid-turn line read once, as
+/// a `queued_command` inside the running turn. Parking therefore bought
+/// nothing and cost everything — a planner that stayed in one 6h40m turn saw
+/// none of its hires' completions until that turn ended (GitHub #220).
+///
+/// Only the CHANNEL changes. The origin stays `Internal`, so an injected
+/// notification does not re-address the running turn's reply route
+/// ([`TurnOrigins::record`], #242). A vendor without a native mid-turn channel
+/// queues it and reports the disposition it actually used. A distinct turn of
+/// its own is a dispatcher's explicit choice (`agent{routing:"queue"}`), never
+/// a default.
+const DEFAULT_ROUTING: TurnRouting = TurnRouting::Inject;
 
 /// What one submission asks for: WHO is asking (the delivery-side fact) and
 /// WHICH vendor channel to use (the submit-side one).
@@ -646,9 +652,8 @@ fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
 /// what puts a session's answer back into its IM thread, so borrowing it for
 /// routing would push every delegated task's answer at a human who never asked
 /// (issue #194 / v0.10.1, the `has_addressee` gate). Two axes, one default:
-/// [`routing_for_origin`] still decides for every caller that has no opinion,
-/// so a new submit path keeps today's behaviour without naming it (issue #197
-/// D).
+/// [`DEFAULT_ROUTING`] decides for every caller that has no opinion, so a new
+/// submit path keeps today's behaviour without naming it (issue #197 D).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TurnIntent {
     origin: TurnOrigin,
@@ -663,11 +668,11 @@ impl TurnIntent {
         }
     }
 
-    /// The default: the origin picks the channel.
+    /// The default channel ([`DEFAULT_ROUTING`]) for a line from `origin`.
     fn from_origin(origin: TurnOrigin) -> Self {
         Self {
             origin,
-            routing: routing_for_origin(origin),
+            routing: DEFAULT_ROUTING,
         }
     }
 
@@ -704,10 +709,8 @@ impl TurnOrigins {
                 Some(route)
             }
             (TurnOrigin::Internal, TurnDisposition::Started) => {
-                // Internal is already the lookup default. Notification batches
-                // execute under one of several accepted ids; storing every
-                // internal id would leave the other members here forever
-                // (GitHub #205).
+                // Internal is already the lookup default, so it is not stored:
+                // the map holds only the rows a lookup could not infer.
                 self.by_turn.remove(&turn_id);
                 self.latest = origin;
                 Some(route)
@@ -725,8 +728,8 @@ impl TurnOrigins {
 
     /// A turn opened: if it is a parked internal line, it is now the question
     /// being answered, so its route becomes the session's. Lines parked before
-    /// it have opened already or rode along in its batch; they are dropped.
-    /// Any other turn (a submitted one, a vendor continuation) changes nothing.
+    /// it have opened already (the queue is FIFO); they are dropped. Any other
+    /// turn (a submitted one, a vendor continuation) changes nothing.
     fn open(&mut self, turn_id: &str) -> Option<ChatKey> {
         let at = self.parked.iter().position(|(id, _)| id == turn_id)?;
         let (_, route) = self.parked.drain(..=at).next_back()?;
@@ -735,8 +738,8 @@ impl TurnOrigins {
     }
 
     /// Consume the origin of a known execution id. Missing identity is never
-    /// inferred from the remaining user-only entries: internal notification
-    /// ids are intentionally absent from that map (GitHub #205).
+    /// inferred from the remaining user-only entries: internal ids are
+    /// intentionally absent from that map (see [`Self::record`]).
     fn take(&mut self, turn_id: Option<&str>) -> TurnOrigin {
         match turn_id {
             Some(id) => self.by_turn.remove(id).unwrap_or(TurnOrigin::Internal),
@@ -27933,7 +27936,7 @@ mod tests {
         ) -> (String, TurnDisposition, Option<usize>) {
             let mut queues = self.turn_queues.lock().unwrap();
             let queue = queues.entry(identity.to_string()).or_default();
-            let queued = matches!(routing, TurnRouting::Queue | TurnRouting::Notification)
+            let queued = routing == TurnRouting::Queue
                 || (self.degrade_inject_to_queue && routing == TurnRouting::Inject);
             match queue.active.clone() {
                 None => {
@@ -28570,13 +28573,12 @@ mod tests {
         );
     }
 
-    /// GitHub #197 (D) — routing became a DISPATCHER's choice; the notifier's
-    /// door did not move with it. Whatever a parent asks for on its own tasks,
-    /// a ccteam-authored completion notification is still a distinct queued
-    /// turn — the whole of issue #194's saving, and the one submit path that
-    /// must never take an argument for it.
+    /// GitHub #197 (D) — routing is a DISPATCHER's choice; the notifier's door
+    /// takes no argument for it. Whatever a parent asks for on its own tasks,
+    /// a ccteam-authored completion notification takes the default channel, a
+    /// steer — the same one a human's message takes (GitHub #220).
     #[tokio::test]
-    async fn the_notifier_door_still_queues_whatever_dispatchers_may_now_ask_for() {
+    async fn the_notifier_door_steers_whatever_dispatchers_may_ask_for() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
@@ -28615,19 +28617,18 @@ mod tests {
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Notification],
-            "a dispatch may steer; a completion notification never does"
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "a dispatch steers by default, and so does a completion notification"
         );
     }
 
-    /// issue #194 — a ccteam-authored turn (a delegation completion
-    /// notification) asks for a DISTINCT follow-up turn, never a steer: on
-    /// claude a mid-turn stdin line is shown to the model twice. A human's
-    /// message keeps steering. The fake reports the queued disposition, and the
-    /// gateway treats it as it treats every queued turn: no steer flag, the
-    /// original turn's start preserved.
+    /// GitHub #220 — a ccteam-authored turn (a delegation completion
+    /// notification) reaching a busy session is a steer, exactly like a
+    /// human's message: it JOINS the running turn instead of waiting for that
+    /// turn to end. The gateway treats it as every steer: the steer flag is
+    /// set and the running turn keeps its start.
     #[tokio::test]
-    async fn internal_turns_are_routed_as_a_queued_follow_up_not_a_steer() {
+    async fn internal_turns_join_a_busy_session_as_a_steer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
@@ -28642,7 +28643,7 @@ mod tests {
             .unwrap()
             .sid;
 
-        gateway
+        let asked = gateway
             .submit_to_sid_with_origin(&sid, "human asks".into(), TurnOrigin::User)
             .await
             .unwrap();
@@ -28652,26 +28653,30 @@ mod tests {
             .unwrap()
             .expect("turn in flight");
         // `submit_to_sid` is the A2A / notifier path: Internal origin.
-        gateway
+        let notified = gateway
             .submit_to_sid(&sid, "s7 done · claude · turn 1\nok".into())
             .await
             .unwrap();
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Notification],
-            "human = Inject, ccteam-authored = Queue"
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "human = Inject, ccteam-authored = Inject"
+        );
+        assert_eq!(
+            notified, asked,
+            "the notification joined the running turn (Injected), not a turn of its own"
         );
         assert!(
-            !gateway.sessions[&sid]
+            gateway.sessions[&sid]
                 .steered_this_turn
                 .load(Ordering::SeqCst),
-            "a queued follow-up is not a steer"
+            "a notification joined mid-turn is a steer"
         );
         assert_eq!(
             *gateway.sessions[&sid].turn_started_at.lock().unwrap(),
             Some(started),
-            "the running turn keeps its start; the queued one opens its own on TurnStarted"
+            "the running turn keeps its start"
         );
     }
 
@@ -30938,11 +30943,13 @@ mod tests {
     }
 
     /// #242 — drive a tenant session from the tenant's own IM chat, then hand it
-    /// an INTERNAL line while the human's turn is still running, by `routing`.
-    /// Returns the answer to the human's line and the answer to the internal
-    /// one, in the shape each reached the delivery sink.
+    /// an INTERNAL line while the human's turn is still running: through the
+    /// dispatch door with an explicit `routing`, or (`None`) through the
+    /// delegation notifier's own door, which names no channel. Returns the
+    /// answer to the human's line and the answer to the internal one, in the
+    /// shape each reached the delivery sink.
     async fn answers_around_an_internal_line_mid_turn(
-        routing: TurnRouting,
+        routing: Option<TurnRouting>,
     ) -> (GatewayEvent, GatewayEvent) {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, project_dir) = mirror_test_paths(&tmp);
@@ -30987,16 +30994,31 @@ mod tests {
             .await
             .unwrap();
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
-        Gateway::submit_to_sid_receipt_shared(
-            Arc::clone(&gateway),
-            &sid,
-            "s9 done · turn 1\nold news".into(),
-            routing,
-            None,
-            GatewayDeadline::start(),
-        )
-        .await
-        .unwrap();
+        let line = "s9 done · turn 1\nold news".to_string();
+        match routing {
+            Some(routing) => {
+                Gateway::submit_to_sid_receipt_shared(
+                    Arc::clone(&gateway),
+                    &sid,
+                    line,
+                    routing,
+                    None,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap();
+            }
+            None => {
+                Gateway::submit_to_sid_shared(
+                    Arc::clone(&gateway),
+                    &sid,
+                    line,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap();
+            }
+        }
         fake.events_held.store(false, Ordering::SeqCst);
         fake.wake(&identity);
 
@@ -31025,15 +31047,36 @@ mod tests {
 
     /// #242 — the production loss, verbatim: s1593 (tenant project, driven from
     /// the tenant's Telegram) was answering "replan every proposal" when a
-    /// child's completion notification parked behind that turn. The notifier
+    /// child's completion notification arrived mid-turn. The notifier
     /// re-pointed the session at the tenant's web console the moment the line
     /// was accepted, so the human's answer went to web only — and, being a
     /// human's turn, was not mirrored back to IM either. The chat that asked
-    /// never saw it. The parked line takes over when ITS turn opens.
+    /// never saw it.
+    ///
+    /// The notification now JOINS that turn (GitHub #220). Joined, it is not
+    /// the turn's question, so it re-addresses nothing: the running answer,
+    /// and whatever the turn says about the notification, stay in the chat
+    /// that asked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_notification_parked_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
+    async fn a_notification_injected_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
+        let (human, internal) = answers_around_an_internal_line_mid_turn(None).await;
+        for answer in [&human, &internal] {
+            assert_eq!(
+                (answer.channel.as_str(), answer.chat_id.as_str()),
+                ("telegram@ualice", "chat-1"),
+                "the turn that asked keeps its route: {answer:?}"
+            );
+        }
+    }
+
+    /// #242, the parked shape — an internal task its dispatcher explicitly
+    /// QUEUED behind a human's running turn does not take the route when it is
+    /// accepted: the human's answer stays in their chat, and the queued line
+    /// answers on its own (owner) route only once ITS turn opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_queued_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
         let (human, internal) =
-            answers_around_an_internal_line_mid_turn(TurnRouting::Notification).await;
+            answers_around_an_internal_line_mid_turn(Some(TurnRouting::Queue)).await;
         assert_eq!(
             (human.channel.as_str(), human.chat_id.as_str()),
             ("telegram@ualice", "chat-1"),
@@ -31041,7 +31084,7 @@ mod tests {
         );
         assert_eq!(
             internal.channel, "web",
-            "the notification's own turn answers on the owner's route: {internal:?}"
+            "the queued task's own turn answers on the owner's route: {internal:?}"
         );
     }
 
@@ -31050,7 +31093,8 @@ mod tests {
     /// human is still owed the answer, in their chat.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_internal_steer_into_a_humans_turn_leaves_its_answer_in_their_chat() {
-        let (human, internal) = answers_around_an_internal_line_mid_turn(TurnRouting::Inject).await;
+        let (human, internal) =
+            answers_around_an_internal_line_mid_turn(Some(TurnRouting::Inject)).await;
         for answer in [&human, &internal] {
             assert_eq!(
                 (answer.channel.as_str(), answer.chat_id.as_str()),
@@ -40039,7 +40083,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_batch_origins_do_not_retain_unused_member_ids() {
+    fn internal_origins_leave_no_rows_behind() {
         let chat = ChatKey::new("telegram", "c1", "u1");
         let mut origins = TurnOrigins::default();
         origins.record(
@@ -40088,8 +40132,8 @@ mod tests {
     }
 
     /// #242 — a line parked behind a running turn re-addresses the session
-    /// when ITS turn opens, never when it is accepted; a batch opens under its
-    /// first member and the rest leave with the next turn that opens.
+    /// when ITS turn opens, never when it is accepted; lines parked behind it
+    /// wait for their own turns.
     #[test]
     fn a_parked_internal_line_takes_the_route_only_when_its_turn_opens() {
         let im = ChatKey::new("telegram", "c1", "u1");
@@ -40129,7 +40173,7 @@ mod tests {
         );
         assert_eq!(origins.open("note-a"), Some(web.clone()));
         assert_eq!(origins.latest, TurnOrigin::Internal);
-        assert_eq!(origins.parked.len(), 1, "the batch tail waits");
+        assert_eq!(origins.parked.len(), 1, "note-b waits for its own turn");
         origins.record(
             "task".into(),
             TurnOrigin::Internal,
@@ -40190,7 +40234,6 @@ mod tests {
             TurnRouting::Queue,
             TurnRouting::Queue,
             TurnRouting::Queue,
-            TurnRouting::Notification,
             TurnRouting::Inject,
         ] {
             crate::pending_turns::enqueue_pending_turn(
@@ -40206,7 +40249,7 @@ mod tests {
         }
         assert_eq!(
             gateway.drain_and_dispatch_pending_turns(&sid).await.len(),
-            5
+            4
         );
         assert_eq!(
             *fake.routings.lock().await,
@@ -40214,7 +40257,6 @@ mod tests {
                 TurnRouting::Queue,
                 TurnRouting::Queue,
                 TurnRouting::Queue,
-                TurnRouting::Notification,
                 TurnRouting::Inject
             ]
         );

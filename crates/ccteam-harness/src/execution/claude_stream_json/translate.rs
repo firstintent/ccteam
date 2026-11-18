@@ -69,10 +69,12 @@ pub struct TurnIdentity {
     pending: Option<String>,
     /// The turn the translator currently has in flight.
     active: Option<String>,
-    /// A line ccteam wrote INTO a running turn is not read there: claude shows
-    /// it to the model as a queued-command preview and then RE-RUNS it as the
-    /// prompt of the next turn. Until that turn opens, the boundary of the turn
-    /// the line joined answers nothing it was dispatched for (GitHub #199).
+    /// A line ccteam wrote INTO a running turn is shown to the model as a
+    /// `queued_command` inside that turn, and the CLI MAY also re-run it as the
+    /// prompt of the next turn. Until such a turn opens, or the gateway's
+    /// replay grace runs out, the boundary of the turn the line joined is not
+    /// taken as the answer to what it was dispatched for (GitHub #199; see
+    /// [`crate::TurnContinuation::Replay`]).
     ///
     /// A flag rather than a count, deliberately. Nothing in the protocol says
     /// how claude batches two queued lines — one replay turn or two — and a

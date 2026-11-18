@@ -120,23 +120,21 @@ struct LiveSession {
     ///   line only when idle; mid-turn it is a steer the MODEL reads as prose
     ///   (issue #193: `/goal …` typed while the planner was working surfaced as
     ///   "the user sent a new message");
-    /// - `TurnRouting::Queue` tasks and `TurnRouting::Notification` completion
-    ///   lines: claude shows a mid-turn stdin line
-    ///   to the model TWICE, as a `queued_command` preview inside the running
-    ///   turn and again as the prompt of the next one (issue #194: every
-    ///   completion report charged the orchestrator double), so it waits for
-    ///   the boundary. Adjacent completion lines share a bounded batch turn;
-    ///   tasks and slash commands keep their independent execution turns.
+    /// - `TurnRouting::Queue` tasks: the dispatcher asked for a turn of the
+    ///   task's own (`agent{routing:"queue"}`), so it waits for the boundary.
+    ///
+    /// Nothing else parks. A delegation completion notification is routed
+    /// `Inject` like a human's steer and joins the running turn (GitHub #220).
     ///
     /// The status tap writes the next line the moment a `result` closes the
-    /// turn, so a command lands where the CLI executes it and a notification
-    /// is read once. Mirrored to `deferred-input.json` in the session's chat
-    /// dir ([`persist_deferred_input`]) so a daemon restart mid-turn does not
-    /// lose what was parked: the next `start_thread` of the same sid reloads
-    /// it, and the tap flushes it after that life's first `result` — the
-    /// message that triggered the resume runs first, as its own turn, and what
-    /// was parked follows in order. A batch is written ahead before dispatch,
-    /// and leaves the mirror only when its consuming turn ends.
+    /// turn, so a command lands where the CLI executes it and a queued task
+    /// opens its own turn. Mirrored to `deferred-input.json` in the session's
+    /// chat dir ([`persist_deferred_input`]) so a daemon restart mid-turn does
+    /// not lose what was parked: the next `start_thread` of the same sid
+    /// reloads it, and the tap flushes it after that life's first `result` —
+    /// the message that triggered the resume runs first, as its own turn, and
+    /// what was parked follows in order. A line is written ahead before
+    /// dispatch, and leaves the mirror only when its consuming turn ends.
     ///
     /// Each entry carries the EXECUTION-turn id its line will open, minted at
     /// park time and persisted with it: that is the identity a dispatcher's
@@ -168,93 +166,6 @@ struct DeferredLine {
     turn_id: String,
     /// The verbatim line to write — a vendor slash command or queued user text.
     text: String,
-    #[serde(default)]
-    notification: bool,
-    /// Original delivery identities, retained even when their text shares one
-    /// execution turn. Nonempty also freezes a prepared batch across retries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    members: Vec<String>,
-    #[serde(default)]
-    replayed: bool,
-}
-
-impl DeferredLine {
-    fn repeat_marker(&self) -> String {
-        format!("[Repeated notification delivery: {}]\n", self.turn_id)
-    }
-
-    fn outbound_text(&self) -> String {
-        if self.replayed {
-            format!("{}{}", self.repeat_marker(), self.text)
-        } else {
-            self.text.clone()
-        }
-    }
-}
-
-/// The maximum explicit agent_read budget. Notifications are already bounded
-/// excerpts; batch their verbatim lines up to this ceiling, never wait for more.
-const NOTIFICATION_BATCH_MAX_CHARS: usize = 50_000;
-
-fn notification_batch_text(id: &str, texts: &[&str], remaining: usize) -> String {
-    let noun = if texts.len() == 1 { "item" } else { "items" };
-    format!(
-        "[Notification batch {id}: {} {noun}]\n{}\n[Notifications still undelivered: {remaining}]",
-        texts.len(),
-        texts.join("\n\n")
-    )
-}
-
-fn take_deferred_batch(queue: &mut DeferredQueue) -> Option<DeferredLine> {
-    let mut first = queue.parked.pop_front()?;
-    if !first.notification || !first.members.is_empty() {
-        return Some(first);
-    }
-    let mut texts = vec![first.text.clone()];
-    first.members.push(first.turn_id.clone());
-    let mut remaining = queue.parked.iter().filter(|line| line.notification).count();
-    while let Some(next) = queue.parked.front() {
-        // A dispatched task or a slash command is a FIFO barrier. A replayed
-        // batch keeps its original membership and identity, even if new lines
-        // arrived since the crash.
-        if !next.notification || !next.members.is_empty() {
-            break;
-        }
-        let mut candidate: Vec<_> = texts.iter().map(String::as_str).collect();
-        candidate.push(&next.text);
-        if notification_batch_text(&first.turn_id, &candidate, remaining - 1)
-            .chars()
-            .count()
-            + first.repeat_marker().chars().count()
-            > NOTIFICATION_BATCH_MAX_CHARS
-        {
-            break;
-        }
-        let next = queue.parked.pop_front().expect("front inspected");
-        first.members.push(next.turn_id);
-        first.replayed |= next.replayed;
-        texts.push(next.text);
-        remaining -= 1;
-    }
-    first.text = notification_batch_text(
-        &first.turn_id,
-        &texts.iter().map(String::as_str).collect::<Vec<_>>(),
-        remaining,
-    );
-    // A notification is an indivisible receipt: dropping bytes would alter
-    // its header/outcome/reference. Producers normally cap excerpts at 2000
-    // chars, but an unbounded vendor error kind can still exceed this budget.
-    // Deliver that item alone and say so instead of silently truncating it or
-    // permanently blocking all following receipts.
-    if first.text.chars().count() + first.repeat_marker().chars().count()
-        > NOTIFICATION_BATCH_MAX_CHARS
-    {
-        first.text = format!(
-            "[Oversized indivisible notification: delivered alone; batch budget {NOTIFICATION_BATCH_MAX_CHARS} chars]\n{}",
-            first.text
-        );
-    }
-    Some(first)
 }
 
 /// One session's parked lines, in memory and on disk alike.
@@ -297,6 +208,14 @@ struct DeferredMirror {
 }
 
 /// Bumped when the shape changes; the bare array of v1 no longer parses.
+///
+/// Still 3 after notifications stopped parking (GitHub #220): a line is
+/// `{turn_id, text}`, a subset of what schema 3 always carried. The extra
+/// per-line keys a mirror from the batching build holds (`notification`,
+/// `members`, `replayed`) are ignored on read, so whatever it parked — a
+/// queued task, a slash command, a completion notification, a prepared batch —
+/// replays as one ordinary line in FIFO order instead of the whole file being
+/// discarded as unreadable.
 const DEFERRED_INPUT_SCHEMA: u32 = 3;
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -571,8 +490,8 @@ fn spawn_status_tap(
                             n.clear();
                         }
                         // Clear occupancy and claim the next deferred input
-                        // line (a slash command, issue #193; a queued turn,
-                        // issue #194) under ONE lock, so a submission racing
+                        // line (a slash command, issue #193; an explicitly
+                        // queued task) under ONE lock, so a submission racing
                         // this `result` either sees the turn still open (→
                         // parked, popped right here) or already closed (→
                         // written directly) — never parked behind a turn that
@@ -585,7 +504,7 @@ fn spawn_status_tap(
                             &sid,
                         );
                         if let Some(parked) = next {
-                            let line = parked.outbound_text();
+                            let line = parked.text.clone();
                             match transport.send_line(protocol::user_text_line(&line)).await {
                                 Ok(()) => {}
                                 Err(error) => {
@@ -714,9 +633,9 @@ fn deferred_input_path(project_dir: &Path, sid: &str) -> PathBuf {
 }
 
 /// Mirror the queue to disk (the file is removed when nothing is left).
-/// Callers decide what a failure means: a parked notification must be durable
-/// before it is accepted (the notifier spends the child's watch on the
-/// acceptance), a slash command or a retirement is best-effort.
+/// Callers decide what a failure means: a parked task must be durable before it
+/// is accepted (its dispatcher is told it is queued, under the turn id it will
+/// open), a slash command or a retirement is best-effort.
 fn persist_deferred_input(
     project_dir: &Path,
     sid: &str,
@@ -750,14 +669,8 @@ fn persist_deferred_input(
 /// row means it ran, and replaying it would ask the child to do the work twice.
 fn load_deferred_input(project_dir: &Path, sid: &str) -> DeferredQueue {
     let mut queue = read_deferred_mirror(project_dir, sid);
-    if let Some(mut in_flight) = queue.in_flight.take() {
-        if in_flight.notification {
-            // Seeing a user/transcript row is not a consumption ack. A crash
-            // before retirement replays the exact batch, visibly as a repeat,
-            // including notifications previously collected through agent_read.
-            in_flight.replayed = true;
-            queue.parked.push_front(in_flight);
-        } else if turn_left_a_transcript_row(project_dir, sid, &in_flight.turn_id) {
+    if let Some(in_flight) = queue.in_flight.take() {
+        if turn_left_a_transcript_row(project_dir, sid, &in_flight.turn_id) {
             tracing::info!(
                 session = %sid,
                 turn = %in_flight.turn_id,
@@ -826,8 +739,6 @@ pub struct RetainedInput {
     /// line is still retained — the next life replays it unless the transcript
     /// shows the turn ran.
     pub in_flight: Option<String>,
-    /// Delivery identities sharing that execution turn (notification batches).
-    pub in_flight_members: Vec<String>,
     /// Never handed to the vendor, oldest first: confirmed UNDELIVERED, and
     /// retained.
     pub parked: Vec<String>,
@@ -837,7 +748,6 @@ impl RetainedInput {
     /// Whether `exec_turn_id` is the one line that was written out.
     pub fn is_in_flight(&self, exec_turn_id: &str) -> bool {
         self.in_flight.as_deref() == Some(exec_turn_id)
-            || self.in_flight_members.iter().any(|id| id == exec_turn_id)
     }
 
     /// Whether `exec_turn_id` is still waiting behind the harness.
@@ -851,23 +761,8 @@ impl RetainedInput {
 pub fn retained_input(project_dir: &Path, sid: &str) -> RetainedInput {
     let queue = read_deferred_mirror(project_dir, sid);
     RetainedInput {
-        in_flight_members: queue
-            .in_flight
-            .as_ref()
-            .map(|line| line.members.clone())
-            .unwrap_or_default(),
         in_flight: queue.in_flight.map(|line| line.turn_id),
-        parked: queue
-            .parked
-            .into_iter()
-            .flat_map(|line| {
-                if line.members.is_empty() {
-                    vec![line.turn_id]
-                } else {
-                    line.members
-                }
-            })
-            .collect(),
+        parked: queue.parked.into_iter().map(|line| line.turn_id).collect(),
     }
 }
 
@@ -884,12 +779,10 @@ fn turn_left_a_transcript_row(project_dir: &Path, sid: &str, exec_turn_id: &str)
 /// What a caller wants done when the durable mirror refuses a park.
 enum OnUnmirrorable {
     /// Take the line back — the caller writes it mid-turn instead. A parked
-    /// delegation notification must be durable BEFORE it is accepted: the
-    /// notifier spends the child's watch on that acceptance, so a line that
-    /// only ever lived in memory would turn a crash into a lost notification.
+    /// task must be durable BEFORE it is accepted: its dispatcher is told it
+    /// is queued, so a line that only ever lived in memory would turn a crash
+    /// into a task that silently never runs.
     TakeItBack,
-    /// Completion notifications are the only lines eligible for batching.
-    Notification,
     /// Keep it parked in memory. A slash command is not an at-least-once
     /// contract, and a late command beats one the model reads as prose
     /// (issue #193).
@@ -931,9 +824,6 @@ fn park_deferred_line(
     queue.parked.push_back(DeferredLine {
         turn_id: turn_id.clone(),
         text: text.to_string(),
-        notification: matches!(on_unmirrorable, OnUnmirrorable::Notification),
-        members: Vec::new(),
-        replayed: false,
     });
     match persist_deferred_input(project_dir, sid, &queue) {
         Ok(()) => Some((turn_id, queue.parked.len())),
@@ -944,7 +834,7 @@ fn park_deferred_line(
                 "stream-json: parked line could not be mirrored to disk"
             );
             match on_unmirrorable {
-                OnUnmirrorable::TakeItBack | OnUnmirrorable::Notification => {
+                OnUnmirrorable::TakeItBack => {
                     queue.parked.pop_back();
                     None
                 }
@@ -976,9 +866,8 @@ fn advance_deferred_queue(
         return None;
     };
     active_turn.store(false, Ordering::Release);
-    let before = queue.clone();
     let retired = queue.in_flight.take().is_some();
-    let next = take_deferred_batch(&mut queue);
+    let next = queue.parked.pop_front();
     if let Some(line) = next.as_ref() {
         active_turn.store(true, Ordering::Release);
         // The turn this line opens must report the id the dispatcher was handed
@@ -995,15 +884,11 @@ fn advance_deferred_queue(
                 %error,
                 "stream-json: deferred input mirror was not written ahead"
             );
-            // No unrecorded batch is handed out: a retry must retain the exact
-            // membership written ahead, not silently reconstruct a different
-            // batch after a crash. Keep every item for the next boundary/life.
-            if let Some(line) = &next {
-                lock_turn_ids(turn_ids).clear_reservation(&line.turn_id);
-            }
-            *queue = before;
-            active_turn.store(false, Ordering::Release);
-            return None;
+            // The line still goes out: holding it would stall every line
+            // behind it until some later boundary that an idle session never
+            // produces. The disk keeps the previous snapshot, where the line
+            // is still parked, so a crash in this window replays it rather
+            // than losing it.
         }
     }
     next
@@ -2139,25 +2024,21 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 format!("Tool result for {call_id}: {body}")
             }
         };
-        if matches!(routing, TurnRouting::Queue | TurnRouting::Notification) {
-            // A distinct follow-up turn was asked for (a ccteam-authored
-            // delegation completion notification). Mid-turn, claude shows a
-            // stdin line to the model TWICE — as a `queued_command` preview
-            // inside the running turn, then again as the next prompt (issue
-            // #194: every completion report charged the orchestrator double)
-            // — so park it and let the status tap write it right after this
-            // turn's `result`, where it is read exactly once. Idle, the same
-            // line simply starts a turn below. Check-and-park under the queue
-            // lock, like the slash path: the tap clears `active_turn` and pops
-            // under the same lock, so this never parks behind a turn that has
-            // already ended.
+        if routing == TurnRouting::Queue {
+            // A distinct follow-up turn was asked for: a dispatcher wants its
+            // task answered in a turn of its own (`agent{routing:"queue"}`).
+            // Park it and let the status tap write it right after this turn's
+            // `result`. Idle, the same line simply starts a turn below.
+            // Check-and-park under the queue lock, like the slash path: the tap
+            // clears `active_turn` and pops under the same lock, so this never
+            // parks behind a turn that has already ended.
             //
-            // Durable BEFORE it is accepted: the delegation notifier spends the
-            // child's watch on this Ok, so a parked line that only lived in
-            // memory would turn a daemon crash into a lost notification. The
-            // mirror is written under the queue lock (the tap cannot flush the
-            // line in between); if the disk refuses, the line is taken back
-            // and written now instead — read twice by claude, never lost.
+            // Durable BEFORE it is accepted: the dispatcher is told the task is
+            // queued, so a parked line that only lived in memory would turn a
+            // daemon crash into a task that never runs. The mirror is written
+            // under the queue lock (the tap cannot flush the line in between);
+            // if the disk refuses, the line is taken back and written now
+            // instead — it joins the running turn as a steer, never lost.
             //
             // The parked line's EXECUTION-turn id is minted here, before it is
             // durable, and travels with it: a caller is handed the id of the
@@ -2171,11 +2052,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 &live.project_dir,
                 &live.identity.sid,
                 &text,
-                if routing == TurnRouting::Notification {
-                    OnUnmirrorable::Notification
-                } else {
-                    OnUnmirrorable::TakeItBack
-                },
+                OnUnmirrorable::TakeItBack,
             );
             if let Some((turn_id, position)) = parked {
                 return Ok(TurnSubmission::queued_at(TurnId::new(turn_id), position));
@@ -2198,10 +2075,10 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     ids.reserve(&id);
                     id
                 });
-                // …and claude will re-run this line as the prompt of the NEXT
-                // turn, so the turn it joined does not end this dispatch. The
-                // binding rides the joined turn's id and moves onto the replay
-                // turn when that opens (GitHub #199).
+                // …and claude may re-run this line as the prompt of the NEXT
+                // turn, so the turn it joined does not settle this dispatch
+                // outright. The binding rides the joined turn's id and moves
+                // onto the replay turn if one opens (GitHub #199).
                 ids.note_injected();
                 (id, true)
             } else {
@@ -2875,148 +2752,53 @@ mod deferred_queue_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn notification_line(n: usize) -> DeferredLine {
-        serde_json::from_value(json!({
-            "turn_id": format!("notification-{n}"),
-            "text": format!("s{n} done · claude · turn {n} req-{n}\nanswer {n} agent_read{{sid:s{n},turn:t{n}}}"),
-            "notification": true
-        })).unwrap()
-    }
-
+    /// GitHub #220 — a mirror the batching build left behind (completion
+    /// notifications parked, one batch prepared and in flight, a queued task
+    /// and a slash command behind them) is still schema 3 and still readable:
+    /// every line replays once, in order, as an ordinary parked line. Nothing
+    /// queued is discarded with the notification-only keys.
     #[test]
-    fn thirteen_parked_notifications_share_one_boundary_turn() {
+    fn a_mirror_from_the_batching_build_replays_every_line_in_order() {
         let dir = tempfile::tempdir().unwrap();
-        let lines: Vec<_> = (0..13).map(notification_line).collect();
-        let queue = StdMutex::new(DeferredQueue {
-            in_flight: None,
-            parked: lines.clone().into(),
-        });
-        let ids = StdMutex::new(TurnIdentity::default());
-        let active = AtomicBool::new(true);
-        let batch = advance_deferred_queue(&queue, &ids, &active, dir.path(), "s99").unwrap();
-        for line in &lines {
-            assert!(batch.text.contains(&line.text), "missing {}", line.turn_id);
-        }
-        assert!(queue.lock().unwrap().parked.is_empty());
-        assert!(advance_deferred_queue(&queue, &ids, &active, dir.path(), "s99").is_none());
-    }
+        let path = deferred_input_path(dir.path(), "s9");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema": DEFERRED_INPUT_SCHEMA,
+                "in_flight": {
+                    "turn_id": "batch-1",
+                    "text": "[Notification batch batch-1: 2 items]\ns1 done\n\ns2 done\n[Notifications still undelivered: 1]",
+                    "notification": true,
+                    "members": ["batch-1", "note-2"],
+                    "replayed": false
+                },
+                "parked": [
+                    {"turn_id": "note-3", "text": "s3 done", "notification": true},
+                    {"turn_id": "task-4", "text": "build the thing", "notification": false},
+                    {"turn_id": "slash-5", "text": "/compact"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
-    #[test]
-    fn notification_batch_replays_unchanged_until_retired() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = StdMutex::new(DeferredQueue {
-            in_flight: None,
-            parked: (0..13).map(notification_line).collect(),
-        });
-        let ids = StdMutex::new(TurnIdentity::default());
-        let active = AtomicBool::new(true);
-        let first = advance_deferred_queue(&queue, &ids, &active, dir.path(), "s99").unwrap();
-        let retained = retained_input(dir.path(), "s99");
-        for n in 0..13 {
-            assert!(retained.is_in_flight(&format!("notification-{n}")));
-        }
-        // Crash after write, before retirement: the persisted batch is the
-        // source of truth, including its original member order and trailer.
-        let replay = StdMutex::new(load_deferred_input(dir.path(), "s99"));
-        replay
-            .lock()
-            .unwrap()
-            .parked
-            .push_back(notification_line(13));
-        let second = advance_deferred_queue(&replay, &ids, &active, dir.path(), "s99").unwrap();
-        assert_eq!(second.text, first.text);
-        assert_eq!(second.members, first.members);
-        assert_eq!(second.turn_id, first.turn_id);
-        assert!(second
-            .outbound_text()
-            .starts_with("[Repeated notification delivery:"));
-        assert_eq!(replay.lock().unwrap().parked.len(), 1);
-    }
-
-    #[test]
-    fn notification_budget_splits_in_fifo_order_without_crossing_tasks() {
-        let mut lines: Vec<_> = (0..5).map(notification_line).collect();
-        for line in &mut lines {
-            line.text.push_str(&"字".repeat(20_000));
-        }
-        let task: DeferredLine =
-            serde_json::from_value(json!({"turn_id":"task", "text":"/compact"})).unwrap();
-        let mut queue = DeferredQueue {
-            in_flight: None,
-            parked: lines.clone().into(),
-        };
-        queue.parked.insert(4, task.clone());
-        for (members, remaining) in [
-            (vec!["notification-0", "notification-1"], 3),
-            (vec!["notification-2", "notification-3"], 1),
-        ] {
-            let batch = take_deferred_batch(&mut queue).unwrap();
-            assert_eq!(batch.members, members);
-            assert!(batch.text.chars().count() <= NOTIFICATION_BATCH_MAX_CHARS);
-            assert!(batch
-                .text
-                .ends_with(&format!("[Notifications still undelivered: {remaining}]")));
-        }
-        assert_eq!(take_deferred_batch(&mut queue).unwrap(), task);
-        let last = take_deferred_batch(&mut queue).unwrap();
-        assert_eq!(last.members, vec!["notification-4"]);
-        assert!(last.text.contains(&lines[4].text));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn failed_batch_write_ahead_keeps_every_parked_item() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = StdMutex::new(DeferredQueue {
-            in_flight: None,
-            parked: (0..13).map(notification_line).collect(),
-        });
-        let original = queue.lock().unwrap().clone();
-        std::fs::create_dir_all(deferred_input_path(dir.path(), "s99")).unwrap();
-        let ids = StdMutex::new(TurnIdentity::default());
-        let active = AtomicBool::new(true);
-        assert!(advance_deferred_queue(&queue, &ids, &active, dir.path(), "s99").is_none());
-        assert_eq!(*queue.lock().unwrap(), original);
-        assert!(!active.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn batch_budget_reserves_replay_overhead_and_reports_indivisible_overflow() {
-        let mut first = notification_line(0);
-        let mut second = notification_line(1);
-        first.text = "a".repeat(25_000);
-        let overhead = notification_batch_text(&first.turn_id, &[&first.text, ""], 0)
-            .chars()
-            .count();
-        second.text = "b".repeat(NOTIFICATION_BATCH_MAX_CHARS - overhead);
-        let mut queue = DeferredQueue {
-            in_flight: None,
-            parked: vec![first, second].into(),
-        };
-        let mut batch = take_deferred_batch(&mut queue).unwrap();
+        let mut queue = load_deferred_input(dir.path(), "s9");
+        let replayed: Vec<_> = std::iter::from_fn(|| queue.parked.pop_front())
+            .map(|line| (line.turn_id, line.text))
+            .collect();
         assert_eq!(
-            batch.members.len(),
-            1,
-            "reserve room for a crash replay marker"
-        );
-        batch.replayed = true;
-        assert!(batch.outbound_text().chars().count() <= NOTIFICATION_BATCH_MAX_CHARS);
-
-        let mut oversized = notification_line(2);
-        oversized
-            .text
-            .push_str(&"大".repeat(NOTIFICATION_BATCH_MAX_CHARS));
-        queue.parked.push_front(oversized.clone());
-        let batch = take_deferred_batch(&mut queue).unwrap();
-        assert!(batch
-            .text
-            .starts_with("[Oversized indivisible notification:"));
-        assert!(batch.text.contains(&oversized.text));
-        assert_eq!(batch.members, vec![oversized.turn_id]);
-        assert_eq!(
-            queue.parked.len(),
-            1,
-            "the following item is still deliverable"
+            replayed,
+            vec![
+                (
+                    "batch-1".to_string(),
+                    "[Notification batch batch-1: 2 items]\ns1 done\n\ns2 done\n[Notifications still undelivered: 1]".to_string()
+                ),
+                ("note-3".to_string(), "s3 done".to_string()),
+                ("task-4".to_string(), "build the thing".to_string()),
+                ("slash-5".to_string(), "/compact".to_string()),
+            ],
+            "the in-flight line never opened a turn, so it replays first"
         );
     }
 

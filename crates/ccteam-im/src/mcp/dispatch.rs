@@ -3559,8 +3559,8 @@ async fn dispatch_task(
             title.clone(),
             // What the DISPATCHER asked for; what the adapter did with it is
             // the request's state + bound turn (issue #197 D). A ccteam-authored
-            // completion notification is a different path entirely and stays
-            // queued (issue #194).
+            // completion notification is a different path entirely and takes
+            // the default channel, a steer (GitHub #220).
             routing,
             idempotency_key,
             deadline,
