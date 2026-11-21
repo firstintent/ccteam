@@ -72,6 +72,64 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// #239 — one directory is one project: `POST /projects` on a directory that
+/// already is a project returns that project (200) instead of registering a
+/// second slug over the same `.ccteam/` (the retry-after-a-failed-launch case);
+/// a directory whose project the caller cannot see is refused (409) without
+/// naming it.
+#[tokio::test]
+async fn post_projects_on_a_registered_directory_returns_that_project() {
+    disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths.clone())).await;
+    let create = |slug: &'static str, path: String| {
+        client()
+            .post(format!("http://{addr}/api/v1/projects"))
+            .json(&serde_json::json!({ "slug": slug, "path": path }))
+            .send()
+    };
+
+    let dir = tmp.path().join("work").join("sdk");
+    let first = create("sdk", dir.display().to_string()).await.unwrap();
+    assert_eq!(first.status(), 201);
+    let state_path = CcteamPaths::project_state_in(&dir);
+    let state_before = fs::read(&state_path).unwrap();
+
+    let again = create("sdk", format!("{}/", dir.display())).await.unwrap();
+    assert_eq!(again.status(), 200);
+    let body: Value = again.json().await.unwrap();
+    assert_eq!(body["slug"], "sdk");
+    assert_eq!(body["host"], "local");
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+    let other_owner = tmp.path().join("work").join("b");
+    ccteam_core::create_project(
+        &paths,
+        &ccteam_core::NewProject {
+            slug: "bobs",
+            dir: &other_owner,
+            team: None,
+            owner: Some("user:ubob"),
+        },
+    )
+    .unwrap();
+    let denied = create("mine", other_owner.display().to_string())
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 409);
+    let denied = denied.text().await.unwrap();
+    assert!(!denied.contains("bobs"), "names nothing: {denied}");
+
+    let slugs: Vec<String> = ccteam_core::load_ccteam_config(&paths.root)
+        .unwrap()
+        .projects
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    assert_eq!(slugs, ["sdk", "bobs"]);
+}
+
 #[tokio::test]
 async fn get_api_v1_projects_returns_dashboard_row_array() {
     let tmp = TempDir::new().unwrap();

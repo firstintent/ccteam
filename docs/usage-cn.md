@@ -166,7 +166,9 @@ DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、
 
 ### 开会话、切换、对话
 
-本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。每行显示 `#<编号> <名字>`（cswap 别名，否则邮箱 @ 前的部分，不显示域名）和 cswap 最近读到的 5h / 7d 额度（Max 套餐没有 5h 窗口，只显示 7d；需要重新登录的账号会注明）。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，会话按「默认登录」运行，可继续跟随外部 `cswap auto`；其他账号使用各自的 cswap profile（凭据按账号隔离），恢复时保持原身份，不能静默退回默认号；已隔离的会话遇到账号移除、slot 换绑或目录变化会报错并保留历史。ccteam 用 cswap 的共享历史启动账号（`cswap run --share-history`），所以会话记录对每个账号都可读。
+本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。每行显示 `#<编号> <名字>`（cswap 别名，否则邮箱 @ 前的部分，不显示域名）和 cswap 最近读到的 5h / 7d 额度（Max 套餐没有 5h 窗口，只显示 7d；需要重新登录的账号会注明）。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，会话按「默认登录」运行，可继续跟随外部 `cswap auto`；其他账号的会话在使用期间固定在该账号上，恢复时保持原账号，不会换到第三个号；账号移除或 slot 换绑会报错并保留历史。固定账号的会话平时用该账号自己的 cswap profile（凭据按账号隔离）；这个账号被切成默认登录（`cswap switch` / `cswap auto`）后改在默认登录上运行，默认号换走后再回到自己的 profile——cswap 要求同一账号只有一份在用的凭据，否则其中一份的 token 会失效。切换发生时会话进程若还留在旧 profile，ccteam 在它空闲后一分钟内结束该进程，下一条消息在同一会话里继续，历史不丢。固定账号的会话不会一直占着账号。只要它的进程还在该账号的 profile 里，cswap 就认为账号在用：`cswap auto` 跳过它，`cswap switch` 切过去会警告，会话刷新过该账号的 token 之后则直接拒绝。cswap 被拒时不通知任何人，所以 ccteam 按时间让出账号：会话安静满 `sessions.account_yield_secs`（默认 3600 秒 = Claude 提示缓存的寿命，此时已没有缓存可丢；`0` = 一直占着，直到你自己换号）后，进程结束，会话变成「默认登录」会话，下一条消息在同一会话里按默认号继续，历史不丢；想放回原账号，在按钮里（或 `/account <编号>`）再选一次即可。turn 正在运行、在等你确认或后台任务未结束时不让出；历史还只在该账号自己 profile 里的会话也不让出。切到一个仍被会话占着的账号（turn 在跑，或安静还不满这个窗口），cswap 会提示该账号有运行中的会话（它的 token 已在会话里轮换过时会拒绝切换）：等它让出账号再切，或者先停掉那个会话。
+
+`cswap auto` 不会切到 session profile 里还有 Claude 进程的账号（任何 `cswap run <账号>` 起的会话，包括 ccteam 固定账号的会话），这类会话一多，auto 就可能无号可切。仓库里的 `scripts/cswap-auto.sh` 是一个独立脚本（只依赖 cswap，不调用 ccteam，没装 ccteam 也能用），用它代替直接运行 `cswap auto`（参数原样传给 `cswap auto`，两者不要同时跑）：它每分钟执行一次 `cswap auto --once`，选号、阈值、冷却仍由 cswap 决定；只有当 cswap 想切却没有可用账号时，它才问 cswap 本来会选谁（`--dry-run`），然后用手动的 `cswap switch` 切过去——手动切换对占用中的账号是「警告后照切」。强制切换之后该账号同时是默认登录、又被原会话占着，两份凭据里有一份的 token 之后可能失效；ccteam 固定账号的会话会在空闲后一分钟内自动转到默认登录上（见上），终端里手动起的 `cswap run` 会话若之后认证失败，退出并重新 `cswap run <账号>` 即可。会话已经轮换过该账号 token 时 cswap 会直接拒绝，只能先退出那个会话。ccteam 用 cswap 的共享历史启动账号（`cswap run --share-history`），所以会话记录对每个账号都可读。
 
 进行中的 Claude 会话，输入框模型按钮旁同样有「Claude 账号」按钮（IM 里用 `/account`）：它显示会话当前用的账号——默认登录时显示此刻默认号是哪个（`默认 · #2 cloud`）——选另一个账号（或「默认登录」）即切换：当前空闲进程结束，下一条消息在同一会话里按新账号继续，历史不丢（提示缓存会重建，换号必然如此）。有 turn 在跑、在等你确认或后台任务未结束时拒绝切换；会话历史还只在当前账号自己的 profile 里（共享历史之前启动的会话）时也拒绝：cswap 会在该会话下次在原账号上运行、且该账号没有其他 Claude 在用时把历史合并进共享历史，之后即可切换。没装 cswap 时，未绑定账号的会话不显示这个按钮。
 
@@ -364,7 +366,8 @@ bot 在群聊/频道里是每条都回、还是只在被 @ 时才回,是同一�
 /status                    当前会话的深度视图——无论什么状态都是同一张卡:idle / working /
                            stuck,或 💤 released(下条消息即恢复;卡片读的是落盘事实)。
                            含 model · 强度 · ctx、账号用量窗口(5h / 周;本会话没进程时
-                           向同 harness 的在线会话读,并按 harness 记住,所以一个进程都不在
+                           向同 harness 的在线会话读;Claude 的取自它自己对话的响应头,
+                           读取不发任何请求;并按 harness 记住,所以一个进程都不在
                            也照样显示;过了厂商自报的重置时间就丢弃,不显示过期数)、
                            自己的后台工作(只有 harness 自报「已后台化」的才叫后台任务,
                            前台命令就写「命令」)、💬 在飞 turn 已经说到哪儿了(它自己的话的
@@ -466,7 +469,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
+`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。一个目录 = 一个项目:在已经是项目的目录上再创建,得到的是那个项目,不会多出第二个 slug(Web 直接返回它,IM `/newproject` 切换过去,`ccteam init` 原地刷新,`--slug` 指向别的项目时拒绝);目录属于你看不到的项目时拒绝。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
 
 ### `project`(项目生命周期)
 

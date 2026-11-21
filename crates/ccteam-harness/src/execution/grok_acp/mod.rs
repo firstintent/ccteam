@@ -78,8 +78,7 @@ const GROK_BILLING_METHOD: &str = "_x.ai/billing";
 
 /// Ceiling on the billing round trip. Grok answers it by calling its own
 /// backend, so it is the one adapter read on the `/status` path that can hang;
-/// the reader gets "unknown" rather than a stalled dashboard. Matches the
-/// budget claude's `get_usage` control_request uses.
+/// the reader gets "unknown" rather than a stalled dashboard.
 const GROK_BILLING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Ask ONE live transport for the account's billing state. Split out from the
@@ -1062,9 +1061,8 @@ impl HarnessAdapter for GrokAcpAdapter {
         // agent-level ACP extension method its own first-party client calls
         // (grok-build `crates/codegen/xai-grok-shell/src/extensions/billing.rs`
         // → `crates/codegen/xai-grok-pager/.../credit_bar.rs`). Asking it costs
-        // no turn and no model call — same shape as claude's `get_usage`
-        // control_request — so it is safe on the read path a `/status` card or
-        // `GET /api/v1/usage` sits on. Private log / session-file scraping
+        // no turn and no model call, so it is safe on the read path a `/status`
+        // card or `GET /api/v1/usage` sits on. Private log / session-file scraping
         // stays off the table (red line): if the extension is absent, the
         // answer is honestly "unknown".
         let live = self.get_live(&h.identity)?;

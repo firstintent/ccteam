@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::CcteamConfig;
 use ccteam_core::projects::{create_project, validate_slug_format, NewProject};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
+use ccteam_harness::execution::claude_accounts::ClaudeAccountBinding;
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::usage_catalog::VendorAccountUsage;
 use ccteam_harness::{
@@ -102,13 +103,79 @@ pub struct ClaudeAccountSwitch {
 }
 
 /// One deadline for every live account-usage ask in a single read (#234). A
-/// live answer is an in-memory read on the vendor side (claude `get_usage`
-/// with `skip_behaviors` answers in milliseconds); past this, the vendor's
-/// last recorded observation answers instead.
+/// live answer is normally an in-memory read on the vendor side (claude and
+/// codex answer from rate-limit state their turns already received); past
+/// this, the vendor's last recorded observation answers instead.
 const ACCOUNT_USAGE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// How long a `/status` usage prefetch stays valid for the render that follows.
 const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
+
+/// How long one live process's account-usage answer stands in for asking that
+/// process again (#244).
+///
+/// An ask can cost the vendor a read of its own usage API. Claude's did: its
+/// `get_usage` answer read `/api/oauth/usage`, an endpoint that allows each
+/// token about 30 reads an hour shared with every claude process on the
+/// account and with cswap, and ccteam's asks helped spend it into 429s that
+/// froze cswap's view of the default login. Claude now answers from the
+/// rate-limit headers its turns already received and costs nothing (#244),
+/// but grok's `x.ai/billing` still calls its backend. The windows move on a
+/// 5-hour and weekly clock, so a five-minute-old answer is as good as a new
+/// one for a status card, and reusing it bounds any vendor's cost to one ask
+/// per process per five minutes however often `/status` is asked.
+const ACCOUNT_USAGE_REUSE: Duration = Duration::from_secs(300);
+
+/// Recent account-usage answers, one per live process (#244).
+///
+/// Keyed by the process, not by vendor: with cswap accounts the live sessions
+/// of one vendor can be on different accounts, and a `/status` card reports
+/// its focus's account, so only the same process's own answer may stand in
+/// for asking it. A resumed or rebuilt session is a new process (a new
+/// `started_at`) and is asked afresh, which also covers an account switch.
+#[derive(Default)]
+pub struct AccountUsageAnswers {
+    by_process: std::sync::Mutex<HashMap<UsageProcessKey, (Instant, VendorAccountUsage)>>,
+}
+
+/// One live process: its vendor, the thread identity and when it started.
+type UsageProcessKey = (AgentVendor, String, chrono::DateTime<chrono::Utc>);
+
+fn usage_process_key(thread: &ThreadHandle) -> UsageProcessKey {
+    (thread.vendor, thread.identity.clone(), thread.started_at)
+}
+
+impl AccountUsageAnswers {
+    /// The process's own answer, while it is younger than [`ACCOUNT_USAGE_REUSE`].
+    fn recent(&self, thread: &ThreadHandle) -> Option<VendorAccountUsage> {
+        let map = self.by_process.lock().ok()?;
+        let (at, entry) = map.get(&usage_process_key(thread))?;
+        (at.elapsed() < ACCOUNT_USAGE_REUSE).then(|| entry.clone())
+    }
+
+    fn remember(&self, thread: &ThreadHandle, entry: &VendorAccountUsage) {
+        if let Ok(mut map) = self.by_process.lock() {
+            map.retain(|_, (at, _)| at.elapsed() < ACCOUNT_USAGE_REUSE);
+            map.insert(usage_process_key(thread), (Instant::now(), entry.clone()));
+        }
+    }
+
+    /// The process is going away; its answer can no longer be reused.
+    fn forget(&self, thread: &ThreadHandle) {
+        if let Ok(mut map) = self.by_process.lock() {
+            map.remove(&usage_process_key(thread));
+        }
+    }
+
+    #[cfg(test)]
+    fn backdate(&self, by: Duration) {
+        if let Ok(mut map) = self.by_process.lock() {
+            for (at, _) in map.values_mut() {
+                *at = at.checked_sub(by).unwrap_or(*at);
+            }
+        }
+    }
+}
 
 /// The live sessions to ask for each vendor's account windows, captured
 /// under the gateway lock (cheap handle clones) so that the asking itself
@@ -117,6 +184,7 @@ const STATUS_USAGE_PREFETCH_TTL: Duration = Duration::from_secs(10);
 /// whole daemon for up to a minute and stalled web, IM and MCP with it.
 pub struct AccountUsageProbes {
     root: Option<PathBuf>,
+    answers: Arc<AccountUsageAnswers>,
     by_vendor: Vec<(AgentVendor, Vec<UsageAsker>)>,
 }
 
@@ -124,26 +192,42 @@ pub struct AccountUsageProbes {
 type UsageAsker = (Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle);
 
 impl AccountUsageProbes {
-    /// Ask every captured session at once, all against one deadline. Per
-    /// vendor the first answer in capture order wins (a `/status` card
-    /// captures its own focus first: across a login switch processes can
-    /// disagree on the account), and is recorded; a vendor nobody answered
-    /// for reads its last observation from
+    /// Per vendor, the first answer in capture order (a `/status` card
+    /// captures its own focus first: across a login switch or with cswap
+    /// accounts, processes can be on different accounts), and is recorded; a
+    /// vendor nobody answered for reads its last observation from
     /// [`ccteam_harness::usage_catalog`], which drops each window at the
     /// vendor's declared reset. A vendor with neither is absent — never an
     /// "unknown" row to misread as plenty left. Keyed by vendor token.
+    ///
+    /// Sessions are asked one at a time and the first answer ends the read,
+    /// so one read asks one process (#244). Asking every process at once (as
+    /// #234 did) made each of them read the usage endpoint when claude's
+    /// shared 60 s snapshot was stale, so one `/status` spent one request per
+    /// live session from the token's allowance (see [`ACCOUNT_USAGE_REUSE`]).
+    /// A process that answered within that window is not asked again. All
+    /// asks still share one deadline (#234): a stuck process costs at most
+    /// that, after which the recorded observation answers.
     pub async fn resolve(self) -> BTreeMap<String, VendorAccountUsage> {
         let deadline = tokio::time::Instant::now() + ACCOUNT_USAGE_DEADLINE;
         let root = self.root;
+        let answers = self.answers;
         let per_vendor = self.by_vendor.into_iter().map(|(vendor, askers)| {
             let root = root.clone();
+            let answers = Arc::clone(&answers);
             async move {
-                let answers = futures::future::join_all(askers.iter().map(|(adapter, thread)| {
-                    tokio::time::timeout_at(deadline, adapter.account_usage(thread))
-                }))
-                .await;
-                let entry = match answers.into_iter().find_map(|answer| answer.ok().flatten()) {
-                    Some(usage) => {
+                let mut entry = None;
+                for (adapter, thread) in &askers {
+                    if let Some(recent) = answers.recent(thread) {
+                        entry = Some(recent);
+                        break;
+                    }
+                    let Ok(answer) =
+                        tokio::time::timeout_at(deadline, adapter.account_usage(thread)).await
+                    else {
+                        break;
+                    };
+                    if let Some(usage) = answer {
                         if let Some(root) = root.as_deref() {
                             ccteam_harness::usage_catalog::record_vendor_usage_best_effort(
                                 root,
@@ -152,20 +236,25 @@ impl AccountUsageProbes {
                                 &usage,
                             );
                         }
-                        Some(VendorAccountUsage {
+                        let fresh = VendorAccountUsage {
                             observed_at: chrono::Utc::now().to_rfc3339(),
                             source: "status card".to_string(),
                             usage,
-                        })
+                        };
+                        answers.remember(thread, &fresh);
+                        entry = Some(fresh);
+                        break;
                     }
-                    None => root.as_deref().and_then(|root| {
+                }
+                let entry = entry.or_else(|| {
+                    root.as_deref().and_then(|root| {
                         ccteam_harness::usage_catalog::last_known_entry_in(
                             root,
                             vendor_str(vendor),
                             chrono::Utc::now(),
                         )
-                    }),
-                };
+                    })
+                });
                 entry.map(|entry| (vendor_str(vendor).to_string(), entry))
             }
         });
@@ -495,7 +584,7 @@ enum TurnOrigin {
     Internal,
 }
 
-/// Who asked for a session's turns, in the two shapes the delivery paths need.
+/// Who asked for a session's turns, in the shapes the delivery paths need.
 ///
 /// `by_turn` answers "who asked for turn X" and is consumed at the vendor turn
 /// boundary — only the events that carry a turn id (a failure) can use it.
@@ -503,11 +592,26 @@ enum TurnOrigin {
 /// which is what IM egress needs: an ordinary assistant answer carries no turn
 /// id, and an answer nobody in the chat asked for must not be pushed into that
 /// chat. Both are written by the same `record`, so they cannot drift.
+///
+/// "Now" is the RUNNING turn, never merely the newest submission: an internal
+/// line parked behind a human's turn used to take the session's route the
+/// moment it was accepted, so the human's still-running turn answered into the
+/// owner's web console and never reached the chat that asked (#242). `parked`
+/// holds such a line's route until its own turn opens ([`Self::open`]).
 #[derive(Debug, Default)]
 struct TurnOrigins {
     by_turn: BTreeMap<String, TurnOrigin>,
     latest: TurnOrigin,
+    /// Internal follow-ups waiting behind the running turn, in submission
+    /// order, each with the reply route its own answer takes.
+    parked: std::collections::VecDeque<(String, ChatKey)>,
 }
+
+/// Parked routes kept at most. A queued line normally opens under its own id
+/// and leaves with that turn; this bounds the rows of lines whose turn never
+/// opens in this session entry's life (the body was stopped or released with
+/// them still parked, or an adapter never reports the queued id opening).
+const PARKED_ROUTES_MAX: usize = 64;
 
 impl Default for TurnOrigin {
     /// A session nobody has submitted to yet has no ccteam-authored question
@@ -517,21 +621,27 @@ impl Default for TurnOrigin {
     }
 }
 
-/// The vendor channel a turn's origin asks for. A human's message joins the
-/// running turn (`Inject`: they are steering work they can see). A
-/// ccteam-authored turn — a delegation completion notification — is a distinct
-/// follow-up (`Notification`, batchable at a boundary): nobody is steering
-/// with it, and on claude a mid-turn
-/// stdin line is shown to the model twice, as a queued-command preview and then
-/// as the next prompt (issue #194: every completion report charged the
-/// orchestrator double). A vendor without a queued-turn channel takes its
-/// mid-turn path and reports the disposition it actually used.
-fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
-    match origin {
-        TurnOrigin::User => TurnRouting::Inject,
-        TurnOrigin::Internal => TurnRouting::Notification,
-    }
-}
+/// The vendor channel of every submission whose caller names none, whatever
+/// its origin: `Inject`. A human's message joins the running turn (they are
+/// steering work they can see), and so does a ccteam-authored delegation
+/// completion notification — an idle parent starts a turn with it, a busy one
+/// reads it inside the turn it is running.
+///
+/// Notifications used to be parked behind the running turn and delivered at
+/// its boundary, on the premise that claude shows a mid-turn stdin line to the
+/// model twice (as a queued-command preview, then again as the next prompt).
+/// The current CLI does not: transcripts show every mid-turn line read once, as
+/// a `queued_command` inside the running turn. Parking therefore bought
+/// nothing and cost everything — a planner that stayed in one 6h40m turn saw
+/// none of its hires' completions until that turn ended (GitHub #220).
+///
+/// Only the CHANNEL changes. The origin stays `Internal`, so an injected
+/// notification does not re-address the running turn's reply route
+/// ([`TurnOrigins::record`], #242). A vendor without a native mid-turn channel
+/// queues it and reports the disposition it actually used. A distinct turn of
+/// its own is a dispatcher's explicit choice (`agent{routing:"queue"}`), never
+/// a default.
+const DEFAULT_ROUTING: TurnRouting = TurnRouting::Inject;
 
 /// What one submission asks for: WHO is asking (the delivery-side fact) and
 /// WHICH vendor channel to use (the submit-side one).
@@ -542,9 +652,8 @@ fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
 /// what puts a session's answer back into its IM thread, so borrowing it for
 /// routing would push every delegated task's answer at a human who never asked
 /// (issue #194 / v0.10.1, the `has_addressee` gate). Two axes, one default:
-/// [`routing_for_origin`] still decides for every caller that has no opinion,
-/// so a new submit path keeps today's behaviour without naming it (issue #197
-/// D).
+/// [`DEFAULT_ROUTING`] decides for every caller that has no opinion, so a new
+/// submit path keeps today's behaviour without naming it (issue #197 D).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TurnIntent {
     origin: TurnOrigin,
@@ -559,11 +668,11 @@ impl TurnIntent {
         }
     }
 
-    /// The default: the origin picks the channel.
+    /// The default channel ([`DEFAULT_ROUTING`]) for a line from `origin`.
     fn from_origin(origin: TurnOrigin) -> Self {
         Self {
             origin,
-            routing: routing_for_origin(origin),
+            routing: DEFAULT_ROUTING,
         }
     }
 
@@ -576,21 +685,61 @@ impl TurnIntent {
 }
 
 impl TurnOrigins {
-    fn record(&mut self, turn_id: String, origin: TurnOrigin) {
-        // Internal is already the lookup default. Notification batches execute
-        // under one of several accepted ids; storing every internal id would
-        // leave the other members here forever (GitHub #205).
-        if origin == TurnOrigin::Internal {
-            self.by_turn.remove(&turn_id);
-        } else {
-            self.by_turn.insert(turn_id, origin);
+    /// Book one accepted submission and say whether it re-addresses the
+    /// session now: `Some(route)` is the reply route to install at once, `None`
+    /// leaves the current one standing.
+    ///
+    /// A human's line always re-addresses: they are in the conversation now,
+    /// whether their line started a turn or steers the running one. An
+    /// internal line (a delegation completion notification, an A2A task)
+    /// re-addresses only the turn it STARTED. Joined into a running turn, it
+    /// is not that turn's question — whoever asked it is still owed the answer
+    /// — and parked behind one, it takes over when its own turn opens.
+    fn record(
+        &mut self,
+        turn_id: String,
+        origin: TurnOrigin,
+        disposition: TurnDisposition,
+        route: ChatKey,
+    ) -> Option<ChatKey> {
+        match (origin, disposition) {
+            (TurnOrigin::User, _) => {
+                self.by_turn.insert(turn_id, origin);
+                self.latest = origin;
+                Some(route)
+            }
+            (TurnOrigin::Internal, TurnDisposition::Started) => {
+                // Internal is already the lookup default, so it is not stored:
+                // the map holds only the rows a lookup could not infer.
+                self.by_turn.remove(&turn_id);
+                self.latest = origin;
+                Some(route)
+            }
+            (TurnOrigin::Internal, TurnDisposition::Injected) => None,
+            (TurnOrigin::Internal, TurnDisposition::Queued) => {
+                if self.parked.len() >= PARKED_ROUTES_MAX {
+                    self.parked.pop_front();
+                }
+                self.parked.push_back((turn_id, route));
+                None
+            }
         }
-        self.latest = origin;
+    }
+
+    /// A turn opened: if it is a parked internal line, it is now the question
+    /// being answered, so its route becomes the session's. Lines parked before
+    /// it have opened already (the queue is FIFO); they are dropped. Any other
+    /// turn (a submitted one, a vendor continuation) changes nothing.
+    fn open(&mut self, turn_id: &str) -> Option<ChatKey> {
+        let at = self.parked.iter().position(|(id, _)| id == turn_id)?;
+        let (_, route) = self.parked.drain(..=at).next_back()?;
+        self.latest = TurnOrigin::Internal;
+        Some(route)
     }
 
     /// Consume the origin of a known execution id. Missing identity is never
-    /// inferred from the remaining user-only entries: internal notification
-    /// ids are intentionally absent from that map (GitHub #205).
+    /// inferred from the remaining user-only entries: internal ids are
+    /// intentionally absent from that map (see [`Self::record`]).
     fn take(&mut self, turn_id: Option<&str>) -> TurnOrigin {
         match turn_id {
             Some(id) => self.by_turn.remove(id).unwrap_or(TurnOrigin::Internal),
@@ -741,6 +890,9 @@ struct UnlockedTurnPlan {
     session_catalog: Arc<crate::session_catalog::SessionCatalog>,
     has_event_sink: bool,
     origin: TurnOrigin,
+    /// Where this line's answer goes once it is the turn being answered —
+    /// installed at plan time or by the commit ([`address_submission`]).
+    reply_route: ChatKey,
     user_text: String,
     start_visible_events: u64,
     requested_routing: TurnRouting,
@@ -833,6 +985,15 @@ enum ReleaseReason {
     /// The user moved the session to another Claude account (#236); the next
     /// message resumes the same sid under it.
     AccountSwitch,
+    /// Claude's default login moved onto or off the account this session is
+    /// pinned to (docs-local issue #240), so its process sits in a profile
+    /// cswap no longer picks for that account; the next message resumes the
+    /// same sid in the one it does.
+    LoginMoved,
+    /// A session sat quiet in its pinned account's session profile for
+    /// `sessions.account_yield_secs` (docs-local issue #245): the account is
+    /// given back and the session returns to the default login.
+    AccountYield,
 }
 
 impl ReleaseReason {
@@ -841,6 +1002,8 @@ impl ReleaseReason {
             ReleaseReason::Capacity => "capacity",
             ReleaseReason::Idle => "idle",
             ReleaseReason::AccountSwitch => "account_switch",
+            ReleaseReason::LoginMoved => "login_moved",
+            ReleaseReason::AccountYield => "account_yield",
         }
     }
 }
@@ -864,6 +1027,29 @@ struct ResidencySnapshot {
     last_active: String,
     /// Time since the later of "installed in the live map" and "last event".
     idle_for: std::time::Duration,
+    /// A session pinned to a cswap account: its persisted binding and the
+    /// profile this process launched in (see [`ResidencySnapshot::login_moved`]).
+    pinned_account: Option<(ClaudeAccountBinding, ClaudeAccountBinding)>,
+}
+
+impl ResidencySnapshot {
+    /// Whether this process is no longer in the profile cswap picks for its
+    /// account now that the default login is `default_login`.
+    fn login_moved(&self, default_login: Option<&str>) -> bool {
+        self.pinned_account
+            .as_ref()
+            .is_some_and(|(pinned, launched)| pinned.launch_profile_moved(launched, default_login))
+    }
+
+    /// Whether this process sits in its pinned account's own session profile,
+    /// which makes it that account's credential holder as far as cswap is
+    /// concerned. A pinned session cswap launched on the default login holds
+    /// nothing of its own.
+    fn holds_account_profile(&self) -> bool {
+        self.pinned_account
+            .as_ref()
+            .is_some_and(|(_, launched)| launched.config_dir.is_some() && !launched.default_login)
+    }
 }
 
 /// The sids whose vendor reports a turn-OUTLIVING task still running
@@ -1145,6 +1331,18 @@ pub struct Gateway {
     /// Optional cswap discovery (#236 IM `/account`), shared with the web
     /// picker so both read one cache.
     cswap_accounts: Arc<ccteam_harness::execution::claude_accounts::CswapAccountService>,
+    /// Recent account-usage answers per live process, reused by every usage
+    /// read and by the release capture (#244).
+    account_usage_answers: Arc<AccountUsageAnswers>,
+    /// Test seam: the identity of Claude's default login, instead of reading
+    /// the real `~/.claude.json`.
+    claude_default_login_override: Option<Option<String>>,
+    /// sid → the default login a [`ReleaseReason::LoginMoved`] release was
+    /// made under. One release per default login: if cswap puts the session
+    /// back in the same profile, that is cswap's decision (it does so when the
+    /// default login holds no usable token) and releasing again would only
+    /// cost a cold resume per message.
+    login_moved_releases: HashMap<String, String>,
     /// The `(sid, secret)` authority behind every managed session's tool face
     /// — see [`crate::principals`]. Separate from `sessions` because a
     /// principal has to work BEFORE its session is live (the vendor uses it
@@ -3860,6 +4058,9 @@ impl Gateway {
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             cswap_accounts: Default::default(),
+            account_usage_answers: Default::default(),
+            claude_default_login_override: None,
+            login_moved_releases: HashMap::new(),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
@@ -7640,7 +7841,7 @@ impl Gateway {
         // v0.8.18 柱2 — the creating chat is recorded as owner (explicit field;
         // NOT path-derived). One shared creation path (issue #222): scaffold,
         // owner stamp and config.yaml registration happen together.
-        create_project(
+        let created = create_project(
             &paths,
             &NewProject {
                 slug: &slug,
@@ -7648,8 +7849,25 @@ impl Gateway {
                 team: None,
                 owner,
             },
-        )
-        .with_context(|| format!("create project {slug} at {}", abs.display()))?;
+        );
+        if let Err(err) = created {
+            // One directory is one project (#239): a directory this chat can
+            // already see is where it wanted to work, so switch there; another
+            // owner's reads like any refusal and names nothing.
+            let Some(taken) = err.downcast_ref::<ccteam_core::ProjectDirTaken>() else {
+                return Err(err.context(format!("create project {slug} at {}", abs.display())));
+            };
+            let existing = taken.slug.clone();
+            self.ensure_project_loaded(&existing);
+            if !self.can_see_project(chat, &existing) {
+                return Err(anyhow!("{} 已被其他项目使用,不能再建项目", abs.display()));
+            }
+            let switched = self.change_project(chat, &existing)?;
+            return Ok(format!(
+                "📁 {} 已是项目 {existing},没有再建新项目\n   {switched}",
+                abs.display()
+            ));
+        }
         self.register_project(slug.clone(), abs.clone());
         // Switch the creating chat INTO the new project (mirror `/cd`): point its
         // `current_project` at the fresh slug and clear the active session — a
@@ -9132,6 +9350,11 @@ impl Gateway {
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id, opening } = &evt {
+                            // An internal line parked behind the turn that just
+                            // ended is the question now: its answer takes the
+                            // route it was submitted with, from here and not
+                            // before (#242).
+                            open_turn_route(&session, turn_id);
                             structured_turn_open = true;
                             // What an earlier stretch said outside any turn is
                             // not this turn's answer.
@@ -12008,10 +12231,6 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        // Replies for this turn go back to whoever sent it.
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = chat.clone();
-        }
         // v0.8.19 `/status` — a real Turn is now in flight: stamp its start (the
         // pump clears it on `TurnCompleted`). A same-turn Inject preserves the
         // original timestamp; resetting it here made any long-running turn look
@@ -12019,11 +12238,15 @@ impl Gateway {
         // reach here, so a `/model` switch is not counted as a working turn.
         // v0.9 T5 — if a prior turn was still in flight this is a mid-turn
         // steer; otherwise clear the steered flag for a fresh turn.
-        let was_in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
+        let was_in_flight = session_turn_in_flight(session);
+        // Replies for this turn go back to whoever sent it — unless it is an
+        // internal line arriving mid-turn, which is booked by disposition
+        // after the submit below (#242).
+        if addresses_before_submit(origin, was_in_flight) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = chat.clone();
+            }
+        }
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
         let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
@@ -12167,9 +12390,7 @@ impl Gateway {
             }
         }
         let turn_id = submitted.turn_id.clone();
-        if let Ok(mut origins) = session.turn_origins.lock() {
-            origins.record(turn_id.0.clone(), origin);
-        }
+        address_submission(session, &turn_id.0, origin, submitted.disposition, chat);
         self.mirror_user_turn(session, &user_text, &submitted.input_id);
         // Grok's native interjection path may hold its TurnCompleted boundary
         // until the accepted input is registered above. Release only after
@@ -12203,8 +12424,10 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = chat.clone();
+        if addresses_before_submit(origin, session_turn_in_flight(session)) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = chat.clone();
+            }
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         let submit_wait = gateway_submit_timeout_duration();
@@ -12219,14 +12442,12 @@ impl Gateway {
         .map_err(|_| anyhow!("directive timed out after {submit_wait:?} for {session_id}"))??;
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
-                if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.record(turn_id.0.clone(), origin);
-                }
                 // A directive that resolves to a turn was submitted by the
                 // adapter itself (`/model` re-prompt, grok steer): it is
                 // running, not queued. The turn body is the adapter's own
                 // re-prompt, not user text, so the progress row carries no
                 // excerpt rather than a fabricated one.
+                address_submission(session, &turn_id.0, origin, TurnDisposition::Started, chat);
                 self.after_turn_submitted(
                     session,
                     start_visible_events,
@@ -13809,7 +14030,11 @@ impl Gateway {
     /// DAEMON's own vendor accounts (every session of that vendor spends from
     /// them), not any one caller's data.
     pub fn account_usage_probes(&self, vendor: Option<AgentVendor>) -> AccountUsageProbes {
-        let live: Vec<&GatewaySession> = self.sessions.values().collect();
+        let mut live: Vec<&GatewaySession> = self.sessions.values().collect();
+        // No caller order to honor here (map order is arbitrary anyway), so a
+        // process with a recent answer goes first and the read reuses it
+        // instead of asking another process (#244).
+        live.sort_by_key(|s| self.account_usage_answers.recent(&s.thread).is_none());
         self.account_usage_probes_from(vendor, &live)
     }
 
@@ -13822,6 +14047,7 @@ impl Gateway {
     ) -> AccountUsageProbes {
         AccountUsageProbes {
             root: self.state_root.clone(),
+            answers: Arc::clone(&self.account_usage_answers),
             by_vendor: AgentVendor::ALL
                 .iter()
                 .copied()
@@ -15452,9 +15678,37 @@ impl Gateway {
                     waiting_approval: pending.pending_for_sid(&session.id).is_some(),
                     last_active: self.session_last_active(session),
                     idle_for: now.saturating_duration_since(floor),
+                    pinned_account: self.pinned_account_launch(session),
                 }
             })
             .collect()
+    }
+
+    /// The persisted account binding of a session pinned to a cswap account,
+    /// with the profile its live process was launched in. `None` for a
+    /// default-login session (nothing to follow) and for a process whose
+    /// launch reported no profile.
+    fn pinned_account_launch(
+        &self,
+        session: &GatewaySession,
+    ) -> Option<(ClaudeAccountBinding, ClaudeAccountBinding)> {
+        let pinned = self
+            .session_catalog
+            .get(&session.id)
+            .and_then(|entry| entry.meta.claude_account)
+            .filter(|binding| !binding.default_login)?;
+        let launched = session
+            .thread
+            .raw_extras
+            .get("claude_account")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())?;
+        Some((pinned, launched))
+    }
+
+    /// Answer "which account is Claude's default login" with `id` instead of
+    /// reading the real `~/.claude.json` (deterministic tests).
+    pub fn set_claude_default_login(&mut self, id: Option<String>) {
+        self.claude_default_login_override = Some(id);
     }
 
     /// Fence one sid OUT of the live map without touching chat focus routes.
@@ -15537,17 +15791,25 @@ impl Gateway {
         // at all. Off the registry lock, like the close below, and on a short
         // deadline: this is a nicety, and a child too wedged to answer must
         // still be released promptly (the timeout simply means no capture).
-        if let Ok(Some(usage)) = tokio::time::timeout(
-            Self::RELEASE_USAGE_CAPTURE_TIMEOUT,
-            adapter.account_usage(&thread),
-        )
-        .await
-        {
-            gateway
-                .lock()
-                .await
-                .record_account_usage(adapter.vendor(), "session release", &usage);
+        // A process that answered a usage read moments ago is not asked again
+        // (#244): that answer is already recorded, and for a vendor whose ask
+        // reads its usage API, asking would spend a read for nothing.
+        let answers = Arc::clone(&gateway.lock().await.account_usage_answers);
+        if answers.recent(&thread).is_none() {
+            if let Ok(Some(usage)) = tokio::time::timeout(
+                Self::RELEASE_USAGE_CAPTURE_TIMEOUT,
+                adapter.account_usage(&thread),
+            )
+            .await
+            {
+                gateway.lock().await.record_account_usage(
+                    adapter.vendor(),
+                    "session release",
+                    &usage,
+                );
+            }
         }
+        answers.forget(&thread);
         // Graceful vendor close is the slow half and never occupies the
         // registry lock. The entry is already fenced out, so new work cannot
         // race onto the retiring handle.
@@ -15582,6 +15844,24 @@ impl Gateway {
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         target: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+    ) -> std::result::Result<ClaudeAccountSwitch, ClaudeAccountSwitchError> {
+        Self::move_claude_account_shared(gateway, sid, target, ReleaseReason::AccountSwitch, None)
+            .await
+    }
+
+    /// The one way a session changes account: [`Self::switch_claude_account_shared`]
+    /// on the user's word, and the account-yield pass on its clock (issue
+    /// #245), which must leave the session exactly as resumable as a switch
+    /// the user asked for.
+    ///
+    /// `only_generation` limits the move to the process a caller looked at: a
+    /// session that started a new one since is left alone.
+    async fn move_claude_account_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        target: Option<ccteam_harness::execution::claude_accounts::CswapAccount>,
+        reason: ReleaseReason,
+        only_generation: Option<u64>,
     ) -> std::result::Result<ClaudeAccountSwitch, ClaudeAccountSwitchError> {
         use ccteam_harness::execution::claude_accounts::{
             history_follows_switch, ClaudeAccountBinding,
@@ -15632,6 +15912,13 @@ impl Gateway {
                 .sessions
                 .get(sid)
                 .map(|s| (s.generation, Arc::clone(&s.adapter), s.thread.clone()));
+            if only_generation.is_some()
+                && only_generation != live.as_ref().map(|(generation, ..)| *generation)
+            {
+                return Err(ClaudeAccountSwitchError::Busy(
+                    "the session just started or stopped; try again".into(),
+                ));
+            }
             (slug, cwd, meta, live)
         };
         let current = meta.claude_account.clone();
@@ -15727,17 +16014,10 @@ impl Gateway {
         };
         let released = fenced.is_some();
         if let Some((slug, adapter, thread)) = fenced {
-            Self::finish_release_shared(
-                gateway,
-                sid,
-                slug,
-                adapter,
-                thread,
-                ReleaseReason::AccountSwitch,
-            )
-            .await?;
+            Self::finish_release_shared(gateway, sid, slug, adapter, thread, reason).await?;
         }
-        tracing::info!(sid, %slug, released, "ccteam-im: switched Claude account");
+        tracing::info!(sid, %slug, released, reason = reason.as_str(),
+            "ccteam-im: switched Claude account");
         Ok(ClaudeAccountSwitch {
             claude_account: next.as_ref().map(ClaudeAccountBinding::display),
             changed: true,
@@ -15876,28 +16156,94 @@ impl Gateway {
     /// workflow / async agent is real work the session's process is still
     /// carrying — the same `RunningTask::outlives_turn` authority the status
     /// surfaces use), and an idle clock past the harness's TTL.
+    ///
+    /// The same pass lets go of a quiet process whose Claude account moved
+    /// onto or off the default login (docs-local issue #240), whatever its
+    /// idle clock says and even with idle release off: cswap keeps one live
+    /// credential copy per account, so a process left in the profile cswap no
+    /// longer picks either holds a second copy of the default login's
+    /// credential (`cswap switch` warns, and one copy's token goes stale once
+    /// the server rotates it) or spends another account's quota. The session
+    /// is untouched and its next message resumes it in the right profile.
+    ///
+    /// And it gives a pinned account back (docs-local issue #245). A process
+    /// in an account's session profile is that account's credential holder:
+    /// while it lives `cswap auto` skips the account, and once it has
+    /// refreshed its token `cswap switch` onto the account refuses outright.
+    /// cswap tells nobody that a switch was wanted, so there is no moment to
+    /// step aside at; a process quiet for `sessions.account_yield_secs` is
+    /// released instead and its session moved to the default login, the same
+    /// move as the user picking "Default login" and held to the same checks.
     pub async fn idle_release_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) -> Vec<String> {
-        let (snapshot, config) = {
+        let (snapshot, config, default_login_override) = {
             let guard = gateway.lock().await;
-            (guard.residency_snapshot().await, guard.sessions_config())
+            (
+                guard.residency_snapshot().await,
+                guard.sessions_config(),
+                guard.claude_default_login_override.clone(),
+            )
         };
+        // One small file read, and only while a pinned session is resident.
+        let default_login = if snapshot.iter().any(|row| row.pinned_account.is_some()) {
+            match default_login_override {
+                Some(id) => id,
+                None => tokio::task::spawn_blocking(
+                    ccteam_harness::execution::claude_accounts::default_login_account_id,
+                )
+                .await
+                .unwrap_or(None),
+            }
+        } else {
+            None
+        };
+        let login_moved: HashSet<&str> = match &default_login {
+            // Nothing pinned is resident, or the default login is unknown.
+            None => HashSet::new(),
+            Some(current) => {
+                let mut guard = gateway.lock().await;
+                // A release remembered under an earlier default login says
+                // nothing about this one.
+                guard
+                    .login_moved_releases
+                    .retain(|_, released_under| released_under == current);
+                snapshot
+                    .iter()
+                    .filter(|row| {
+                        row.login_moved(Some(current))
+                            && !guard.login_moved_releases.contains_key(&row.sid)
+                    })
+                    .map(|row| row.sid.as_str())
+                    .collect()
+            }
+        };
+        let idle_ripe = |row: &ResidencySnapshot| {
+            config
+                .idle_release_for(&row.vendor)
+                .is_some_and(|ttl| row.idle_for >= ttl)
+        };
+        let account_yield = config.account_yield();
         // Candidates first (cheap, in-memory), so the adapter round-trip below
         // is paid only for sessions that are otherwise ready to be released.
-        let ripe: Vec<&ResidencySnapshot> = snapshot
+        let ripe: Vec<(&ResidencySnapshot, ReleaseReason)> = snapshot
             .iter()
-            .filter(|row| {
-                !row.turn_in_flight
-                    && !row.waiting_approval
-                    && config
-                        .idle_release_for(&row.vendor)
-                        .is_some_and(|ttl| row.idle_for >= ttl)
+            .filter(|row| !row.turn_in_flight && !row.waiting_approval)
+            .filter_map(|row| {
+                if login_moved.contains(row.sid.as_str()) {
+                    Some((row, ReleaseReason::LoginMoved))
+                } else if row.holds_account_profile()
+                    && account_yield.is_some_and(|window| row.idle_for >= window)
+                {
+                    Some((row, ReleaseReason::AccountYield))
+                } else {
+                    idle_ripe(row).then_some((row, ReleaseReason::Idle))
+                }
             })
             .collect();
         if ripe.is_empty() {
             return Vec::new();
         }
         let mut released = Vec::new();
-        for row in ripe {
+        for (row, reason) in ripe {
             // Per session: one release that panics must not skip every
             // session after it on every pass.
             let freed = crate::supervise::contain_panic("idle-release sweeper", &row.sid, async {
@@ -15912,23 +16258,51 @@ impl Gateway {
                 {
                     return false;
                 }
-                match Self::release_session_shared(
-                    gateway,
-                    &row.sid,
-                    row.generation,
-                    ReleaseReason::Idle,
-                )
-                .await
+                let reason = if reason == ReleaseReason::AccountYield {
+                    match Self::move_claude_account_shared(
+                        gateway,
+                        &row.sid,
+                        None,
+                        reason,
+                        Some(row.generation),
+                    )
+                    .await
+                    {
+                        Ok(moved) => return moved.released,
+                        // Its history cannot follow it yet, or it just got
+                        // busy: the account stays its own, and it is still an
+                        // idle process like any other.
+                        Err(error) => {
+                            tracing::debug!(sid = %row.sid, ?error,
+                                "ccteam-im: account not given back");
+                            if !idle_ripe(row) {
+                                return false;
+                            }
+                            ReleaseReason::Idle
+                        }
+                    }
+                } else {
+                    reason
+                };
+                match Self::release_session_shared(gateway, &row.sid, row.generation, reason).await
                 {
                     Ok(released) => released,
                     Err(error) => {
-                        tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                        tracing::warn!(sid = %row.sid, %error, reason = reason.as_str(),
+                            "ccteam-im: session release failed");
                         false
                     }
                 }
             })
             .await;
             if freed == Some(true) {
+                if let (ReleaseReason::LoginMoved, Some(current)) = (reason, &default_login) {
+                    gateway
+                        .lock()
+                        .await
+                        .login_moved_releases
+                        .insert(row.sid.clone(), current.clone());
+                }
                 released.push(row.sid.clone());
             }
         }
@@ -15940,6 +16314,12 @@ impl Gateway {
     #[cfg(test)]
     pub(crate) fn set_replay_grace_for_tests(&mut self, grace: std::time::Duration) {
         self.replay_grace = grace;
+    }
+
+    /// Test seam: age every remembered account-usage answer by `by` (#244).
+    #[cfg(test)]
+    pub(crate) fn backdate_account_usage_answers_for_tests(&self, by: std::time::Duration) {
+        self.account_usage_answers.backdate(by);
     }
 
     /// Test seam: pretend `sid` has been resident and silent for `by`, so an
@@ -18405,8 +18785,10 @@ impl Gateway {
                 .cloned()
                 .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
             let chat = guard.owner_reply_target(&session);
-            if let Ok(mut target) = session.reply_to.lock() {
-                *target = chat.clone();
+            if addresses_before_submit(origin, session_turn_in_flight(&session)) {
+                if let Ok(mut target) = session.reply_to.lock() {
+                    *target = chat.clone();
+                }
             }
             (
                 chat,
@@ -18452,9 +18834,14 @@ impl Gateway {
 
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
-                if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.record(turn_id.0.clone(), origin);
-                }
+                // Running, not queued — see `dispatch_directive`.
+                address_submission(
+                    &session,
+                    &turn_id.0,
+                    origin,
+                    TurnDisposition::Started,
+                    &chat,
+                );
                 if !session.protocol.is_terminal() {
                     if let Some(paths) = project_paths.as_ref() {
                         let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
@@ -18545,15 +18932,16 @@ impl Gateway {
         // Owner-derived, with the session's thread kept: an internal turn's
         // answer (a delegation completion notification) belongs in the thread
         // the session lives in, where it is that thread's focus.
-        let reply_to = self.owner_reply_target(&session);
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = reply_to;
+        let reply_route = self.owner_reply_target(&session);
+        let was_in_flight = session_turn_in_flight(&session);
+        // An internal line arriving mid-turn is not installed yet: the running
+        // turn may be someone else's question, and still owes them its answer.
+        // The commit books it by what the adapter did with it (#242).
+        if addresses_before_submit(origin, was_in_flight) {
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = reply_route.clone();
+            }
         }
-        let was_in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|started| started.is_some())
-            .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
         let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
@@ -18580,6 +18968,7 @@ impl Gateway {
             session_catalog: Arc::clone(&self.session_catalog),
             has_event_sink: self.event_sink.is_some(),
             origin,
+            reply_route,
             user_text,
             requested_routing,
             provisional_inject,
@@ -18617,9 +19006,13 @@ impl Gateway {
                     .steered_this_turn
                     .store(plan.prior_steered, Ordering::SeqCst);
             }
-            if let Ok(mut origins) = current.turn_origins.lock() {
-                origins.record(submitted.turn_id.0.clone(), plan.origin);
-            };
+            address_submission(
+                current,
+                &submitted.turn_id.0,
+                plan.origin,
+                submitted.disposition,
+                &plan.reply_route,
+            );
         }
 
         Self::mirror_unlocked_user_turn(&plan, &submitted.input_id);
@@ -20850,6 +21243,62 @@ fn pump_target(session: &GatewaySession) -> ChatKey {
         .unwrap_or_else(|_| session.owner.clone())
 }
 
+/// Whether a submission's reply route goes in BEFORE the vendor is handed the
+/// line. A turn it starts can speak before the submit call returns, so its
+/// route must already stand; a human's line re-addresses the session either
+/// way. Only an internal line arriving while a turn runs waits for the
+/// adapter's disposition ([`address_submission`]) — it may not be the running
+/// turn's question at all (#242).
+fn addresses_before_submit(origin: TurnOrigin, turn_in_flight: bool) -> bool {
+    origin == TurnOrigin::User || !turn_in_flight
+}
+
+/// Whether `session` has a vendor turn running (the gateway's own marker:
+/// stamped at submit, opened again by the pump on `TurnStarted`, cleared at
+/// the boundary).
+fn session_turn_in_flight(session: &GatewaySession) -> bool {
+    session
+        .turn_started_at
+        .lock()
+        .map(|started| started.is_some())
+        .unwrap_or(false)
+}
+
+/// Book an accepted submission on `session` and install the reply route it
+/// re-addresses the session to, if any — the one rule every submit path
+/// shares ([`TurnOrigins::record`]).
+fn address_submission(
+    session: &GatewaySession,
+    turn_id: &str,
+    origin: TurnOrigin,
+    disposition: TurnDisposition,
+    route: &ChatKey,
+) {
+    let now = session.turn_origins.lock().ok().and_then(|mut origins| {
+        origins.record(turn_id.to_string(), origin, disposition, route.clone())
+    });
+    if let Some(route) = now {
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = route;
+        }
+    }
+}
+
+/// The pump saw `turn_id` open: a parked internal line now answers to the
+/// route it was submitted with ([`TurnOrigins::open`]).
+fn open_turn_route(session: &GatewaySession, turn_id: &str) {
+    let opened = session
+        .turn_origins
+        .lock()
+        .ok()
+        .and_then(|mut origins| origins.open(turn_id));
+    if let Some(route) = opened {
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = route;
+        }
+    }
+}
+
 fn take_turn_origin(session: &GatewaySession, turn_id: Option<&str>) -> TurnOrigin {
     let Ok(mut origins) = session.turn_origins.lock() else {
         return TurnOrigin::Internal;
@@ -22920,10 +23369,11 @@ mod tests {
     /// #234 — `/status` asked every live session for account usage one after
     /// another while holding the daemon-wide gateway lock (3 s each), so a
     /// slow vendor answer held web, IM and MCP for up to a minute. The asks
-    /// now share one deadline and run concurrently, and the shared IM entry
-    /// runs them with the lock dropped.
+    /// now share one deadline, and the shared IM entry runs them with the
+    /// lock dropped. (#244 asks them in turn again — one process per read —
+    /// which the shared deadline keeps bounded.)
     #[tokio::test]
-    async fn status_usage_asks_run_concurrently_and_outside_the_gateway_lock() {
+    async fn status_usage_asks_share_one_deadline_and_run_outside_the_gateway_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let alpha = tmp.path().join("alpha");
         std::fs::create_dir_all(&alpha).unwrap();
@@ -22938,8 +23388,9 @@ mod tests {
         fake.set_account_usage_delay(std::time::Duration::from_millis(600));
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
 
-        // Concurrent: the #234 shape — no session has an answer, so every one
-        // is asked. Three 600 ms asks finish together, not in 1.8 s.
+        // Bounded: the #234 shape — no session has an answer, so they are
+        // asked in turn, and the shared deadline ends the read instead of
+        // three 600 ms asks adding up to 1.8 s.
         let started = std::time::Instant::now();
         gateway
             .lock()
@@ -22949,7 +23400,7 @@ mod tests {
             .unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_millis(1400),
-            "asks ran one after another: {:?}",
+            "the asks outlived the shared deadline: {:?}",
             started.elapsed()
         );
         fake.set_account_usage(Some(AccountUsage {
@@ -22986,7 +23437,12 @@ mod tests {
         let replies = status.await.unwrap().unwrap();
         assert!(replies[0].contains("5h 7%"), "{replies:?}");
 
-        // Bounded: a stuck vendor costs one deadline, not 3 × its delay.
+        // Bounded: a stuck vendor costs one deadline, not 3 × its delay. (The
+        // answer above is reused for a while, so age it out first, #244.)
+        gateway
+            .lock()
+            .await
+            .backdate_account_usage_answers_for_tests(ACCOUNT_USAGE_REUSE);
         fake.set_account_usage_delay(std::time::Duration::from_secs(5));
         let started = std::time::Instant::now();
         gateway
@@ -23000,6 +23456,139 @@ mod tests {
             "a stuck vendor was waited out: {:?}",
             started.elapsed()
         );
+    }
+
+    /// #244 — a usage read asks one live process, not all of them: claude
+    /// answers past its 60 s shared snapshot by reading the usage endpoint, so
+    /// asking every process at once spent one request per live session from
+    /// the token's allowance (~30 an hour, shared with every claude process
+    /// and cswap) and left cswap's view of the account frozen on 429s. A
+    /// process that answered recently is not asked again.
+    #[tokio::test]
+    async fn a_usage_read_asks_one_session_and_reuses_its_recent_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..3 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(7),
+            ..Default::default()
+        }))
+        .await;
+        let focus = gateway.sessions["s3"].thread.identity.clone();
+
+        // One read: the focus answers, nobody else is asked.
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(card.contains("5h 7%"), "{card}");
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone()]);
+
+        // Every surface reads through the same probes: MCP / web / a second
+        // card within the reuse window ask no one.
+        let usage = gateway.account_usage_probes(None).resolve().await;
+        assert_eq!(usage["claude"].usage.five_hour_pct, Some(7));
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone()]);
+
+        // Past the window the focus is asked again — once.
+        gateway.backdate_account_usage_answers_for_tests(ACCOUNT_USAGE_REUSE);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![focus.clone(), focus]);
+    }
+
+    /// #244 — a process that has no answer is passed over for the next one, in
+    /// capture order, so one read still finds the account's windows when the
+    /// focus cannot say (a vendor without a usage channel, or a stuck one).
+    #[tokio::test]
+    async fn a_usage_read_moves_on_when_a_session_has_no_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        // Only s1 can answer; s2 (the focus) has nothing to say.
+        let s1 = gateway.sessions["s1"].thread.identity.clone();
+        let s2 = gateway.sessions["s2"].thread.identity.clone();
+        fake.set_thread_account_usage(
+            &s1,
+            AccountUsage {
+                weekly_pct: Some(40),
+                ..Default::default()
+            },
+        );
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(card.contains("周 40%"), "{card}");
+        assert_eq!(fake.account_usage_asks(), vec![s2, s1]);
+    }
+
+    /// #244 — releasing a session that answered a usage read moments ago does
+    /// not ask it again: that answer is already recorded. One that has not
+    /// answered recently is still asked, so the account's windows outlive it.
+    #[tokio::test]
+    async fn a_release_reuses_a_recent_usage_answer_instead_of_asking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        fake.set_account_usage(Some(AccountUsage {
+            five_hour_pct: Some(9),
+            ..Default::default()
+        }))
+        .await;
+        for _ in 0..2 {
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+        let s1 = gateway.sessions["s1"].thread.identity.clone();
+        let s2 = gateway.sessions["s2"].thread.identity.clone();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(fake.account_usage_asks(), vec![s2.clone()]);
+
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        gateway.backdate_residency_for_tests("s2", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut released = Gateway::idle_release_tick(&gateway).await;
+        released.sort();
+        assert_eq!(released, vec!["s1", "s2"]);
+        // s2 answered moments ago: not asked again. s1 never answered: asked.
+        assert_eq!(fake.account_usage_asks(), vec![s2, s1]);
     }
 
     /// `/status` on a focus that points at a released session must render the
@@ -25529,6 +26118,313 @@ mod tests {
         assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
     }
 
+    /// #240 — a session pinned to a cswap account follows that account across
+    /// the default login. `cswap switch` onto the account leaves the process
+    /// in the session profile holding a second copy of the now-default
+    /// credential; a switch off it leaves a default-login process spending
+    /// another account's quota. Either way the quiet process is released and
+    /// the same sid resumes, still pinned to its account.
+    #[tokio::test]
+    async fn a_pinned_process_is_released_when_the_default_login_moves_across_its_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        // What the relay confirms for a launch: the profile cswap chose.
+        let launched_on = |gw: &mut Gateway, default_login: bool| {
+            let mut binding = ClaudeAccountBinding::requested(one.id.clone()).unwrap();
+            binding.config_dir = Some(tmp.path().join("profile"));
+            binding.default_login = default_login;
+            gw.sessions.get_mut(&sid).unwrap().thread.raw_extras["claude_account"] =
+                serde_json::to_value(binding).unwrap();
+        };
+        let resume = || async {
+            Gateway::resume_stopped_session_shared(
+                Arc::clone(&gateway),
+                &sid,
+                "user:web-api",
+                None,
+                GatewayDeadline::start(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fake.spawn_accounts.lock().await.last().cloned(),
+                Some(Some(one.id.clone())),
+                "the same sid resumes pinned to the same account"
+            );
+        };
+        {
+            let mut gw = gateway.lock().await;
+            // Not the idle policy: it fires with idle release switched off.
+            gw.set_sessions_config(ccteam_core::SessionsConfig {
+                idle_release_secs: 0,
+                ..Default::default()
+            });
+            launched_on(&mut gw, false);
+            gw.set_claude_default_login(Some(two.id.clone()));
+        }
+        // Another account is the default login: the session profile is right.
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // `cswap switch 1` while a turn runs: the turn is never cut short.
+        {
+            let gw = gateway.lock().await;
+            *gw.sessions[&sid].turn_started_at.lock().unwrap() = Some(Instant::now());
+        }
+        gateway
+            .lock()
+            .await
+            .set_claude_default_login(Some(one.id.clone()));
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        end_turn(&*gateway.lock().await, &sid);
+        let mut events = gateway.lock().await.subscribe_events();
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+        let event = events.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "login_moved"
+        ));
+        assert!(!gateway.lock().await.sessions.contains_key(&sid));
+        assert_eq!(
+            stored_account(&gateway, &sid).await.unwrap().id,
+            one.id,
+            "the pin is untouched"
+        );
+
+        // cswap now runs the account on the default login: nothing to do.
+        resume().await;
+        launched_on(&mut *gateway.lock().await, true);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        // An unreadable default login is not evidence of a move.
+        gateway.lock().await.set_claude_default_login(None);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // The default login moves on to another account: this process would
+        // now run as that account.
+        gateway
+            .lock()
+            .await
+            .set_claude_default_login(Some(two.id.clone()));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+
+        // One release per default login: if cswap launches it in the same
+        // profile again, that is cswap's decision, not a reason to loop.
+        resume().await;
+        launched_on(&mut *gateway.lock().await, true);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+    }
+
+    /// A session created on the default login follows it by design: a default
+    /// login change is not a reason to release it.
+    #[tokio::test]
+    async fn a_default_login_session_is_not_released_when_the_login_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (_fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        {
+            let mut gw = gateway.lock().await;
+            let mut binding = ClaudeAccountBinding::requested(one.id.clone()).unwrap();
+            binding.config_dir = Some(tmp.path().join("default-profile"));
+            binding.default_login = true;
+            gw.sessions.get_mut(&sid).unwrap().thread.raw_extras["claude_account"] =
+                serde_json::to_value(&binding).unwrap();
+            let (_, cwd, mut meta) = gw.find_meta_for_sid(&sid).unwrap();
+            meta.claude_account = Some(binding);
+            gw.persist_session_meta(&cwd, &meta).unwrap();
+            gw.set_claude_default_login(Some(two.id.clone()));
+        }
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+    }
+
+    /// What the relay confirms for a launch: the profile cswap chose.
+    fn launched_in(
+        gw: &mut Gateway,
+        sid: &str,
+        account: &str,
+        profile: &std::path::Path,
+        default_login: bool,
+    ) {
+        let mut binding = ClaudeAccountBinding::requested(account.to_string()).unwrap();
+        binding.config_dir = Some(profile.to_path_buf());
+        binding.default_login = default_login;
+        gw.sessions.get_mut(sid).unwrap().thread.raw_extras["claude_account"] =
+            serde_json::to_value(binding).unwrap();
+    }
+
+    /// #245 — a process in its pinned account's session profile is that
+    /// account's credential holder: `cswap auto` skips the account and, once
+    /// the process refreshed its token, `cswap switch` onto it refuses. A
+    /// quiet one gives the account back after `sessions.account_yield_secs`:
+    /// the process is released, the session returns to the default login, and
+    /// the same sid resumes there.
+    #[tokio::test]
+    async fn a_quiet_pinned_process_gives_its_account_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        let quiet_for = |secs: u64| {
+            let gateway = Arc::clone(&gateway);
+            let sid = sid.clone();
+            async move {
+                gateway
+                    .lock()
+                    .await
+                    .backdate_residency_for_tests(&sid, std::time::Duration::from_secs(secs));
+            }
+        };
+        {
+            let mut gw = gateway.lock().await;
+            // Not the idle policy: it fires with idle release switched off.
+            gw.set_sessions_config(ccteam_core::SessionsConfig {
+                idle_release_secs: 0,
+                account_yield_secs: 600,
+                ..Default::default()
+            });
+            launched_in(&mut gw, &sid, &one.id, &tmp.path().join("profile"), false);
+            gw.set_claude_default_login(Some(two.id.clone()));
+            end_turn(&gw, &sid);
+        }
+        // Inside the window the account is the session's.
+        quiet_for(300).await;
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // Past it, but a turn is running: the turn is never cut short.
+        quiet_for(400).await;
+        {
+            let gw = gateway.lock().await;
+            *gw.sessions[&sid].turn_started_at.lock().unwrap() = Some(Instant::now());
+        }
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+
+        end_turn(&*gateway.lock().await, &sid);
+        let mut events = gateway.lock().await.subscribe_events();
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+        let event = events.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "account_yield"
+        ));
+        assert!(
+            !gateway.lock().await.sessions.contains_key(&sid),
+            "the process is released, the session is not"
+        );
+        assert_eq!(
+            stored_account(&gateway, &sid).await,
+            None,
+            "the session is back on the default login"
+        );
+
+        Gateway::resume_stopped_session_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "user:web-api",
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.spawn_accounts.lock().await.last().cloned(),
+            Some(None),
+            "the same sid resumes on the default login"
+        );
+        // A default-login session has no account to give back.
+        quiet_for(10_000).await;
+        end_turn(&*gateway.lock().await, &sid);
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+    }
+
+    /// #245 — what does NOT give an account back: the window switched off, a
+    /// pinned session cswap runs on the default login (it holds no credential
+    /// of its own), and a session whose history could not follow it.
+    #[tokio::test]
+    async fn an_account_is_kept_when_giving_it_back_is_off_pointless_or_lossy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (cswap_account("1", "cloud"), cswap_account("2", "work"));
+        let (_fake, gateway, sid) =
+            account_session(tmp.path(), AgentVendor::Claude, Some(one.id.clone())).await;
+        let profile = tmp.path().join("profile");
+        let config = |account_yield_secs, idle_release_secs| ccteam_core::SessionsConfig {
+            idle_release_secs,
+            account_yield_secs,
+            ..Default::default()
+        };
+        {
+            let mut gw = gateway.lock().await;
+            gw.set_sessions_config(config(0, 0));
+            launched_in(&mut gw, &sid, &one.id, &profile, false);
+            gw.set_claude_default_login(Some(two.id.clone()));
+            end_turn(&gw, &sid);
+            gw.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(10_000));
+        }
+        // `0` = never.
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // The account is the default login and cswap runs the session there.
+        {
+            let mut gw = gateway.lock().await;
+            gw.set_sessions_config(config(600, 0));
+            launched_in(&mut gw, &sid, &one.id, &tmp.path().join("default"), true);
+            gw.set_claude_default_login(Some(one.id.clone()));
+        }
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+
+        // Its transcript exists only in the account's own profile: on the
+        // default login the resume would start the conversation over.
+        let uuid = {
+            let mut gw = gateway.lock().await;
+            launched_in(&mut gw, &sid, &one.id, &profile, false);
+            gw.set_claude_default_login(Some(two.id.clone()));
+            let (_, cwd, mut meta) = gw.find_meta_for_sid(&sid).unwrap();
+            let mut binding = ClaudeAccountBinding::requested(one.id.clone()).unwrap();
+            binding.config_dir = Some(profile.clone());
+            meta.claude_account = Some(binding);
+            gw.persist_session_meta(&cwd, &meta).unwrap();
+            if meta.vendor_uuid.is_empty() {
+                ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid(
+                    "alpha", &sid,
+                )
+            } else {
+                meta.vendor_uuid
+            }
+        };
+        let transcript = ccteam_harness::execution::transcript_tail::anthropic_project_dir_in(
+            &profile.join("projects"),
+            tmp.path(),
+        );
+        std::fs::create_dir_all(&transcript).unwrap();
+        std::fs::write(transcript.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        // It is still an idle process like any other: the idle policy
+        // releases it, pin intact.
+        gateway.lock().await.set_sessions_config(config(600, 900));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+        assert_eq!(stored_account(&gateway, &sid).await.unwrap().id, one.id);
+    }
+
     /// The fake vendor never ends a turn; end it as a real one would.
     fn end_turn(gw: &Gateway, sid: &str) {
         *gw.sessions[sid].turn_started_at.lock().unwrap() = None;
@@ -27041,6 +27937,8 @@ mod tests {
         /// How long each `account_usage` ask takes — a slow or stuck vendor
         /// (#234). Zero = immediate.
         account_usage_delay: Arc<std::sync::Mutex<std::time::Duration>>,
+        /// Every `account_usage` ask, by thread identity, in order (#244).
+        account_usage_asks: Arc<std::sync::Mutex<Vec<String>>>,
         /// Monotone submission counter, so every accepted message gets its OWN
         /// execution-turn id. One id per THREAD was enough while nothing
         /// correlated a completion with the message that asked for it; a
@@ -27140,6 +28038,7 @@ mod tests {
                 account_usage: Arc::new(Mutex::new(None)),
                 account_usage_by_thread: Arc::default(),
                 account_usage_delay: Arc::default(),
+                account_usage_asks: Arc::default(),
                 turn_seq: Arc::new(AtomicUsize::new(0)),
                 turn_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 events_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -27290,7 +28189,7 @@ mod tests {
         ) -> (String, TurnDisposition, Option<usize>) {
             let mut queues = self.turn_queues.lock().unwrap();
             let queue = queues.entry(identity.to_string()).or_default();
-            let queued = matches!(routing, TurnRouting::Queue | TurnRouting::Notification)
+            let queued = routing == TurnRouting::Queue
                 || (self.degrade_inject_to_queue && routing == TurnRouting::Inject);
             match queue.active.clone() {
                 None => {
@@ -27388,6 +28287,11 @@ mod tests {
         /// Set the account usage this fake reports from `account_usage`.
         async fn set_account_usage(&self, usage: Option<AccountUsage>) {
             *self.account_usage.lock().await = usage;
+        }
+
+        /// Thread identities asked for account usage so far, in order (#244).
+        fn account_usage_asks(&self) -> Vec<String> {
+            self.account_usage_asks.lock().unwrap().clone()
         }
 
         fn set_account_usage_delay(&self, delay: std::time::Duration) {
@@ -27709,6 +28613,10 @@ mod tests {
         }
 
         async fn account_usage(&self, h: &ThreadHandle) -> Option<AccountUsage> {
+            self.account_usage_asks
+                .lock()
+                .unwrap()
+                .push(h.identity.clone());
             let delay = *self.account_usage_delay.lock().unwrap();
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -27918,13 +28826,12 @@ mod tests {
         );
     }
 
-    /// GitHub #197 (D) — routing became a DISPATCHER's choice; the notifier's
-    /// door did not move with it. Whatever a parent asks for on its own tasks,
-    /// a ccteam-authored completion notification is still a distinct queued
-    /// turn — the whole of issue #194's saving, and the one submit path that
-    /// must never take an argument for it.
+    /// GitHub #197 (D) — routing is a DISPATCHER's choice; the notifier's door
+    /// takes no argument for it. Whatever a parent asks for on its own tasks,
+    /// a ccteam-authored completion notification takes the default channel, a
+    /// steer — the same one a human's message takes (GitHub #220).
     #[tokio::test]
-    async fn the_notifier_door_still_queues_whatever_dispatchers_may_now_ask_for() {
+    async fn the_notifier_door_steers_whatever_dispatchers_may_ask_for() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
@@ -27963,19 +28870,18 @@ mod tests {
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Notification],
-            "a dispatch may steer; a completion notification never does"
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "a dispatch steers by default, and so does a completion notification"
         );
     }
 
-    /// issue #194 — a ccteam-authored turn (a delegation completion
-    /// notification) asks for a DISTINCT follow-up turn, never a steer: on
-    /// claude a mid-turn stdin line is shown to the model twice. A human's
-    /// message keeps steering. The fake reports the queued disposition, and the
-    /// gateway treats it as it treats every queued turn: no steer flag, the
-    /// original turn's start preserved.
+    /// GitHub #220 — a ccteam-authored turn (a delegation completion
+    /// notification) reaching a busy session is a steer, exactly like a
+    /// human's message: it JOINS the running turn instead of waiting for that
+    /// turn to end. The gateway treats it as every steer: the steer flag is
+    /// set and the running turn keeps its start.
     #[tokio::test]
-    async fn internal_turns_are_routed_as_a_queued_follow_up_not_a_steer() {
+    async fn internal_turns_join_a_busy_session_as_a_steer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
@@ -27990,7 +28896,7 @@ mod tests {
             .unwrap()
             .sid;
 
-        gateway
+        let asked = gateway
             .submit_to_sid_with_origin(&sid, "human asks".into(), TurnOrigin::User)
             .await
             .unwrap();
@@ -28000,26 +28906,30 @@ mod tests {
             .unwrap()
             .expect("turn in flight");
         // `submit_to_sid` is the A2A / notifier path: Internal origin.
-        gateway
+        let notified = gateway
             .submit_to_sid(&sid, "s7 done · claude · turn 1\nok".into())
             .await
             .unwrap();
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Notification],
-            "human = Inject, ccteam-authored = Queue"
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "human = Inject, ccteam-authored = Inject"
+        );
+        assert_eq!(
+            notified, asked,
+            "the notification joined the running turn (Injected), not a turn of its own"
         );
         assert!(
-            !gateway.sessions[&sid]
+            gateway.sessions[&sid]
                 .steered_this_turn
                 .load(Ordering::SeqCst),
-            "a queued follow-up is not a steer"
+            "a notification joined mid-turn is a steer"
         );
         assert_eq!(
             *gateway.sessions[&sid].turn_started_at.lock().unwrap(),
             Some(started),
-            "the running turn keeps its start; the queued one opens its own on TurnStarted"
+            "the running turn keeps its start"
         );
     }
 
@@ -30283,6 +31193,168 @@ mod tests {
             !echo.contains('('),
             "roleless echo carries no (role) parens: {echo:?}"
         );
+    }
+
+    /// #242 — drive a tenant session from the tenant's own IM chat, then hand it
+    /// an INTERNAL line while the human's turn is still running: through the
+    /// dispatch door with an explicit `routing`, or (`None`) through the
+    /// delegation notifier's own door, which names no channel. Returns the
+    /// answer to the human's line and the answer to the internal one, in the
+    /// shape each reached the delivery sink.
+    async fn answers_around_an_internal_line_mid_turn(
+        routing: Option<TurnRouting>,
+    ) -> (GatewayEvent, GatewayEvent) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        // Tenant-owned, like excore: an internal turn's owner route is the
+        // tenant's web console, never the IM chat the human is typing in.
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary(),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let chat = ChatKey::new("telegram@ualice", "chat-1", "chat-1");
+        gateway.focus_session(&chat, sid.clone());
+        let identity = format!("alpha-reviewer-{sid}");
+
+        // A genuinely busy session: nothing reaches the pump until both lines
+        // are in, so the internal one lands while the human's turn runs.
+        fake.events_held.store(true, Ordering::SeqCst);
+        gateway
+            .submit_resolved(
+                &chat,
+                &sid,
+                "",
+                "replan every proposal".into(),
+                TurnIntent::from_origin(TurnOrigin::User),
+                false,
+            )
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let line = "s9 done · turn 1\nold news".to_string();
+        match routing {
+            Some(routing) => {
+                Gateway::submit_to_sid_receipt_shared(
+                    Arc::clone(&gateway),
+                    &sid,
+                    line,
+                    routing,
+                    None,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap();
+            }
+            None => {
+                Gateway::submit_to_sid_shared(
+                    Arc::clone(&gateway),
+                    &sid,
+                    line,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        fake.events_held.store(false, Ordering::SeqCst);
+        fake.wake(&identity);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut human, mut internal) = (None, None);
+            loop {
+                let event = sink.recv().await.expect("gateway sink remains open");
+                if !matches!(event.kind, GatewayEventKind::Answer) {
+                    continue;
+                }
+                // The internal answer first: every status line quotes the
+                // session's title, which is the human's opening line.
+                if event.content.contains("old news") {
+                    internal = Some(event);
+                } else if event.content.contains("replan every proposal") {
+                    human = Some(event);
+                }
+                if let (Some(human), Some(internal)) = (&human, &internal) {
+                    return (human.clone(), internal.clone());
+                }
+            }
+        })
+        .await
+        .expect("both lines are answered")
+    }
+
+    /// #242 — the production loss, verbatim: s1593 (tenant project, driven from
+    /// the tenant's Telegram) was answering "replan every proposal" when a
+    /// child's completion notification arrived mid-turn. The notifier
+    /// re-pointed the session at the tenant's web console the moment the line
+    /// was accepted, so the human's answer went to web only — and, being a
+    /// human's turn, was not mirrored back to IM either. The chat that asked
+    /// never saw it.
+    ///
+    /// The notification now JOINS that turn (GitHub #220). Joined, it is not
+    /// the turn's question, so it re-addresses nothing: the running answer,
+    /// and whatever the turn says about the notification, stay in the chat
+    /// that asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_injected_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
+        let (human, internal) = answers_around_an_internal_line_mid_turn(None).await;
+        for answer in [&human, &internal] {
+            assert_eq!(
+                (answer.channel.as_str(), answer.chat_id.as_str()),
+                ("telegram@ualice", "chat-1"),
+                "the turn that asked keeps its route: {answer:?}"
+            );
+        }
+    }
+
+    /// #242, the parked shape — an internal task its dispatcher explicitly
+    /// QUEUED behind a human's running turn does not take the route when it is
+    /// accepted: the human's answer stays in their chat, and the queued line
+    /// answers on its own (owner) route only once ITS turn opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_queued_mid_turn_leaves_the_running_answer_in_the_chat_that_asked() {
+        let (human, internal) =
+            answers_around_an_internal_line_mid_turn(Some(TurnRouting::Queue)).await;
+        assert_eq!(
+            (human.channel.as_str(), human.chat_id.as_str()),
+            ("telegram@ualice", "chat-1"),
+            "the human's answer goes back to the chat that asked: {human:?}"
+        );
+        assert_eq!(
+            internal.channel, "web",
+            "the queued task's own turn answers on the owner's route: {internal:?}"
+        );
+    }
+
+    /// #242, the steer shape — an internal line JOINED into a human's running
+    /// turn is not that turn's question, so it re-addresses nothing: the
+    /// human is still owed the answer, in their chat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_internal_steer_into_a_humans_turn_leaves_its_answer_in_their_chat() {
+        let (human, internal) =
+            answers_around_an_internal_line_mid_turn(Some(TurnRouting::Inject)).await;
+        for answer in [&human, &internal] {
+            assert_eq!(
+                (answer.channel.as_str(), answer.chat_id.as_str()),
+                ("telegram@ualice", "chat-1"),
+                "{answer:?}"
+            );
+        }
     }
 
     /// v0.10.1 (issue #184) — a shared IM thread needs an ADDRESSEE. An answer
@@ -37816,6 +38888,90 @@ mod tests {
         assert!(Gateway::is_gateway_command("/newproject demo /x"));
     }
 
+    /// #239 — `/newproject` on a directory that already is a project never
+    /// registers a second one: a project the chat can see is switched to; a
+    /// directory owned by someone else is refused without naming its project.
+    /// Both outcomes return before anything is written (no trust entry, no
+    /// `state.json` rewrite), so the seeds go straight into the registry.
+    #[tokio::test]
+    async fn gateway_newproject_on_a_registered_directory_reuses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let seed = |slug: &str, dir_name: &str, owner: Option<&str>| {
+            let dir = tmp.path().join(dir_name);
+            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+            state.owner = owner.map(str::to_string);
+            state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+            ccteam_core::config::upsert_project(
+                &paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: slug.to_string(),
+                    path: dir.clone(),
+                    host: "local".into(),
+                    remote_slug: None,
+                    remote_path: None,
+                    team: "dev".into(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+            dir
+        };
+        let mine = seed("sdk", "work-a", None);
+        let theirs = seed("bobs", "work-b", Some("user:ubob"));
+        let state_before = std::fs::read(CcteamPaths::project_state_in(&mine)).unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let home = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", home.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.enable_project_creation(paths.clone());
+
+        let reply = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                &format!("/newproject sdk2 {}/", mine.display()),
+            )
+            .await
+            .unwrap();
+        assert!(reply[0].contains("已是项目 sdk"), "{reply:?}");
+        assert!(reply[0].contains("project set to sdk"), "{reply:?}");
+        let chat = ChatKey::new("mock", "chat-1", "alice");
+        assert_eq!(gateway.current_project.get(&chat).as_deref(), Some("sdk"));
+        assert_eq!(
+            std::fs::read(CcteamPaths::project_state_in(&mine)).unwrap(),
+            state_before,
+            "the existing project's state.json is untouched"
+        );
+
+        let err = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                &format!("/newproject mine {}", theirs.display()),
+            )
+            .await
+            .expect_err("another owner's directory is refused");
+        let err = format!("{err:#}");
+        assert!(err.contains("已被其他项目使用"), "{err}");
+        assert!(!err.contains("bobs"), "names nothing: {err}");
+
+        let slugs: Vec<String> = ccteam_core::config::load(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, ["sdk", "bobs"]);
+    }
+
     #[test]
     fn expand_project_path_requires_absolute_and_expands_tilde() {
         assert_eq!(
@@ -39180,11 +40336,22 @@ mod tests {
     }
 
     #[test]
-    fn notification_batch_origins_do_not_retain_unused_member_ids() {
+    fn internal_origins_leave_no_rows_behind() {
+        let chat = ChatKey::new("telegram", "c1", "u1");
         let mut origins = TurnOrigins::default();
-        origins.record("human".into(), TurnOrigin::User);
+        origins.record(
+            "human".into(),
+            TurnOrigin::User,
+            TurnDisposition::Started,
+            chat.clone(),
+        );
         for n in 0..13 {
-            origins.record(format!("note-{n}"), TurnOrigin::Internal);
+            origins.record(
+                format!("note-{n}"),
+                TurnOrigin::Internal,
+                TurnDisposition::Queued,
+                chat.clone(),
+            );
         }
         assert_eq!(origins.by_turn.len(), 1);
         assert_eq!(
@@ -39199,10 +40366,106 @@ mod tests {
         );
         assert_eq!(origins.take(Some("note-0")), TurnOrigin::Internal);
         assert_eq!(origins.take(Some("human")), TurnOrigin::User);
-        origins.record("steer".into(), TurnOrigin::User);
-        origins.record("steer".into(), TurnOrigin::Internal);
-        assert_eq!(origins.take(Some("steer")), TurnOrigin::Internal);
+        // An internal line that joins a human's running turn is not that
+        // turn's question: the human's claim on its answer stands (#242).
+        origins.record(
+            "steer".into(),
+            TurnOrigin::User,
+            TurnDisposition::Started,
+            chat.clone(),
+        );
+        origins.record(
+            "steer".into(),
+            TurnOrigin::Internal,
+            TurnDisposition::Injected,
+            chat,
+        );
+        assert_eq!(origins.take(Some("steer")), TurnOrigin::User);
         assert!(origins.by_turn.is_empty());
+    }
+
+    /// #242 — a line parked behind a running turn re-addresses the session
+    /// when ITS turn opens, never when it is accepted; lines parked behind it
+    /// wait for their own turns.
+    #[test]
+    fn a_parked_internal_line_takes_the_route_only_when_its_turn_opens() {
+        let im = ChatKey::new("telegram", "c1", "u1");
+        let web = ChatKey::new("web", "tenant", "tenant");
+        let mut origins = TurnOrigins::default();
+        assert_eq!(
+            origins.record(
+                "human".into(),
+                TurnOrigin::User,
+                TurnDisposition::Started,
+                im.clone()
+            ),
+            Some(im.clone()),
+            "a human's line addresses the session at once"
+        );
+        for id in ["note-a", "note-b"] {
+            assert_eq!(
+                origins.record(
+                    id.into(),
+                    TurnOrigin::Internal,
+                    TurnDisposition::Queued,
+                    web.clone()
+                ),
+                None,
+                "a parked line leaves the running turn's route alone"
+            );
+        }
+        assert_eq!(
+            origins.latest,
+            TurnOrigin::User,
+            "the human's turn is still the one being answered"
+        );
+        assert_eq!(
+            origins.open("human"),
+            None,
+            "a submitted turn opening changes nothing"
+        );
+        assert_eq!(origins.open("note-a"), Some(web.clone()));
+        assert_eq!(origins.latest, TurnOrigin::Internal);
+        assert_eq!(origins.parked.len(), 1, "note-b waits for its own turn");
+        origins.record(
+            "task".into(),
+            TurnOrigin::Internal,
+            TurnDisposition::Queued,
+            web.clone(),
+        );
+        assert_eq!(origins.open("task"), Some(web.clone()));
+        assert!(
+            origins.parked.is_empty(),
+            "a turn opening drops every line parked before it"
+        );
+        assert_eq!(
+            origins.record(
+                "joined".into(),
+                TurnOrigin::Internal,
+                TurnDisposition::Injected,
+                web.clone()
+            ),
+            None
+        );
+        assert_eq!(
+            origins.record(
+                "fresh".into(),
+                TurnOrigin::Internal,
+                TurnDisposition::Started,
+                web.clone()
+            ),
+            Some(web.clone()),
+            "an internal line that starts a turn addresses it"
+        );
+        for n in 0..(PARKED_ROUTES_MAX + 10) {
+            origins.record(
+                format!("tail-{n}"),
+                TurnOrigin::Internal,
+                TurnDisposition::Queued,
+                web.clone(),
+            );
+        }
+        assert_eq!(origins.parked.len(), PARKED_ROUTES_MAX);
     }
 
     #[tokio::test]
@@ -39224,7 +40487,6 @@ mod tests {
             TurnRouting::Queue,
             TurnRouting::Queue,
             TurnRouting::Queue,
-            TurnRouting::Notification,
             TurnRouting::Inject,
         ] {
             crate::pending_turns::enqueue_pending_turn(
@@ -39240,7 +40502,7 @@ mod tests {
         }
         assert_eq!(
             gateway.drain_and_dispatch_pending_turns(&sid).await.len(),
-            5
+            4
         );
         assert_eq!(
             *fake.routings.lock().await,
@@ -39248,7 +40510,6 @@ mod tests {
                 TurnRouting::Queue,
                 TurnRouting::Queue,
                 TurnRouting::Queue,
-                TurnRouting::Notification,
                 TurnRouting::Inject
             ]
         );

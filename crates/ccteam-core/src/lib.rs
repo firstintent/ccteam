@@ -272,10 +272,10 @@ pub use progress::{
     AgentSessionStatus, AgentSessionSummary,
 };
 pub use projects::{
-    bootstrap_project, create_project, ensure_project_data_home, pick_unused_slug,
-    pick_unused_slug_verbatim, pre_trust_project, read_current_branch, refuses_active_session,
-    slugify, slugify_brief, validate_slug_format, ActiveSessionRefusal, NewProject,
-    NewProjectReport,
+    bootstrap_project, create_project, ensure_project_data_home, local_project_at,
+    pick_unused_slug, pick_unused_slug_verbatim, pre_trust_project, read_current_branch,
+    refuses_active_session, slugify, slugify_brief, validate_slug_format, ActiveSessionRefusal,
+    NewProject, NewProjectReport, ProjectDirTaken,
 };
 // v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{

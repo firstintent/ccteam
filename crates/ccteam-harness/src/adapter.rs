@@ -542,18 +542,14 @@ pub enum TurnInput {
 #[serde(rename_all = "snake_case")]
 pub enum TurnRouting {
     /// Merge the message into the active vendor turn at its next safe point —
-    /// a human steering the work they are watching.
+    /// a human steering the work they are watching, an `agent{sid,task}`
+    /// dispatch by default, and every ccteam-authored delegation completion
+    /// notification (GitHub #220: a busy parent reads it mid-turn).
     Inject,
-    /// Preserve the message as a distinct FIFO follow-up turn — a message
-    /// nobody is steering with, such as a ccteam-authored delegation
-    /// completion notification (issue #194: on claude a mid-turn stdin line is
-    /// shown to the model twice, once as a queued-command preview and once as
-    /// the next prompt; a distinct turn is charged once).
+    /// Preserve the message as a distinct FIFO follow-up turn — a dispatcher
+    /// that asked for its task to be answered in a turn of its own
+    /// (`agent{routing:"queue"}`).
     Queue,
-    /// Internal completion delivery. Like Queue, but adjacent notifications
-    /// already parked at a boundary may share a turn (GitHub #205). Explicit
-    /// dispatched tasks keep Queue and their independent execution identities.
-    Notification,
 }
 
 /// What the adapter actually did with one accepted message.
@@ -1536,8 +1532,9 @@ pub struct ContextRequestUsage {
     pub reasoning_output_tokens: Option<u64>,
 }
 
-/// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
-/// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
+/// Account-level usage / rate-limits (Claude: the rate-limit headers its turns
+/// report; Codex: its rate-limit notifications; Grok: `x.ai/billing`),
+/// vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
 /// credits), NOT a per-session property — the gateway queries it once on any
 /// live session. Percentages are 0-100; `*_resets_at` is the vendor's ISO-8601
@@ -2128,7 +2125,8 @@ pub trait HarnessAdapter: Send + Sync {
     /// Report ACCOUNT-level usage / rate-limits (5-hour + weekly windows + extra
     /// credits) for the IM `/status` operator dashboard. Unlike `thread_status`
     /// this is OPTIONAL (a default `None`): only adapters with a usage channel
-    /// implement it (Claude stream-json via the `get_usage` control_request).
+    /// implement it (Claude stream-json from the `rate_limit_event`s its turns
+    /// print, so reading it asks claude nothing — #244).
     /// It is account-, not session-, scoped — the gateway queries it once on any
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
