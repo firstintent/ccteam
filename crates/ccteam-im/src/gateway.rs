@@ -13822,6 +13822,7 @@ impl Gateway {
             silent_seconds: now.saturating_duration_since(baseline).as_secs(),
             elapsed_seconds: now.saturating_duration_since(started).as_secs(),
             stuck_after_seconds: stuck_after.as_secs(),
+            started_at: started,
         })
     }
 

@@ -742,6 +742,11 @@ html.dark .dot.off { background: #4b4e57; }
     opacity: 0; transition: opacity .12s;
   }
   .msg.agent .reply-footer:not(.warn) .reply-copy { width: 18px; height: 18px; }
+  /* One line out of flow: a narrow window ellipsizes the facts (full line in
+     the title) and never lets them run under Copy. */
+  .msg.agent .reply-footer:not(.warn) .turn-status {
+    flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis;
+  }
   .msg.agent:hover .reply-footer,
   .msg.agent:focus-within .reply-footer { opacity: 1; }
 }

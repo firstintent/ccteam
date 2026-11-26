@@ -433,7 +433,7 @@ export default function SessionView({
     ctxToggleRef.current?.focus();
   }, [setContextOpen]);
 
-  const { events, lastError, gatewayUnavailable, connectionEpoch } =
+  const { events, lastError, gatewayUnavailable, connectionEpoch, turnState } =
     useSessionEvents(sid);
 
   // A turn ending is the moment the window changes, so the panel re-fetches
@@ -584,12 +584,25 @@ export default function SessionView({
   // interim line (the session talking mid-turn; Stop + the cursor must stay),
   // an approval prompt, or a sealed progress card (`done` closes one card,
   // not the turn) does not end it.
-  const busy = turnInFlight(events, turnMark);
-  if (turnMark !== null && !busy) {
+  const localBusy = turnInFlight(events, turnMark);
+  if (turnMark !== null && !localBusy) {
     // Retire the finished turn's watermark (render-phase adjust) so its
     // boundary aging out of the ring can never resurrect it.
     setTurnMark(null);
   }
+  // ---- a turn started anywhere (#247) --------------------------------------
+  // The daemon says on the stream whether a turn is in flight (`turn_state`),
+  // so a turn IM / CLI / another device started shows the cursor, heartbeat
+  // and Stop here too. It ends on the same boundary a send from this page
+  // waits for (ordered by the daemon's replay seq), or on an idle frame.
+  const remoteBusy = turnState?.busy === true;
+  const busy = localBusy || remoteBusy;
+  // The heartbeat's clock: our own send's when we sent it, else the daemon's.
+  const shownBusySince = localBusy
+    ? busySince
+    : turnState?.busy
+      ? turnState.receivedAt - (turnState.elapsedSeconds ?? 0) * 1000
+      : null;
 
   // ---- per-session status (model + effort + ctx%) --------------------------
   const lastEventTs =
@@ -1224,7 +1237,7 @@ export default function SessionView({
                               .join(" · ");
                             return (
                               <div className={`reply-footer${footer?.warn ? " warn" : ""}`} data-testid="reply-footer">
-                                <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                                <span className={`turn-status${footer?.warn ? " warn" : ""}`} title={tail}>
                                 <RowTime ts={row.ts} lang={lang} />
                                 {row.ts ? ` · ${tail}` : tail}
                                 </span>
@@ -1244,7 +1257,7 @@ export default function SessionView({
                         <div className="bubble">
                           <span className="cursor" />
                           <BusyHeartbeat
-                            since={busySince}
+                            since={shownBusySince}
                             lastEventTs={lastEventTs}
                             lang={lang}
                           />

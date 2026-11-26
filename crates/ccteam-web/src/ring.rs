@@ -147,6 +147,14 @@ impl SessionEventRing {
         seq
     }
 
+    /// The newest seq recorded for `sid` (0 = none yet). The ordering point a
+    /// derived `turn_state` frame (#247) is stamped with: every frame up to
+    /// it was recorded before the state was read.
+    pub(crate) fn last_seq(&self, sid: &str) -> u64 {
+        let guard = self.rings.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.by_sid.get(sid).map_or(0, |s| s.next_seq)
+    }
+
     /// Every buffered entry for `sid` with `seq > since`, oldest first.
     /// Best-effort catch-up: if `since` predates everything still buffered
     /// (the gap outran the ring's capacity), this simply returns everything

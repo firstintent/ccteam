@@ -492,6 +492,114 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     assert!(json["content"].as_str().unwrap().contains("rm -rf"));
 }
 
+/// The next `event: turn_state` frame on an open SSE line stream (#247),
+/// skipping every other frame: its payload, and its SSE `id:` if it carried
+/// one (it must not — see the caller). `None` after 5s of nothing.
+async fn next_turn_state<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut tokio::io::Lines<R>,
+) -> Option<(Value, Option<String>)> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut event = String::new();
+        let mut id: Option<String> = None;
+        let mut data: Option<String> = None;
+        loop {
+            let line = lines.next_line().await.ok().flatten()?;
+            if line.is_empty() {
+                // Frames are blank-line delimited; fields can come in any order.
+                if event == "turn_state" {
+                    if let Some(data) = data.take() {
+                        return serde_json::from_str::<Value>(&data).ok().map(|v| (v, id));
+                    }
+                }
+                event.clear();
+                id = None;
+                data = None;
+            } else if let Some(name) = line.strip_prefix("event:") {
+                event = name.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("id:") {
+                id = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data = Some(value.trim().to_string());
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// #247 — the session stream says whether a turn is in flight, read from the
+/// daemon's own in-flight-turn state rather than from who sent it: a page that
+/// did not start the turn (IM, CLI, another device) still learns of it. The
+/// stream opens with the current state (`busy:false` on a fresh session), and
+/// a turn submitted while it is open arrives as `busy:true` on the SAME
+/// stream. (`FakeAdapter` emits no turn boundary, so the turn stays open.)
+#[tokio::test]
+async fn session_events_carry_the_daemon_turn_state() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+    let addr = spawn_server(
+        AppState::new(paths).with_gateway(Arc::clone(&gateway), gateway.lock().await.principals()),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/{sid}/events"))
+        .await
+        .expect("sse get");
+    assert_eq!(resp.status(), 200);
+
+    use futures_util::StreamExt;
+    let mapped = resp
+        .bytes_stream()
+        .map(|r| r.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(mapped);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let (first, first_id) = next_turn_state(&mut lines)
+        .await
+        .expect("a turn_state frame on connect");
+    // A derived state, not a ring event: an `id:` would move the client's
+    // Last-Event-ID replay watermark.
+    assert_eq!(first_id, None, "turn_state must not carry an SSE id");
+    assert_eq!(first["sid"], sid.as_str());
+    assert_eq!(first["busy"], false, "{first}");
+
+    let turned = client
+        .post(format!("http://{addr}/api/v1/sessions/{sid}/turn"))
+        .json(&serde_json::json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned.status(), 202);
+
+    let (busy, busy_id) = next_turn_state(&mut lines)
+        .await
+        .expect("the in-flight turn reaches the open stream");
+    assert_eq!(busy_id, None, "turn_state must not carry an SSE id");
+    assert_eq!(busy["busy"], true, "{busy}");
+    assert!(busy["elapsed_seconds"].as_u64().is_some(), "{busy}");
+    // The ring seq it was read after — what orders it against replayed frames.
+    assert!(busy["after_seq"].as_u64().is_some(), "{busy}");
+}
+
 /// End-to-end proof that the `?last_event_id=` query wiring (axum's `Query`
 /// extractor → [`parse_last_event_id`](ccteam_web) → the catchup batch) works
 /// over a real HTTP round-trip, and that it composes correctly with the

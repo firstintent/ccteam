@@ -156,6 +156,58 @@ for (const width of [390, 320]) {
   });
 }
 
+// #247 — a turn this page did not send (IM, CLI, another device) still shows:
+// the daemon's `turn_state` frame drives the cursor, the heartbeat (on the
+// daemon's elapsed clock) and Stop; an idle frame takes them away again.
+test("a turn the daemon reports in flight shows cursor, heartbeat and Stop without a local send", async ({ page }) => {
+  const captured = await mockCcteamApi(page);
+  let busy = true;
+  // Each (re)connect replays the daemon's current word; the hook reconnects
+  // ~1s after a body ends, so flipping `busy` reaches the page quickly.
+  await page.route("**/api/v1/sessions/s1/events", route => route.fulfill({
+    status: 200,
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    body: `event: turn_state\ndata: ${JSON.stringify({ sid: "s1", kind: "turn_state", busy, elapsed_seconds: busy ? 65 : null, after_seq: 0 })}\n\n`,
+  }));
+  await page.goto("/app/chat/s/s1");
+  await expect(page.getByTestId("streaming-cursor")).toBeVisible();
+  await expect(page.getByTestId("busy-heartbeat")).toContainText(/1:0\d/);
+  const stop = page.getByTestId("composer-stop");
+  await expect(stop).toBeVisible();
+  await stop.click();
+  await expect.poll(() => captured.some(row => row.url.endsWith("/api/v1/sessions/s1/interrupt"))).toBe(true);
+  busy = false;
+  await expect(page.getByTestId("streaming-cursor")).toBeHidden({ timeout: 10_000 });
+  await expect(page.getByTestId("composer-send")).toBeVisible();
+});
+
+// #246 — on a hover device the footer floats under the reply on ONE line: a
+// narrow window ellipsizes the facts (full line in the title) and keeps Copy
+// clear of them.
+test("a narrow hover window ellipsizes the reply footer and keeps Copy clear", async ({ page }) => {
+  await mockCcteamApi(page);
+  await page.setViewportSize({ width: 480, height: 800 });
+  const model = "claude-opus-5-5-a-very-long-model-id[1m]";
+  await page.route("**/api/v1/sessions/s1", route => route.fulfill({ json: { sid:"s1",events:[
+    {turn_id:"t1",ts:"2026-11-02T01:00:00Z",role:"",user:"first",assistant:"A reply.",status:{turn:12,model,context:{used_tokens:8000,window_tokens:100000}}},
+  ] } }));
+  await page.goto("/app/chat/s/s1");
+  const reply = page.getByTestId("agent-reply").first();
+  await reply.locator(".bubble").hover();
+  const status = reply.locator(".reply-footer .turn-status");
+  await expect(status).toHaveAttribute("title", new RegExp(`${model.replace(/[[\]]/g, "\\$&")} · turn 12`));
+  // Clipped to its own box with an ellipsis — not overflowing under Copy.
+  expect(await status.evaluate(node => {
+    const style = getComputedStyle(node);
+    return [node.scrollWidth > node.clientWidth, style.overflowX, style.textOverflow];
+  })).toEqual([true, "hidden", "ellipsis"]);
+  const statusBox = await status.boundingBox();
+  const copyBox = await reply.getByTestId("reply-copy").boundingBox();
+  expect(statusBox).not.toBeNull();
+  expect(copyBox).not.toBeNull();
+  expect(statusBox!.x + statusBox!.width).toBeLessThanOrEqual(copyBox!.x);
+});
+
 // #246 — the per-reply footer (time · vendor · sid · model · turn · ctx +
 // Copy) is on demand: touch collapses it until the reply is tapped, a tap on a
 // link inside the reply keeps its own job, and a context warning stays shown.
