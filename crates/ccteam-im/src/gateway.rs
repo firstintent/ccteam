@@ -11981,7 +11981,6 @@ impl Gateway {
     /// fields can't drift between them. Returns the bound adapter + handle; the
     /// caller records them (insert a fresh [`GatewaySession`], or swap in place).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_session_thread(
         &self,
         vendor: AgentVendor,
