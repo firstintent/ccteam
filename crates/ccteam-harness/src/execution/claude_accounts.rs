@@ -818,16 +818,25 @@ mod tests {
 
     /// #238: after an upgrade unlinks a running binary, its image still runs
     /// through `/proc/<pid>/exe`, while the `current_exe()` spelling
-    /// (`<path> (deleted)`) does not. A copied `sleep` stands in for the
-    /// daemon, so the test runner's own ELF is never touched.
+    /// (`<path> (deleted)`) does not. A copied `bash` stands in for the
+    /// daemon, so the test runner's own ELF is never touched. Not coreutils
+    /// `sleep`: Ubuntu 26.04 (CI's `ubuntu-latest`) ships uutils, one
+    /// multicall binary that refuses to run under any other name — a renamed
+    /// copy, or its own image through `/proc/<pid>/exe` ("Requested utility
+    /// `exe` does not match executable name"). bash does not care what it is
+    /// called; it blocks on `read` while the test holds its stdin open.
     #[cfg(target_os = "linux")]
     #[test]
     fn process_image_runs_after_the_binary_is_deleted() {
         use std::process::{Command, Stdio};
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("daemon-standin");
-        std::fs::copy("/bin/sleep", &bin).unwrap();
-        let mut running = Command::new(&bin).arg("30").spawn().unwrap();
+        std::fs::copy("/bin/bash", &bin).unwrap();
+        let mut running = Command::new(&bin)
+            .args(["-c", "read -t 30 _"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
         // `spawn` can return a moment before the child's exec has replaced
         // its image: the kernel wakes a vfork parent while the child still
         // points at the image it was cloned from, so `/proc/<pid>/exe` names
