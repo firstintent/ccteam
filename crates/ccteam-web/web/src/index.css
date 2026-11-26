@@ -576,17 +576,29 @@ button { font-family: inherit; cursor: pointer; }
 .account-menu .sel-item[disabled] { opacity: .55; cursor: progress; }
 .account-menu .account-retry { color: #0E7490; }
 html.dark .account-menu .account-retry { color: #67e8f9; }
-/* Phones: the row must keep mic + send on screen, so labels yield first —
-   HITL and account go icon-only (state stays visible), effort hides, and the
-   model label ellipsizes. */
+/* Phones: the row must keep send on screen, so labels yield first — HITL and
+   account go icon-only (state stays visible), effort hides, and the model
+   label ellipsizes. A <button> sizes to its content by default, so the model
+   button must be capped at its (shrunk) menu wrapper or the label never
+   ellipsizes and paints over the send button (#246). The composer itself
+   starts at one line and grows with the text (ChatComposer autoGrow reads
+   these bounds). */
 @media (max-width: 600px) {
   .account-btn .account-label, .hitl-btn span, .model-btn .eff { display: none; }
   .hitl-btn { padding: 6px 8px; }
   .composer-row .right, .composer-row .model-sel, .model-btn { min-width: 0; }
+  .model-btn { max-width: 100%; }
   .model-btn .model-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .composer { padding: 10px 12px 8px; gap: 6px; }
+  .composer textarea { min-height: 24px; }
   /* The account button sits mid-row; anchor its menu to the row's right edge. */
   .composer-row .right { position: relative; }
   .composer-row .account-sel { position: static; }
+}
+/* The narrowest phones: the harness keeps its colour dot (name in title /
+   aria-label) so the model id still gets readable room. */
+@media (max-width: 360px) {
+  .vendor-btn > span:not(.dot) { display: none; }
 }
 
 .send-btn {
@@ -714,6 +726,28 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .conv-head .meta { display: flex; align-items: center; gap: 8px; }
 .reply-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+/* #246: the per-reply footer (time · vendor · sid · model · turn · ctx + copy)
+   is on demand — every narration line of a long turn carrying it read as noise.
+   Hover devices float it in the gap under the reply (out of flow, so a hidden
+   footer leaves no hole and revealing it shifts nothing) and fade it in on
+   hover / keyboard focus — it stays focusable, so Tab still reaches Copy.
+   Touch devices collapse it until the reply is tapped (`.footer-open`,
+   SessionView). A WARNING footer (context window nearly full, `ctx N%⚠`) stays
+   in flow and is never hidden — the reader must not have to hunt for it. */
+@media (hover: hover) {
+  .msg.agent { position: relative; }
+  .msg.agent .reply-footer:not(.warn) {
+    position: absolute; top: 100%; left: 0; max-width: 100%; z-index: 1;
+    height: 18px; flex-wrap: nowrap; overflow: hidden;
+    opacity: 0; transition: opacity .12s;
+  }
+  .msg.agent .reply-footer:not(.warn) .reply-copy { width: 18px; height: 18px; }
+  .msg.agent:hover .reply-footer,
+  .msg.agent:focus-within .reply-footer { opacity: 1; }
+}
+@media (hover: none) {
+  .msg.agent:not(.footer-open) .reply-footer:not(.warn) { display: none; }
+}
 .reply-footer .turn-status { min-width: 0; overflow-wrap: anywhere; }
 .reply-copy { flex: none; color: var(--text-faint); }
 .reply-copy-feedback { font-size: 11px; color: var(--text-muted); }
@@ -898,6 +932,12 @@ html.dark .dot.off { background: #4b4e57; }
 .hosts-head-desc { font-size: 12.5px; color: var(--text-muted); font-weight: 300; line-height: 1.5; margin-top: 5px; }
 /* The Team-page pointer is a react-router Link wearing the ghost button skin. */
 .hosts-head-bar a.btn { text-decoration: none; white-space: nowrap; }
+/* #246: on a phone the description takes the full row and the actions wrap
+   under it, instead of squeezing the copy into a narrow column. */
+@media (max-width: 640px) {
+  .hosts-head-bar { flex-wrap: wrap; }
+  .hosts-head-copy { flex-basis: 100%; }
+}
 
 /* Daemon health strip — always the first thing on 运维总览. */
 .daemon-strip {

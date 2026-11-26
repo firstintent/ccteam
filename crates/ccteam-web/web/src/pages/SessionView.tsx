@@ -314,6 +314,21 @@ export default function SessionView({
       return next;
     });
   }, []);
+  // Reply footers a touch reader has tapped open (#246). Touch devices hide
+  // the `HH:MM · vendor · sid · model · turn · ctx` line until the reply is
+  // tapped; hover devices fade it in on hover/focus (index.css). Per-sid like
+  // `expandedFolds`.
+  const [openFooters, setOpenFooters] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const toggleFooter = useCallback((rowId: string) => {
+    setOpenFooters((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+  }, []);
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
@@ -1167,7 +1182,20 @@ export default function SessionView({
                       }
                       // assistant — full Markdown document (红线: never plain text).
                       return (
-                        <div key={row.id} className="msg agent fade-in">
+                        <div
+                          key={row.id}
+                          className={`msg agent fade-in${openFooters.has(row.id) ? " footer-open" : ""}`}
+                          data-testid="agent-reply"
+                          onClick={(event) => {
+                            // A tap on the reply body toggles its footer; a tap
+                            // on a link / button / file chip keeps its own job,
+                            // and finishing a text selection is not a tap.
+                            const target = event.target as Element | null;
+                            if (target?.closest("a, button, input, textarea, select, summary, [role=button]")) return;
+                            if (window.getSelection()?.toString()) return;
+                            toggleFooter(row.id);
+                          }}
+                        >
                           <div className="bubble md">
                             {row.content ? (
                               <Markdown
@@ -1195,7 +1223,7 @@ export default function SessionView({
                               .filter((part): part is string => !!part)
                               .join(" · ");
                             return (
-                              <div className="reply-footer">
+                              <div className={`reply-footer${footer?.warn ? " warn" : ""}`} data-testid="reply-footer">
                                 <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
                                 <RowTime ts={row.ts} lang={lang} />
                                 {row.ts ? ` · ${tail}` : tail}

@@ -85,7 +85,22 @@ for (const width of [1360, 390, 320]) {
     await expect(page.getByTestId("ctx-toggle")).toBeVisible();
     expect(await head.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     expect(await page.getByTestId("ctx-toggle").evaluate(node => node.getBoundingClientRect().height)).toBeLessThanOrEqual(44);
-    expect(await page.locator(".right-panel-tools").evaluate(node => node.getBoundingClientRect().width)).toBeGreaterThan(150);
+    if (width >= 700) {
+      // Room to spare: the toggles keep their text labels.
+      expect(await page.locator(".right-panel-tools").evaluate(node => node.getBoundingClientRect().width)).toBeGreaterThan(150);
+    } else {
+      // #246: a phone keeps the header on ONE row — the toggles go icon-only
+      // (Context keeps its %) and keep their accessible names.
+      const mid = async (testId: string) => {
+        const box = await page.getByTestId(testId).boundingBox();
+        expect(box).not.toBeNull();
+        return box!.y + box!.height / 2;
+      };
+      expect(Math.abs((await mid("conv-title")) - (await mid("ctx-toggle")))).toBeLessThan(8);
+      expect(Math.abs((await mid("conv-title")) - (await mid("files-toggle")))).toBeLessThan(8);
+      await expect(page.getByTestId("files-toggle")).toHaveAccessibleName(/文件|Files/);
+      await expect(page.getByTestId("ctx-toggle")).toHaveAccessibleName(/上下文|context/i);
+    }
     const copies = page.getByTestId("reply-copy");
     await expect(copies).toHaveCount(2);
     await copies.first().click();
@@ -113,6 +128,71 @@ for (const width of [1360, 390, 320]) {
     await expect(page.getByTestId("ctx-toggle")).toBeFocused();
   });
 }
+
+// #246 — on a phone the session composer must keep Send reachable whatever the
+// model id: the model label ellipsizes inside its button instead of painting
+// over Send, and there is no dead mic button taking the room.
+for (const width of [390, 320]) {
+  test(`phone composer keeps Send clear of a long model id at ${width}px`, async ({ page }) => {
+    await mockCcteamApi(page);
+    await page.setViewportSize({ width, height: 844 });
+    await page.route("**/api/v1/sessions/s1/status", route => route.fulfill({ json: {sid:"s1",model:"claude-opus-5-5-a-very-long-model-id[1m]",context:{used_tokens:8000,window_tokens:100000,pct:8},status_line:null} }));
+    await page.goto("/app/chat/s/s1");
+    const model = page.getByTestId("model-btn");
+    await expect(model).toContainText("claude-opus-5-5");
+    await expect(page.getByRole("button", { name: "mic" })).toHaveCount(0);
+    const modelBox = await model.boundingBox();
+    const sendBox = await page.getByTestId("composer-send").boundingBox();
+    expect(modelBox).not.toBeNull();
+    expect(sendBox).not.toBeNull();
+    // The model button ends before Send starts, and Send stays on screen.
+    expect(modelBox!.x + modelBox!.width).toBeLessThanOrEqual(sendBox!.x);
+    expect(sendBox!.x + sendBox!.width).toBeLessThanOrEqual(width);
+    // The label really ellipsizes (clipped inside its own box) and still
+    // carries the full id for a long-press / hover.
+    const label = model.locator(".model-label");
+    expect(await label.evaluate(node => node.scrollWidth > node.clientWidth)).toBe(true);
+    await expect(label).toHaveAttribute("title", "claude-opus-5-5-a-very-long-model-id[1m]");
+  });
+}
+
+// #246 — the per-reply footer (time · vendor · sid · model · turn · ctx +
+// Copy) is on demand: touch collapses it until the reply is tapped, a tap on a
+// link inside the reply keeps its own job, and a context warning stays shown.
+test.describe("reply footer on touch", () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  test("collapses until the reply is tapped; a ctx warning stays visible", async ({ page }) => {
+    await mockCcteamApi(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.route("**/api/v1/sessions/s1", route => route.fulfill({ json: { sid:"s1",events:[
+      {turn_id:"t1",ts:"2026-11-02T01:00:00Z",role:"",user:"first",assistant:"See [the docs](https://example.com) for more.",status:{turn:1,model:"gpt-test",context:{used_tokens:8000,window_tokens:100000}}},
+      {turn_id:"t2",ts:"2026-11-02T02:00:00Z",role:"",user:"second",assistant:"Almost out of room.",status:{turn:2,model:"gpt-test",context:{used_tokens:90000,window_tokens:100000}}},
+    ] } }));
+    await page.goto("/app/chat/s/s1");
+    const replies = page.getByTestId("agent-reply");
+    await expect(replies).toHaveCount(2);
+    const first = replies.first();
+    const firstFooter = first.getByTestId("reply-footer");
+    await expect(firstFooter).toBeHidden();
+    // A tap on the link inside the reply is the link's — no footer toggle.
+    await page.context().route("https://example.com/**", route => route.fulfill({ body: "ok" }));
+    await first.getByRole("link", { name: "the docs" }).evaluate(node => node.addEventListener("click", e => e.preventDefault()));
+    await first.getByRole("link", { name: "the docs" }).tap();
+    await expect(firstFooter).toBeHidden();
+    // A tap on the reply body opens its footer; a second tap closes it.
+    await first.locator(".bubble").tap({ position: { x: 4, y: 4 } });
+    await expect(firstFooter).toBeVisible();
+    await expect(firstFooter).toContainText("turn 1");
+    await expect(first.getByTestId("reply-copy")).toBeVisible();
+    await first.locator(".bubble").tap({ position: { x: 4, y: 4 } });
+    await expect(firstFooter).toBeHidden();
+    // 90% context is a warning: that footer is never hidden.
+    const warnFooter = replies.last().getByTestId("reply-footer");
+    await expect(warnFooter).toBeVisible();
+    await expect(warnFooter).toContainText("ctx 90%⚠");
+  });
+});
 
 const statusSnapshot = {
   daemon_healthy: true,

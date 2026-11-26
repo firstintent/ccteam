@@ -27,7 +27,6 @@ import {
   Hand,
   Image as ImageIcon,
   Loader2,
-  Mic,
   Plus,
   Sparkles,
   Square,
@@ -492,12 +491,17 @@ export function ChatComposer({
     if (prefill?.nonce) taRef.current?.focus();
   }, [prefill?.nonce]);
 
-  // Auto-grow the textarea (52 → 260px, then scroll).
+  // Auto-grow the textarea between its CSS min/max height, then scroll. The
+  // bounds live in CSS so a phone can start at one line (index.css) while a
+  // desktop keeps its roomier two-line floor.
   const autoGrow = useCallback(() => {
     const ta = taRef.current;
     if (!ta) return;
+    const style = window.getComputedStyle(ta);
+    const min = Number.parseFloat(style.minHeight) || 0;
+    const max = Number.parseFloat(style.maxHeight) || 260;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(260, Math.max(52, ta.scrollHeight))}px`;
+    ta.style.height = `${Math.min(max, Math.max(min, ta.scrollHeight))}px`;
   }, []);
   useEffect(() => {
     autoGrow();
@@ -967,7 +971,7 @@ export function ChatComposer({
       <textarea
         ref={taRef}
         data-testid="composer-textarea"
-        rows={2}
+        rows={1}
         value={text}
         disabled={disabled}
         placeholder={t(placeholderKey)}
@@ -1093,6 +1097,8 @@ export function ChatComposer({
               type="button"
               className="model-btn vendor-btn"
               data-testid="vendor-btn"
+              title={spec.label}
+              aria-label={spec.label}
               aria-haspopup="menu"
               aria-expanded={vendorOpen}
               onClick={(e) => {
@@ -1132,7 +1138,7 @@ export function ChatComposer({
                 setMenuOpen((o) => !o);
               }}
             >
-              <span className="model-label">{modelText}</span>
+              <span className="model-label" title={modelText}>{modelText}</span>
               <span className="eff">{effortText}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
@@ -1193,9 +1199,6 @@ export function ChatComposer({
               ))}
             </div>
           </div>
-          <button type="button" className="icon-btn" title="mic" aria-label="mic">
-            <Mic />
-          </button>
           {showStop ? (
             <button
               type="button"

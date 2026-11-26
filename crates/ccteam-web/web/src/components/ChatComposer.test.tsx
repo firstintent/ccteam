@@ -176,7 +176,7 @@ describe("model button label", () => {
 
   const vendorBtn = (html: string) =>
     /data-testid="vendor-btn"[^>]*><span class="dot [a-z]+"><\/span><span>([^<]*)<\/span>/.exec(html)?.[1];
-  const modelBtn = (html: string) => /<span class="model-label">([^<]*)<\/span>/.exec(html)?.[1];
+  const modelBtn = (html: string) => /<span class="model-label"[^>]*>([^<]*)<\/span>/.exec(html)?.[1];
 
   it("new-session draft: vendor and model are separate buttons; claude opens on opus · high", () => {
     const html = renderBtn();
