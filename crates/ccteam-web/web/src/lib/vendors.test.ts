@@ -58,8 +58,8 @@ const CATALOG: VendorCatalog = {
   },
 };
 
-describe("VENDORS registry (7-way)", () => {
-  it("lists exactly seven distinct harnesses — never collapses Pi or DSH", () => {
+describe("VENDORS registry (8-way)", () => {
+  it("lists exactly eight distinct harnesses — never collapses Pi, DSH or Antigravity", () => {
     expect(VENDORS.map((v) => v.id)).toEqual([
       "claude",
       "codex",
@@ -68,10 +68,12 @@ describe("VENDORS registry (7-way)", () => {
       "kimi",
       "pi",
       "dsh",
+      "agy",
     ]);
-    expect(new Set(VENDORS.map((v) => v.label)).size).toBe(7);
+    expect(new Set(VENDORS.map((v) => v.label)).size).toBe(8);
     expect(vendorSpec("pi").label).toBe("Pi");
     expect(vendorSpec("dsh").label).toBe("DSH");
+    expect(vendorSpec("agy").label).toBe("Antigravity");
     const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
     const color = (vendor: string) => css.match(new RegExp(`--${vendor}:\\s*(#[0-9A-F]+)`, "i"))?.[1];
     const pi = color("pi");
@@ -80,6 +82,16 @@ describe("VENDORS registry (7-way)", () => {
     expect(dsh).toBeTruthy();
     expect(["claude", "codex", "grok", "opencode", "kimi"].map(color)).not.toContain(pi);
     expect(["claude", "codex", "grok", "opencode", "kimi", "pi"].map(color)).not.toContain(dsh);
+    // Light AND dark: both declarations must exist, and neither may reuse a
+    // colour another vendor already owns.
+    const all = (vendor: string) =>
+      [...css.matchAll(new RegExp(`--${vendor}:\\s*(#[0-9A-F]+)`, "gi"))].map((m) =>
+        m[1]!.toLowerCase(),
+      );
+    const agy = all("agy");
+    expect(agy).toHaveLength(2);
+    const taken = ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"].flatMap(all);
+    for (const value of agy) expect(taken).not.toContain(value);
   });
 
   it("claude offers stream-json (default) + terminal (frozen)", () => {
@@ -95,6 +107,7 @@ describe("VENDORS registry (7-way)", () => {
     expect(vendorSpec("opencode").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("kimi").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("dsh").protocols.map((p) => p.wire)).toEqual(["acp"]);
+    expect(vendorSpec("agy").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("pi").protocols).toEqual([
       { id: "stream-json", label: "stream-json", sub: "Pi RPC JSONL", wire: "stream-json" },
     ]);

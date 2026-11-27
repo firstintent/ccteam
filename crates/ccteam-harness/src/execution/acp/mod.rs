@@ -6,6 +6,7 @@
 //! - [`crate::execution::opencode_acp`]
 //! - [`crate::execution::kimi_acp`]
 //! - [`crate::execution::dsh_acp`]
+//! - [`crate::execution::agy_acp`]
 
 pub mod context_probe;
 pub mod protocol;

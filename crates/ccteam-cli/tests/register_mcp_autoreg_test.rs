@@ -89,12 +89,24 @@ impl Sandbox {
         self.kimi_home.join("mcp.json")
     }
 
+    /// Antigravity's config lives under the (sandboxed) HOME; agy has no env
+    /// override for it.
+    fn agy_config(&self) -> PathBuf {
+        self.home.join(".gemini/config/mcp_config.json")
+    }
+
     /// Kimi's gate is "binary resolvable OR config already exists". Seeding an
-    /// empty-ish config is how a test gets all FIVE dialects written in one run
+    /// empty-ish config is how a test gets every dialect written in one run
     /// without pretending a kimi binary is installed.
+    ///
+    /// Antigravity rides the same gate, seeded with what agy itself leaves
+    /// behind on first run: a ZERO-BYTE `mcp_config.json`. The writer must
+    /// read that as "no servers", not as a parse failure.
     fn seed_kimi_config(&self) {
         std::fs::create_dir_all(&self.kimi_home).unwrap();
         std::fs::write(self.kimi_config(), r#"{"mcpServers":{}}"#).unwrap();
+        std::fs::create_dir_all(self.agy_config().parent().unwrap()).unwrap();
+        std::fs::write(self.agy_config(), b"").unwrap();
     }
 
     fn seed_siblings(&self) {
@@ -152,8 +164,8 @@ impl Sandbox {
 
     /// What a machine that ran a pre-enrollment ccteam looks like: the HTTP
     /// shape is already current, but the bearer is the machine-wide SHARED admin
-    /// web token. All five dialects, kimi included, so the config-exists gate
-    /// also lets kimi through.
+    /// web token. Every dialect, kimi and agy included, so the config-exists
+    /// gate also lets those two through.
     fn seed_legacy_admin_token_entries(&self) {
         const LEGACY: &str = "Bearer ccteam:deadbeefcafe";
         std::fs::write(
@@ -211,6 +223,17 @@ impl Sandbox {
             .to_string(),
         )
         .unwrap();
+        std::fs::create_dir_all(self.agy_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            self.agy_config(),
+            serde_json::json!({"mcpServers": {"ccteam": {
+                "serverUrl": "http://127.0.0.1:7331/mcp",
+                "headers": {"Authorization": LEGACY},
+                "disabled": false,
+            }}})
+            .to_string(),
+        )
+        .unwrap();
     }
 
     fn run(&self) -> Output {
@@ -262,7 +285,7 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
 
     let first = parse_output(&sb.run());
     let results = first["results"].as_array().unwrap();
-    assert_eq!(results.len(), 5);
+    assert_eq!(results.len(), 6);
     assert!(
         results.iter().all(|row| row["vendor"] != "pi"),
         "managed-bridge Pi must never enter native MCP registration: {results:?}"
@@ -287,11 +310,18 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
         !sb.kimi_config().exists(),
         "absent vendor must not gain a config footprint"
     );
+    // agy: no binary on the (empty) PATH and no config yet — skipped too.
+    let agy = results.iter().find(|row| row["vendor"] == "agy").unwrap();
+    assert_eq!(agy["status"], "skipped");
+    assert!(
+        !sb.home.join(".gemini").exists(),
+        "absent vendor must not gain a config footprint"
+    );
 
     let claude: Value =
         serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
     assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
-    // One transport for all five vendors: HTTP + enrollment bearer, no stdio child.
+    // One transport for every vendor: HTTP + enrollment bearer, no stdio child.
     assert_eq!(claude["mcpServers"]["ccteam"]["type"], "http");
     assert!(claude["mcpServers"]["ccteam"]["url"].is_string());
     assert!(claude["mcpServers"]["ccteam"]
@@ -362,6 +392,7 @@ fn authorization_headers(sb: &Sandbox) -> Vec<(&'static str, String)> {
         ("grok", toml_at(&sb.grok_config(), "headers")),
         ("opencode", json_at(&sb.opencode_config(), "mcp")),
         ("kimi", json_at(&sb.kimi_config(), "mcpServers")),
+        ("agy", json_at(&sb.agy_config(), "mcpServers")),
     ]
 }
 
@@ -369,8 +400,8 @@ fn authorization_headers(sb: &Sandbox) -> Vec<(&'static str, String)> {
 /// credential, never the admin web token: that file is shared by every process
 /// the vendor ever starts, so an admin token there made every hand-started
 /// `claude`/`codex`/`grok` the same caller — no delegation parent, no project of
-/// its own. One credential covers all five dialects, and re-registering must not
-/// mint a second one (daemon start rewrites five files on every restart).
+/// its own. One credential covers every dialect, and re-registering must not
+/// mint a second one (daemon start rewrites each file on every restart).
 #[test]
 fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
     let sb = Sandbox::new();
@@ -381,7 +412,7 @@ fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
     for row in results["results"].as_array().unwrap() {
         assert_eq!(
             row["status"], "registered",
-            "all five dialects must be written: {row}"
+            "every dialect must be written: {row}"
         );
     }
 
@@ -415,6 +446,7 @@ fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
         sb.grok_config(),
         sb.opencode_config(),
         sb.kimi_config(),
+        sb.agy_config(),
     ]
     .iter()
     .map(|p| std::fs::read_to_string(p).unwrap())
@@ -426,6 +458,7 @@ fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
         sb.grok_config(),
         sb.opencode_config(),
         sb.kimi_config(),
+        sb.agy_config(),
     ]
     .iter()
     .zip(&bodies)
@@ -456,8 +489,8 @@ fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
     );
 }
 
-/// A machine that upgraded still has `Bearer ccteam:<admin web token>` in five
-/// config files. Nobody edits those by hand, so the predicate must read them as
+/// A machine that upgraded still has `Bearer ccteam:<admin web token>` in its
+/// vendor config files. Nobody edits those by hand, so the predicate must read them as
 /// NOT registered and daemon start must replace them in place — no migration
 /// code, per pre-v1.0 discipline.
 #[test]

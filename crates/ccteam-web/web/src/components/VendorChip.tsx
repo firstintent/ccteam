@@ -74,6 +74,16 @@ function VendorMark({ vendor }: { vendor: string }) {
           />
         </svg>
       );
+    case "agy":
+      // Antigravity: an arch lifting off its baseline (ccteam's own mark).
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">
+          <path
+            fill="currentColor"
+            d="M8 2.2c.5 0 .9.3 1.1.8l4.2 10.3h-2.3L8 5.8 5 13.3H2.7L6.9 3c.2-.5.6-.8 1.1-.8z"
+          />
+        </svg>
+      );
     default:
       return (
         <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">

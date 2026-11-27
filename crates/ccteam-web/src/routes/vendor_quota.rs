@@ -306,7 +306,7 @@ async fn probe_one(
 }
 
 /// `GET /api/v1/vendors/quota` — the local machine's per-vendor quota rows.
-/// Vendors with no probe surface (opencode/pi/dsh) are absent from the list
+/// Vendors with no probe surface (opencode/pi/dsh/agy) are absent from the list
 /// — the UI renders nothing for them, exactly like `not_subscription` /
 /// `unavailable` rows.
 #[utoipa::path(

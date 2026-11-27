@@ -31,7 +31,8 @@ or the web/IM entry points):\n\n\
 - `opencode` — OpenCode\n\
 - `kimi` — Kimi Code (Moonshot)\n\
 - `pi` — Pi (local-only harness)\n\
-- `dsh` — DSH / DeepSeek Harness (local-only harness)\n\n\
+- `dsh` — DSH / DeepSeek Harness (local-only harness)\n\
+- `agy` — Antigravity CLI (Google)\n\n\
 Which of them are actually installed on this machine — with versions and each\n\
 vendor's advisory model + effort catalog — arrives live in the vendor panel of\n\
 the same `status` response as these notes. Trust that panel, not a list here.\n\n\

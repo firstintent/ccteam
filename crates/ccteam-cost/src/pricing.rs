@@ -79,6 +79,9 @@ pub enum Vendor {
     /// DSH ACP (DeepSeek Harness) — v1 reports raw token counts with no USD
     /// figure; no static table (`table_for` always `None`).
     Dsh,
+    /// Antigravity CLI ACP — subscription-billed; the wire reports token
+    /// counts and no USD, so there is no static table and cost reads "—".
+    Agy,
 }
 
 impl Vendor {
@@ -91,6 +94,7 @@ impl Vendor {
         Vendor::Kimi,
         Vendor::Pi,
         Vendor::Dsh,
+        Vendor::Agy,
     ];
 }
 
@@ -184,6 +188,8 @@ fn table_for(vendor: Vendor) -> Option<&'static PricingTable> {
         Vendor::Kimi => None,
         // DSH v1: raw token counts only, no USD — no table (K14).
         Vendor::Dsh => None,
+        // Antigravity: token counts only, no USD on the wire — no table.
+        Vendor::Agy => None,
     }
 }
 
@@ -199,7 +205,7 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
         // may still estimate from their static table.
         if matches!(
             vendor,
-            Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh
+            Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh | Vendor::Agy
         ) {
             return None;
         }
@@ -220,7 +226,7 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
 pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
     if matches!(
         vendor,
-        Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh
+        Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh | Vendor::Agy
     ) {
         return None;
     }

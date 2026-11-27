@@ -83,6 +83,10 @@ pub const OPENCODE_BIN_ENV: &str = "CCTEAM_OPENCODE_BIN";
 /// the hermetic fake (`tests/fixtures/kimi_acp/fake_kimi_acp.py`).
 pub const KIMI_BIN_ENV: &str = "CCTEAM_KIMI_BIN";
 
+/// Environment override for the `agy` (Antigravity CLI) binary path. Tests
+/// set this to the hermetic fake (`tests/fixtures/agy_acp/fake_agy_acp.py`).
+pub const AGY_BIN_ENV: &str = "CCTEAM_AGY_BIN";
+
 /// Environment override for the global ccteam root. Harness-owned
 /// adapters use this for per-session state sidecars without depending
 /// on `ccteam-core::paths::CcteamPaths`.
@@ -129,6 +133,9 @@ pub enum AgentVendor {
     /// which also carries the tool face and the team panel); see
     /// `execution/dsh_acp`.
     Dsh,
+    /// Antigravity CLI (`agy acp`, Google). Plain ACP stdio; see
+    /// `execution/agy_acp`.
+    Agy,
 }
 
 /// Where ccteam may execute a vendor adapter. Declaring this beside
@@ -151,6 +158,7 @@ impl AgentVendor {
         AgentVendor::Kimi,
         AgentVendor::Pi,
         AgentVendor::Dsh,
+        AgentVendor::Agy,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
@@ -162,6 +170,7 @@ impl AgentVendor {
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
             AgentVendor::Pi => ccteam_cost::Vendor::Pi,
             AgentVendor::Dsh => ccteam_cost::Vendor::Dsh,
+            AgentVendor::Agy => ccteam_cost::Vendor::Agy,
         }
     }
 
@@ -175,6 +184,7 @@ impl AgentVendor {
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
             AgentVendor::Dsh => "dsh",
+            AgentVendor::Agy => "agy",
         }
     }
 
@@ -185,7 +195,8 @@ impl AgentVendor {
             | AgentVendor::Codex
             | AgentVendor::Grok
             | AgentVendor::Opencode
-            | AgentVendor::Kimi => HostExecutionScope::LocalOrSatellite,
+            | AgentVendor::Kimi
+            | AgentVendor::Agy => HostExecutionScope::LocalOrSatellite,
             AgentVendor::Pi | AgentVendor::Dsh => HostExecutionScope::LocalOnly,
         }
     }
@@ -1917,9 +1928,11 @@ pub struct SpawnCtx {
     /// Explicit vendor session-mode token for this thread. `None` = the
     /// vendor default. Same verbatim-ride contract as
     /// `effort`: an adapter with no mode axis REFUSES a non-empty value
-    /// (`spawn_pick_refused`) instead of quietly ignoring it. Today only DSH
-    /// consumes it as a native agent-preset id; DSH owns the roster and default.
-    /// ccteam's `creator` product label selects the native `cordis` preset.
+    /// (`spawn_pick_refused`) instead of quietly ignoring it. Two vendors
+    /// consume it: DSH as a native agent-preset id (DSH owns the roster and
+    /// default; ccteam's `creator` product label selects the native `cordis`
+    /// preset), and Antigravity as its ACP session mode (`session/set_mode`:
+    /// `default` | `accept-edits` | `auto` | `plan`, validated by agy).
     pub mode: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
@@ -2445,6 +2458,7 @@ impl SessionHandle {
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
             AgentVendor::Dsh => "dsh",
+            AgentVendor::Agy => "agy",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

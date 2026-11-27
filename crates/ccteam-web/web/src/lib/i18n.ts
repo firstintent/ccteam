@@ -215,7 +215,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     accessResetCredentials: "重置",
     accessMcpTitle: "外部 Agent 接入 (MCP)",
     accessMcpDesc:
-      "生成一份带凭据的 MCP 配置,粘贴到任意机器上的 agent(Claude / Codex / Grok / OpenCode / Kimi),它就能用 ccteam 的工具面。",
+      "生成一份带凭据的 MCP 配置,粘贴到任意机器上的 agent(Claude / Codex / Grok / OpenCode / Kimi / Antigravity),它就能用 ccteam 的工具面。",
     accessMcpFooter:
       "凭据可随时吊销,互不影响。手动启动的 pi 没有 ccteam 工具面(它的工具面走受管会话桥接)。",
     accessMcpScopeLabel: "范围",
@@ -657,7 +657,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     accessResetCredentials: "Reset",
     accessMcpTitle: "External agent access (MCP)",
     accessMcpDesc:
-      "Mint an MCP config with its own credential, then paste it into an agent on any machine (Claude / Codex / Grok / OpenCode / Kimi) to give it ccteam's tools.",
+      "Mint an MCP config with its own credential, then paste it into an agent on any machine (Claude / Codex / Grok / OpenCode / Kimi / Antigravity) to give it ccteam's tools.",
     accessMcpFooter:
       "Revoke any credential any time; the others are untouched. A hand-started pi has no ccteam tools by design (its tool surface is the managed-session bridge).",
     accessMcpScopeLabel: "Scope",

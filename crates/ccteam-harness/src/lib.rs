@@ -60,7 +60,7 @@ pub use adapter::{
     SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState,
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
     TitleSync, ToolSurfaceRebuild, TurnContinuation, TurnDisposition, TurnId, TurnInput,
-    TurnOpening, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx,
+    TurnOpening, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, AGY_BIN_ENV,
     CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
     CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, IN_FLIGHT_NARRATION_MAX_CHARS,
     KIMI_BIN_ENV, OPENCODE_BIN_ENV,
@@ -69,6 +69,7 @@ pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
 };
+pub use execution::agy_acp::{AgyAcpAdapter, AGY_ACP_ADAPTER_NAME};
 pub use execution::claude_stream_json::{persisted_session_model, ClaudeStreamJsonAdapter};
 pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT_SESSION_PREFIX};
 pub use execution::codex_exec::codex_chat_session_name;

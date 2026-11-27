@@ -1167,60 +1167,43 @@ pub struct DoctorOptions {
 
 fn render_install_mcp_report() -> Result<String> {
     // ccteam is a pure CLI (not a vendor plugin), so `ccteam config` is the
-    // MCP installer for ALL vendors (v0.9.3 symmetry — any vendor's main
-    // session can orchestrate): Claude (`~/.claude.json`), Codex
-    // (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
-    // (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`).
-    let claude_path = crate::mcp_serve::install_mcp()?;
-    let codex_path = crate::mcp_serve::install_codex_mcp()?;
-    let grok_path = crate::mcp_serve::install_grok_mcp()?;
-    let opencode_path = crate::mcp_serve::install_opencode_mcp()?;
-    let kimi_path = crate::mcp_serve::install_kimi_mcp()?;
-    Ok(render_install_mcp_body(
-        &claude_path,
-        &codex_path,
-        &grok_path,
-        &opencode_path,
-        &kimi_path,
-    ))
+    // MCP installer for ALL vendors with a native MCP config (vendor symmetry
+    // — any vendor's main session can orchestrate): Claude (`~/.claude.json`),
+    // Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
+    // (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`),
+    // Antigravity (`~/.gemini/config/mcp_config.json`).
+    let registered = [
+        ("Claude", crate::mcp_serve::install_mcp()?),
+        ("Codex", crate::mcp_serve::install_codex_mcp()?),
+        ("Grok", crate::mcp_serve::install_grok_mcp()?),
+        ("OpenCode", crate::mcp_serve::install_opencode_mcp()?),
+        ("Kimi", crate::mcp_serve::install_kimi_mcp()?),
+        ("Antigravity", crate::mcp_serve::install_agy_mcp()?),
+    ];
+    Ok(render_install_mcp_body(&registered))
 }
 
 /// Pure renderer for the `config mcp` report body, split out from the
 /// vendor-config writes so it stays unit-testable without touching the real
-/// configs. The `tools surface` line interpolates the live tool count from
-/// the same `tool_definitions()` source `run_verify_mcp` introspects — never
-/// hard-code it, or the number drifts (it was stuck at "9" while the surface
-/// grew to 27).
-fn render_install_mcp_body(
-    claude_path: &std::path::Path,
-    codex_path: &std::path::Path,
-    grok_path: &std::path::Path,
-    opencode_path: &std::path::Path,
-    kimi_path: &std::path::Path,
-) -> String {
-    let mut out = String::from(
-        "ccteam config: register MCP server (Claude + Codex + Grok + OpenCode + Kimi)\n\n",
+/// configs. One `(label, config path)` row per registered vendor, in order —
+/// a slice, so the next vendor is a row at the call site and not another
+/// positional parameter. The `tools surface` line interpolates the live tool
+/// count from the same `tool_definitions()` source `run_verify_mcp`
+/// introspects — never hard-code it, or the number drifts (it was stuck at
+/// "9" while the surface grew to 27).
+fn render_install_mcp_body(registered: &[(&str, std::path::PathBuf)]) -> String {
+    let labels: Vec<&str> = registered.iter().map(|(label, _)| *label).collect();
+    let mut out = format!(
+        "ccteam config: register MCP server ({})\n\n",
+        labels.join(" + ")
     );
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Claude   in {}\n",
-        claude_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Codex    in {}\n",
-        codex_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Grok     in {}\n",
-        grok_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for OpenCode in {}\n",
-        opencode_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Kimi     in {}\n",
-        kimi_path.display()
-    ));
+    let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    for (label, path) in registered {
+        out.push_str(&format!(
+            "  registered ccteam MCP server for {label:<width$} in {}\n",
+            path.display()
+        ));
+    }
     for spec in ccteam_core::host_registry::AGENT_PROBE_SPECS
         .iter()
         .filter(|spec| !spec.tool_surface.uses_native_mcp_config())
@@ -5084,12 +5067,29 @@ mod tests {
         // the pure body renderer with a synthetic path so it never
         // touches the real ~/.claude.json.
         let total = run_verify_mcp().total_tools;
-        let report = render_install_mcp_body(
-            std::path::Path::new("/tmp/fake-claude.json"),
-            std::path::Path::new("/tmp/fake-codex/config.toml"),
-            std::path::Path::new("/tmp/fake-grok/config.toml"),
-            std::path::Path::new("/tmp/fake-opencode/opencode.json"),
-            std::path::Path::new("/tmp/fake-kimi/mcp.json"),
+        let report = render_install_mcp_body(&[
+            ("Claude", "/tmp/fake-claude.json".into()),
+            ("Codex", "/tmp/fake-codex/config.toml".into()),
+            ("Grok", "/tmp/fake-grok/config.toml".into()),
+            ("OpenCode", "/tmp/fake-opencode/opencode.json".into()),
+            ("Kimi", "/tmp/fake-kimi/mcp.json".into()),
+            (
+                "Antigravity",
+                "/tmp/fake-gemini/config/mcp_config.json".into(),
+            ),
+        ]);
+        assert!(
+            report.starts_with(
+                "ccteam config: register MCP server \
+                 (Claude + Codex + Grok + OpenCode + Kimi + Antigravity)\n"
+            ),
+            "header names every registered vendor: {report}",
+        );
+        assert!(
+            report.contains(
+                "  registered ccteam MCP server for Claude      in /tmp/fake-claude.json\n"
+            ),
+            "rows stay column-aligned on the longest label: {report}",
         );
         assert!(
             report.contains(&format!("tools surface : {total}")),
@@ -5100,7 +5100,7 @@ mod tests {
             !report.contains("interfaces §12.2"),
             "stale section tag must be dropped: {report}",
         );
-        // All five vendor targets must be named in the report body
+        // Every registered vendor target must be named in the report body
         // (vendor symmetry: any vendor's main session can orchestrate).
         for target in [
             "/tmp/fake-claude.json",
@@ -5108,6 +5108,7 @@ mod tests {
             "/tmp/fake-grok/config.toml",
             "/tmp/fake-opencode/opencode.json",
             "/tmp/fake-kimi/mcp.json",
+            "/tmp/fake-gemini/config/mcp_config.json",
         ] {
             assert!(
                 report.contains(target),

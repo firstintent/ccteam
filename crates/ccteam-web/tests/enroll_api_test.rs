@@ -210,7 +210,7 @@ async fn minted_bearer_verifies_and_snippets_carry_the_browsed_host() {
         .collect();
     assert_eq!(
         vendors,
-        ["claude", "codex", "grok", "opencode", "kimi"],
+        ["claude", "codex", "grok", "opencode", "kimi", "agy"],
         "every vendor whose config ccteam writes gets a snippet (pi's tool \
          surface is the managed-session bridge, so it has no config)"
     );
@@ -232,6 +232,7 @@ async fn minted_bearer_verifies_and_snippets_carry_the_browsed_host() {
             "grok" => reg::grok_mcp_registered(&file),
             "opencode" => reg::opencode_mcp_registered(&file),
             "kimi" => reg::kimi_mcp_registered(&file),
+            "agy" => reg::agy_mcp_registered(&file),
             other => panic!("unknown dialect {other}"),
         };
         assert!(

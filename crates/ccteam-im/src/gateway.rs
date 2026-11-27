@@ -3081,8 +3081,8 @@ pub struct SpawnTuning {
     /// Explicit reasoning-effort token (vendor-specific value set — the
     /// vendor validates it; see `SpawnCtx::effort`).
     pub effort: Option<String>,
-    /// Explicit vendor session-mode token (DSH agent preset today — the
-    /// vendor validates it; see `SpawnCtx::mode`).
+    /// Explicit vendor session-mode token (a DSH agent preset, an Antigravity
+    /// session mode — the vendor validates it; see `SpawnCtx::mode`).
     pub mode: Option<String>,
 }
 
@@ -3720,7 +3720,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>] [mode=<mode>]"),
+        arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh|agy] [role] [hitl] [model=<id>] [effort=<level>] [mode=<mode>]"),
         help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
         in_menu: true,
     },
@@ -20058,6 +20058,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Kimi => "kimi",
         AgentVendor::Pi => "pi",
         AgentVendor::Dsh => "dsh",
+        AgentVendor::Agy => "agy",
     }
 }
 
@@ -22617,6 +22618,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
         "dsh" => Ok(AgentVendor::Dsh),
+        "agy" => Ok(AgentVendor::Agy),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -22634,7 +22636,7 @@ struct NewSessionArgs {
 /// The one-line `/new` syntax, echoed by every parse error so a chat user
 /// never has to leave the conversation to find the shape.
 const NEW_COMMAND_SYNTAX: &str =
-    "/new [claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>] [mode=<mode>]";
+    "/new [claude|codex|grok|opencode|kimi|pi|dsh|agy] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>] [mode=<mode>]";
 
 /// Parse the tokens after `/new`.
 ///
@@ -22706,9 +22708,11 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
     // changes the outcome. Pi RPC is canonical stream-json at the gateway
     // boundary even though its child wire is Pi's own JSONL protocol.
     protocol = match vendor {
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
-            SessionProtocol::Acp
-        }
+        AgentVendor::Grok
+        | AgentVendor::Opencode
+        | AgentVendor::Kimi
+        | AgentVendor::Dsh
+        | AgentVendor::Agy => SessionProtocol::Acp,
         AgentVendor::Pi => SessionProtocol::StreamJson,
         AgentVendor::Claude | AgentVendor::Codex => protocol,
     };
@@ -22835,6 +22839,16 @@ mod tests {
         let dsh = parse_new("dsh").unwrap();
         assert_eq!(dsh.vendor, AgentVendor::Dsh);
         assert_eq!(dsh.role, "", "bare /new dsh is roleless");
+
+        // Antigravity: ACP whatever was typed; role and mode ride through
+        // untouched (agy resolves the role as its own agent, and owns the
+        // verdict on the mode).
+        let agy = parse_new("agy reviewer terminal mode=plan effort=low").unwrap();
+        assert_eq!(agy.vendor, AgentVendor::Agy);
+        assert_eq!(agy.role, "reviewer");
+        assert_eq!(agy.protocol, SessionProtocol::Acp);
+        assert_eq!(agy.tuning.mode.as_deref(), Some("plan"));
+        assert_eq!(agy.tuning.effort.as_deref(), Some("low"));
 
         // ACP vendors settle the protocol axis last, whatever was typed.
         assert_eq!(
@@ -35655,7 +35669,9 @@ mod tests {
         > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
+        for vendor in [
+            "claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy",
+        ] {
             gateway
                 .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
                 .await
@@ -35668,7 +35684,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
+        for vendor in [
+            "claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy",
+        ] {
             assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
@@ -37593,6 +37611,7 @@ mod tests {
                         AgentVendor::Kimi => codex.clone(),
                         AgentVendor::Pi => codex.clone(), // tests: no dedicated Pi fake
                         AgentVendor::Dsh => codex.clone(), // tests: no dedicated Dsh fake
+                        AgentVendor::Agy => codex.clone(), // tests: no dedicated agy fake
                     }
                 },
             )
@@ -37687,6 +37706,7 @@ mod tests {
                         AgentVendor::Kimi => codex.clone(),
                         AgentVendor::Pi => codex.clone(),
                         AgentVendor::Dsh => codex.clone(),
+                        AgentVendor::Agy => codex.clone(),
                     }
                 },
             )

@@ -29,8 +29,17 @@ import type {
 } from '../shared/contract.js'
 import { isTurnBoundary } from '../shared/contract.js'
 
-/** The seven spawnable vendors, in display order. */
-export const VENDORS: readonly string[] = ['claude', 'codex', 'grok', 'opencode', 'kimi', 'pi', 'dsh']
+/** The eight spawnable vendors, in display order. */
+export const VENDORS: readonly string[] = [
+  'claude',
+  'codex',
+  'grok',
+  'opencode',
+  'kimi',
+  'pi',
+  'dsh',
+  'agy',
+]
 
 /** Recents strip capacity. */
 export const MAX_RECENTS = 5

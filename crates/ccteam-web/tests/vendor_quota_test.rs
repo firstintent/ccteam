@@ -6,7 +6,7 @@
 //! 2. with all credential homes pointed at an EMPTY tempdir, every probe
 //!    resolves locally without any network call: claude/codex/kimi report
 //!    `not_subscription` (no credential file), grok `unavailable` (stubbed
-//!    by construction), and opencode/pi/dsh are absent from the list
+//!    by construction), and opencode/pi/dsh/agy are absent from the list
 //! 3. a repeat GET rides the per-vendor cache (same rows, still 200)
 //!
 //! The env mutation (HOME + the three vendor home overrides) is why this
@@ -139,7 +139,7 @@ async fn empty_credential_homes_yield_local_only_rows_and_cache_repeats() {
         Some("unavailable")
     );
     // No probe surface: absent from the list entirely (UI renders nothing).
-    for vendor in ["opencode", "pi", "dsh"] {
+    for vendor in ["opencode", "pi", "dsh", "agy"] {
         assert!(!by_vendor.contains_key(vendor), "{vendor} must be absent");
     }
     // Exactly the four probe-bearing vendors, registry-ordered.

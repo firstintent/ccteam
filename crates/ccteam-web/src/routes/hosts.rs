@@ -176,6 +176,9 @@ fn mcp_registered(vendor: &str, ccteam_root: &std::path::Path) -> bool {
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
+        "agy" => ccteam_core::mcp_register::resolve_agy_config_path()
+            .map(|p| ccteam_core::mcp_register::agy_mcp_registered(&p))
+            .unwrap_or(false),
         // DSH has no vendor MCP config file: "registered" means ccteam's
         // Cordis plugins (each bundle + its configured patch row) are present
         // in the operator's own `~/.dsh` web profile — exactly what
@@ -709,6 +712,11 @@ fn register_mcp_blocking(
         let path = ccteam_core::mcp_register::resolve_kimi_config_path()?;
         ccteam_core::mcp_register::install_kimi_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("kimi".to_string(), path.display().to_string());
+    }
+    if do_vendor("agy") {
+        let path = ccteam_core::mcp_register::resolve_agy_config_path()?;
+        ccteam_core::mcp_register::install_agy_mcp_into(&path, mcp_http_url, &bearer)?;
+        written.insert("agy".to_string(), path.display().to_string());
     }
     Ok(written)
 }
@@ -1358,7 +1366,7 @@ mod tests {
 
     #[test]
     fn probe_specs_declare_their_tool_surface_mode() {
-        assert_eq!(AGENT_PROBE_SPECS.len(), 7);
+        assert_eq!(AGENT_PROBE_SPECS.len(), 8);
         assert_eq!(
             AgentProbeSpec::by_vendor("pi").unwrap().tool_surface,
             ToolSurfaceMode::ManagedSessionBridge

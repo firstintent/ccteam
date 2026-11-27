@@ -531,7 +531,7 @@ pub(crate) fn spawn_unavailable_message(
          (installed there: {installed}; observed {freshness}). Hire one of the installed \
          vendors, or install `{vendor}` on that host and retry — the admin can one-click \
          install npm-packaged vendors (claude/codex/grok/opencode/dsh) from the Ops & Hosts \
-         web page; kimi/pi install manually. Model ids stay advisory (ccteam does not \
+         web page; kimi/pi/agy install manually. Model ids stay advisory (ccteam does not \
          validate them), so a genuinely fresh install can just retry."
     )
 }
@@ -603,6 +603,7 @@ fn vendor_cap(budgets: Option<&ccteam_cost::Budgets>, vendor: &str) -> Option<f6
         "kimi" => ccteam_cost::Vendor::Kimi,
         "pi" => ccteam_cost::Vendor::Pi,
         "dsh" => ccteam_cost::Vendor::Dsh,
+        "agy" => ccteam_cost::Vendor::Agy,
         _ => return None,
     };
     budgets.cap_for(v).max_cost_usd_per_24h

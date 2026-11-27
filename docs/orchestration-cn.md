@@ -14,7 +14,7 @@
 |---|---|
 | **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;说一句「也问问 codex 和 grok」,它自己把问题扇给几个 vendor,再把几份答案比出结论。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具 |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi / Antigravity / DSH / Pi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具 |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -135,7 +135,7 @@ steer 有一处代价值得知道:在 Claude 上,这行纠正会以 turn 中预�
 
 ## 8. 装一次
 
-对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `agent{vendor:"dsh", task:"…"}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/ccteam-ui`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
+对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi / Antigravity,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `agent{vendor:"dsh", task:"…"}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/ccteam-ui`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
 - 本机 `ccteam start` 起着 daemon。
 - 你有一个**已注册的 ccteam 项目**并知道它的 slug;可写配置的 CLI 会话也可以从工作目录识别项目。

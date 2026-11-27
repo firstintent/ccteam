@@ -13,7 +13,7 @@
 //     effect when the human restarts their own `dsh web`).
 //   · install / update (VENDOR-INSTALL-1) — ADMIN-only one-click npm
 //     install/update on the local host (recipe argv is pinned server-side in
-//     `AgentProbeSpec::install_recipe` and runs shell-free; kimi/pi have no
+//     `AgentProbeSpec::install_recipe` and runs shell-free; kimi/pi/agy have no
 //     recipe and keep manual guidance with a docs link). The row polls the
 //     job and re-probes the host on success. The 403 is the real gate —
 //     `useMe().isAdmin` only hides the button.
@@ -114,7 +114,7 @@ export function toolSurfaceNoticesFor(detail: HostDetail): string[] {
 /** VENDOR-INSTALL-1 — what the row's one-click CTA offers, if anything.
  *  `install` for a missing npm-packaged vendor, `update` when the npm
  *  "latest" is strictly newer than the probe version, `none` otherwise
- *  (up-to-date, non-admin, satellite, or a recipe-less vendor — kimi/pi keep
+ *  (up-to-date, non-admin, satellite, or a recipe-less vendor — kimi/pi/agy keep
  *  their manual-install hint). Pure + hook-free so the node tests pin the
  *  three states without a DOM. */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with its only consumer for unit tests.
@@ -213,12 +213,12 @@ export default function HostsView({
 
   // Latest published versions for the Update CTA — fired once over the whole
   // vendor axis (mirrors the Team roster); `fetchVendorLatests` drops the
-  // vendors it has no npm channel for (kimi/pi) and caches the rest. Pure
+  // vendors it has no npm channel for (kimi/pi/agy) and caches the rest. Pure
   // decoration: any failure leaves the map empty and rows simply never show
   // an Update button.
   useEffect(() => {
     let cancelled = false;
-    fetchVendorLatests(["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"])
+    fetchVendorLatests(["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"])
       .then((map) => {
         if (!cancelled) setLatests(map);
       })

@@ -26,7 +26,7 @@ use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
 /// so an unrecognised client must not be forced into a wrong vendor — the
 /// caller keeps the raw string as the node's title instead. Observed names on
 /// this machine: `claude-code`, `codex`, `grok`, `opencode`, `kimi-code`,
-/// `ccteam-dsh-client` / `dsh`.
+/// `ccteam-dsh-client` / `dsh`, `antigravity-client` (agy 1.5.18).
 pub fn vendor_from_client(client_name: &str) -> Option<AgentVendor> {
     let name = client_name.trim().to_ascii_lowercase();
     // Match on the leading token so `codex-cli` / `claude-code-sdk` still land.
@@ -39,6 +39,7 @@ pub fn vendor_from_client(client_name: &str) -> Option<AgentVendor> {
         h if h.starts_with("kimi") => Some(AgentVendor::Kimi),
         h if h.starts_with("pi") => Some(AgentVendor::Pi),
         h if h.starts_with("dsh") || name.starts_with("ccteam-dsh") => Some(AgentVendor::Dsh),
+        h if h.starts_with("antigravity") || h.starts_with("agy") => Some(AgentVendor::Agy),
         _ => None,
     }
 }
@@ -58,9 +59,11 @@ pub fn external_node_meta(
     let now = chrono::Utc::now().to_rfc3339();
     let resolved_vendor = vendor.unwrap_or(AgentVendor::Claude);
     let protocol = match resolved_vendor {
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
-            SessionProtocol::Acp
-        }
+        AgentVendor::Grok
+        | AgentVendor::Opencode
+        | AgentVendor::Kimi
+        | AgentVendor::Dsh
+        | AgentVendor::Agy => SessionProtocol::Acp,
         AgentVendor::Claude | AgentVendor::Codex | AgentVendor::Pi => SessionProtocol::StreamJson,
     };
     let mut meta = SessionMeta {
@@ -143,6 +146,7 @@ mod tests {
             ("kimi-code", AgentVendor::Kimi),
             ("pi", AgentVendor::Pi),
             ("dsh", AgentVendor::Dsh),
+            ("antigravity-client", AgentVendor::Agy),
         ] {
             assert_eq!(vendor_from_client(client), Some(want), "client {client}");
         }

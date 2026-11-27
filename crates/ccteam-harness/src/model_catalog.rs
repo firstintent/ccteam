@@ -209,15 +209,18 @@ pub fn supported_efforts(vendor: &str) -> Vec<String> {
 /// - codex: `ReasoningEffort` accepts more (`none`/`minimal`/`ultra`), but
 ///   which ones a model takes is per-model — offer the four every reasoning
 ///   model has;
-/// - grok / kimi / opencode: their handshakes declare the axis (grok
-///   `_meta.reasoningEfforts`, kimi `thought_level` options), so these are
-///   only the cold-start guess before the first session.
+/// - grok / kimi / agy / opencode: their handshakes declare the axis (grok
+///   `_meta.reasoningEfforts`, kimi and agy `thought_level` options), so
+///   these are only the cold-start guess before the first session. agy's
+///   levels are per-model (`xhigh` on some); the guess is the three every
+///   thinking model offered on agy 1.5.18.
 fn pinned_efforts(vendor: &str) -> Vec<String> {
     let levels: &[&str] = match vendor {
         "claude" => &["low", "medium", "high", "xhigh", "max"],
         "codex" => &["low", "medium", "high", "xhigh"],
         "grok" => &["low", "medium", "high"],
         "kimi" => &["low", "high", "max"],
+        "agy" => &["low", "medium", "high"],
         // OpenCode: no shared axis on the wire today (per-model variants).
         _ => &[],
     };

@@ -1,6 +1,7 @@
 //! Execution support modules shared by concrete harness adapters.
 //!
 pub mod acp;
+pub mod agy_acp;
 pub mod claude_accounts;
 pub mod claude_bg;
 pub mod claude_common;
@@ -37,6 +38,7 @@ pub mod typed_events;
 pub mod vendor_pids;
 pub mod vendor_title;
 
+pub use agy_acp::AgyAcpAdapter;
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_stream_json::ClaudeStreamJsonAdapter;
 pub use claude_tui::ClaudeTuiAdapter;

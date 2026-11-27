@@ -63,6 +63,7 @@ impl Default for VendorPools {
         slots.insert(AgentVendor::Opencode, 8);
         slots.insert(AgentVendor::Kimi, 32);
         slots.insert(AgentVendor::Dsh, 32);
+        slots.insert(AgentVendor::Agy, 8);
         slots.insert(AgentVendor::Pi, 4);
         Self { slots, fallback: 8 }
     }

@@ -3,7 +3,7 @@
 //! A workflow is a plain JavaScript file. Its control flow is deterministic
 //! and written by a human (or by an agent, once); its *work* is done by
 //! ccteam sessions. Every `agent()` call in the script is an A2A hire on any
-//! harness — claude, codex, grok, opencode, kimi, pi, dsh — and therefore a
+//! harness — claude, codex, grok, opencode, kimi, pi, dsh, agy — and therefore a
 //! real ledger session with a sid, a transcript and a cost, not an anonymous
 //! subprocess.
 //!

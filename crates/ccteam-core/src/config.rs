@@ -189,7 +189,7 @@ pub struct SessionsConfig {
     #[serde(default = "default_sessions_account_yield_secs")]
     pub account_yield_secs: u64,
     /// Per-harness override of [`Self::idle_release_secs`], keyed by the vendor
-    /// wire name (`claude` | `codex` | `grok` | `opencode` | `kimi` | `pi` |
+    /// wire name (`claude` | `codex` | `grok` | `opencode` | `kimi` | `pi` | `agy` |
     /// `dsh`). Absent key ⇒ the global value; `0` ⇒ never release that harness.
     /// Exists because prompt-cache TTL is a VENDOR fact, not a ccteam one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

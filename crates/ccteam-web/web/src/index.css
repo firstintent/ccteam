@@ -127,6 +127,8 @@
   --pi: #4F46E5;
   /* dsh — 7th vendor (blue; distinct from OpenCode sky and Pi indigo). */
   --dsh: #2563EB;
+  /* agy — 8th vendor (teal; distinct from codex green and the blues). */
+  --agy: #0F766E;
   --radius-card: 12px;
   --radius-input: 18px;
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 6px 24px rgba(16,24,40,.06);
@@ -155,6 +157,7 @@ html.dark {
   --kimi: #F472B6;
   --pi: #818CF8;
   --dsh: #60A5FA;
+  --agy: #2DD4BF;
   --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.35);
   --shadow-menu: 0 4px 10px rgba(0,0,0,.5), 0 12px 32px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -648,6 +651,7 @@ html.dark .sel-item.new { color: #67e8f9; }
 .dot.opencode { background: var(--opencode); } .dot.kimi { background: var(--kimi); }
 .dot.pi { background: var(--pi); }
 .dot.dsh { background: var(--dsh); }
+.dot.agy { background: var(--agy); }
 .dot.on { background: var(--green); } .dot.off { background: #C9CBD1; } .dot.busy { background: #F59E0B; }
 .dot.err { background: var(--red); }
 html.dark .dot.off { background: #4b4e57; }
@@ -689,6 +693,7 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.kimi { color: var(--kimi); border-color: #db277755; }
 .chip.pi { color: var(--pi); border-color: #4f46e555; }
 .chip.dsh { color: var(--dsh); border-color: #2563eb55; }
+.chip.agy { color: var(--agy); border-color: #0f766e55; }
 .chip.sid { color: var(--text-muted); }
 /* Icon-only vendor mark (replaces the text label). Fixed square so session
  * rows / cards don't burn horizontal space on "claude"/"opencode" strings. */

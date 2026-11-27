@@ -92,7 +92,7 @@ export interface InstallJob {
 
 /** `POST /api/v1/hosts/{host}/vendors/{vendor}/install` — start (or join the
  *  running) one-click install/update job. Admin-only (backend 403s tenants);
- *  400 for a recipe-less vendor (kimi/pi), 404 off-local. */
+ *  400 for a recipe-less vendor (kimi/pi/agy), 404 off-local. */
 export function installVendor(host: string, vendor: string): Promise<InstallJob> {
   return postJson<InstallJob>(
     `/api/v1/hosts/${encodeURIComponent(host)}/vendors/${encodeURIComponent(vendor)}/install`,

@@ -494,6 +494,7 @@ fn agent_vendor_from_str(vendor: &str) -> ccteam_harness::AgentVendor {
         "kimi" => ccteam_harness::AgentVendor::Kimi,
         "pi" => ccteam_harness::AgentVendor::Pi,
         "dsh" => ccteam_harness::AgentVendor::Dsh,
+        "agy" => ccteam_harness::AgentVendor::Agy,
         _ => ccteam_harness::AgentVendor::Claude,
     }
 }
