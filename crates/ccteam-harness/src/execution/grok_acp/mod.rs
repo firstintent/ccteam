@@ -40,7 +40,7 @@ use protocol::{
     split_trailing_effort, AcpModelOption, ModelInfo,
 };
 use spawn_spec::{build_argv, build_envs, grok_bin, GrokSpawnInput};
-use translate::{apply_notification, SessionTranslateState};
+use translate::SessionTranslateState;
 use transport::{AcpTransport, InboundPolicy};
 
 /// Max wait for the dispatcher to reach the turn boundary after the prompt
@@ -359,8 +359,11 @@ impl GrokAcpAdapter {
             }
         }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
-        let dispatcher =
-            spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
+        let dispatcher = crate::execution::acp::spawn_notification_dispatcher(
+            Arc::clone(&transport),
+            Arc::clone(&state),
+            event_tx.clone(),
+        );
         let live = Arc::new(LiveSession {
             transport,
             session_id: session_id.clone(),
@@ -577,47 +580,6 @@ fn grok_interject_was_admitted(response: &Value) -> bool {
         .or_else(|| response.get("status"))
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("queued"))
-}
-
-fn spawn_notif_dispatcher(
-    transport: Arc<AcpTransport>,
-    state: Arc<StdMutex<SessionTranslateState>>,
-    event_tx: broadcast::Sender<ThreadEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Take the handshake backlog with the subscription: the vendor's
-        // command catalog and any opening usage arrive before this task exists.
-        let (early, mut sub) = transport.subscribe_with_early();
-        for n in early {
-            let events = if let Ok(mut guard) = state.lock() {
-                apply_notification(&mut guard, &n)
-            } else {
-                Vec::new()
-            };
-            for ev in events {
-                let _ = event_tx.send(ev);
-            }
-        }
-        loop {
-            tokio::select! {
-                _ = transport.wait_closed() => return,
-                msg = sub.recv() => match msg {
-                    Ok(n) => {
-                        let events = if let Ok(mut guard) = state.lock() {
-                            apply_notification(&mut guard, &n)
-                        } else {
-                            Vec::new()
-                        };
-                        for ev in events {
-                            let _ = event_tx.send(ev);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        }
-    })
 }
 
 #[async_trait]
