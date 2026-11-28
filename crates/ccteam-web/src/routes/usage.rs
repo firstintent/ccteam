@@ -146,6 +146,7 @@ fn vendor_token(vendor: AgentVendor) -> &'static str {
         AgentVendor::Kimi => "kimi",
         AgentVendor::Pi => "pi",
         AgentVendor::Dsh => "dsh",
+        AgentVendor::Agy => "agy",
     }
 }
 

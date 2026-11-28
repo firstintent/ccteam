@@ -454,6 +454,95 @@ pub fn resolve_kimi_config_path() -> Result<PathBuf> {
     Ok(kimi_home.join("mcp.json"))
 }
 
+/// Register the ccteam MCP server in Antigravity CLI's global
+/// `~/.gemini/config/mcp_config.json` as an `mcpServers.ccteam` HTTP entry —
+/// byte-for-byte the shape `agy mcp add --header … ccteam <url>` writes
+/// (agy 1.5.18, captured in a sandbox home 2026-11-27): `serverUrl` (NOT
+/// `url`), a `headers` **map**, and `disabled: false`. Do not copy the ACP
+/// `mcpServers` parameter's name/value array shape here.
+///
+/// MERGE, never clobber + idempotent: only `mcpServers.ccteam` is set; every
+/// other key survives (agy ships this file empty, which reads as no servers).
+/// Credential inside → 0600. ccteam-managed agy sessions ALSO receive a
+/// same-named ACP-injected server with their per-session principal.
+pub fn install_agy_mcp_into(mcp_json: &Path, mcp_http_url: &str, bearer: &str) -> Result<()> {
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
+
+    let mut root = match std::fs::read(mcp_json) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", mcp_json.display())),
+    };
+
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !servers.is_object() {
+        *servers = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = servers {
+        map.insert(
+            crate::CCTEAM_MCP_SERVER_KEY.into(),
+            json!({
+                "serverUrl": url,
+                "headers": { "Authorization": authorization_value(bearer) },
+                "disabled": false,
+            }),
+        );
+    }
+
+    let body = serde_json::to_string_pretty(&Value::Object(root))?;
+    atomic_write(mcp_json, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(mcp_json, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", mcp_json.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether Antigravity's `mcp_config.json` carries an ENABLED ccteam HTTP MCP
+/// entry with a current ([`is_current_bearer`]) credential. Best-effort;
+/// missing/junk file reads as `false`. A `disabled: true` entry is not a
+/// registration — agy would not load it.
+pub fn agy_mcp_registered(mcp_json: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(mcp_json) else {
+        return false;
+    };
+    let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(entry) = root
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(crate::CCTEAM_MCP_SERVER_KEY))
+    else {
+        return false;
+    };
+    entry
+        .get("serverUrl")
+        .and_then(Value::as_str)
+        .is_some_and(|u| !u.trim().is_empty())
+        && entry.get("disabled").and_then(Value::as_bool) != Some(true)
+        && entry
+            .pointer("/headers/Authorization")
+            .and_then(Value::as_str)
+            .is_some_and(is_current_bearer)
+}
+
+/// Resolve Antigravity CLI's user MCP config:
+/// `~/.gemini/config/mcp_config.json` — the file `agy mcp add` writes. agy
+/// has no env override for it (its `--gemini-dir` is a per-invocation flag).
+pub fn resolve_agy_config_path() -> Result<PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow!("cannot resolve ~/.gemini/config/mcp_config.json (no home dir)"))?;
+    Ok(home.join(".gemini").join("config").join("mcp_config.json"))
+}
+
 /// Whether Grok's `config.toml` carries the current HTTP form of
 /// `[mcp_servers.ccteam]` with a current ([`is_current_bearer`]) credential.
 /// Best-effort; missing/junk file reads as `false`.
@@ -813,6 +902,10 @@ mod tests {
                 "kimi",
                 install_kimi_mcp_into(&tmp.path().join("k.json"), url, stale),
             ),
+            (
+                "agy",
+                install_agy_mcp_into(&tmp.path().join("a.json"), url, stale),
+            ),
         ] {
             let err = result.expect_err(&format!("{name} accepted the admin-token form"));
             assert!(
@@ -822,7 +915,7 @@ mod tests {
             );
         }
         // Nothing was written on the way out.
-        for file in ["c.json", "cx.toml", "g.toml", "o.json", "k.json"] {
+        for file in ["c.json", "cx.toml", "g.toml", "o.json", "k.json", "a.json"] {
             assert!(!tmp.path().join(file).exists(), "{file} was created");
         }
     }
@@ -1199,6 +1292,91 @@ mod tests {
         assert!(!kimi_mcp_registered(&kimi));
         install_kimi_mcp_into(&kimi, "http://x/mcp", &enroll("fresh")).unwrap();
         assert!(kimi_mcp_registered(&kimi));
+
+        let agy = tmp.path().join("mcp_config.json");
+        std::fs::write(
+            &agy,
+            json!({"mcpServers": {"ccteam": {
+                "serverUrl": "http://x/mcp",
+                "headers": {"Authorization": legacy},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!agy_mcp_registered(&agy));
+        install_agy_mcp_into(&agy, "http://x/mcp", &enroll("fresh")).unwrap();
+        assert!(agy_mcp_registered(&agy));
+    }
+
+    /// The exact file `agy mcp add` produced in a sandbox home (agy 1.5.18):
+    /// ccteam writes the same entry shape and leaves the user's own server be.
+    #[test]
+    fn install_agy_mcp_into_writes_agys_own_shape_and_merges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mcp_json = tmp.path().join("mcp_config.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"fs":{"args":["-y","some-server","/work"],"command":"npx","disabled":false}}}"#,
+        )
+        .unwrap();
+        install_agy_mcp_into(&mcp_json, "http://127.0.0.1:7331/mcp", &enroll("tok")).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["fs"]["command"], "npx");
+        let entry = &v["mcpServers"]["ccteam"];
+        assert_eq!(entry["serverUrl"], "http://127.0.0.1:7331/mcp");
+        assert_eq!(entry["disabled"], false);
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            format!("Bearer {}", enroll("tok"))
+        );
+        assert!(
+            entry.get("url").is_none(),
+            "agy's key is serverUrl: {entry}"
+        );
+        assert!(agy_mcp_registered(&mcp_json));
+        assert!(!agy_mcp_registered(&tmp.path().join("absent.json")));
+    }
+
+    /// agy creates the file EMPTY on first run — that must read as "no
+    /// servers", not as a parse failure, and a re-run must converge.
+    #[test]
+    fn install_agy_mcp_into_handles_agys_empty_file_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mcp_json = tmp.path().join("config").join("mcp_config.json");
+        std::fs::create_dir_all(mcp_json.parent().unwrap()).unwrap();
+        std::fs::write(&mcp_json, b"").unwrap();
+        install_agy_mcp_into(&mcp_json, "http://localhost:7331/mcp", &enroll("a")).unwrap();
+        install_agy_mcp_into(&mcp_json, "http://localhost:7444/mcp", &enroll("b")).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["serverUrl"],
+            "http://localhost:7444/mcp"
+        );
+
+        let fresh = tmp.path().join("nested").join("mcp_config.json");
+        install_agy_mcp_into(&fresh, "http://localhost/mcp", &enroll("s")).unwrap();
+        assert!(agy_mcp_registered(&fresh));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// A user who ran `agy mcp disable ccteam` has no working registration.
+    #[test]
+    fn a_disabled_agy_entry_is_not_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mcp_json = tmp.path().join("mcp_config.json");
+        install_agy_mcp_into(&mcp_json, "http://x/mcp", &enroll("t")).unwrap();
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
+        v["mcpServers"]["ccteam"]["disabled"] = json!(true);
+        std::fs::write(&mcp_json, v.to_string()).unwrap();
+        assert!(!agy_mcp_registered(&mcp_json));
+        install_agy_mcp_into(&mcp_json, "http://x/mcp", &enroll("t")).unwrap();
+        assert!(agy_mcp_registered(&mcp_json));
     }
 
     #[cfg(unix)]

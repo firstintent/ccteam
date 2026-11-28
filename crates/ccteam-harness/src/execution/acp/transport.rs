@@ -5,7 +5,8 @@
 //! - always emits `"jsonrpc":"2.0"`
 //! - matches pending responses only by **numeric** outbound ids
 //! - tolerates string ids (e.g. grok `"skills-reload"`) without panic
-//! - inbound agent→client requests follow [`InboundPolicy`]
+//! - inbound agent→client requests (an id of either JSON-RPC type) follow
+//!   [`InboundPolicy`]
 //!   (OpenCode skip must auto-allow `session/request_permission` —
 //!   not implementing it is treated as reject by opencode)
 
@@ -661,16 +662,24 @@ async fn dispatch(
             }
             return;
         }
+    }
 
-        // Inbound agent→client request (id + method).
-        if let Some(method) = method {
-            let reply = inbound_reply(id, method, v.get("params").unwrap_or(&Value::Null), inbound);
-            if let Ok(mut line) = serde_json::to_vec(&reply) {
-                line.push(b'\n');
-                let _ = out.send(line).await;
-            }
-            return;
+    // Inbound agent→client request: a method plus an id of ANY JSON-RPC type.
+    // Our own outbound ids are numeric, but the vendor mints its own for the
+    // requests IT sends, and the spec allows strings — Antigravity numbers its
+    // permission asks `"1"`, `"2"`, …. Answering only numeric ids let such a
+    // request fall through to the notification path below, where nobody ever
+    // replied and the turn waited on the ask forever.
+    if let (Some(id), Some(method)) = (
+        v.get("id").filter(|id| id.is_number() || id.is_string()),
+        method,
+    ) {
+        let reply = inbound_reply(id, method, v.get("params").unwrap_or(&Value::Null), inbound);
+        if let Ok(mut line) = serde_json::to_vec(&reply) {
+            line.push(b'\n');
+            let _ = out.send(line).await;
         }
+        return;
     }
 
     // String-id frames we never sent (e.g. skills-reload) — skip, no panic.
@@ -682,7 +691,7 @@ async fn dispatch(
         return;
     }
 
-    // Notification: method, typically no id (or ignore id for push).
+    // Notification: a method with no usable id.
     if let Some(method) = method {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         let n = Notification {
@@ -713,14 +722,15 @@ async fn dispatch(
     tracing::debug!(value = %v, "acp: unrecognised frame");
 }
 
-fn inbound_reply(id: i64, method: &str, params: &Value, policy: InboundPolicy) -> Value {
+/// Answer one inbound request, echoing its id verbatim (number or string).
+fn inbound_reply(id: &Value, method: &str, params: &Value, policy: InboundPolicy) -> Value {
     let is_permission =
         method == "session/request_permission" || method.ends_with("request_permission");
     match policy {
         InboundPolicy::AutoAllowPermission if is_permission => {
             let option_id = pick_allow_option_id(params);
             tracing::info!(
-                id,
+                %id,
                 method,
                 %option_id,
                 "acp: inbound permission auto-allow (skip policy)"
@@ -737,7 +747,7 @@ fn inbound_reply(id: i64, method: &str, params: &Value, policy: InboundPolicy) -
             })
         }
         _ => {
-            tracing::info!(id, method, ?policy, "acp: inbound request; default-decline");
+            tracing::info!(%id, method, ?policy, "acp: inbound request; default-decline");
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -930,6 +940,52 @@ mod tests {
         let result = client.call("initialize", json!({})).await.unwrap();
         assert_eq!(result["protocolVersion"], 1);
         peer.await.unwrap();
+    }
+
+    /// The vendor numbers ITS requests however it likes. Antigravity sends
+    /// `session/request_permission` with `"id":"1"`; the answer must come
+    /// back under that exact string id, under either policy, or the vendor
+    /// waits on the ask forever.
+    #[tokio::test]
+    async fn inbound_request_with_a_string_id_is_answered_under_that_id() {
+        for (policy, want_allow) in [
+            (InboundPolicy::AutoAllowPermission, true),
+            (InboundPolicy::DefaultDecline, false),
+        ] {
+            let (client_rw, mut peer_rw) = tokio::io::duplex(4096);
+            let (client_r, client_w) = tokio::io::split(client_rw);
+            let _client = AcpTransport::from_halves_with_policy(client_r, client_w, None, policy);
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let (pr, mut pw) = tokio::io::split(&mut peer_rw);
+            let ask = json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "session/request_permission",
+                "params": {"options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Deny", "kind": "reject_once"}
+                ]}
+            });
+            let mut line = serde_json::to_vec(&ask).unwrap();
+            line.push(b'\n');
+            pw.write_all(&line).await.unwrap();
+
+            let mut buf = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                BufReader::new(pr).read_line(&mut buf),
+            )
+            .await
+            .expect("a string-id request must be answered, not swallowed")
+            .unwrap();
+            let reply: Value = serde_json::from_str(buf.trim()).unwrap();
+            assert_eq!(reply["id"], "1", "the id is echoed verbatim: {reply}");
+            if want_allow {
+                assert_eq!(reply["result"]["outcome"]["optionId"], "allow", "{reply}");
+            } else {
+                assert_eq!(reply["error"]["code"], -32601, "{reply}");
+            }
+        }
     }
 
     #[tokio::test]

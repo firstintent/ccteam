@@ -579,7 +579,7 @@ fn is_insecure_transport(url: &str) -> bool {
 // Snippets — rendered BY the writers that own each vendor's shape
 // =====================================================================
 
-/// Signature shared by all five vendor writers in
+/// Signature shared by every vendor writer in
 /// `ccteam_core::mcp_register`.
 type ConfigWriter = fn(&Path, &str, &str) -> anyhow::Result<()>;
 
@@ -625,6 +625,13 @@ const DIALECTS: &[(&str, &str, &str, &str, ConfigWriter)] = &[
         "~/.kimi-code/mcp.json",
         "kimi.json",
         ccteam_core::mcp_register::install_kimi_mcp_into,
+    ),
+    (
+        "agy",
+        "json",
+        "~/.gemini/config/mcp_config.json",
+        "agy.json",
+        ccteam_core::mcp_register::install_agy_mcp_into,
     ),
 ];
 
@@ -764,11 +771,7 @@ mod tests {
         use ccteam_core::mcp_register as reg;
         let bearer = "ccteam-enroll:deadbeefdeadbeef:sekritsekrit";
         let snippets = render_snippets("http://box.example:7331/mcp", bearer).unwrap();
-        assert_eq!(
-            snippets.len(),
-            5,
-            "five vendors take a config: {snippets:?}"
-        );
+        assert_eq!(snippets.len(), 6, "six vendors take a config: {snippets:?}");
         let tmp = tempfile::TempDir::new().unwrap();
         for s in &snippets {
             assert!(s.body.contains(bearer), "{} lost the bearer", s.vendor);
@@ -785,6 +788,7 @@ mod tests {
                 "grok" => reg::grok_mcp_registered(&file),
                 "opencode" => reg::opencode_mcp_registered(&file),
                 "kimi" => reg::kimi_mcp_registered(&file),
+                "agy" => reg::agy_mcp_registered(&file),
                 other => panic!("unknown dialect {other}"),
             };
             assert!(

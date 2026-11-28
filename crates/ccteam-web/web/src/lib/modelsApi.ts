@@ -66,11 +66,13 @@ export type VendorCatalog = Record<
   }
 >;
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, {
+async function getJson<T>(url: string, options?: { signal?: AbortSignal }): Promise<T> {
+  const init: RequestInit = {
     headers: { Accept: "application/json" },
     credentials: "same-origin",
-  });
+  };
+  if (options?.signal) init.signal = options.signal;
+  const res = await fetch(url, init);
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
@@ -79,8 +81,8 @@ async function getJson<T>(url: string): Promise<T> {
 /** Exported so callers share one template (and the test asserts one string). */
 export const MODELS_URL = "/api/v1/models";
 
-export function fetchModels(): Promise<ModelsResponse> {
-  return getJson<ModelsResponse>(MODELS_URL);
+export function fetchModels(options?: { signal?: AbortSignal }): Promise<ModelsResponse> {
+  return getJson<ModelsResponse>(MODELS_URL, options);
 }
 
 /** Dedupe while preserving the vendor's own ordering (its first entry is its

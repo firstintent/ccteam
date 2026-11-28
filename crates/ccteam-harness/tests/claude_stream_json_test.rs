@@ -731,11 +731,10 @@ fn write_deferred_mirror(tmp: &Path, sid: &str, mirror: serde_json::Value) {
     std::fs::write(&file, serde_json::to_vec(&mirror).unwrap()).unwrap();
 }
 
-/// issue #194 — a `TurnRouting::Queue` line (a delegation completion
-/// notification) sent while a turn is in flight is NOT written mid-turn: claude
-/// would show it to the model twice (queued-command preview + next prompt). It
-/// is parked, reported as `Queued`, mirrored to disk, and written verbatim as
-/// its own turn right after the running turn's `result`.
+/// A `TurnRouting::Queue` line (a task its dispatcher asked to run in a turn of
+/// its own, `agent{routing:"queue"}`) sent while a turn is in flight is NOT
+/// written mid-turn. It is parked, reported as `Queued`, mirrored to disk, and
+/// written verbatim as its own turn right after the running turn's `result`.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
@@ -796,82 +795,18 @@ async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
         "the caller is told where in the queue it sits, not just `pending`"
     );
 
-    // Two vendor turns complete: the long task, then the notification as its
+    // Two vendor turns complete: the long task, then the queued task as its
     // own turn — written exactly once.
     await_completed_turns(&mut events, 2).await;
     let logged = std::fs::read_to_string(&user_log).unwrap();
     assert_eq!(
         logged.lines().collect::<Vec<_>>(),
         vec!["long task", "s7 done · claude · turn 1"],
-        "the notification reaches the CLI verbatim, once, after the turn"
+        "the queued task reaches the CLI verbatim, once, after the turn"
     );
     // Dropped once the boundary RETIRES it — not once the bytes went out.
     // In between it is the write-ahead record that survives a crash.
     await_no_deferred_mirror(tmp.path(), "s9").await;
-    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
-    std::env::remove_var("FAKE_SJ_USER_LOG");
-}
-
-/// GitHub #205: real adapter transport, 13 independently accepted completion
-/// lines, exactly one boundary wakeup. Their text and identities stay verbatim.
-#[tokio::test(flavor = "current_thread")]
-#[serial]
-async fn thirteen_completion_notifications_open_one_vendor_turn() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    setup(tmp.path());
-    let user_log = tmp.path().join("user.log");
-    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
-    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "2");
-    let adapter = ClaudeStreamJsonAdapter::new();
-    let handle = adapter
-        .start_thread(
-            &AgentSpecBrief {
-                role: "alice".into(),
-            },
-            &ctx(tmp.path(), "demo", "s9"),
-        )
-        .await
-        .unwrap();
-    let mut events = adapter.events(&handle);
-    adapter
-        .submit_turn(&handle, TurnInput::UserText("long task".into()))
-        .await
-        .unwrap();
-    let lines: Vec<_> = (0..13).map(|n| {
-        format!("s{n} done · claude · turn {n} req-{n}\nanswer {n} agent_read{{sid:s{n},turn:t{n}}}")
-    }).collect();
-    for (n, line) in lines.iter().enumerate() {
-        let receipt = adapter
-            .submit_turn_routed(
-                &handle,
-                TurnInput::UserText(line.clone()),
-                TurnRouting::Notification,
-            )
-            .await
-            .unwrap();
-        assert_eq!(receipt.disposition, TurnDisposition::Queued);
-        assert_eq!(receipt.queue_position, Some(n + 1));
-    }
-    assert_eq!(
-        read_deferred_mirror(tmp.path(), "s9").unwrap()["parked"]
-            .as_array()
-            .unwrap()
-            .len(),
-        13
-    );
-    await_completed_turns(&mut events, 2).await;
-    await_no_deferred_mirror(tmp.path(), "s9").await;
-    let logged = std::fs::read_to_string(&user_log).unwrap();
-    assert_eq!(
-        logged.matches("[Notification batch ").count(),
-        1,
-        "{logged}"
-    );
-    assert!(logged.contains("13 items]"), "{logged}");
-    for line in &lines {
-        assert_eq!(logged.matches(line).count(), 1, "{logged}");
-    }
-    assert!(logged.contains("[Notifications still undelivered: 0]"));
     std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
@@ -917,7 +852,7 @@ async fn queued_text_when_idle_starts_a_turn_at_once() {
 }
 
 /// The parked queue outlives the daemon: what a previous process life mirrored
-/// to `deferred-input.json` (a notification parked behind a turn the daemon did
+/// to `deferred-input.json` (a queued task parked behind a turn the daemon did
 /// not live to see end) is reloaded by the next `start_thread` of the same sid
 /// and flushed after that life's FIRST turn — the message that resumed the
 /// session runs first, as its own clean turn; the parked lines follow in order,
@@ -972,7 +907,7 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
     assert_eq!(
         submitted.disposition,
         TurnDisposition::Started,
-        "the resuming message is a clean turn, not a steer of a stale notification"
+        "the resuming message is a clean turn, not a steer of a stale parked line"
     );
     let completed = collect_completed_turn_ids(&mut events, 3).await;
     let logged = std::fs::read_to_string(&user_log).unwrap();
@@ -1352,11 +1287,10 @@ async fn an_unreadable_parked_mirror_is_discarded() {
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
-/// A parked notification must be durable BEFORE the adapter accepts it (the
-/// notifier spends the child's watch on that acceptance). When the mirror
-/// cannot be written, the line is not parked in memory only — it is written
-/// now, mid-turn, and reported as the steer it became: read twice by claude,
-/// never lost across a crash.
+/// A parked task must be durable BEFORE the adapter accepts it (its dispatcher
+/// is told it is queued). When the mirror cannot be written, the line is not
+/// parked in memory only — it is written now, mid-turn, and reported as the
+/// steer it became: never lost across a crash.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn unmirrorable_queue_request_is_written_now_instead_of_parked() {

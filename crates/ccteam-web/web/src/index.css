@@ -127,6 +127,8 @@
   --pi: #4F46E5;
   /* dsh — 7th vendor (blue; distinct from OpenCode sky and Pi indigo). */
   --dsh: #2563EB;
+  /* agy — 8th vendor (teal; distinct from codex green and the blues). */
+  --agy: #0F766E;
   --radius-card: 12px;
   --radius-input: 18px;
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 6px 24px rgba(16,24,40,.06);
@@ -155,6 +157,7 @@ html.dark {
   --kimi: #F472B6;
   --pi: #818CF8;
   --dsh: #60A5FA;
+  --agy: #2DD4BF;
   --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.35);
   --shadow-menu: 0 4px 10px rgba(0,0,0,.5), 0 12px 32px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -576,17 +579,29 @@ button { font-family: inherit; cursor: pointer; }
 .account-menu .sel-item[disabled] { opacity: .55; cursor: progress; }
 .account-menu .account-retry { color: #0E7490; }
 html.dark .account-menu .account-retry { color: #67e8f9; }
-/* Phones: the row must keep mic + send on screen, so labels yield first —
-   HITL and account go icon-only (state stays visible), effort hides, and the
-   model label ellipsizes. */
+/* Phones: the row must keep send on screen, so labels yield first — HITL and
+   account go icon-only (state stays visible), effort hides, and the model
+   label ellipsizes. A <button> sizes to its content by default, so the model
+   button must be capped at its (shrunk) menu wrapper or the label never
+   ellipsizes and paints over the send button (#246). The composer itself
+   starts at one line and grows with the text (ChatComposer autoGrow reads
+   these bounds). */
 @media (max-width: 600px) {
   .account-btn .account-label, .hitl-btn span, .model-btn .eff { display: none; }
   .hitl-btn { padding: 6px 8px; }
   .composer-row .right, .composer-row .model-sel, .model-btn { min-width: 0; }
+  .model-btn { max-width: 100%; }
   .model-btn .model-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .composer { padding: 10px 12px 8px; gap: 6px; }
+  .composer textarea { min-height: 24px; }
   /* The account button sits mid-row; anchor its menu to the row's right edge. */
   .composer-row .right { position: relative; }
   .composer-row .account-sel { position: static; }
+}
+/* The narrowest phones: the harness keeps its colour dot (name in title /
+   aria-label) so the model id still gets readable room. */
+@media (max-width: 360px) {
+  .vendor-btn > span:not(.dot) { display: none; }
 }
 
 .send-btn {
@@ -636,6 +651,7 @@ html.dark .sel-item.new { color: #67e8f9; }
 .dot.opencode { background: var(--opencode); } .dot.kimi { background: var(--kimi); }
 .dot.pi { background: var(--pi); }
 .dot.dsh { background: var(--dsh); }
+.dot.agy { background: var(--agy); }
 .dot.on { background: var(--green); } .dot.off { background: #C9CBD1; } .dot.busy { background: #F59E0B; }
 .dot.err { background: var(--red); }
 html.dark .dot.off { background: #4b4e57; }
@@ -677,6 +693,7 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.kimi { color: var(--kimi); border-color: #db277755; }
 .chip.pi { color: var(--pi); border-color: #4f46e555; }
 .chip.dsh { color: var(--dsh); border-color: #2563eb55; }
+.chip.agy { color: var(--agy); border-color: #0f766e55; }
 .chip.sid { color: var(--text-muted); }
 /* Icon-only vendor mark (replaces the text label). Fixed square so session
  * rows / cards don't burn horizontal space on "claude"/"opencode" strings. */
@@ -714,6 +731,33 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .conv-head .meta { display: flex; align-items: center; gap: 8px; }
 .reply-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+/* #246: the per-reply footer (time · vendor · sid · model · turn · ctx + copy)
+   is on demand — every narration line of a long turn carrying it read as noise.
+   Hover devices float it in the gap under the reply (out of flow, so a hidden
+   footer leaves no hole and revealing it shifts nothing) and fade it in on
+   hover / keyboard focus — it stays focusable, so Tab still reaches Copy.
+   Touch devices collapse it until the reply is tapped (`.footer-open`,
+   SessionView). A WARNING footer (context window nearly full, `ctx N%⚠`) stays
+   in flow and is never hidden — the reader must not have to hunt for it. */
+@media (hover: hover) {
+  .msg.agent { position: relative; }
+  .msg.agent .reply-footer:not(.warn) {
+    position: absolute; top: 100%; left: 0; max-width: 100%; z-index: 1;
+    height: 18px; flex-wrap: nowrap; overflow: hidden;
+    opacity: 0; transition: opacity .12s;
+  }
+  .msg.agent .reply-footer:not(.warn) .reply-copy { width: 18px; height: 18px; }
+  /* One line out of flow: a narrow window ellipsizes the facts (full line in
+     the title) and never lets them run under Copy. */
+  .msg.agent .reply-footer:not(.warn) .turn-status {
+    flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis;
+  }
+  .msg.agent:hover .reply-footer,
+  .msg.agent:focus-within .reply-footer { opacity: 1; }
+}
+@media (hover: none) {
+  .msg.agent:not(.footer-open) .reply-footer:not(.warn) { display: none; }
+}
 .reply-footer .turn-status { min-width: 0; overflow-wrap: anywhere; }
 .reply-copy { flex: none; color: var(--text-faint); }
 .reply-copy-feedback { font-size: 11px; color: var(--text-muted); }
@@ -898,6 +942,12 @@ html.dark .dot.off { background: #4b4e57; }
 .hosts-head-desc { font-size: 12.5px; color: var(--text-muted); font-weight: 300; line-height: 1.5; margin-top: 5px; }
 /* The Team-page pointer is a react-router Link wearing the ghost button skin. */
 .hosts-head-bar a.btn { text-decoration: none; white-space: nowrap; }
+/* #246: on a phone the description takes the full row and the actions wrap
+   under it, instead of squeezing the copy into a narrow column. */
+@media (max-width: 640px) {
+  .hosts-head-bar { flex-wrap: wrap; }
+  .hosts-head-copy { flex-basis: 100%; }
+}
 
 /* Daemon health strip — always the first thing on 运维总览. */
 .daemon-strip {

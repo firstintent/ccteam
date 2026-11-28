@@ -160,6 +160,9 @@ impl DaemonConfig {
 /// - [`Self::max_live`] is the SECONDARY ceiling: a hard cap for the burst
 ///   case (many sessions active inside one TTL window), enforced by evicting
 ///   the least-recently-active eligible session at admission time.
+///
+/// [`Self::account_yield_secs`] is not a residency policy but an account one:
+/// it bounds how long a quiet session keeps a cswap account to itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionsConfig {
     /// Maximum number of concurrently RESIDENT sessions daemon-wide.
@@ -171,8 +174,22 @@ pub struct SessionsConfig {
     /// resident until the capacity cap evicts it).
     #[serde(default = "default_sessions_idle_release_secs")]
     pub idle_release_secs: u64,
+    /// Seconds a resident Claude session pinned to a cswap account may sit
+    /// quiet in that account's session profile before ccteam gives the
+    /// account back: the process is released and the session returns to the
+    /// default login, where its next message resumes it. `0` = never.
+    ///
+    /// cswap keeps one live credential copy per account, so a process left in
+    /// an account's profile keeps `cswap auto` off that account and, once the
+    /// process has refreshed its token, makes `cswap switch` onto it refuse
+    /// (docs-local issue #245). Nothing tells ccteam that a switch was
+    /// wanted, so the account is handed back on a clock instead. The default
+    /// is one hour, Claude's prompt-cache lifetime: past it the session has
+    /// no cache left to lose by moving to another account.
+    #[serde(default = "default_sessions_account_yield_secs")]
+    pub account_yield_secs: u64,
     /// Per-harness override of [`Self::idle_release_secs`], keyed by the vendor
-    /// wire name (`claude` | `codex` | `grok` | `opencode` | `kimi` | `pi` |
+    /// wire name (`claude` | `codex` | `grok` | `opencode` | `kimi` | `pi` | `agy` |
     /// `dsh`). Absent key ⇒ the global value; `0` ⇒ never release that harness.
     /// Exists because prompt-cache TTL is a VENDOR fact, not a ccteam one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -188,11 +205,17 @@ pub fn default_sessions_idle_release_secs() -> u64 {
     250 * 60
 }
 
+/// Claude's prompt-cache lifetime (docs-local/issues/#245).
+pub fn default_sessions_account_yield_secs() -> u64 {
+    60 * 60
+}
+
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             max_live: default_sessions_max_live(),
             idle_release_secs: default_sessions_idle_release_secs(),
+            account_yield_secs: default_sessions_account_yield_secs(),
             idle_release_by_vendor: BTreeMap::new(),
         }
     }
@@ -214,6 +237,13 @@ impl SessionsConfig {
             .copied()
             .unwrap_or(self.idle_release_secs);
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
+    }
+
+    /// How long a quiet session keeps a pinned cswap account. `None` means
+    /// "never give it back" (`0`).
+    pub fn account_yield(&self) -> Option<std::time::Duration> {
+        (self.account_yield_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.account_yield_secs))
     }
 }
 
@@ -593,6 +623,7 @@ mod tests {
         assert_eq!(cfg.daemon.workers, 4);
         assert_eq!(cfg.sessions.max_live, 50);
         assert_eq!(cfg.sessions.idle_release_secs, 15_000);
+        assert_eq!(cfg.sessions.account_yield_secs, 3_600);
         assert!(cfg.sessions.idle_release_by_vendor.is_empty());
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);
@@ -645,6 +676,7 @@ mod tests {
             sessions: SessionsConfig {
                 max_live: 12,
                 idle_release_secs: 900,
+                account_yield_secs: 600,
                 idle_release_by_vendor: BTreeMap::from([
                     ("codex".to_string(), 0),
                     ("dsh".to_string(), 60),
@@ -657,7 +689,21 @@ mod tests {
 
         let yaml = std::fs::read_to_string(config_path(tmp.path())).unwrap();
         assert!(yaml.contains("idle_release_secs: 900"), "{yaml}");
+        assert!(yaml.contains("account_yield_secs: 600"), "{yaml}");
         assert!(yaml.contains("idle_release_by_vendor:"), "{yaml}");
+    }
+
+    #[test]
+    fn account_yield_is_a_window_or_never() {
+        assert_eq!(
+            SessionsConfig::default().account_yield(),
+            Some(std::time::Duration::from_secs(3_600))
+        );
+        let never = SessionsConfig {
+            account_yield_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(never.account_yield(), None);
     }
 
     #[test]

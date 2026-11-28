@@ -207,6 +207,13 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
             false,
             check_vendor_auth_dsh,
         )),
+        ReportRow::visible(check_agent(
+            "agy",
+            ccteam_core::AGY_BIN_ENV,
+            "agy",
+            false,
+            check_vendor_auth_agy,
+        )),
     ];
 
     let daemon_probe = ccteam_core::daemon::probe_daemon(paths);
@@ -491,6 +498,21 @@ fn check_vendor_auth_kimi() -> AuthCheck {
     AuthCheck::simple(Some(ok), "run `kimi login` or set MOONSHOT_API_KEY")
 }
 
+/// Antigravity signs in through the system keyring first and only falls back
+/// to a token file, so an absent file proves nothing: a hit is a Pass, a miss
+/// is "unknown" (no false "auth missing" for a keyring login). The MCP config
+/// under `~/.gemini/config/` is deliberately not a signal — ccteam writes it.
+fn check_vendor_auth_agy() -> AuthCheck {
+    let ok = std::env::var("GEMINI_API_KEY").is_ok()
+        || dirs::home_dir().is_some_and(|home| {
+            home.join(".gemini")
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token")
+                .exists()
+        });
+    AuthCheck::simple(ok.then_some(true), "")
+}
+
 fn check_vendor_auth_pi() -> AuthCheck {
     // Pi may use any configured provider. The RPC feature handshake is the
     // authoritative model/auth verdict when a managed session starts.
@@ -557,6 +579,10 @@ fn check_vendor_mcp(vendor: &str) -> McpCheck {
         }),
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path().map(|path| {
             let registered = ccteam_core::mcp_register::kimi_mcp_registered(&path);
+            (path, registered)
+        }),
+        "agy" => ccteam_core::mcp_register::resolve_agy_config_path().map(|path| {
+            let registered = ccteam_core::mcp_register::agy_mcp_registered(&path);
             (path, registered)
         }),
         _ => unreachable!("doctor vendor list is closed"),

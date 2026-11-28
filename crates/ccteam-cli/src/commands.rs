@@ -112,7 +112,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // When the slug was derived from the install-dir basename (no
     // `--slug`), point the user at `--slug` instead of failing opaquely
     // — a dir like `AgentServe` (caps) can't be a slug verbatim.
-    let target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
+    let mut target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
         if slug_was_explicit {
             format!("ccteam init: invalid slug {derived_slug:?}")
         } else {
@@ -142,7 +142,25 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
     // -- 3b. Refuse sensitive paths (HOME / filesystem root) ---------
     refuse_sensitive_install_target(&target, opts.force)?;
-    // -- 3c. Fail-loud slug collision against config.yaml -----------
+    // -- 3c. One directory is one project (#239) ---------------------
+    // Re-running init in a registered directory refreshes THAT project; an
+    // explicit `--slug` naming another project is refused rather than
+    // registering a second one over the same `.ccteam/`.
+    if let Some(existing) = ccteam_core::local_project_at(&paths.root, &target)? {
+        if existing.slug != target_slug {
+            if slug_was_explicit {
+                return Err(anyhow::anyhow!(
+                    "{dir} is already project `{existing}`; one directory is one project. \
+                     Re-run without `--slug` to refresh it, or remove it first \
+                     (`ccteam project rm {existing}`).",
+                    dir = target.display(),
+                    existing = existing.slug,
+                ));
+            }
+            target_slug = existing.slug;
+        }
+    }
+    // -- 3d. Fail-loud slug collision against config.yaml -----------
     if let Some(existing) = ccteam_core::lookup_project_in_config(&paths.root, &target_slug)? {
         let same_target = std::fs::canonicalize(&existing.path)
             .ok()
@@ -1149,60 +1167,43 @@ pub struct DoctorOptions {
 
 fn render_install_mcp_report() -> Result<String> {
     // ccteam is a pure CLI (not a vendor plugin), so `ccteam config` is the
-    // MCP installer for ALL vendors (v0.9.3 symmetry — any vendor's main
-    // session can orchestrate): Claude (`~/.claude.json`), Codex
-    // (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
-    // (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`).
-    let claude_path = crate::mcp_serve::install_mcp()?;
-    let codex_path = crate::mcp_serve::install_codex_mcp()?;
-    let grok_path = crate::mcp_serve::install_grok_mcp()?;
-    let opencode_path = crate::mcp_serve::install_opencode_mcp()?;
-    let kimi_path = crate::mcp_serve::install_kimi_mcp()?;
-    Ok(render_install_mcp_body(
-        &claude_path,
-        &codex_path,
-        &grok_path,
-        &opencode_path,
-        &kimi_path,
-    ))
+    // MCP installer for ALL vendors with a native MCP config (vendor symmetry
+    // — any vendor's main session can orchestrate): Claude (`~/.claude.json`),
+    // Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
+    // (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`),
+    // Antigravity (`~/.gemini/config/mcp_config.json`).
+    let registered = [
+        ("Claude", crate::mcp_serve::install_mcp()?),
+        ("Codex", crate::mcp_serve::install_codex_mcp()?),
+        ("Grok", crate::mcp_serve::install_grok_mcp()?),
+        ("OpenCode", crate::mcp_serve::install_opencode_mcp()?),
+        ("Kimi", crate::mcp_serve::install_kimi_mcp()?),
+        ("Antigravity", crate::mcp_serve::install_agy_mcp()?),
+    ];
+    Ok(render_install_mcp_body(&registered))
 }
 
 /// Pure renderer for the `config mcp` report body, split out from the
 /// vendor-config writes so it stays unit-testable without touching the real
-/// configs. The `tools surface` line interpolates the live tool count from
-/// the same `tool_definitions()` source `run_verify_mcp` introspects — never
-/// hard-code it, or the number drifts (it was stuck at "9" while the surface
-/// grew to 27).
-fn render_install_mcp_body(
-    claude_path: &std::path::Path,
-    codex_path: &std::path::Path,
-    grok_path: &std::path::Path,
-    opencode_path: &std::path::Path,
-    kimi_path: &std::path::Path,
-) -> String {
-    let mut out = String::from(
-        "ccteam config: register MCP server (Claude + Codex + Grok + OpenCode + Kimi)\n\n",
+/// configs. One `(label, config path)` row per registered vendor, in order —
+/// a slice, so the next vendor is a row at the call site and not another
+/// positional parameter. The `tools surface` line interpolates the live tool
+/// count from the same `tool_definitions()` source `run_verify_mcp`
+/// introspects — never hard-code it, or the number drifts (it was stuck at
+/// "9" while the surface grew to 27).
+fn render_install_mcp_body(registered: &[(&str, std::path::PathBuf)]) -> String {
+    let labels: Vec<&str> = registered.iter().map(|(label, _)| *label).collect();
+    let mut out = format!(
+        "ccteam config: register MCP server ({})\n\n",
+        labels.join(" + ")
     );
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Claude   in {}\n",
-        claude_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Codex    in {}\n",
-        codex_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Grok     in {}\n",
-        grok_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for OpenCode in {}\n",
-        opencode_path.display()
-    ));
-    out.push_str(&format!(
-        "  registered ccteam MCP server for Kimi     in {}\n",
-        kimi_path.display()
-    ));
+    let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    for (label, path) in registered {
+        out.push_str(&format!(
+            "  registered ccteam MCP server for {label:<width$} in {}\n",
+            path.display()
+        ));
+    }
     for spec in ccteam_core::host_registry::AGENT_PROBE_SPECS
         .iter()
         .filter(|spec| !spec.tool_surface.uses_native_mcp_config())
@@ -4871,6 +4872,57 @@ mod tests {
         );
     }
 
+    /// #239 — one directory is one project: re-running init in a registered
+    /// directory refreshes THAT project (even when its basename would derive
+    /// another slug), and an explicit `--slug` naming a second project is
+    /// refused.
+    #[test]
+    fn run_init_in_a_registered_directory_keeps_its_project() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("sdk");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("sdk-main".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let err = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("sdk2".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already project `sdk-main`"), "{msg}");
+
+        let slugs: Vec<String> = ccteam_core::load_ccteam_config(&paths.root)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, ["sdk-main"]);
+        let state =
+            ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&target)).unwrap();
+        assert_eq!(state.slug, "sdk-main");
+    }
+
     /// Re-running on the SAME path with the same slug is a legitimate
     /// refresh, not a collision.
     #[test]
@@ -5015,12 +5067,29 @@ mod tests {
         // the pure body renderer with a synthetic path so it never
         // touches the real ~/.claude.json.
         let total = run_verify_mcp().total_tools;
-        let report = render_install_mcp_body(
-            std::path::Path::new("/tmp/fake-claude.json"),
-            std::path::Path::new("/tmp/fake-codex/config.toml"),
-            std::path::Path::new("/tmp/fake-grok/config.toml"),
-            std::path::Path::new("/tmp/fake-opencode/opencode.json"),
-            std::path::Path::new("/tmp/fake-kimi/mcp.json"),
+        let report = render_install_mcp_body(&[
+            ("Claude", "/tmp/fake-claude.json".into()),
+            ("Codex", "/tmp/fake-codex/config.toml".into()),
+            ("Grok", "/tmp/fake-grok/config.toml".into()),
+            ("OpenCode", "/tmp/fake-opencode/opencode.json".into()),
+            ("Kimi", "/tmp/fake-kimi/mcp.json".into()),
+            (
+                "Antigravity",
+                "/tmp/fake-gemini/config/mcp_config.json".into(),
+            ),
+        ]);
+        assert!(
+            report.starts_with(
+                "ccteam config: register MCP server \
+                 (Claude + Codex + Grok + OpenCode + Kimi + Antigravity)\n"
+            ),
+            "header names every registered vendor: {report}",
+        );
+        assert!(
+            report.contains(
+                "  registered ccteam MCP server for Claude      in /tmp/fake-claude.json\n"
+            ),
+            "rows stay column-aligned on the longest label: {report}",
         );
         assert!(
             report.contains(&format!("tools surface : {total}")),
@@ -5031,7 +5100,7 @@ mod tests {
             !report.contains("interfaces §12.2"),
             "stale section tag must be dropped: {report}",
         );
-        // All five vendor targets must be named in the report body
+        // Every registered vendor target must be named in the report body
         // (vendor symmetry: any vendor's main session can orchestrate).
         for target in [
             "/tmp/fake-claude.json",
@@ -5039,6 +5108,7 @@ mod tests {
             "/tmp/fake-grok/config.toml",
             "/tmp/fake-opencode/opencode.json",
             "/tmp/fake-kimi/mcp.json",
+            "/tmp/fake-gemini/config/mcp_config.json",
         ] {
             assert!(
                 report.contains(target),

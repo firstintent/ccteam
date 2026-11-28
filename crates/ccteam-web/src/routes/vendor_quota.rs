@@ -2,8 +2,9 @@
 //! subscription-quota snapshot for the Ops & Hosts page.
 //!
 //! Standalone endpoint, deliberately NOT folded into the host detail: quota
-//! probing is network I/O (three vendor APIs) and must not slow the binary
-//! probe path. Admin-only ([`deny_non_admin`]) — it reads the daemon user's
+//! probing is network I/O (two vendor APIs) and must not slow the binary
+//! probe path. Claude is read from the usage ccteam recorded from its own
+//! rate-limit headers instead (#244, [`QuotaProbeKind::ClaudeRecordedUsage`]). Admin-only ([`deny_non_admin`]) — it reads the daemon user's
 //! vendor credential files. Those reads are strictly read-only and there are
 //! NO OAuth refresh flows: an expired token simply 401s into `unavailable`.
 //!
@@ -15,7 +16,7 @@
 //! module is the thin HTTP + credential-file + cache layer.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -26,9 +27,9 @@ use axum::{
 };
 use ccteam_core::host_registry::AgentProbeSpec;
 use ccteam_core::vendor_quota::{
-    claude_oauth_from_credentials, codex_chatgpt_from_auth, kimi_managed_token_from_credentials,
-    parse_claude_usage, parse_codex_wham_usage, parse_kimi_usages, probed_specs, QuotaProbeKind,
-    QuotaVerdict, VendorQuota,
+    claude_plan_from_credentials, codex_chatgpt_from_auth, kimi_managed_token_from_credentials,
+    parse_codex_wham_usage, parse_kimi_usages, probed_specs, QuotaProbeKind, QuotaVerdict,
+    QuotaWindow, QuotaWindowKind, VendorQuota,
 };
 
 use crate::auth::{deny_non_admin, Identity};
@@ -41,10 +42,6 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// Per-request budget for one vendor's usage API.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-/// The OAuth-subscriber beta flag the claude codebase sends on
-/// `/api/oauth/usage` (`OAUTH_BETA_HEADER` in `src/constants/oauth.ts`).
-const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const KIMI_USAGES_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
@@ -103,12 +100,16 @@ impl Default for VendorQuotaService {
 
 impl VendorQuotaService {
     /// Every probe-bearing vendor's quota row, registry-ordered. Cached rows
-    /// serve from memory; misses probe concurrently and fill the cache.
-    pub async fn quotas(&self) -> Vec<VendorQuota> {
+    /// serve from memory; misses probe concurrently and fill the cache. The
+    /// claude row reads a local record under `root` (the ccteam home) every
+    /// time — nothing to cache.
+    pub async fn quotas(&self, root: &Path) -> Vec<VendorQuota> {
         let mut by_vendor: BTreeMap<&'static str, VendorQuota> = BTreeMap::new();
         let mut misses = Vec::new();
         for (spec, kind) in probed_specs() {
-            if let Some(hit) = self.cache.fresh(spec.vendor) {
+            if kind == QuotaProbeKind::ClaudeRecordedUsage {
+                by_vendor.insert(spec.vendor, claude_recorded_quota(spec.vendor, root));
+            } else if let Some(hit) = self.cache.fresh(spec.vendor) {
                 by_vendor.insert(spec.vendor, hit);
             } else {
                 misses.push((spec, kind));
@@ -165,20 +166,64 @@ fn read_credential<T>(path: Option<PathBuf>, extract: impl FnOnce(&str) -> Optio
     extract(&body)
 }
 
-// ── HTTP layer (thin; every failure → None → `unavailable`) ─────────────────
-
-fn claude_usage_request(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-) -> Option<reqwest::Request> {
-    client
-        .get(url)
-        .bearer_auth(token)
-        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
-        .build()
-        .ok()
+/// The claude row: the plan from the credential file, the windows from the
+/// usage ccteam last recorded from claude's own rate-limit headers (each
+/// window dropped once its reset has passed). No subscription login →
+/// `not_subscription`; nothing recorded that still holds → `unavailable`.
+fn claude_recorded_quota(vendor: &str, root: &Path) -> VendorQuota {
+    claude_quota_from(
+        vendor,
+        read_credential(claude_credentials_path(), claude_plan_from_credentials),
+        ccteam_harness::usage_catalog::last_known_entry_in(root, vendor, chrono::Utc::now()),
+    )
 }
+
+/// [`claude_recorded_quota`] without the file reads: `plan` is the credential
+/// verdict, `entry` the recorded observation (already stripped of reset
+/// windows).
+fn claude_quota_from(
+    vendor: &str,
+    plan: Option<Option<String>>,
+    entry: Option<ccteam_harness::usage_catalog::VendorAccountUsage>,
+) -> VendorQuota {
+    let Some(plan) = plan else {
+        return VendorQuota::not_subscription(vendor);
+    };
+    let Some(entry) = entry else {
+        return VendorQuota::unavailable(vendor);
+    };
+    let usage = &entry.usage;
+    let window = |kind, pct: Option<u8>, resets_at: Option<&str>| {
+        pct.map(|pct| QuotaWindow {
+            kind,
+            used_percent: f64::from(pct).min(100.0),
+            resets_at: resets_at
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&chrono::Utc)),
+        })
+    };
+    let windows: Vec<QuotaWindow> = [
+        window(
+            QuotaWindowKind::FiveHour,
+            usage.five_hour_pct,
+            usage.five_hour_resets_at.as_deref(),
+        ),
+        window(
+            QuotaWindowKind::Weekly,
+            usage.weekly_pct,
+            usage.weekly_resets_at.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if windows.is_empty() {
+        return VendorQuota::unavailable(vendor);
+    }
+    VendorQuota::available(vendor, plan, windows)
+}
+
+// ── HTTP layer (thin; every failure → None → `unavailable`) ─────────────────
 
 fn codex_usage_request(
     client: &reqwest::Client,
@@ -231,18 +276,8 @@ async fn probe_one(
         // `~/.grok/` (refresh-keyed token, internal proxy base) — stubbed
         // unavailable by construction; see QuotaProbeKind's doc comment.
         QuotaProbeKind::GrokBillingUnavailable => VendorQuota::unavailable(vendor),
-        QuotaProbeKind::ClaudeOauthUsage => {
-            let Some((token, plan)) =
-                read_credential(claude_credentials_path(), claude_oauth_from_credentials)
-            else {
-                return VendorQuota::not_subscription(vendor);
-            };
-            let request = claude_usage_request(client, CLAUDE_USAGE_URL, &token);
-            execute_and_parse(client, request, |body| parse_claude_usage(body, plan))
-                .await
-                .map(|verdict| verdict.into_quota(vendor))
-                .unwrap_or_else(|| VendorQuota::unavailable(vendor))
-        }
+        // Answered from the local record in `quotas`, never probed.
+        QuotaProbeKind::ClaudeRecordedUsage => VendorQuota::unavailable(vendor),
         QuotaProbeKind::CodexWhamUsage => {
             let Some((token, account_id)) =
                 read_credential(codex_auth_path(), codex_chatgpt_from_auth)
@@ -271,7 +306,7 @@ async fn probe_one(
 }
 
 /// `GET /api/v1/vendors/quota` — the local machine's per-vendor quota rows.
-/// Vendors with no probe surface (opencode/pi/dsh) are absent from the list
+/// Vendors with no probe surface (opencode/pi/dsh/agy) are absent from the list
 /// — the UI renders nothing for them, exactly like `not_subscription` /
 /// `unavailable` rows.
 #[utoipa::path(
@@ -291,7 +326,7 @@ pub(crate) async fn handle_vendor_quota(
     if let Some(deny) = deny_non_admin(&identity) {
         return deny;
     }
-    let quotas = app.vendor_quotas.quotas().await;
+    let quotas = app.vendor_quotas.quotas(&app.paths.root).await;
     Json(serde_json::json!({ "quotas": quotas })).into_response()
 }
 
@@ -302,20 +337,57 @@ mod tests {
 
     // ── request builders (the thin wiring the parsers rely on) ───────────
 
+    // ── claude: the recorded observation, no request (#244) ───────────
+
+    fn recorded(
+        usage: ccteam_harness::AccountUsage,
+    ) -> ccteam_harness::usage_catalog::VendorAccountUsage {
+        ccteam_harness::usage_catalog::VendorAccountUsage {
+            observed_at: "2026-11-14T18:00:00Z".into(),
+            source: "status card".into(),
+            usage,
+        }
+    }
+
     #[test]
-    fn claude_request_carries_oauth_bearer_and_beta_header() {
-        let client = reqwest::Client::new();
-        let req = claude_usage_request(&client, "https://api.anthropic.com/api/oauth/usage", "tok")
-            .unwrap();
-        assert_eq!(req.method(), reqwest::Method::GET);
-        assert_eq!(
-            req.url().as_str(),
-            "https://api.anthropic.com/api/oauth/usage"
+    fn claude_row_is_the_recorded_windows_with_the_credential_plan() {
+        let quota = claude_quota_from(
+            "claude",
+            Some(Some("team".into())),
+            Some(recorded(ccteam_harness::AccountUsage {
+                five_hour_pct: Some(33),
+                five_hour_resets_at: Some("2026-11-14T22:50:00+00:00".into()),
+                weekly_pct: Some(62),
+                weekly_resets_at: Some("2026-11-17T13:00:00+00:00".into()),
+                ..Default::default()
+            })),
         );
-        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer tok");
+        assert_eq!(quota.state, QuotaState::Available);
+        assert_eq!(quota.plan.as_deref(), Some("team"));
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].kind, QuotaWindowKind::FiveHour);
+        assert_eq!(quota.windows[0].used_percent, 33.0);
         assert_eq!(
-            req.headers().get("anthropic-beta").unwrap(),
-            "oauth-2025-04-20"
+            quota.windows[0].resets_at.unwrap().to_rfc3339(),
+            "2026-11-14T22:50:00+00:00"
+        );
+        assert_eq!(quota.windows[1].kind, QuotaWindowKind::Weekly);
+        assert_eq!(quota.windows[1].used_percent, 62.0);
+    }
+
+    #[test]
+    fn claude_row_without_a_login_or_a_record() {
+        let weekly = ccteam_harness::AccountUsage {
+            weekly_pct: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            claude_quota_from("claude", None, Some(recorded(weekly))).state,
+            QuotaState::NotSubscription
+        );
+        assert_eq!(
+            claude_quota_from("claude", Some(None), None).state,
+            QuotaState::Unavailable
         );
     }
 
@@ -374,8 +446,8 @@ mod tests {
         let addr = spawn_mock(axum::http::StatusCode::UNAUTHORIZED, "{\"error\":\"nope\"}").await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://{addr}/usage");
-        let req = claude_usage_request(&client, &url, "tok");
-        let verdict = execute_and_parse(&client, req, |body| parse_claude_usage(body, None)).await;
+        let req = codex_usage_request(&client, &url, "tok", "acc-1");
+        let verdict = execute_and_parse(&client, req, parse_codex_wham_usage).await;
         assert!(verdict.is_none(), "401 → None → unavailable row");
     }
 
@@ -407,12 +479,12 @@ mod tests {
 
     #[tokio::test]
     async fn ok_body_parses_through_the_fixture_path() {
-        let body = r#"{"five_hour":{"utilization":42.0,"resets_at":"2026-08-17T18:00:00Z"}}"#;
+        let body = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":42,"reset_at":1789000000}}}"#;
         let addr = spawn_mock(axum::http::StatusCode::OK, body).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://{addr}/usage");
-        let req = claude_usage_request(&client, &url, "tok");
-        let verdict = execute_and_parse(&client, req, |b| parse_claude_usage(b, None))
+        let req = codex_usage_request(&client, &url, "tok", "acc-1");
+        let verdict = execute_and_parse(&client, req, parse_codex_wham_usage)
             .await
             .unwrap();
         let QuotaVerdict::Available { windows, .. } = verdict else {

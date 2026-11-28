@@ -31,6 +31,10 @@ pub const OPENCODE_BIN_ENV: &str = "CCTEAM_OPENCODE_BIN";
 /// a fake ACP stdio script so harness tests stay hermetic.
 pub const KIMI_BIN_ENV: &str = "CCTEAM_KIMI_BIN";
 
+/// Environment override for the `agy` (Antigravity CLI) binary path. Tests
+/// set this to a fake ACP stdio script so harness tests stay hermetic.
+pub const AGY_BIN_ENV: &str = "CCTEAM_AGY_BIN";
+
 /// V0.6.8 F195 — per-turn watchdog default (seconds).
 ///
 /// 90s leaves enough headroom for normal multi-tool turns to finish

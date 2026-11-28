@@ -53,6 +53,18 @@ describe("fetchModels", () => {
     expect(got.vendors[0]!.efforts).toEqual(["low", "high", "max"]);
   });
 
+  it("forwards an AbortSignal when supplied", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, RESPONSE));
+    const controller = new AbortController();
+    await fetchModels({ signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledWith(MODELS_URL, {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      signal: controller.signal,
+    });
+  });
+
   it("maps 401 → UNAUTHENTICATED (the global token gate handles it)", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, {}));
     await expect(fetchModels()).rejects.toThrow("UNAUTHENTICATED");

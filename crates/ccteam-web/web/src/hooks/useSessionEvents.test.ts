@@ -12,12 +12,15 @@ import {
   foldSessionLiveness,
   isTurnBoundary,
   parseSessionEvent,
+  foldTurnState,
+  parseTurnState,
   sessionEventsUrl,
   startSessionEventStream,
   shouldAcceptEventSeq,
   SESSION_RING_CAP,
   turnInFlight,
   type SessionEvent,
+  type SessionTurnState,
 } from "./useSessionEvents";
 
 class FakeEventSource {
@@ -101,6 +104,101 @@ function streamHarness() {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+// #247 — the daemon says on the stream whether a turn is in flight, whoever
+// started it; the page ends it on the same boundary a local send waits for,
+// ordered by the daemon's replay seq, not by delivery or render order.
+describe("turn_state (#247)", () => {
+  it("parses the frame and rejects anything malformed", () => {
+    expect(parseTurnState('{"sid":"s1","kind":"turn_state","busy":true,"elapsed_seconds":42,"after_seq":7}', 1000)).toEqual({
+      busy: true,
+      elapsedSeconds: 42,
+      receivedAt: 1000,
+      afterSeq: 7,
+    });
+    expect(parseTurnState('{"busy":false,"elapsed_seconds":null,"after_seq":0}', 5)).toEqual({
+      busy: false,
+      elapsedSeconds: null,
+      receivedAt: 5,
+      afterSeq: 0,
+    });
+    expect(parseTurnState('{"busy":true,"elapsed_seconds":3}')).toBeNull();
+    expect(parseTurnState('{"elapsed_seconds":3,"after_seq":1}')).toBeNull();
+    expect(parseTurnState("not json")).toBeNull();
+  });
+
+  it("only a boundary recorded after the busy state ends it, and the end is latched", () => {
+    const busy = { busy: true, elapsedSeconds: 3, receivedAt: 0, afterSeq: 10 };
+    // An older turn's final answer — even delivered AFTER the frame (a slow
+    // connection's backlog) — was recorded before it and cannot end it.
+    const older: SessionEvent = { kind: "answer", content: "turn A done", seq: 9 };
+    expect(foldTurnState(busy, older)).toBe(busy);
+    const interim: SessionEvent = { kind: "answer", content: "still working", interim: true, seq: 11 };
+    const tool: SessionEvent = { kind: "activity", content: "", seq: 12 };
+    const prompt: SessionEvent = { kind: "answer", content: "approve?", seq: 13, options: [{ id: "y", label: "yes" }] };
+    expect(foldTurnState(foldTurnState(foldTurnState(busy, interim), tool), prompt)).toBe(busy);
+    const final: SessionEvent = { kind: "answer", content: "turn B done", seq: 14 };
+    const ended = foldTurnState(busy, final);
+    expect(ended).toEqual({ ...busy, busy: false });
+    // Latched: later frames (or the answer leaving a full buffer) cannot revive it.
+    expect(foldTurnState(ended, { kind: "activity", content: "", seq: 15 })).toBe(ended);
+  });
+
+  it("idle states and seq-less frames pass through untouched", () => {
+    const idle = { busy: false, elapsedSeconds: null, receivedAt: 0, afterSeq: 0 };
+    const final: SessionEvent = { kind: "answer", content: "done", seq: 5 };
+    expect(foldTurnState(idle, final)).toBe(idle);
+    expect(foldTurnState(null, final)).toBeNull();
+    const busy = { busy: true, elapsedSeconds: 0, receivedAt: 0, afterSeq: 0 };
+    expect(foldTurnState(busy, { kind: "answer", content: "no seq" })).toBe(busy);
+  });
+
+  it("the stream stamps each frame's seq and hands turn_state over without a seq", () => {
+    const events: SessionEvent[] = [];
+    const states: SessionTurnState[] = [];
+    const sources: FakeEventSource[] = [];
+    const seq = { current: 0 };
+    const stop = startSessionEventStream(
+      "s1",
+      seq,
+      {
+        onOpen: () => {},
+        onEvent: (event) => events.push(event),
+        onDisconnected: () => {},
+        onError: () => {},
+        onGatewayUnavailable: () => {},
+        onTurnState: (state) => states.push(state),
+      },
+      {
+        createEventSource: () => {
+          const source = new FakeEventSource();
+          sources.push(source);
+          return source;
+        },
+        document: { visibilityState: "visible", addEventListener: () => {}, removeEventListener: () => {} },
+        window: { addEventListener: () => {}, removeEventListener: () => {} },
+        setTimer: (callback, delay) => setTimeout(callback, delay),
+        clearTimer: (timer) => clearTimeout(timer),
+      },
+    );
+    const fire = (type: string, data: string, lastEventId = "") => {
+      for (const listener of sources[0]!.listeners.get(type) ?? []) {
+        listener(new MessageEvent(type, { data, lastEventId }));
+      }
+    };
+    fire("progress", '{"kind":"answer","content":"before"}', "4");
+    fire("turn_state", '{"busy":true,"elapsed_seconds":7,"after_seq":4}');
+    fire("turn_state", "garbage");
+    fire("progress", '{"kind":"answer","content":"after"}', "5");
+    expect(events.map((event) => [event.content, event.seq])).toEqual([["before", 4], ["after", 5]]);
+    expect(states.map((state) => [state.busy, state.elapsedSeconds, state.afterSeq])).toEqual([[true, 7, 4]]);
+    // turn_state carries no seq: the replay watermark only moved with progress.
+    expect(seq.current).toBe(5);
+    // Folded in arrival order, the answer after it ends the turn.
+    expect(events.reduce(foldTurnState, states[0]!)?.busy).toBe(false);
+    stop();
+  });
 });
 
 describe("session event stream reconnect lifecycle", () => {

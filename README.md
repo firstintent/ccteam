@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="ccteam mascot — a juggler bot keeping codex, grok and kimi in the air" />
   <h1>ccteam</h1>
-  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, Deepseek Harness) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, Slack, or a browser tab.</b></p>
+  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, Antigravity, Deepseek Harness) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, Slack, or a browser tab.</b></p>
   <p>
     <a href="https://github.com/firstintent/ccteam/actions/workflows/check.yml"><img src="https://github.com/firstintent/ccteam/actions/workflows/check.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/made%20with-Rust-b7410e" alt="Made with Rust" />
@@ -62,7 +62,7 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 </p>
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
-- optional Claude subscription selection through a preinstalled [cswap](https://github.com/realiti4/claude-swap): pick any local account — listed as `#<slot> <name>` with the 5h / 7d quota cswap reports — from the **Claude account** button beside the model selector; default login works without cswap, a session keeps its account across resumes, and the same button in a running session (IM: `/account`) shows its current account and switches it in place — the conversation continues on the new account through cswap's shared history
+- optional Claude subscription selection through a preinstalled [cswap](https://github.com/realiti4/claude-swap): pick any local account — listed as `#<slot> <name>` with the 5h / 7d quota cswap reports — from the **Claude account** button beside the model selector; default login works without cswap, a session keeps its account while it is in use and hands it back to cswap after an hour of quiet (continuing on the default login), and the same button in a running session (IM: `/account`) shows its current account and switches it in place — the conversation continues on the new account through cswap's shared history
 - a chat per session with a compact title/model header and unified Files / Context toolbar, including a clock on the composer to queue delayed user turns above the input; a turn's folded activity row opens into its steps, and each step into its full thinking text or tool input and output
 - a context sidebar per session: session status, harness/model/host, delegation parent, cumulative cost and last activity, followed by the harness's own context accounting — detailed categories for Claude; window totals and last-request input/cache/output/reasoning usage for Codex — refreshed when a turn ends, with dated snapshots after release
 - a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place, and a Runs tab listing every ccteam Flow run with the sessions it hired
@@ -147,6 +147,7 @@ Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 > - **Grok Build** — install [Grok CLI](https://docs.x.ai/build/overview), then `grok login`
 > - **OpenCode** — install [OpenCode](https://opencode.ai), then `opencode auth login`
 > - **Kimi Code** — install [Kimi Code](https://moonshotai.github.io/kimi-code/), then `kimi login`
+> - **Antigravity** — install the [Antigravity CLI](https://antigravity.google/docs/cli/overview), then run `agy` once to sign in (`agy acp --login` over SSH)
 > - **DSH** — install [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) with `npm i -g @deepseek-ai/dsh`. DSH sessions and DSH Web use `DEEPSEEK_API_KEY` when set, otherwise the identity's DSH Settings → Models config.
 > - **Pi** — install [Pi](https://pi.dev/), then set your provider key and check it with `pi auth check --provider <provider>`
 >
@@ -193,7 +194,7 @@ After you reboot your computer, run `ccteam start` again to bring ccteam back.
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
 - **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, or as plain text for plugin-backed flows such as DSH, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark/Slack bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
-- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. DSH's one-click on the same page registers ccteam's plugin into your own `~/.dsh` web profile instead (a DSH session of yours can also orchestrate after pasting an Access credential); Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
+- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi, Antigravity), so even hand-started sessions can hire the team. DSH's one-click on the same page registers ccteam's plugin into your own `~/.dsh` web profile instead (a DSH session of yours can also orchestrate after pasting an Access credential); Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
 - **DSH** — open native DSH Web as a first-class console page. Each identity runs one DSH runtime and ccteam is its second client: DSH sessions hired anywhere in ccteam are created inside that same runtime, appear live in this page's sidebar under the project's workspace, and can be opened mid-task to watch or interject — the agent's next dispatch continues the same conversation. The owner sees the real `~/.dsh` space (ccteam attaches to a DSH Web already on `127.0.0.1:3080` when present); each regular user gets an isolated `$CCTEAM_HOME/runtime/dsh/web/<user>/` space with the ccteam client plugin preloaded. It works out of the box by following this machine's DSH login until the user changes DSH Settings → Models; the whole identity — menu sessions and hires alike — runs on that one config. User-installed DSH plugins are preserved.
 
@@ -227,7 +228,7 @@ Async by default: the completion notification lands in the parent's chat like a 
 
 Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, each one's models and reasoning-effort levels as it last declared them, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback).
 
-Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`, and pi's is per *model* — it declares which levels the chosen model actually supports), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
+Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`, agy `low|medium|high` plus `xhigh` on the models that have it, and pi's is per *model* — it declares which levels the chosen model actually supports), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
 
 ## Project context
 
@@ -279,4 +280,4 @@ Per project, delete `.ccteam/` — or, before uninstalling, run `ccteam project 
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode**, **Kimi**, **DSH** and **Pi**.
+MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode**, **Kimi**, **Antigravity**, **DSH** and **Pi**.

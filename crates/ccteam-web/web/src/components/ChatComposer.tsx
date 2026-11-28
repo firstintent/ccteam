@@ -6,7 +6,7 @@
 //   - HITL 胶囊 toggle (black-on when armed) with a permission-mode toast
 //   - the 3-section model menu: models grouped by vendor · effort · protocol,
 //     all of it driven by what the vendor itself declares (`GET
-//     /api/v1/models`, cached once per page load) — never a ccteam-invented
+//     /api/v1/models`, shared and auto-refreshed on focus/menu/spawn) — never a ccteam-invented
 //     ladder, and the picked token rides the spawn verbatim
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
@@ -27,7 +27,6 @@ import {
   Hand,
   Image as ImageIcon,
   Loader2,
-  Mic,
   Plus,
   Sparkles,
   Square,
@@ -43,7 +42,7 @@ import {
   type SkillSummary,
   type TurnAttachment,
 } from "../lib/attachmentsApi";
-import { useVendorCatalog } from "../hooks/useVendorCatalog";
+import { useVendorCatalog, vendorCatalogStore } from "../hooks/useVendorCatalog";
 import type { VendorCatalog } from "../lib/modelsApi";
 import {
   effortRowLabel,
@@ -313,6 +312,38 @@ export function SkillMenuSections({
  *  switch (the conversation view is keyed by sid and remounts on switch). */
 const draftStorageKey = (key: string) => `ccteam.draft.v1.${key}`;
 
+/** Seed another surface's draft — e.g. a just-started session whose first
+ *  message did not go out (#239), so it waits in that session's composer. */
+// eslint-disable-next-line react-refresh/only-export-components -- storage helper shared with HomeView.
+export function saveComposerDraft(key: string, text: string): void {
+  try {
+    localStorage.setItem(draftStorageKey(key), text);
+  } catch {
+    /* storage disabled */
+  }
+}
+
+/** What a send handler reports back to the composer:
+ *  - `false` — keep the draft (validation failed upstream);
+ *  - a promise — the draft (text, attachments and its localStorage copy)
+ *    stays until it resolves to anything but `false`; a rejection or `false`
+ *    keeps it, so a failed launch or send never eats what was typed
+ *    (docs-local issue #237). Further sends wait for it;
+ *  - anything else — clear at once. */
+export type SendOutcome = boolean | void | Promise<boolean | void>;
+
+function isPending(outcome: SendOutcome): outcome is Promise<boolean | void> {
+  return typeof (outcome as Promise<unknown> | undefined)?.then === "function";
+}
+
+/** The composer text once `sent` (the raw text at send time) has landed:
+ *  empty, or whatever was typed after it while the send was in flight. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function remainderAfterSend(current: string, sent: string): string {
+  if (current === sent) return "";
+  return current.startsWith(sent) ? current.slice(sent.length).replace(/^\s+/, "") : current;
+}
+
 function loadDraft(key: string): string {
   try {
     return localStorage.getItem(draftStorageKey(key)) ?? "";
@@ -354,9 +385,8 @@ export function ChatComposer({
   /** A turn is in flight → the send button morphs into Stop when empty. */
   busy?: boolean;
   disabled?: boolean;
-  /** Send the trimmed text (+ any ready attachments). Return `false` to KEEP
-   *  the draft (validation failed upstream); anything else clears it. */
-  onSend: (text: string, attachments: TurnAttachment[]) => boolean | void;
+  /** Send the trimmed text (+ any ready attachments). See [`SendOutcome`]. */
+  onSend: (text: string, attachments: TurnAttachment[]) => SendOutcome;
   /** Interrupt the running turn (session kept). */
   onStop?: () => void;
   /** The model/effort/protocol/HITL draft the menu edits. */
@@ -394,8 +424,9 @@ export function ChatComposer({
   /** Home 快速开始 templates: bump `nonce` to replace the draft text with
    *  `text` and focus the textarea (nonce 0 = no prefill). */
   prefill?: { text: string; nonce: number };
-  /** Conversation-only delayed send. Omit on Home to hide schedule mode. */
-  onSchedule?: (text: string, when: string) => boolean | void;
+  /** Conversation-only delayed send (same [`SendOutcome`] contract). Omit on
+   *  Home to hide schedule mode. */
+  onSchedule?: (text: string, when: string) => SendOutcome;
   /** Label reported by the daemon (`PDT (UTC-07:00)`, etc.). */
   scheduleTimezone?: string;
 }) {
@@ -418,6 +449,9 @@ export function ChatComposer({
   /** `datetime-local` value in the browser wall clock. */
   const [scheduleAbsolute, setScheduleAbsolute] = useState("");
   const composingRef = useRef(false);
+  /** A send whose outcome is still pending (#237): blocks a second send. */
+  const sendingRef = useRef(false);
+  const [sending, setSending] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
   const vendorRef = useRef<HTMLDivElement | null>(null);
@@ -457,12 +491,17 @@ export function ChatComposer({
     if (prefill?.nonce) taRef.current?.focus();
   }, [prefill?.nonce]);
 
-  // Auto-grow the textarea (52 → 260px, then scroll).
+  // Auto-grow the textarea between its CSS min/max height, then scroll. The
+  // bounds live in CSS so a phone can start at one line (index.css) while a
+  // desktop keeps its roomier two-line floor.
   const autoGrow = useCallback(() => {
     const ta = taRef.current;
     if (!ta) return;
+    const style = window.getComputedStyle(ta);
+    const min = Number.parseFloat(style.minHeight) || 0;
+    const max = Number.parseFloat(style.maxHeight) || 260;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(260, Math.max(52, ta.scrollHeight))}px`;
+    ta.style.height = `${Math.min(max, Math.max(min, ta.scrollHeight))}px`;
   }, []);
   useEffect(() => {
     autoGrow();
@@ -604,8 +643,51 @@ export function ChatComposer({
     setScheduleAbsolute("");
   }, []);
 
+  /** Clear what was sent once `outcome` says it landed (see [`SendOutcome`]). */
+  const settleSend = useCallback(
+    (outcome: SendOutcome, sent: { text: string; attachmentIds: string[] }, onLanded?: () => void) => {
+      const key = draftStorageKey(draftKey);
+      const landed = () => {
+        setText((current) => remainderAfterSend(current, sent.text));
+        setAttachments((current) => current.filter((a) => !sent.attachmentIds.includes(a.id)));
+        onLanded?.();
+        // The surface may be gone by now (Home navigates to the new session
+        // first), so its persist effect will not run: drop the stored copy
+        // here when it is still exactly what was sent.
+        try {
+          if (localStorage.getItem(key) === sent.text) localStorage.removeItem(key);
+        } catch {
+          /* ignore */
+        }
+      };
+      if (outcome === false) return;
+      if (!isPending(outcome)) {
+        landed();
+        return;
+      }
+      sendingRef.current = true;
+      setSending(true);
+      outcome
+        .then(
+          (result) => {
+            if (result !== false) landed();
+          },
+          () => {
+            /* the caller reports the failure; the draft stays */
+          },
+        )
+        .finally(() => {
+          sendingRef.current = false;
+          setSending(false);
+        });
+    },
+    [draftKey],
+  );
+
   const send = useCallback(() => {
+    if (sendingRef.current) return;
     const trimmed = text.trim();
+    const sent = { text, attachmentIds: attachments.map((a) => a.id) };
     if (scheduleMode) {
       if (!trimmed) {
         toastBus.handler?.info(t("emptyInput"));
@@ -621,16 +703,10 @@ export function ChatComposer({
         toastBus.handler?.info(t("schedulePickTime"));
         return;
       }
-      const keep = onSchedule?.(trimmed, when) === false;
-      if (keep) return;
-      setText("");
-      clearScheduleFields();
-      setScheduleMode(false);
-      try {
-        localStorage.removeItem(draftStorageKey(draftKey));
-      } catch {
-        /* ignore */
-      }
+      settleSend(onSchedule?.(trimmed, when), sent, () => {
+        clearScheduleFields();
+        setScheduleMode(false);
+      });
       return;
     }
     if (!trimmed && attachments.length === 0) {
@@ -641,15 +717,7 @@ export function ChatComposer({
       toastBus.handler?.info(t("uploadingWait"));
       return;
     }
-    const keep = onSend(trimmed, attachmentsPayload(attachments)) === false;
-    if (keep) return;
-    setText("");
-    setAttachments([]);
-    try {
-      localStorage.removeItem(draftStorageKey(draftKey));
-    } catch {
-      /* ignore */
-    }
+    settleSend(onSend(trimmed, attachmentsPayload(attachments)), sent);
   }, [
     text,
     attachments,
@@ -661,7 +729,7 @@ export function ChatComposer({
     scheduleHours,
     scheduleAbsolute,
     clearScheduleFields,
-    draftKey,
+    settleSend,
     t,
   ]);
 
@@ -721,6 +789,7 @@ export function ChatComposer({
       return;
     }
     onDraftChange(switchDraftVendor(draft, vendor));
+    vendorCatalogStore.refresh();
   };
 
   /** `effort` is the vendor's own token, verbatim; `""` = vendor default. */
@@ -903,7 +972,7 @@ export function ChatComposer({
       <textarea
         ref={taRef}
         data-testid="composer-textarea"
-        rows={2}
+        rows={1}
         value={text}
         disabled={disabled}
         placeholder={t(placeholderKey)}
@@ -1029,6 +1098,8 @@ export function ChatComposer({
               type="button"
               className="model-btn vendor-btn"
               data-testid="vendor-btn"
+              title={spec.label}
+              aria-label={spec.label}
               aria-haspopup="menu"
               aria-expanded={vendorOpen}
               onClick={(e) => {
@@ -1065,10 +1136,11 @@ export function ChatComposer({
               onClick={(e) => {
                 e.stopPropagation();
                 setVendorOpen(false);
+                if (!menuOpen) vendorCatalogStore.refresh();
                 setMenuOpen((o) => !o);
               }}
             >
-              <span className="model-label">{modelText}</span>
+              <span className="model-label" title={modelText}>{modelText}</span>
               <span className="eff">{effortText}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
@@ -1129,9 +1201,6 @@ export function ChatComposer({
               ))}
             </div>
           </div>
-          <button type="button" className="icon-btn" title="mic" aria-label="mic">
-            <Mic />
-          </button>
           {showStop ? (
             <button
               type="button"
@@ -1148,7 +1217,7 @@ export function ChatComposer({
               data-testid={sendTestId}
               className="send-btn"
               onClick={send}
-              disabled={disabled || (scheduleMode && !resolvedScheduleWhen)}
+              disabled={disabled || sending || (scheduleMode && !resolvedScheduleWhen)}
               title={scheduleMode ? t("scheduleSend") : t("sendTip")}
             >
               {scheduleMode ? <Clock /> : <ArrowUp />}

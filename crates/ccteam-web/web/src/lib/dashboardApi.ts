@@ -83,6 +83,9 @@ export interface CreatedProject {
   slug: string;
   host: string;
   path: string;
+  /** The directory already was this project (HTTP 200, not 201): one
+   *  directory is one project, so the existing one came back (#239). */
+  existing: boolean;
 }
 
 export interface CreateProjectOpts {
@@ -139,7 +142,8 @@ export async function createProject(
     }
     throw new Error(detail);
   }
-  return (await resp.json()) as CreatedProject;
+  const created = (await resp.json()) as Omit<CreatedProject, "existing">;
+  return { ...created, existing: resp.status === 200 };
 }
 
 /** Catalog a project already registered on a satellite. The optional `slug`

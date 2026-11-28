@@ -331,7 +331,7 @@ async fn get_models_reports_every_vendor_with_observed_and_fallback_rows() {
         .collect();
     assert_eq!(
         names,
-        ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
+        ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"]
     );
     let kimi = vendors.iter().find(|e| e["vendor"] == "kimi").unwrap();
     assert_eq!(kimi["source"], "ACP session availableModels");
@@ -476,10 +476,13 @@ async fn post_project_auto_appends_on_duplicate_slug() {
     // A duplicate slug does NOT 409 — `handle_create_project` AUTO-APPENDS a
     // numeric suffix (dup → dup2), the same rule `ccteam init` uses (red line:
     // "新建项目 slug = 目录名 + 数字累加"). The 201 body carries the slug actually
-    // used. (409 is reserved for the pathological >999-collisions case.)
+    // used. The collision is between two DIFFERENT directories: the same
+    // directory again is the same project (#239, see
+    // `post_projects_on_a_registered_directory_returns_that_project`).
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let target = tmp.path().join("repo1");
+    let other = tmp.path().join("elsewhere").join("repo1");
     let addr = spawn(AppState::new(paths)).await;
     let client = reqwest::Client::new();
 
@@ -493,7 +496,7 @@ async fn post_project_auto_appends_on_duplicate_slug() {
 
     let second = client
         .post(format!("http://{addr}/api/v1/projects"))
-        .json(&serde_json::json!({ "slug": "dup", "path": target.display().to_string() }))
+        .json(&serde_json::json!({ "slug": "dup", "path": other.display().to_string() }))
         .send()
         .await
         .unwrap();

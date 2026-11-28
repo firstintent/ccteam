@@ -128,8 +128,9 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
         "dsh" => Ok(AgentVendor::Dsh),
+        "agy" => Ok(AgentVendor::Agy),
         other => Err(format!(
-            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi|pi|dsh)"
+            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi|pi|dsh|agy)"
         )),
     }
 }
@@ -463,9 +464,11 @@ pub(crate) async fn handle_create_session(
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
     let protocol = match vendor {
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
-            SessionProtocol::Acp
-        }
+        AgentVendor::Grok
+        | AgentVendor::Opencode
+        | AgentVendor::Kimi
+        | AgentVendor::Dsh
+        | AgentVendor::Agy => SessionProtocol::Acp,
         AgentVendor::Pi => SessionProtocol::StreamJson,
         AgentVendor::Claude | AgentVendor::Codex => protocol,
     };
@@ -1859,6 +1862,14 @@ async fn build_catchup_events(app: &AppState, sid: &str, last_id: Option<u64>) -
 /// as `text/event-stream`; each `event: progress` frame's `data` is a
 /// JSON line `{id, sid, kind:"answer"|"progress", content, done?, options?}`,
 /// and the SSE frame itself carries an `id:` (the replay-ring seq).
+///
+/// #247 — `event: turn_state` frames (`data` = `{sid, kind:"turn_state",
+/// busy, elapsed_seconds, after_seq}`, no `id:`) carry whether the session has
+/// a turn in flight, whoever started it: one on connect, then one per change
+/// (busy ↔ idle, or a new turn while busy) and every [`TURN_STATE_REASSERT`]
+/// while busy. Derived from the daemon's in-flight-turn state each
+/// [`TURN_STATE_POLL`], never replayed. `after_seq` orders the frame against
+/// the replayed ones: only a frame with a higher seq can be the turn's end.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{sid}/events",
@@ -1868,7 +1879,7 @@ async fn build_catchup_events(app: &AppState, sid: &str, last_id: Option<u64>) -
         ("last_event_id" = Option<String>, Query, description = "Reconnect watermark (query fallback for the `Last-Event-ID` header — EventSource can't set custom headers)"),
     ),
     responses(
-        (status = 200, description = "SSE stream (text/event-stream). Frames: `event: progress` with `data` = `{id, sid, kind, content, done?, options?}`, each carrying an SSE `id:` seq. Never 503 — a no-gateway path emits one `gateway_unavailable` frame then keep-alives.", content_type = "text/event-stream"),
+        (status = 200, description = "SSE stream (text/event-stream). Frames: `event: progress` with `data` = `{id, sid, kind, content, done?, options?}`, each carrying an SSE `id:` seq; `event: turn_state` with `data` = `{sid, kind:\"turn_state\", busy, elapsed_seconds, after_seq}` (no `id:`) — sent on connect, whenever the session's in-flight turn starts, ends or is replaced (whoever started it), and periodically while busy; only a frame with a seq above `after_seq` can end that turn. Never 503 — a no-gateway path emits one `gateway_unavailable` frame then keep-alives.", content_type = "text/event-stream"),
     ),
 )]
 pub(crate) async fn handle_session_events(
@@ -1895,27 +1906,44 @@ pub(crate) async fn handle_session_events(
     // single `impl Stream` return. With a gateway: the catchup batch chained
     // into the filtered live tap. Without: a one-shot `gateway_unavailable`
     // notice (then only keep-alives).
-    let stream = match rx {
-        Some(rx) => {
+    let stream = match (rx, app.gateway.clone()) {
+        (Some(rx), Some(gateway)) => {
             let catchup = build_catchup_events(&app, &sid, last_id).await;
-            futures::stream::iter(catchup.into_iter().map(Ok::<Event, Infallible>))
-                .chain(BroadcastStream::new(rx).filter_map(move |item| {
-                    let target_sid = target_sid.clone();
-                    async move {
-                        match item {
-                            Ok(entry) if event_matches_sid(&entry.event, &target_sid) => {
-                                Some(Ok(session_event(&entry.event, entry.seq)))
-                            }
-                            Ok(_) => None,
-                            Err(BroadcastStreamRecvError::Lagged(n)) => {
-                                Some(Ok(reconnect_hint(&format!("lagged {n} events"))))
-                            }
+            // #247 — the session's busy state rides the same stream, derived
+            // from the daemon's in-flight turn, so a page sees a turn that
+            // IM / CLI / another device started (not only its own sends).
+            let probe_sid = sid.clone();
+            let ring = Arc::clone(&app.session_ring);
+            let turn_state = turn_state_frames(
+                sid.clone(),
+                move || probe_turn_state(&ring, &gateway, &probe_sid),
+                TURN_STATE_POLL,
+                TURN_STATE_REASSERT,
+            )
+            .map(|payload| Ok::<Event, Infallible>(turn_state_event(&payload)));
+            // The catchup batch goes out BEFORE any turn_state frame: a
+            // replayed answer of an older turn must not land after the current
+            // busy snapshot, or the page would read it as the new turn's end.
+            let catchup = futures::stream::iter(catchup.into_iter().map(Ok::<Event, Infallible>));
+            let live = BroadcastStream::new(rx).filter_map(move |item| {
+                let target_sid = target_sid.clone();
+                async move {
+                    match item {
+                        Ok(entry) if event_matches_sid(&entry.event, &target_sid) => {
+                            Some(Ok(session_event(&entry.event, entry.seq)))
+                        }
+                        Ok(_) => None,
+                        Err(BroadcastStreamRecvError::Lagged(n)) => {
+                            Some(Ok(reconnect_hint(&format!("lagged {n} events"))))
                         }
                     }
-                }))
+                }
+            });
+            catchup
+                .chain(futures::stream::select(live, turn_state))
                 .left_stream()
         }
-        None => futures::stream::iter(vec![Ok::<Event, Infallible>(gateway_unavailable_event())])
+        _ => futures::stream::iter(vec![Ok::<Event, Infallible>(gateway_unavailable_event())])
             .right_stream(),
     };
     Sse::new(stream)
@@ -2500,6 +2528,117 @@ pub(crate) fn gateway_unavailable_event() -> Event {
         .data(json!({ "type": "gateway_unavailable", "reason": "no live gateway" }).to_string())
 }
 
+/// How often an open session stream re-reads the daemon's in-flight turn
+/// (#247). One read is a ring lookup plus a `try_lock` and a map lookup.
+pub(crate) const TURN_STATE_POLL: Duration = Duration::from_secs(1);
+
+/// While a turn stays in flight, how often its `turn_state` is sent again even
+/// though nothing changed (#247): the backstop that heals a page which ended
+/// the turn on a frame it could not order. The one known window: the ring
+/// feeder stamps seqs asynchronously, so when turn A's final answer is still
+/// in the feeder as back-to-back turn B is read busy, A's answer takes a seq
+/// above B's `after_seq` and ends B on the page — until this re-send.
+pub(crate) const TURN_STATE_REASSERT: Duration = Duration::from_secs(2);
+
+/// One read of a session's turn state (#247).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnStateRead {
+    /// The newest replay-ring seq for the sid, read BEFORE the turn: every
+    /// frame with a seq up to it was recorded before this state, so none of
+    /// them can be this turn's end — whatever order they reach the page in.
+    pub(crate) after_seq: u64,
+    /// The in-flight turn, if any.
+    pub(crate) live: Option<ccteam_core::stall::LiveTurn>,
+}
+
+/// #247 — read `sid`'s turn state from the daemon's ONE in-flight-turn truth
+/// ([`Gateway::live_turn_for`](ccteam_im::gateway::Gateway::live_turn_for):
+/// `turn_started_at`, which every turn entry — web, IM, CLI, MCP delegation —
+/// goes through, and which IM `/status`, MCP `agent_read` and the session
+/// list's `working` already read). `None` = the gateway lock is held right
+/// now: skip this read rather than queue on a hot lock.
+fn probe_turn_state(
+    ring: &crate::ring::SessionEventRing,
+    gateway: &tokio::sync::Mutex<ccteam_im::gateway::Gateway>,
+    sid: &str,
+) -> Option<TurnStateRead> {
+    let after_seq = ring.last_seq(sid);
+    let guard = gateway.try_lock().ok()?;
+    Some(TurnStateRead {
+        after_seq,
+        live: guard.live_turn_for(sid),
+    })
+}
+
+/// The `turn_state` frame body: is a turn in flight, for how long, and which
+/// replay-ring seq it was read after.
+pub(crate) fn turn_state_payload(sid: &str, read: TurnStateRead) -> serde_json::Value {
+    json!({
+        "sid": sid,
+        "kind": "turn_state",
+        "busy": read.live.is_some(),
+        "elapsed_seconds": read.live.map(|turn| turn.elapsed_seconds),
+        "after_seq": read.after_seq,
+    })
+}
+
+/// #247 — the session stream's busy signal, DERIVED from the daemon's
+/// in-flight-turn truth rather than emitted at each place a turn starts or
+/// ends, so a new turn entry point is covered without touching it. Yields the
+/// current state at once, then a frame when it changes — busy ↔ idle, or a
+/// DIFFERENT turn while busy ([`LiveTurn::started_at`](ccteam_core::stall::LiveTurn::started_at)
+/// is the turn's identity: a turn that ended and the next one that started
+/// between two reads would otherwise look like one unbroken turn) — and,
+/// while busy, again every `reassert` (see [`TURN_STATE_REASSERT`]). A read
+/// the probe skips (`None`, lock busy) changes nothing.
+pub(crate) fn turn_state_frames<P>(
+    sid: String,
+    probe: P,
+    every: Duration,
+    reassert: Duration,
+) -> impl futures::Stream<Item = serde_json::Value> + Send + 'static
+where
+    P: FnMut() -> Option<TurnStateRead> + Send + 'static,
+{
+    // State: (probe, the turn last reported — `Some(None)` = idle —, when it
+    // was last sent, and whether to wait before the next read).
+    futures::stream::unfold(
+        (
+            probe,
+            None::<Option<std::time::Instant>>,
+            None::<tokio::time::Instant>,
+            false,
+        ),
+        move |(mut probe, mut last, mut sent, mut wait)| {
+            let sid = sid.clone();
+            async move {
+                loop {
+                    if wait {
+                        tokio::time::sleep(every).await;
+                    }
+                    wait = true;
+                    let Some(read) = probe() else { continue };
+                    let turn = read.live.map(|turn| turn.started_at);
+                    let due = turn.is_some() && sent.is_some_and(|at| at.elapsed() >= reassert);
+                    if last != Some(turn) || due {
+                        last = Some(turn);
+                        sent = Some(tokio::time::Instant::now());
+                        return Some((turn_state_payload(&sid, read), (probe, last, sent, wait)));
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn turn_state_event(payload: &serde_json::Value) -> Event {
+    // No `id:` — a derived state, not a ring event: it must not move the
+    // client's `Last-Event-ID` replay watermark.
+    Event::default()
+        .event("turn_state")
+        .data(payload.to_string())
+}
+
 /// Shared POST error responder honoring the [`FormOrJson`] mode
 /// convention: form ⇒ plain text, JSON ⇒ `{ "ok": false, "error": ... }`.
 fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
@@ -2602,6 +2741,139 @@ fn conflict_error(msg: String, error_code: &str, mode: InputMode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #247 — a scripted probe for [`turn_state_frames`]: each read takes the
+    /// next scripted answer — `None` = lock held, `Some(None)` = idle,
+    /// `Some(Some((turn, elapsed)))` = turn number `turn` in flight for
+    /// `elapsed` seconds. Once the script runs out the lock reads as held
+    /// forever (no further frames).
+    fn scripted_probe(
+        script: Vec<Option<Option<(u64, u64)>>>,
+    ) -> impl FnMut() -> Option<TurnStateRead> + Send + 'static {
+        let base = std::time::Instant::now();
+        let mut script = std::collections::VecDeque::from(script);
+        let mut reads = 0;
+        move || {
+            reads += 1;
+            script.pop_front().flatten().map(|turn| TurnStateRead {
+                // Stand-in for the ring: a later read sees a later seq.
+                after_seq: reads,
+                live: turn.map(|(turn, elapsed)| ccteam_core::stall::LiveTurn {
+                    silent_seconds: 0,
+                    elapsed_seconds: elapsed,
+                    stuck_after_seconds: 300,
+                    started_at: base + Duration::from_secs(turn),
+                }),
+            })
+        }
+    }
+
+    /// Effectively never re-assert (the change-only behaviour under test).
+    const NO_REASSERT: Duration = Duration::from_secs(3600);
+
+    /// Drain `frames` until it goes quiet, as `(busy, elapsed_seconds)`.
+    async fn drain_turn_states(
+        frames: impl futures::Stream<Item = serde_json::Value>,
+    ) -> Vec<(bool, Option<u64>)> {
+        let mut frames = Box::pin(frames);
+        let mut seen = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(200), frames.next()).await
+        {
+            assert_eq!(frame["kind"], "turn_state");
+            assert_eq!(frame["sid"], "s9");
+            seen.push((
+                frame["busy"].as_bool().unwrap(),
+                frame["elapsed_seconds"].as_u64(),
+            ));
+        }
+        seen
+    }
+
+    /// #247 — the current state goes out at once, then only changes: an idle
+    /// read after an idle frame and a busy read during the same turn are
+    /// silent; a turn starting or ending is a frame.
+    #[tokio::test]
+    async fn turn_state_frames_send_the_current_state_then_only_changes() {
+        let probe = scripted_probe(vec![
+            Some(None),
+            Some(None),
+            Some(Some((1, 3))),
+            Some(Some((1, 4))),
+            Some(Some((1, 5))),
+            Some(None),
+            Some(None),
+        ]);
+        let frames = turn_state_frames("s9".into(), probe, Duration::from_millis(1), NO_REASSERT);
+        assert_eq!(
+            drain_turn_states(frames).await,
+            vec![(false, None), (true, Some(3)), (false, None)]
+        );
+    }
+
+    /// #247 — one turn ending and the next starting between two reads still
+    /// reaches the page as a second start — even when both read as 0s
+    /// elapsed: the turn's identity changed, not (necessarily) its clock.
+    #[tokio::test]
+    async fn turn_state_frames_resend_busy_for_a_new_turn_between_reads() {
+        let probe = scripted_probe(vec![
+            Some(Some((1, 0))),
+            Some(Some((2, 0))),
+            Some(Some((2, 1))),
+            Some(Some((3, 7))),
+        ]);
+        let frames = turn_state_frames("s9".into(), probe, Duration::from_millis(1), NO_REASSERT);
+        assert_eq!(
+            drain_turn_states(frames).await,
+            vec![(true, Some(0)), (true, Some(0)), (true, Some(7))]
+        );
+    }
+
+    /// #247 — a busy turn is re-sent every `reassert` even though nothing
+    /// changed, each with the newer ring seq it was read after: the backstop
+    /// for a page that wrongly ended it. Idle is never re-sent.
+    #[tokio::test]
+    async fn turn_state_frames_reassert_a_running_turn_with_a_fresh_seq() {
+        let probe = scripted_probe(vec![
+            Some(Some((1, 0))),
+            Some(Some((1, 1))),
+            Some(None),
+            Some(None),
+        ]);
+        let frames =
+            turn_state_frames("s9".into(), probe, Duration::from_millis(1), Duration::ZERO);
+        let mut frames = Box::pin(frames);
+        let mut seen = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(200), frames.next()).await
+        {
+            seen.push((
+                frame["busy"].as_bool().unwrap(),
+                frame["after_seq"].as_u64().unwrap(),
+            ));
+        }
+        assert_eq!(seen, vec![(true, 1), (true, 2), (false, 3)]);
+    }
+
+    /// #247 — a read that finds the gateway lock held is skipped, not taken
+    /// for "idle": it neither emits nor resets what the next read compares to.
+    #[tokio::test]
+    async fn turn_state_frames_skip_reads_while_the_gateway_lock_is_held() {
+        let probe = scripted_probe(vec![
+            None,
+            None,
+            Some(Some((1, 5))),
+            None,
+            Some(Some((1, 6))),
+            None,
+            Some(None),
+        ]);
+        let frames = turn_state_frames("s9".into(), probe, Duration::from_millis(1), NO_REASSERT);
+        assert_eq!(
+            drain_turn_states(frames).await,
+            vec![(true, Some(5)), (false, None)]
+        );
+    }
 
     /// GitHub #189 — the codex writer-lock rejection is recognised
     /// anywhere in the submit error chain and stops the generic retry advice.
@@ -3122,6 +3394,7 @@ mod tests {
                     silent_seconds: 3,
                     elapsed_seconds: 42,
                     stuck_after_seconds: 300,
+                    started_at: std::time::Instant::now(),
                 },
             ),
         );

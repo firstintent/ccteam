@@ -191,6 +191,10 @@ pub struct LiveTurn {
     /// The watchdog's idle window: silence at or past it is the same STUCK the
     /// turn-timeout watchdog would flag.
     pub stuck_after_seconds: u64,
+    /// When the turn was submitted — the turn's identity. Two reads of one
+    /// turn carry the same instant; the next turn carries a later one, even
+    /// when both read as 0s elapsed (web `turn_state`, #247).
+    pub started_at: std::time::Instant,
 }
 
 impl LiveTurn {
@@ -374,6 +378,7 @@ mod tests {
             silent_seconds,
             elapsed_seconds: silent_seconds + 1,
             stuck_after_seconds: 300,
+            started_at: std::time::Instant::now(),
         }
     }
 

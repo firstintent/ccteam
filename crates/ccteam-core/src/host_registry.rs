@@ -81,7 +81,7 @@ pub struct AgentProbeSpec {
     /// argv the daemon runs via `std::process::Command::new(argv[0])
     /// .args(&argv[1..])` — NEVER through a shell, and the package name is
     /// pinned here in the table, never taken from a request. `None` = no
-    /// supported recipe (kimi/pi install manually, see
+    /// supported recipe (kimi/pi/agy install manually, see
     /// `manual_install_url`).
     pub install_recipe: Option<&'static [&'static str]>,
     /// Manual-install docs link shown when there is no recipe. `None` for
@@ -90,7 +90,7 @@ pub struct AgentProbeSpec {
     /// VENDOR-QUOTA-1 — which subscription-quota probe this vendor has, if
     /// any (`ccteam_core::vendor_quota`; implementations in
     /// `ccteam_web::routes::vendor_quota`). `None` = no surface, the UI
-    /// renders nothing (opencode/pi/dsh).
+    /// renders nothing (opencode/pi/dsh/agy).
     pub quota_probe: Option<crate::vendor_quota::QuotaProbeKind>,
 }
 
@@ -122,7 +122,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "@anthropic-ai/claude-code@latest"]),
         manual_install_url: None,
-        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::ClaudeOauthUsage),
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::ClaudeRecordedUsage),
     },
     AgentProbeSpec {
         vendor: "codex",
@@ -185,6 +185,22 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
         install_recipe: Some(&["npm", "install", "-g", "@deepseek-ai/dsh@latest"]),
         manual_install_url: None,
+        quota_probe: None,
+    },
+    AgentProbeSpec {
+        vendor: "agy",
+        harness_id: "agy",
+        bin_env: ccteam_harness::AGY_BIN_ENV,
+        default_bin: "agy",
+        // Antigravity has a config-file MCP seam:
+        // `~/.gemini/config/mcp_config.json` (what `agy mcp add` writes).
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        // The vendor's installer is `curl … | bash`, which is not an argv a
+        // no-shell recipe can express — install manually.
+        install_recipe: None,
+        manual_install_url: Some("https://antigravity.google/docs/cli/overview"),
+        // The ACP handshake names the subscription tier and nothing else — no
+        // window, no remaining quota (see `execution/agy_acp`).
         quota_probe: None,
     },
 ];
@@ -1171,11 +1187,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_probe_specs_covers_seven_vendors() {
+    fn agent_probe_specs_covers_eight_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"]
         );
     }
 
@@ -1273,7 +1289,7 @@ mod tests {
         let vendors: Vec<&str> = avail.iter().map(|a| a.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"]
         );
         // harness_id is carried through from the spec.
         assert_eq!(avail[0].harness_id, "claude-code");
@@ -1322,10 +1338,10 @@ mod tests {
 
     #[test]
     fn install_recipe_absent_means_manual_with_a_link() {
-        // kimi/pi have no supported recipe: the UI keeps manual guidance and
+        // kimi/pi/agy have no supported recipe: the UI keeps manual guidance and
         // the API 400s the install endpoint. The link must be present so the
         // hint can point at real docs.
-        for vendor in ["kimi", "pi"] {
+        for vendor in ["kimi", "pi", "agy"] {
             let spec = AgentProbeSpec::by_vendor(vendor).unwrap();
             assert!(spec.install_recipe.is_none(), "{vendor}");
             let url = spec

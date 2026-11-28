@@ -692,6 +692,7 @@ mod tests {
                 silent_seconds: 1,
                 elapsed_seconds: 1,
                 stuck_after_seconds: 300,
+                started_at: std::time::Instant::now(),
             },
         )]
         .into_iter()

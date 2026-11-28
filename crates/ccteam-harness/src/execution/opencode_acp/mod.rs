@@ -21,9 +21,9 @@ use tokio::sync::broadcast;
 
 use crate::execution::acp::released_thread_status;
 use crate::execution::acp::{
-    acp_model_picker_options, apply_notification, known_efforts, pluck_model_info,
-    pluck_session_id, route_acp_turn, split_trailing_effort, AcpModelOption, AcpTransport,
-    AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, InboundPolicy, ModelInfo, SessionTranslateState,
+    acp_model_picker_options, known_efforts, pluck_model_info, pluck_session_id, route_acp_turn,
+    split_trailing_effort, AcpModelOption, AcpTransport, AcpTurnRoute, AcpTurnRunner,
+    AcpTurnTuning, InboundPolicy, ModelInfo, SessionTranslateState,
 };
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
@@ -243,8 +243,11 @@ impl OpencodeAcpAdapter {
             }
         }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
-        let dispatcher =
-            spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
+        let dispatcher = crate::execution::acp::spawn_notification_dispatcher(
+            Arc::clone(&transport),
+            Arc::clone(&state),
+            event_tx.clone(),
+        );
         let live = Arc::new(LiveSession {
             transport,
             session_id: session_id.clone(),
@@ -379,47 +382,6 @@ impl OpencodeAcpAdapter {
             )),
         }
     }
-}
-
-fn spawn_notif_dispatcher(
-    transport: Arc<AcpTransport>,
-    state: Arc<StdMutex<SessionTranslateState>>,
-    event_tx: broadcast::Sender<ThreadEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Take the handshake backlog with the subscription: the vendor's
-        // command catalog and any opening usage arrive before this task exists.
-        let (early, mut sub) = transport.subscribe_with_early();
-        for n in early {
-            let events = if let Ok(mut guard) = state.lock() {
-                apply_notification(&mut guard, &n)
-            } else {
-                Vec::new()
-            };
-            for ev in events {
-                let _ = event_tx.send(ev);
-            }
-        }
-        loop {
-            tokio::select! {
-                _ = transport.wait_closed() => return,
-                msg = sub.recv() => match msg {
-                    Ok(n) => {
-                        let events = if let Ok(mut guard) = state.lock() {
-                            apply_notification(&mut guard, &n)
-                        } else {
-                            Vec::new()
-                        };
-                        for ev in events {
-                            let _ = event_tx.send(ev);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        }
-    })
 }
 
 #[async_trait]

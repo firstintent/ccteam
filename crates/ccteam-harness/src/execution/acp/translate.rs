@@ -25,7 +25,7 @@ use super::protocol::{
     content_text, cost_from_usage_update, is_replay, is_turn_boundary,
     stop_reason_from_prompt_result, usage_from_prompt_result, AvailableCommand,
 };
-use super::transport::{AcpWriteBarrier, Notification};
+use super::transport::{AcpTransport, AcpWriteBarrier, Notification};
 use crate::{
     ContextSource, ContextUsage, ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails,
     ThreadStatus, UnifiedTokenUsage,
@@ -238,6 +238,13 @@ pub struct SessionTranslateState {
     /// [`Self::context_usage`] can hand provenance to the single render point
     /// instead of every vendor adapter re-deciding it.
     pub used_source: ContextSource,
+    /// The vendor stated occupancy (`usage_update.used`) since the current
+    /// turn began. While set, the turn's own token total is not folded in as
+    /// occupancy: that total sums every model call of the turn, so on a turn
+    /// with tool calls it runs at a multiple of what the window really holds
+    /// (Antigravity, measured: `used` 9 776 vs `totalTokens` 19 357), and after
+    /// a compaction it reports the work done rather than what is left.
+    pub occupancy_reported_this_turn: bool,
     pub effort: Option<String>,
     /// Session-cumulative USD from the latest non-zero `usage_update.cost`.
     pub session_cost_usd: Option<f64>,
@@ -349,6 +356,7 @@ impl SessionTranslateState {
         self.prompt_sent = prompt_sent;
         self.injection_gate = Some(Arc::new(AcpInjectionGate::default()));
         self.prompt_boundary_seen = false;
+        self.occupancy_reported_this_turn = false;
         // Fresh turn → first thought/message chunk should emit immediately.
         self.last_liveness_at = None;
         self.reset_thought();
@@ -741,6 +749,7 @@ fn translate_session_update(
             if let Some(used) = update.get("used").and_then(|v| v.as_u64()) {
                 // Authoritative: the vendor states occupancy outright.
                 state.set_used_tokens(used, ContextSource::Reported);
+                state.occupancy_reported_this_turn = true;
             }
             if let Some(size) = update.get("size").and_then(|v| v.as_u64()) {
                 state.window_tokens = Some(size);
@@ -905,11 +914,15 @@ pub fn finalize_from_prompt_result(
     // verified on the wire). A `0` is never occupancy — it is what a turn that
     // made no model call reports (a vendor-local slash command, an aborted
     // turn), and folding it in would blank a session that is really at 80%.
+    //
+    // And it is only ever an INFERENCE: a vendor that stated occupancy during
+    // this turn has already said the real number, which this must not replace.
     if let Some(total) = result
         .pointer("/_meta/totalTokens")
         .or_else(|| result.pointer("/usage/totalTokens"))
         .and_then(|v| v.as_u64())
         .filter(|t| *t > 0)
+        .filter(|_| !state.occupancy_reported_this_turn)
     {
         state.set_used_tokens(total, ContextSource::Derived);
     }
@@ -990,6 +1003,50 @@ pub fn apply_notification_shared(
         return Vec::new();
     };
     apply_notification(&mut guard, n)
+}
+
+/// Route one ACP connection's notifications into its session state and event
+/// stream — the ONE dispatcher every ACP adapter runs.
+///
+/// The handshake backlog is drained HERE, synchronously, before the task is
+/// spawned — not inside it. Everything the vendor sent up to the handshake
+/// reply is already queued (the reader delivers frames in wire order), so
+/// applying it now means it meets a session with no open turn: catalog and
+/// usage frames land in the state, and message chunks — a `session/load`
+/// history replay — are dropped, as they must be. Draining inside the task
+/// raced the first `submit_turn`: a rebuild submits the pending message the
+/// moment `start_thread` returns, the turn opened first, and the replayed
+/// history was appended to the new turn's reply. Each adapter used to carry
+/// its own copy of this loop, with the drain on the wrong side of the spawn
+/// in all of them.
+pub fn spawn_notification_dispatcher(
+    transport: Arc<AcpTransport>,
+    state: Arc<StdMutex<SessionTranslateState>>,
+    event_tx: tokio::sync::broadcast::Sender<ThreadEvent>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let apply = move |n: &Notification| {
+        for event in apply_notification_shared(&state, n) {
+            let _ = event_tx.send(event);
+        }
+    };
+    let (early, mut sub) = transport.subscribe_with_early();
+    for n in &early {
+        apply(n);
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = transport.wait_closed() => return,
+                msg = sub.recv() => match msg {
+                    Ok(n) => apply(&n),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1101,6 +1158,41 @@ mod tests {
             &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 17_580}}),
         );
         assert_eq!(st.context_usage().unwrap().source, ContextSource::Derived);
+    }
+
+    /// A turn's token total sums every model call it made, so it is not what
+    /// the window holds once the vendor has said that outright. Antigravity,
+    /// live 2026-11-27, one tool-call turn: `usage_update.used` 9 776, then a
+    /// prompt result with `usage.totalTokens` 19 357. The stated number stays —
+    /// but only for the turn it was stated in: the next turn is free to derive.
+    #[test]
+    fn a_stated_occupancy_is_not_replaced_by_the_turns_token_total() {
+        let mut st = SessionTranslateState::default();
+        let used = |n: u64| Notification {
+            method: "session/update".into(),
+            params: json!({
+                "update": {"sessionUpdate": "usage_update", "used": n, "size": 1_048_576}
+            }),
+        };
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        apply_notification(&mut st, &used(9_776));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "usage": {"totalTokens": 19_357}}),
+        );
+        let ctx = st.context_usage().unwrap();
+        assert_eq!(ctx.used_tokens, Some(9_776));
+        assert_eq!(ctx.source, ContextSource::Reported);
+
+        // A turn in which the vendor says nothing still derives.
+        st.begin_turn("t2", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "usage": {"totalTokens": 12_000}}),
+        );
+        let ctx = st.context_usage().unwrap();
+        assert_eq!(ctx.used_tokens, Some(12_000));
+        assert_eq!(ctx.source, ContextSource::Derived);
     }
 
     /// A turn that made no model call reports `totalTokens: 0` (verified on a

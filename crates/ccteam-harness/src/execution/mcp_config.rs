@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | Claude | `NativeMcpConfig` | [`project_claude_mcp_json`] → `.ccteam/chat/<sid>/mcp.json` + `--mcp-config` |
 //! | Codex | `NativeMcpConfig` | [`project_codex_thread_config`] → `thread/start` `config.mcp_servers` |
-//! | Grok / OpenCode / Kimi | `NativeMcpConfig` | [`project_acp_mcp_servers`] → ACP `session/new` `mcpServers[]` |
+//! | Grok / OpenCode / Kimi / Antigravity | `NativeMcpConfig` | [`project_acp_mcp_servers`] → ACP `session/new` `mcpServers[]` |
 //! | Pi | `ManagedSessionBridge` | [`project_bridge_child_env`] → child env the ccteam bridge extension reads |
 //!
 //! **A projection never decides whether there is an endpoint.** It takes an
@@ -49,7 +49,7 @@
 //! | Claude stream-json | **enforced** — `--strict-mcp-config` means the curated file is the ONLY source (also avoids the historical self-referential init deadlock) |
 //! | Claude terminal | `--mcp-config` wins the same-name merge, keeping the user's other ambient servers |
 //! | Codex | per-thread `config.mcp_servers` deep-merges over the global entry; real-machine verified (0.144.3) |
-//! | Grok / OpenCode / Kimi (ACP) | **nothing** — see below |
+//! | Grok / OpenCode / Kimi / Antigravity (ACP) | **nothing** — see below |
 //! | Pi (bridge) | the child env IS the only source; there is no global pi config to collide with |
 //!
 //! **The ACP door is open, and no vendor lever closes it.** `session/new`'s
@@ -73,6 +73,10 @@
 //! both vendors' own merge code takes the caller's entry on a same-name key
 //! (kimi `mergeCallerMcpServers`, opencode `MCP.add` replacing + closing the
 //! previous client), so they are believed unaffected — UNVERIFIED at runtime.
+//! Antigravity shares it too: `agy acp` was measured (1.5.18) loading the
+//! offered entry and calling it with the session bearer, but only with no
+//! same-named entry in its own `mcp_config.json`, so which one it keeps on a
+//! collision is equally unverified.
 //!
 //! Because no vendor lever closes the door, ccteam stopped fighting on the
 //! vendor's terrain: **the daemon wins server-side, by provenance**. Every ACP
@@ -342,8 +346,9 @@ pub fn project_codex_thread_config(ep: &SessionMcpEndpoint) -> Value {
     })
 }
 
-/// ACP `mcpServers` array entry, **shared by all three ACP vendors** (Grok +
-/// OpenCode + Kimi) on `session/new`, `session/resume`, and `session/load`.
+/// ACP `mcpServers` array entry, **shared by every stdio ACP vendor** (Grok,
+/// OpenCode, Kimi, Antigravity) on `session/new`, `session/resume`, and
+/// `session/load`.
 ///
 /// ACP (OpenCode 1.17.x / Grok 0.2.x) validates MCP entries strictly:
 /// `headers` must be an **array** of `{name, value}` (not a map). Wrong shape

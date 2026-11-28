@@ -95,6 +95,10 @@ export interface SessionEvent {
   /** Answer-only (#209): `true` = said mid-turn, the turn is still running.
    *  The server says it positively; absent on every other answer. */
   interim?: boolean;
+  /** The replay-ring seq this frame arrived with (its SSE `id:`), set by the
+   *  stream; absent from an older daemon. Orders frames against a
+   *  `turn_state` (#247). */
+  seq?: number;
 }
 
 /** Whether `ev` ends the exchange its session was working on (#209). A
@@ -136,6 +140,52 @@ export function turnInFlight(events: readonly SessionEvent[], mark: TurnMark | n
   return true;
 }
 
+/** #247 — the daemon's word on whether this session has a turn in flight,
+ *  whoever started it (IM, CLI, MCP delegation, another device): the
+ *  stream's `event: turn_state` frame. A fresh object per frame — a second
+ *  `busy` frame means a NEW turn started. */
+export interface SessionTurnState {
+  busy: boolean;
+  /** How long the in-flight turn has run, by the daemon's clock. */
+  elapsedSeconds: number | null;
+  /** `Date.now()` when the frame arrived — anchors `elapsedSeconds`. */
+  receivedAt: number;
+  /** The newest replay-ring seq the daemon had recorded when it read this
+   *  state: frames up to it came before, so none of them can end this turn —
+   *  whatever order the wire delivers them in. */
+  afterSeq: number;
+}
+
+/** Parse a `turn_state` frame's data; `null` on anything malformed. */
+export function parseTurnState(raw: string, now: number = Date.now()): SessionTurnState | null {
+  try {
+    const data = JSON.parse(raw) as {
+      busy?: unknown;
+      elapsed_seconds?: unknown;
+      after_seq?: unknown;
+    };
+    if (typeof data.busy !== "boolean" || typeof data.after_seq !== "number") return null;
+    const elapsed = typeof data.elapsed_seconds === "number" ? data.elapsed_seconds : null;
+    return { busy: data.busy, elapsedSeconds: elapsed, receivedAt: now, afterSeq: data.after_seq };
+  } catch {
+    return null;
+  }
+}
+
+/** #247 — fold one stream frame into the daemon's last word: a turn boundary
+ *  ({@link isTurnBoundary}, the same end a send from this page waits for)
+ *  recorded AFTER a busy state ends that turn at once — latched, so it holds
+ *  however many frames follow. A frame without a seq cannot be ordered and is
+ *  left to the daemon's next state (it re-sends a running turn's state
+ *  periodically, and an idle one as soon as the turn ends). */
+export function foldTurnState(
+  state: SessionTurnState | null,
+  event: SessionEvent,
+): SessionTurnState | null {
+  if (!state?.busy || event.seq === undefined || event.seq <= state.afterSeq) return state;
+  return isTurnBoundary(event) ? { ...state, busy: false } : state;
+}
+
 export interface UseSessionEventsResult {
   /** Ring buffer of events, newest at the END. Capped — oldest drop. */
   events: SessionEvent[];
@@ -147,6 +197,11 @@ export interface UseSessionEventsResult {
   /** True when the server reported it has no live gateway (the one-shot
    *  `gateway_unavailable` SSE frame on the no-daemon path). */
   gatewayUnavailable: boolean;
+  /** #247 — the daemon's last word on this session's turn: the latest
+   *  `turn_state` frame, ended early by a later boundary
+   *  ({@link foldTurnState}); `null` until one arrives, or after the stream
+   *  gave up. */
+  turnState: SessionTurnState | null;
   /** Successful-open generation for this sid. `1` is the initial stream;
    *  every later value marks a reconnect that consumers can use as an
    *  authoritative-reseed barrier. Resets to `0` when the sid changes or
@@ -369,6 +424,8 @@ export interface SessionEventStreamCallbacks {
   onDisconnected(): void;
   onError(error: string | null): void;
   onGatewayUnavailable(): void;
+  /** #247 — a `turn_state` frame (optional: older callers ignore it). */
+  onTurnState?(state: SessionTurnState): void;
 }
 
 /** Own one sid's EventSource + bounded retry lifecycle. The hook below is a
@@ -432,10 +489,19 @@ export function startSessionEventStream(
       lastSeenSeqRef.current = decision.nextHighest;
       if (!decision.accept) return;
       const parsed = parseSessionEvent(message.data);
-      if (parsed) callbacks.onEvent(parsed);
+      if (!parsed) return;
+      const seq = message.lastEventId ? Number(message.lastEventId) : Number.NaN;
+      if (Number.isFinite(seq)) parsed.seq = seq;
+      callbacks.onEvent(parsed);
     });
     es.addEventListener("gateway_unavailable", () => {
       if (current()) callbacks.onGatewayUnavailable();
+    });
+    // No seq on purpose: a derived state, outside the replay watermark.
+    es.addEventListener("turn_state", (event) => {
+      if (!current()) return;
+      const state = parseTurnState((event as MessageEvent).data);
+      if (state) callbacks.onTurnState?.(state);
     });
     es.addEventListener("reconnect_hint", () => {
       if (!current()) return;
@@ -492,6 +558,7 @@ export function useSessionEvents(
   const [lastError, setLastError] = useState<string | null>(null);
   const [gatewayUnavailable, setGatewayUnavailable] = useState(false);
   const [connectionEpoch, setConnectionEpoch] = useState(0);
+  const [turnState, setTurnState] = useState<SessionTurnState | null>(null);
 
   // Reset the event buffer SYNCHRONOUSLY when the sid changes (React's
   // "adjust state during render" pattern). The subscribe effect below also
@@ -515,6 +582,7 @@ export function useSessionEvents(
     setStreamedSid(sid);
     setEvents([]);
     setConnectionEpoch(0);
+    setTurnState(null);
   }
 
   useEffect(() => {
@@ -538,6 +606,7 @@ export function useSessionEvents(
         setLastError(null);
         setGatewayUnavailable(false);
         setConnectionEpoch(0);
+        setTurnState(null);
       });
       return () => {
         cancelled = true;
@@ -561,16 +630,26 @@ export function useSessionEvents(
         setConnectionEpoch(epoch);
       },
       onEvent: (event) => {
-        if (!cancelled) setEvents((previous) => appendSessionEvent(previous, event));
+        if (cancelled) return;
+        setEvents((previous) => appendSessionEvent(previous, event));
+        // Queued in stream order with `onTurnState`'s update, so a busy
+        // frame and the answer ending it fold in the order they arrived.
+        setTurnState((previous) => foldTurnState(previous, event));
       },
       onDisconnected: () => {
         if (!cancelled) setConnected(false);
       },
       onError: (error) => {
-        if (!cancelled) setLastError(error);
+        if (cancelled) return;
+        setLastError(error);
+        // The stream gave up: the daemon's last word may be stale now.
+        if (error) setTurnState(null);
       },
       onGatewayUnavailable: () => {
         if (!cancelled) setGatewayUnavailable(true);
+      },
+      onTurnState: (state) => {
+        if (!cancelled) setTurnState(state);
       },
     });
 
@@ -581,5 +660,5 @@ export function useSessionEvents(
     // `sid` keys the subscription; `enabled` toggles the whole effect.
   }, [sid, enabled]);
 
-  return { events, connected, lastError, gatewayUnavailable, connectionEpoch };
+  return { events, connected, lastError, gatewayUnavailable, connectionEpoch, turnState };
 }

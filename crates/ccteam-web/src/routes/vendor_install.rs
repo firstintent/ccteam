@@ -314,7 +314,7 @@ fn resolve_install_target(
     ),
     responses(
         (status = 202, description = "Install job running (started or joined); poll `GET .../install/{job_id}`", body = InstallJobView),
-        (status = 400, description = "Vendor has no install recipe (kimi/pi — install manually)"),
+        (status = 400, description = "Vendor has no install recipe (kimi/pi/agy — install manually)"),
         (status = 403, description = "Not the admin/owner"),
         (status = 404, description = "Unknown host or vendor"),
     ),
@@ -411,7 +411,7 @@ mod tests {
         let err = resolve_install_target(LOCAL_HOST, "gemini").unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         // Recipe-less vendors → 400 with the manual link.
-        for vendor in ["kimi", "pi"] {
+        for vendor in ["kimi", "pi", "agy"] {
             let err = resolve_install_target(LOCAL_HOST, vendor).unwrap_err();
             assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{vendor}");
         }

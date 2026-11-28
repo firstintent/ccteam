@@ -43,7 +43,7 @@ export interface EnrollCredentialView {
 
 /** One vendor's paste-ready config. */
 export interface EnrollSnippet {
-  /** `claude` | `codex` | `grok` | `opencode` | `kimi`. */
+  /** `claude` | `codex` | `grok` | `opencode` | `kimi` | `agy`. */
   vendor: string;
   /** `json` | `toml` — how to merge it. */
   format: string;
@@ -70,7 +70,7 @@ export interface MintEnrollRequest {
 
 /** Display order: the JSON `mcpServers` family, then Codex, then the ACP pair.
  *  Vendors the daemon stops emitting simply disappear from the UI. */
-export const VENDOR_ORDER = ["claude", "kimi", "codex", "grok", "opencode"];
+export const VENDOR_ORDER = ["claude", "kimi", "agy", "codex", "grok", "opencode"];
 
 /** Sort snippets into a stable, family-grouped order for the copy buttons. */
 export function orderSnippets(snippets: EnrollSnippet[]): EnrollSnippet[] {

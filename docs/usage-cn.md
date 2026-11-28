@@ -1,6 +1,6 @@
 # ccteam 使用手册
 
-**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi、DSH 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书、Slack 或浏览器里统一指挥。**
+**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi、Antigravity、DSH 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书、Slack 或浏览器里统一指挥。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
@@ -29,7 +29,7 @@
 
 ### 1. 安装
 
-ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / Grok Build / OpenCode / Kimi Code / DSH / Pi,自己不打包它们。
+ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / Grok Build / OpenCode / Kimi Code / Antigravity / DSH / Pi,自己不打包它们。
 
 **先装好并认证其中至少一个** —— 没装、或装了但没认证的 vendor,在那台机器上起不了会话:
 
@@ -40,6 +40,7 @@ ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / G
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+| Antigravity | [antigravity.google/docs/cli/overview](https://antigravity.google/docs/cli/overview) | 跑一次 `agy` 完成登录(SSH 下用 `agy acp --login`) |
 | DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;DSH 会话与 DSH Web 优先用 `DEEPSEEK_API_KEY`,否则用该身份在 DSH Settings → Models 里的配置 |
 | Pi | [pi.dev](https://pi.dev/) | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
@@ -73,6 +74,7 @@ codex --version    # 可选,用 Codex 会话才需要
 grok --version     # 可选,用 Grok Build 会话才需要
 opencode --version  # 可选,用 OpenCode 会话才需要
 kimi --version      # 可选,用 Kimi Code 会话才需要(先 `kimi login`)
+agy --version       # 可选,用 Antigravity 会话才需要(1.5.18 及以上)
 dsh --version       # 可选,用 DSH 会话才需要(0.1.0-rc.6 或以上)
 pi --version        # 可选,用 Pi 会话才需要(0.83.0 及以上)
 ```
@@ -137,7 +139,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 daemon 启动(`ccteam start` / `ccteam daemon start`,含 DSH 插件的自动启动)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
+每次 daemon 启动(`ccteam start` / `ccteam daemon start`,含 DSH 插件的自动启动)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)、Antigravity(`~/.gemini/config/mcp_config.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
 
 **DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `agent {vendor:"dsh", task:"…"}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/ccteam-ui`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/ccteam-ui`)后自行重启即可。你自己的 DSH 会话也能编排团队:在 daemon 所在机器上,插件会自己向 daemon 领取 enrollment 凭据(每个 DSH profile 一份,`dsh-plugin:<profile>`,幂等由 daemon 保证);daemon 在别处时,到 DSH Settings 粘贴 daemon URL 和 **Settings → Access** 里复制的 enrollment 凭据。两种情况下都拿到同一套 6 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
 
@@ -166,16 +168,18 @@ DSH 菜单通过当前 Web 入口的 `/dsh/` 同源代理加载 HTML、资源、
 
 ### 开会话、切换、对话
 
-本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。每行显示 `#<编号> <名字>`（cswap 别名，否则邮箱 @ 前的部分，不显示域名）和 cswap 最近读到的 5h / 7d 额度（Max 套餐没有 5h 窗口，只显示 7d；需要重新登录的账号会注明）。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，会话按「默认登录」运行，可继续跟随外部 `cswap auto`；其他账号使用各自的 cswap profile（凭据按账号隔离），恢复时保持原身份，不能静默退回默认号；已隔离的会话遇到账号移除、slot 换绑或目录变化会报错并保留历史。ccteam 用 cswap 的共享历史启动账号（`cswap run --share-history`），所以会话记录对每个账号都可读。
+本机 Claude stream-json 会话可在新会话输入框里、模型选择旁边的「Claude 账号」按钮选择已安装 cswap 管理的账号。每行显示 `#<编号> <名字>`（cswap 别名，否则邮箱 @ 前的部分，不显示域名）和 cswap 最近读到的 5h / 7d 额度（Max 套餐没有 5h 窗口，只显示 7d；需要重新登录的账号会注明）。cswap 是可选依赖；没有安装时，默认登录、新建和恢复会话及其他 vendor 都照常使用。账号登录、凭据与刷新仍由 cswap / Claude 管理，ccteam 不复制 token。选中的账号恰好是当前默认号时，接受 cswap 的默认登录回退，会话按「默认登录」运行，可继续跟随外部 `cswap auto`；其他账号的会话在使用期间固定在该账号上，恢复时保持原账号，不会换到第三个号；账号移除或 slot 换绑会报错并保留历史。固定账号的会话平时用该账号自己的 cswap profile（凭据按账号隔离）；这个账号被切成默认登录（`cswap switch` / `cswap auto`）后改在默认登录上运行，默认号换走后再回到自己的 profile——cswap 要求同一账号只有一份在用的凭据，否则其中一份的 token 会失效。切换发生时会话进程若还留在旧 profile，ccteam 在它空闲后一分钟内结束该进程，下一条消息在同一会话里继续，历史不丢。固定账号的会话不会一直占着账号。只要它的进程还在该账号的 profile 里，cswap 就认为账号在用：`cswap auto` 跳过它，`cswap switch` 切过去会警告，会话刷新过该账号的 token 之后则直接拒绝。cswap 被拒时不通知任何人，所以 ccteam 按时间让出账号：会话安静满 `sessions.account_yield_secs`（默认 3600 秒 = Claude 提示缓存的寿命，此时已没有缓存可丢；`0` = 一直占着，直到你自己换号）后，进程结束，会话变成「默认登录」会话，下一条消息在同一会话里按默认号继续，历史不丢；想放回原账号，在按钮里（或 `/account <编号>`）再选一次即可。turn 正在运行、在等你确认或后台任务未结束时不让出；历史还只在该账号自己 profile 里的会话也不让出。切到一个仍被会话占着的账号（turn 在跑，或安静还不满这个窗口），cswap 会提示该账号有运行中的会话（它的 token 已在会话里轮换过时会拒绝切换）：等它让出账号再切，或者先停掉那个会话。
+
+`cswap auto` 不会切到 session profile 里还有 Claude 进程的账号（任何 `cswap run <账号>` 起的会话，包括 ccteam 固定账号的会话），这类会话一多，auto 就可能无号可切。仓库里的 `scripts/cswap-auto.sh` 是一个独立脚本（只依赖 cswap，不调用 ccteam，没装 ccteam 也能用），用它代替直接运行 `cswap auto`（参数原样传给 `cswap auto`，两者不要同时跑）：它每分钟执行一次 `cswap auto --once`，选号、阈值、冷却仍由 cswap 决定；只有当 cswap 想切却没有可用账号时，它才问 cswap 本来会选谁（`--dry-run`），然后用手动的 `cswap switch` 切过去——手动切换对占用中的账号是「警告后照切」。强制切换之后该账号同时是默认登录、又被原会话占着，两份凭据里有一份的 token 之后可能失效；ccteam 固定账号的会话会在空闲后一分钟内自动转到默认登录上（见上），终端里手动起的 `cswap run` 会话若之后认证失败，退出并重新 `cswap run <账号>` 即可。会话已经轮换过该账号 token 时 cswap 会直接拒绝，只能先退出那个会话。ccteam 用 cswap 的共享历史启动账号（`cswap run --share-history`），所以会话记录对每个账号都可读。
 
 进行中的 Claude 会话，输入框模型按钮旁同样有「Claude 账号」按钮（IM 里用 `/account`）：它显示会话当前用的账号——默认登录时显示此刻默认号是哪个（`默认 · #2 cloud`）——选另一个账号（或「默认登录」）即切换：当前空闲进程结束，下一条消息在同一会话里按新账号继续，历史不丢（提示缓存会重建，换号必然如此）。有 turn 在跑、在等你确认或后台任务未结束时拒绝切换；会话历史还只在当前账号自己的 profile 里（共享历史之前启动的会话）时也拒绝：cswap 会在该会话下次在原账号上运行、且该账号没有其他 Claude 在用时把历史合并进共享历史，之后即可切换。没装 cswap 时，未绑定账号的会话不显示这个按钮。
 
 账号列表由 `GET /api/v1/vendors/claude/accounts` 返回，创建请求的 `claude_account` 使用其中的稳定 id；已有会话用 `PUT /api/v1/sessions/{sid}/claude-account` 传 `{"claude_account": "<id>"}`（`null` = 默认登录）切换。所有已登录身份（管理员 token、个人链接用户、IM 会话）都可选择执行端 cswap 管理的任一账号，与大家本来就共用默认登录一致，不需要逐账号授权。远程项目、其他 vendor 与 terminal 协议不支持这个选项。ccteam 不代装 cswap，也不会自动换号。若 cswap 提供 `usage.headerProbe`，必须保持关闭，避免账号发现触发额度推理探针。
 
-- **新建会话**:输入框里 vendor 与模型是两个下拉:vendor 下拉选 Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi,旁边的模型下拉放该 vendor 的模型、思考强度与协议(stream-json / terminal 仅 Claude / ACP=Grok·OpenCode·Kimi·DSH / Pi 自己的 RPC);spawn 前设 HITL。新输入框默认 Claude · `opus` · `high`,切到其他 vendor 时用该 vendor 的默认。模型菜单按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 不显示强度菜单。**默认**行什么都不发、由 vendor 自己定;ccteam 见过一次新会话以 vendor 默认运行后,该行直接显示它实际解析到的具体模型 id。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless。建好回句柄 `s<N>`。
+- **新建会话**:输入框里 vendor 与模型是两个下拉:vendor 下拉选 Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi / Antigravity,旁边的模型下拉放该 vendor 的模型、思考强度与协议(stream-json / terminal 仅 Claude / ACP=Grok·OpenCode·Kimi·DSH·Antigravity / Pi 自己的 RPC);spawn 前设 HITL。新输入框默认 Claude · `opus` · `high`,切到其他 vendor 时用该 vendor 的默认。模型菜单按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 不显示强度菜单。**默认**行什么都不发、由 vendor 自己定;ccteam 见过一次新会话以 vendor 默认运行后,该行直接显示它实际解析到的具体模型 id。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless;Antigravity 的 role 选的是 agy 自己的同名 agent(`agy --agent`,定义在项目 `.agents/agents/`),不是 `.claude/agents/` 文件。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
-- **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放;Codex / Grok / OpenCode / Kimi / DSH / Pi 都是 chat-only。
+- **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放;Codex / Grok / OpenCode / Kimi / DSH / Antigravity / Pi 都是 chat-only。
 - **历史会话与恢复**:会话列表下点「更多历史 (N) ▸」展开已**停止但未销毁**的会话(灰显)。点任意一个即从磁盘 `meta.json` **冷恢复**(cold-resume) —— 停止的会话、甚至 daemon 重启前的会话都不丢,随时可恢复(手机上 `/use <sid>` 同样能恢复)。「+ 导入历史会话」对话框还能发现你在 ccteam 之外用原生 `claude` 跑过的会话(按工作目录内容匹配),一键**收编**成普通 ccteam 会话,对话原文保留。
 - **定时发送**:点输入框旁的**时钟**进入定时模式 → 填写「再过 **N 分钟** / **N 小时**」(或点快捷 `+15m` / `+30m` / `+1h` / `+2h`),也可选一个**本机时钟**上的绝对时间——界面会统一换算成相对延迟,浏览器时区与 daemon 时区不会打架;下方预览预计本机发送时刻 → 写正文 → 发送。排队条在**输入框上方**,按发送时间排序,点 **×** 取消。到点后正文作为**普通用户消息**进入该会话。定时模式**不能**带附件/技能。上限:每会话最多 20 条 pending,最远约 **7 天**。失败条目会标红并保留 24 小时。
 
@@ -230,7 +234,7 @@ HTML/HTM 默认打开交互预览，可切换「源码」或在新标签页打�
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算。
 - **上下文侧栏**:顶部整理当前会话的活动与运行状态、ID/项目、harness/模型/主机、父会话和委派深度、本会话累计成本、累计 tokens、最后活动时间。尚未计价与 $0 区分显示，累计 tokens 不等于窗口占用。即使 harness 不提供上下文分析，也可查看会话状态。
 - **厂商上下文分析**:Claude stream-json 显示 system prompt、工具、memory 文件(按路径)、skills、MCP 工具与说明、自定义 agent，以及消息按工具调用/结果和附件类型的拆分；延迟加载工具单独列出，不计入窗口。Codex app-server 显示已用/剩余窗口、最近一次请求的输入、缓存命中、输出及其中推理 tokens；Codex 未提供分类明细和压缩阈值，面板不会补估。数字来自 harness 官方接口，不调用模型估算。每次打开、手动刷新和 turn 结束时更新；Codex 读取最近的用量事件，采集时间不会因打开面板而改变。释放后显示最后一次 turn 结束的快照及时间。REST:`GET /api/v1/sessions/{sid}/context`。
-- 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
+- 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**;**Antigravity 上报 token 与上下文占用,但没有 USD**,成本同样显示「—」。
 
 ### 标准资源 API(给集成方)
 
@@ -251,7 +255,7 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 ```
 
 - **凭据只说明「这份配置是谁的」,身份由 daemon 在 `initialize` 时签发**:响应里的 `Mcp-Session-Id` 让**这个进程**成为一个独立 caller —— 它在账本里有自己的会话行(`managed_by: external`),它 spawn 的会话真的挂在它下面,而不是变成一堆根节点。之后每个请求必须同时带凭据与该 id(id 本身不是凭据,且 binding 只对开它的那枚凭据生效);id 过期返回 `404` 提示重新 `initialize`,用完可 `DELETE /mcp` 关闭。
-- **两种作用域**:每次 `ccteam daemon start` 会把**用户域**的机器凭据——无 label 的那个槽位,跨重启复用、从不重铸——写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 经 `@ccteam/ccteam-ui` 插件走同一套身份模型:插件向本机 daemon 领取自己的用户域凭据(label `dsh-plugin:<profile>`),daemon 在别处时用粘贴的那枚。用户域凭据不钉项目,故首个 `agent` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **两种作用域**:每次 `ccteam daemon start` 会把**用户域**的机器凭据——无 label 的那个槽位,跨重启复用、从不重铸——写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi/Antigravity 直接就有工具;DSH 经 `@ccteam/ccteam-ui` 插件走同一套身份模型:插件向本机 daemon 领取自己的用户域凭据(label `dsh-plugin:<profile>`),daemon 在别处时用粘贴的那枚。用户域凭据不钉项目,故首个 `agent` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
 - **反复启动的程序用 ensure 而不是 mint**:`POST /api/v1/enroll` 带 `ensure: true` 和 `label` 时按 (身份, label) 幂等——daemon 新建记录答 `201` 并附 bearer,记录已存在则答 `200` 且只附 `bearer_prefix`(secret 永不第二次回传);丢了自己那份的调用方发 `rotate: true` 换掉记录,而不是再堆一条。控制台自己的 mint(不带 `ensure`)仍每次新铸一枚。
 - **不做任何推断**:不看工作目录、不看来源地址、没有「最近用过的项目」—— 没有依据就直接拒绝,并告诉你可以点名哪些 slug。无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数;web 控制台令牌(那是 `/api/v1/**` 的凭据)在这里会被 401 拒绝并说明本端点认哪两族凭据。
 
@@ -342,9 +346,11 @@ bot 在群聊/频道里是每条都回、还是只在被 @ 时才回,是同一�
 # 会话
 /new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
                            新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex | grok | opencode | kimi | dsh | pi
+                             · vendor = claude(默认)| codex | grok | opencode | kimi | dsh | pi | agy
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
                              · grok / opencode / kimi / dsh = 无角色 ACP 会话(忽略 role 参数)
+                             · agy = Antigravity CLI(ACP);role = agy 自己的同名 agent;
+                               mode=default | accept-edits | auto | plan
                              · dsh = 只在本机跑;支持冷恢复和 token 记账
                              · pi = 只在本机跑;支持角色
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
@@ -364,7 +370,8 @@ bot 在群聊/频道里是每条都回、还是只在被 @ 时才回,是同一�
 /status                    当前会话的深度视图——无论什么状态都是同一张卡:idle / working /
                            stuck,或 💤 released(下条消息即恢复;卡片读的是落盘事实)。
                            含 model · 强度 · ctx、账号用量窗口(5h / 周;本会话没进程时
-                           向同 harness 的在线会话读,并按 harness 记住,所以一个进程都不在
+                           向同 harness 的在线会话读;Claude 的取自它自己对话的响应头,
+                           读取不发任何请求;并按 harness 记住,所以一个进程都不在
                            也照样显示;过了厂商自报的重置时间就丢弃,不显示过期数)、
                            自己的后台工作(只有 harness 自报「已后台化」的才叫后台任务,
                            前台命令就写「命令」)、💬 在飞 turn 已经说到哪儿了(它自己的话的
@@ -408,11 +415,11 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 - **非网关的 `/命令`**(`/compact`、`/clear`、`/goal`、`/model` …)→ 透传给当前 agent;弹窗型(如 `/model`)会弹**选项按钮**,点一下即应用。Claude 只在空闲时解析斜杠命令,turn 进行中发出的会排队、在该 turn 结束后自动投递(有回执);turn 中发普通文本仍是插话进当前 turn。`/goal` 是各 harness 自己的目标机制,行为也随它:codex 一旦设了目标就**自己开 turn 持续推进**,直到它自己报达成(`/goal clear` 停);`/status` 两家都显示 🎯 目标,vendor 停止推进时还会给出原因。
 - **发图 / 发文件 + 一句说明** → agent 自动读取(报错截图、日志都行);agent 也能把文件发回你的 chat。
 - **回合进行中** → 一条活的进度消息(形如 `⏳ working… · 🔧 bash ×3`);会话中途说了话,这张卡就收成 `↳ 3 tools · 1 files`、话之后另起一张,turn 的最后一张写 `✅ done`。最终答案单独成条(会提醒);超长回答自动分片;agent 中途要你拿主意时会弹**选项按钮**,点一下喂回答案、它继续往下跑。
-- **长 turn 绝不沉默** → 会话说的话在 turn 还在跑时就到 chat,所有 harness 都一样(claude、codex、grok、opencode、kimi、dsh、pi)。一个 turn 的多条消息会先短暂攒住、合成一条投出,所以短 turn 仍是一条带状态行的回复;但这个等待有界:你在 turn 中发的消息被并进这个 turn 之后,会话产出的文本**立刻**投给你(你问了、它答了,不必等一个可能几小时后才来、甚至被 Stop hook 一直拒停的边界);攒满一分钟的话也会自己投出 —— 哪怕会话正卡在一个长时间不出声的工具里 —— 所以长 turn 读起来是一段不超过每分钟一条的实况。这样投过的 turn,结束时只补一条状态行,绝不重复你已经读到的正文。web 控制台同步显示这些消息,并一直把 turn 标为进行中(停止按钮可用),直到它真正结束。turn 失败时,失败前说过的话照样投出。
+- **长 turn 绝不沉默** → 会话说的话在 turn 还在跑时就到 chat,所有 harness 都一样(claude、codex、grok、opencode、kimi、dsh、pi、agy)。一个 turn 的多条消息会先短暂攒住、合成一条投出,所以短 turn 仍是一条带状态行的回复;但这个等待有界:你在 turn 中发的消息被并进这个 turn 之后,会话产出的文本**立刻**投给你(你问了、它答了,不必等一个可能几小时后才来、甚至被 Stop hook 一直拒停的边界);攒满一分钟的话也会自己投出 —— 哪怕会话正卡在一个长时间不出声的工具里 —— 所以长 turn 读起来是一段不超过每分钟一条的实况。这样投过的 turn,结束时只补一条状态行,绝不重复你已经读到的正文。web 控制台同步显示这些消息,并一直把 turn 标为进行中(停止按钮可用),直到它真正结束。turn 失败时,失败前说过的话照样投出。
 
 ### 人工批准(HITL)
 
-默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Claude / DSH / Pi 会话支持这条审批路;DSH 和 Pi 会把自己的 permission dialog 接到同一组同意/拒绝按钮上。Codex 会话自带 sandbox,忽略此模式。Grok / Kimi 当前仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。
+默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Claude / DSH / Pi 会话支持这条审批路;DSH 和 Pi 会把自己的 permission dialog 接到同一组同意/拒绝按钮上。Codex 会话自带 sandbox,忽略此模式。Grok / Kimi 当前仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。Antigravity 的 `hitl` 会话启动时不带 agy 的自动放行开关,并对 agy 发来的每个审批请求一律拒绝——那一次工具调用失败、回合继续——因为同意/拒绝按钮同样尚未接到它上面。
 
 ### 让任何会话派活
 
@@ -466,7 +473,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
+`ccteam init`、Web 创建、IM `/newproject` 和卫星创建统一走一份代码:写 `.ccteam/state.json`,幂等把 `.ccteam/` 加进 `.gitignore`,仅在 `AGENTS.md` 和 `CLAUDE.md` 都不存在时种 `AGENTS.md` 占位文件,补全全局 `~/.ccteam/` 骨架,在 `~/.claude.json` 标记项目 trust,登记到 `~/.ccteam/config.yaml`。一个目录 = 一个项目:在已经是项目的目录上再创建,得到的是那个项目,不会多出第二个 slug(Web 直接返回它,IM `/newproject` 切换过去,`ccteam init` 原地刷新,`--slug` 指向别的项目时拒绝);目录属于你看不到的项目时拒绝。创建时不写 `CLAUDE.md`、`workflow.yaml`、角色或 Claude 设置;`.claude/agents/` 和 `.claude/settings.json` 归你。预算配置可自行创建 `.ccteam/workflow.yaml`。重跑刷新状态,未显式给出时保留已有 team 和 owner(`--force` 会重新盖默认 team),已有项目指引和 workflow 原样保留;同时清理 `.claude/settings.local.json` 中旧 ccteam hook/Telegram 插件钉,其余键和你的 hook 不动;非法 JSON 原样保留并在回执注明。偏好存 `~/.ccteam/preferences.toml`:`fallback.on_claude_quota` = `off`|`codex`,控制 Claude 配额触顶是否回退 Codex。
 
 ### `project`(项目生命周期)
 

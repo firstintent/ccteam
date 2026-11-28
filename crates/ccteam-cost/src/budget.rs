@@ -48,6 +48,8 @@ pub struct Budgets {
     pub pi: BudgetCap,
     #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
     pub dsh: BudgetCap,
+    #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
+    pub agy: BudgetCap,
 }
 
 /// One vendor's cost + spawn caps.
@@ -82,6 +84,7 @@ impl Budgets {
             Vendor::Kimi => &self.kimi,
             Vendor::Pi => &self.pi,
             Vendor::Dsh => &self.dsh,
+            Vendor::Agy => &self.agy,
         }
     }
 
@@ -234,6 +237,7 @@ mod vendor_wire {
             Vendor::Kimi => "kimi",
             Vendor::Pi => "pi",
             Vendor::Dsh => "dsh",
+            Vendor::Agy => "agy",
         })
     }
 
@@ -250,6 +254,7 @@ mod vendor_wire {
             "kimi" => Ok(Vendor::Kimi),
             "pi" => Ok(Vendor::Pi),
             "dsh" => Ok(Vendor::Dsh),
+            "agy" => Ok(Vendor::Agy),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }

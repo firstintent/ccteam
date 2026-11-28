@@ -83,6 +83,10 @@ pub const OPENCODE_BIN_ENV: &str = "CCTEAM_OPENCODE_BIN";
 /// the hermetic fake (`tests/fixtures/kimi_acp/fake_kimi_acp.py`).
 pub const KIMI_BIN_ENV: &str = "CCTEAM_KIMI_BIN";
 
+/// Environment override for the `agy` (Antigravity CLI) binary path. Tests
+/// set this to the hermetic fake (`tests/fixtures/agy_acp/fake_agy_acp.py`).
+pub const AGY_BIN_ENV: &str = "CCTEAM_AGY_BIN";
+
 /// Environment override for the global ccteam root. Harness-owned
 /// adapters use this for per-session state sidecars without depending
 /// on `ccteam-core::paths::CcteamPaths`.
@@ -129,6 +133,9 @@ pub enum AgentVendor {
     /// which also carries the tool face and the team panel); see
     /// `execution/dsh_acp`.
     Dsh,
+    /// Antigravity CLI (`agy acp`, Google). Plain ACP stdio; see
+    /// `execution/agy_acp`.
+    Agy,
 }
 
 /// Where ccteam may execute a vendor adapter. Declaring this beside
@@ -151,6 +158,7 @@ impl AgentVendor {
         AgentVendor::Kimi,
         AgentVendor::Pi,
         AgentVendor::Dsh,
+        AgentVendor::Agy,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
@@ -162,6 +170,7 @@ impl AgentVendor {
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
             AgentVendor::Pi => ccteam_cost::Vendor::Pi,
             AgentVendor::Dsh => ccteam_cost::Vendor::Dsh,
+            AgentVendor::Agy => ccteam_cost::Vendor::Agy,
         }
     }
 
@@ -175,6 +184,7 @@ impl AgentVendor {
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
             AgentVendor::Dsh => "dsh",
+            AgentVendor::Agy => "agy",
         }
     }
 
@@ -185,7 +195,8 @@ impl AgentVendor {
             | AgentVendor::Codex
             | AgentVendor::Grok
             | AgentVendor::Opencode
-            | AgentVendor::Kimi => HostExecutionScope::LocalOrSatellite,
+            | AgentVendor::Kimi
+            | AgentVendor::Agy => HostExecutionScope::LocalOrSatellite,
             AgentVendor::Pi | AgentVendor::Dsh => HostExecutionScope::LocalOnly,
         }
     }
@@ -542,18 +553,14 @@ pub enum TurnInput {
 #[serde(rename_all = "snake_case")]
 pub enum TurnRouting {
     /// Merge the message into the active vendor turn at its next safe point —
-    /// a human steering the work they are watching.
+    /// a human steering the work they are watching, an `agent{sid,task}`
+    /// dispatch by default, and every ccteam-authored delegation completion
+    /// notification (GitHub #220: a busy parent reads it mid-turn).
     Inject,
-    /// Preserve the message as a distinct FIFO follow-up turn — a message
-    /// nobody is steering with, such as a ccteam-authored delegation
-    /// completion notification (issue #194: on claude a mid-turn stdin line is
-    /// shown to the model twice, once as a queued-command preview and once as
-    /// the next prompt; a distinct turn is charged once).
+    /// Preserve the message as a distinct FIFO follow-up turn — a dispatcher
+    /// that asked for its task to be answered in a turn of its own
+    /// (`agent{routing:"queue"}`).
     Queue,
-    /// Internal completion delivery. Like Queue, but adjacent notifications
-    /// already parked at a boundary may share a turn (GitHub #205). Explicit
-    /// dispatched tasks keep Queue and their independent execution identities.
-    Notification,
 }
 
 /// What the adapter actually did with one accepted message.
@@ -1536,8 +1543,9 @@ pub struct ContextRequestUsage {
     pub reasoning_output_tokens: Option<u64>,
 }
 
-/// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
-/// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
+/// Account-level usage / rate-limits (Claude: the rate-limit headers its turns
+/// report; Codex: its rate-limit notifications; Grok: `x.ai/billing`),
+/// vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
 /// credits), NOT a per-session property — the gateway queries it once on any
 /// live session. Percentages are 0-100; `*_resets_at` is the vendor's ISO-8601
@@ -1920,9 +1928,11 @@ pub struct SpawnCtx {
     /// Explicit vendor session-mode token for this thread. `None` = the
     /// vendor default. Same verbatim-ride contract as
     /// `effort`: an adapter with no mode axis REFUSES a non-empty value
-    /// (`spawn_pick_refused`) instead of quietly ignoring it. Today only DSH
-    /// consumes it as a native agent-preset id; DSH owns the roster and default.
-    /// ccteam's `creator` product label selects the native `cordis` preset.
+    /// (`spawn_pick_refused`) instead of quietly ignoring it. Two vendors
+    /// consume it: DSH as a native agent-preset id (DSH owns the roster and
+    /// default; ccteam's `creator` product label selects the native `cordis`
+    /// preset), and Antigravity as its ACP session mode (`session/set_mode`:
+    /// `default` | `accept-edits` | `auto` | `plan`, validated by agy).
     pub mode: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
@@ -2128,7 +2138,8 @@ pub trait HarnessAdapter: Send + Sync {
     /// Report ACCOUNT-level usage / rate-limits (5-hour + weekly windows + extra
     /// credits) for the IM `/status` operator dashboard. Unlike `thread_status`
     /// this is OPTIONAL (a default `None`): only adapters with a usage channel
-    /// implement it (Claude stream-json via the `get_usage` control_request).
+    /// implement it (Claude stream-json from the `rate_limit_event`s its turns
+    /// print, so reading it asks claude nothing — #244).
     /// It is account-, not session-, scoped — the gateway queries it once on any
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
@@ -2447,6 +2458,7 @@ impl SessionHandle {
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
             AgentVendor::Dsh => "dsh",
+            AgentVendor::Agy => "agy",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

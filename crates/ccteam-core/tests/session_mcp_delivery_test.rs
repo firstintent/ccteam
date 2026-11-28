@@ -10,8 +10,8 @@
 //! So the table below is the home: every vendor in `AGENT_PROBE_SPECS` must
 //! declare which dialect carries its session MCP endpoint, and each dialect is
 //! asserted to actually carry a non-empty URL + the session principal. A
-//! seventh vendor added to the registry fails this test until it declares one
-//! — which is the point.
+//! new vendor added to the registry fails this test until it declares one —
+//! which is the point (it caught `agy` on the way in).
 
 use ccteam_core::host_registry::{ToolSurfaceMode, AGENT_PROBE_SPECS};
 use ccteam_harness::execution::mcp_config::{
@@ -31,7 +31,7 @@ enum Dialect {
     ClaudeMcpJson,
     /// Codex: `thread/start` `config.mcp_servers`.
     CodexThreadConfig,
-    /// Grok / OpenCode / Kimi: ACP `session/new` `mcpServers[]`.
+    /// Grok / OpenCode / Kimi / Antigravity: ACP `session/new` `mcpServers[]`.
     AcpMcpServers,
     /// Pi: child env the ccteam bridge extension reads on load.
     BridgeChildEnv,
@@ -43,7 +43,7 @@ fn dialect_of(vendor: &str) -> Option<Dialect> {
     match vendor {
         "claude" => Some(Dialect::ClaudeMcpJson),
         "codex" => Some(Dialect::CodexThreadConfig),
-        "grok" | "opencode" | "kimi" => Some(Dialect::AcpMcpServers),
+        "grok" | "opencode" | "kimi" | "agy" => Some(Dialect::AcpMcpServers),
         "pi" | "dsh" => Some(Dialect::BridgeChildEnv),
         _ => None,
     }

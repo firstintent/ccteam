@@ -41,10 +41,10 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 
 `task` **必填**,原文作为 user turn 转发(零注入);没有「只建不派」的形态。
 
-- **不带 `sid` = 新雇。**`vendor` 选 harness —— `claude`(默认)/ `codex` / `grok` / `opencode` / `kimi` / `pi` / `dsh` —— 响应总是带**新** sid。`model` / `effort` 原样传给 vendor(省略走默认;vendor 拒绝的值 = 雇佣失败,绝不静默忽略)。`role` 指 `.claude/agents/<role>.md`(省略 = roleless,裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`)。`mode` 仅 DSH(`standard` | `ptc` | `minimal` | `creator`)。`permission_mode:"hitl"` 把审批弹到你绑定的 chat;默认 `skip` 不弹。`tools` 设子会话自己的面(§2)。`title`(≤80 字符)只进账本与团队视图,绝不进任何 prompt。`parent_sid` 用于 ccteam 不管理你时保住委派边。
+- **不带 `sid` = 新雇。**`vendor` 选 harness —— `claude`(默认)/ `codex` / `grok` / `opencode` / `kimi` / `pi` / `dsh` / `agy` —— 响应总是带**新** sid。`model` / `effort` 原样传给 vendor(省略走默认;vendor 拒绝的值 = 雇佣失败,绝不静默忽略)。`role` 指 `.claude/agents/<role>.md`(省略 = roleless,裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`)。`mode` 是 vendor 的会话模式:DSH 收 `standard` | `ptc` | `minimal` | `creator`,Antigravity(`agy`)收 `default` | `accept-edits` | `auto` | `plan`,其余 vendor 一律拒绝。`permission_mode:"hitl"` 把审批弹到你绑定的 chat;默认 `skip` 不弹。`tools` 设子会话自己的面(§2)。`title`(≤80 字符)只进账本与团队视图,绝不进任何 prompt。`parent_sid` 用于 ccteam 不管理你时保住委派边。
 - **带 `sid` = 续派**;`released` 会话先按 sid 复活。此形态下雇佣类参数一律拒绝而非静默忽略。
 - `wait` —— 内联等待秒数,0–240(默认 0 = async)。它等的是**这一次请求**的答案:同一子会话里另一个任务先完成,那是那次请求的完成、不是你的,照常推给你。超时回 `answered:false` + 下面那组送达事实,**绝不取消子任务**。
-- `routing` —— 任务进入**忙碌**子会话时走哪条信道:`inject`(默认)并进它正在跑的那个 turn,与人在 IM 里说话同一条路;`queue` 给它一个独立的 FIFO 后续 turn。子会话空闲时两者无差别 —— 反正都开一个新 turn。注入不取消在飞 turn、不新建会话,也不从任务文本推断紧急度;两条信道由你选,没有任何自动合并、替换或语义覆盖。**代价要说清:**在 claude 上,这行注入文本会被模型看两遍(一遍是 turn 中的 queued_command 预览,一遍是下一个 prompt),而了结这条请求的是 CLI 把它**重跑**的那个 turn,不是它并进去的那个 —— 后者的边界之所以不算终结,正是因为那行还等着被重放。要纠正正在干活的子会话就 steer;要拿一份你打算据以决策的独立答复,就传 `routing:"queue"`。ccteam 自己生成的完成通知永远走 queue,与这个参数无关。
+- `routing` —— 任务进入**忙碌**子会话时走哪条信道:`inject`(默认)并进它正在跑的那个 turn,与人在 IM 里说话同一条路;`queue` 给它一个独立的 FIFO 后续 turn。子会话空闲时两者无差别 —— 反正都开一个新 turn。注入不取消在飞 turn、不新建会话,也不从任务文本推断紧急度;两条信道由你选,没有任何自动合并、替换或语义覆盖。**代价要说清:**在 claude 上,模型通常就在这行注入文本并进去的那个 turn 里作答,你的答案与那个 turn 共用;CLI 也可能把它当下一个 prompt **重跑**,ccteam 会把并进去的那个 turn 的边界扣住 30 秒宽限,以便跟上这样的重放 turn。要纠正正在干活的子会话就 steer;要拿一份你打算据以决策的独立答复,就传 `routing:"queue"`。ccteam 自己生成的完成通知永远走 inject 信道,与这个参数无关。
 - `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
 - **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
 
@@ -140,11 +140,9 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 | `final` | 2000 字符,同样形状 | 想把全文推过来的 parent |
 | `off` | 无(只记账本) | 发完不管 |
 
-省略 `notify` 时**继承**你在该子会话仍未决请求中的最近选择;显式覆盖,无先例才默认 `brief`。布尔仍认(`true`→final,`false`→off),退役的 `all` 报错。通过 `agent{wait}` 或在边界返回的 `agent_read{sid,wait}` 拿到答案,只抑制该请求的通知;等 B 不会抑制 A。普通读取和 `collected` 事件不撤销 parked 通知:截断摘录不是消费确认。
+省略 `notify` 时**继承**你在该子会话仍未决请求中的最近选择;显式覆盖,无先例才默认 `brief`。布尔仍认(`true`→final,`false`→off),退役的 `all` 报错。通过 `agent{wait}` 或在边界返回的 `agent_read{sid,wait}` 拿到答案,只抑制该请求的通知;等 B 不会抑制 A。普通读取和 `collected` 事件不撤销待投递的通知:截断摘录不是消费确认。
 
-送达需要受管 parent,通知作为普通 user turn 进入对话。Claude stream-json 在 parent 忙时暂存通知,到边界立即把已排队且相邻的通知装进同一批次,不设凑批等待窗口;显式任务与斜杠命令仍是 FIFO 边界。批次头为 `[Notification batch <id>: N items]`,逐条原样保留请求 id、回答 turn、结果和精确读取引用,并写明 `[Notifications still undelivered: R]`。50000 字符上限包含信封及重放标记预留空间,超出队列按确定性规则分到后续边界;每条请求仍独立记账。耐久队列扛崩溃,重放带 `[Repeated notification delivery: <id>]`;相同请求 id + 回答 turn 识别为同一完成。这是**跨崩溃至少一次**,不是消费确认。进程间隙的通知在 resume 时投递。
-
-若单条不可拆通知本身已超批次预算,独立投递并标注 `[Oversized indivisible notification: delivered alone; batch budget 50000 chars]`;原字节完整保留,后续通知在后续边界继续。
+送达需要受管 parent,通知作为一条普通 user 消息、走与人发消息同一条信道:parent 忙时注入它正在跑的那个 turn,在下一个工具边界就被读到,不必等这个 turn 结束;parent 空闲时它开一个新 turn。每条通知自成一行,原样保留请求 id、回答 turn、结果和精确读取引用;每条请求独立记账。相同请求 id + 回答 turn 识别为同一完成:送到一半崩溃,下一个生命可能重发而不是丢掉 —— **跨崩溃至少一次**,不是消费确认。注入的通知在下一个工具边界之前只在 parent CLI 自己的输入队列里:若 parent 进程先结束(stop、崩溃),模型就读不到它,而请求已记为已通知 —— child 的回答仍可用 `agent_read{sid}` 读到。进程间隙的通知在 resume 时投递。
 
 手起 parent 没有回程:派发回复和初始化都明确说明 `notify_deliverable:false`,用 `agent{wait}` 或 `agent_read{sid,wait}`。派给不是你雇的会话是 handoff:首次接触照跑照记,但不订阅通知,除非显式传 `notify`;在该 peer 点过模式后,续派照常继承。
 
@@ -162,7 +160,7 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 
 ## 7. 接线与验证
 
-- `ccteam config mcp` 向 Claude、Codex、Grok、OpenCode、Kimi 注册(各自全局配置;ccteam 只写自己那一条)。
+- `ccteam config mcp` 向 Claude、Codex、Grok、OpenCode、Kimi、Antigravity 注册(各自全局配置;ccteam 只写自己那一条)。
 - **DSH** 没有 ccteam 可写的配置:它的面是 DSH web 运行时里的 `@ccteam/ccteam-ui` 插件,加载时一次性注册同样六个工具(静态全面 —— 按 caller 出面只对直连 `POST /mcp` 的 harness 生效),且能把完成通知送回 DSH 对话。
 - **Pi** 只在 ccteam 受管会话里拿到工具(内嵌 bridge;Pi 内名字带 `ccteam_` 前缀,只读工具自动放行);你手起的 `pi` 分毫不动。
 - 随时验证:`ccteam doctor --verify-mcp` → **6 tools, 0 stubs**;`claude mcp list` 显示 `ccteam ✔`;某个会话列出的工具比别人少不是坏了 —— 那是它的面(§2)。

@@ -35,9 +35,10 @@ describe("enrollApi", () => {
       snippet("mystery"),
       snippet("claude"),
       snippet("grok"),
+      snippet("agy"),
       snippet("kimi"),
     ]).map((s) => s.vendor);
-    expect(ordered).toEqual(["claude", "kimi", "codex", "grok", "opencode", "mystery"]);
+    expect(ordered).toEqual(["claude", "kimi", "agy", "codex", "grok", "opencode", "mystery"]);
   });
 
   // The scope lives in the ROUTE, never in the body: a project-scoped mint is

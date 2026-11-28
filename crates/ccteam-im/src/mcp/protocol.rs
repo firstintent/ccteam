@@ -76,7 +76,7 @@ observability underneath.";
 /// so no `agent` description can be read at the moment the model reaches for
 /// it.
 const INSTRUCTIONS_ORCH: &str =
-    "When asked to call/use/delegate to another agent (claude/codex/grok/opencode/kimi/pi/dsh), \
+    "When asked to call/use/delegate to another agent (claude/codex/grok/opencode/kimi/pi/dsh/agy), \
 use `agent` — never shell out to a vendor CLI (`codex exec`, `claude -p`): a raw run has no sid, \
 no transcript, no cost, and is invisible to the team. `agent{task,vendor}` hires; \
 `agent{task,sid}` follows up; `wait` returns the answer inline, otherwise a completion \
@@ -256,7 +256,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": STATUS_BEACON_TOOL_NAME,
-            "description": "Alias of `status` (brief): which agents — grok, claude, codex, kimi, opencode, pi, dsh — this machine can hire.",
+            "description": "Alias of `status` (brief): which agents — grok, claude, codex, kimi, opencode, pi, dsh, agy — this machine can hire.",
             "inputSchema": schema(json!({}), &[]),
             "annotations": { "readOnlyHint": true },
         }),
@@ -291,14 +291,14 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. A child doing background work answers over several turns; the completion is its last one. Answer tersely.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh, agy) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. A child doing background work answers over several turns; the completion is its last one. Answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "task_file": { "type": "string", "description": "Absolute path holding it — keeps a long brief out of your context." },
                 "sid": { "type": "string", "description": "Existing session to task; omit to hire a new one." },
                 "vendor": {
                     "type": "string",
-                    "enum": ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"],
+                    "enum": ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"],
                     "description": "Harness for a new session (default claude)."
                 },
                 "wait": { "type": "integer", "description": "Seconds to block inline, 0-240 (default 0 = async)." },
@@ -323,7 +323,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "enum": ["full", "read", "none"],
                     "description": "New session's ccteam tool face (default full)."
                 },
-                "mode": { "type": "string", "description": "Vendor session mode. DSH only: standard|ptc|minimal|creator." },
+                "mode": { "type": "string", "description": "Vendor session mode. DSH: standard|ptc|minimal|creator; agy: default|accept-edits|auto|plan." },
                 "permission_mode": {
                     "type": "string",
                     "enum": ["skip", "hitl"],
@@ -540,13 +540,21 @@ mod tests {
     /// mentions is a field callers do not reach for, and the whole point of
     /// this one is that it is reached for INSTEAD of a stop. ~165 B, which
     /// also has to say the excerpt is not an answer.
+    ///
+    /// 6300 → 6350 B for the eighth vendor (`agy`, issue #248), measured at
+    /// 6331. 16 B is the name itself in the three places a caller picks a
+    /// vendor from (the `vendor` enum and the two descriptions that list who
+    /// can be hired). 33 B is its `mode` values: `mode` used to read "DSH
+    /// only", which became false, and agy's own refusal (`Unknown mode: x`)
+    /// does not say what the valid ones are — the face is the only place a
+    /// caller can learn them before spending a spawn on a guess.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 6300,
-            "full tools/list is {bytes} B; budget is 6300 B"
+            bytes <= 6350,
+            "full tools/list is {bytes} B; budget is 6350 B"
         );
     }
 
@@ -960,7 +968,7 @@ mod tests {
             .collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy"]
         );
         let notify: Vec<&str> = props["notify"]["enum"]
             .as_array()
@@ -1014,7 +1022,9 @@ mod tests {
         let agent = defs.iter().find(|t| t["name"] == "agent").unwrap();
         let description = agent["description"].as_str().unwrap();
         let head: String = description.chars().take(140).collect();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
+        for vendor in [
+            "claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy",
+        ] {
             assert!(
                 head.contains(vendor),
                 "vendor `{vendor}` must appear in the first 140 chars (discoverability): {head}"
@@ -1047,7 +1057,9 @@ mod tests {
         // Vendors stay plain text here too: this tool exists FOR the hosts
         // that only see names and descriptions.
         let description = beacon["description"].as_str().unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
+        for vendor in [
+            "claude", "codex", "grok", "opencode", "kimi", "pi", "dsh", "agy",
+        ] {
             let head: String = description.chars().take(140).collect();
             assert!(head.contains(vendor), "beacon must name {vendor}: {head}");
         }

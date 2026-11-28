@@ -126,12 +126,14 @@ fn doctor_command(sb: &Sandbox) -> Command {
         .env("CCTEAM_KIMI_BIN", sb._tmp.path().join("missing-kimi"))
         .env("CCTEAM_PI_BIN", &sb.pi_bin)
         .env("CCTEAM_DSH_BIN", &sb.dsh_bin)
+        .env("CCTEAM_AGY_BIN", sb._tmp.path().join("missing-agy"))
         .env("NO_COLOR", "1")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("XAI_API_KEY")
         .env_remove("MOONSHOT_API_KEY")
-        .env_remove("DEEPSEEK_API_KEY");
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("GEMINI_API_KEY");
     command
 }
 
@@ -156,6 +158,7 @@ fn bare_doctor_renders_the_readiness_contract() {
         "kimi",
         "pi",
         "dsh",
+        "agy",
         "daemon",
         "version",
         "pricing",

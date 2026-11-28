@@ -2,7 +2,7 @@
 
 > **Agents:** if you were asked to "install https://github.com/firstintent/ccteam", follow this file top to bottom. Do the **Install** step, then relay the **Finish in the web console** step to the user. Do not improvise other commands.
 
-ccteam is a resident daemon (IM gateway + web console + MCP) that drives the stock Claude Code / Codex / Grok / OpenCode / Kimi / Pi CLIs. You install it once, start it in the background, then finish setup in the web console.
+ccteam is a resident daemon (IM gateway + web console + MCP) that drives the stock Claude Code / Codex / Grok / OpenCode / Kimi / Antigravity / Pi CLIs. You install it once, start it in the background, then finish setup in the web console.
 
 ## Prerequisites
 
@@ -15,6 +15,7 @@ ccteam is a resident daemon (IM gateway + web console + MCP) that drives the sto
   | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
   | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
   | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+  | Antigravity | [antigravity.google/docs/cli/overview](https://antigravity.google/docs/cli/overview) | run `agy` once to sign in (`agy acp --login` over SSH) |
   | Pi | [pi.dev](https://pi.dev/) | provider API key, checked with `pi auth check --provider <provider>` |
 
   Verify with `<bin> --version`; after install, `ccteam status` reports which vendors this machine has and whether each is authenticated.

@@ -129,36 +129,33 @@ pub fn stop_reason_from_prompt_result(result: &Value) -> AcpStopReason {
 /// - **OpenCode**: fields live under top-level `usage` (`inputTokens`,
 ///   `outputTokens`, `totalTokens`); cost is **not** here — it arrives via
 ///   `usage_update` session notification as session-cumulative USD.
+/// - **Antigravity**: top-level `usage` too, under its own names —
+///   `cachedReadTokens` / `cachedWriteTokens` / `thoughtTokens` (measured:
+///   `inputTokens` excludes the cached read, `outputTokens` includes thought).
 pub fn usage_from_prompt_result(result: &Value) -> (crate::UnifiedTokenUsage, Option<String>) {
     let meta = result.get("_meta").cloned().unwrap_or(Value::Null);
     let usage_block = result.get("usage").cloned().unwrap_or(Value::Null);
-
-    let input_tokens = usage_block
-        .get("inputTokens")
-        .or_else(|| meta.get("inputTokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage_block
-        .get("outputTokens")
-        .or_else(|| meta.get("outputTokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cached_input_tokens = usage_block
-        .get("cachedInputTokens")
-        .or_else(|| meta.get("cachedReadTokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let reasoning_output_tokens = usage_block
-        .get("reasoningTokens")
-        .or_else(|| meta.get("reasoningTokens"))
-        .and_then(|v| v.as_u64());
+    // First spelling that carries a number wins: `usage` before `_meta`.
+    let pick = |usage_keys: &[&str], meta_keys: &[&str]| {
+        usage_keys
+            .iter()
+            .filter_map(|k| usage_block.get(k))
+            .chain(meta_keys.iter().filter_map(|k| meta.get(k)))
+            .find_map(|v| v.as_u64())
+    };
 
     let usage = crate::UnifiedTokenUsage {
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens: None,
-        reasoning_output_tokens,
+        input_tokens: pick(&["inputTokens"], &["inputTokens"]).unwrap_or(0),
+        output_tokens: pick(&["outputTokens"], &["outputTokens"]).unwrap_or(0),
+        cached_input_tokens: pick(
+            &["cachedInputTokens", "cachedReadTokens"],
+            &["cachedReadTokens"],
+        )
+        .unwrap_or(0),
+        // Only a vendor that actually wrote cache reports a creation bucket;
+        // a literal 0 stays `None` so vendors without the SKU read the same.
+        cache_creation_input_tokens: pick(&["cachedWriteTokens"], &[]).filter(|n| *n > 0),
+        reasoning_output_tokens: pick(&["reasoningTokens", "thoughtTokens"], &["reasoningTokens"]),
         reported_cost_usd: None, // filled by translate from usage_update delta
     };
     let model = meta
@@ -574,6 +571,39 @@ pub fn is_replay(params: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agy 1.5.18 `session/prompt` result, captured live 2026-11-27.
+    #[test]
+    fn usage_reads_antigravitys_field_names() {
+        let (usage, model) = usage_from_prompt_result(&serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 2298, "outputTokens": 47, "cachedReadTokens": 7394,
+                "cachedWriteTokens": 0, "thoughtTokens": 45, "totalTokens": 9739
+            }
+        }));
+        assert_eq!(usage.input_tokens, 2298);
+        assert_eq!(usage.output_tokens, 47);
+        assert_eq!(usage.cached_input_tokens, 7394);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.reasoning_output_tokens, Some(45));
+        assert!(model.is_none());
+    }
+
+    /// The `usage` spelling still beats `_meta`, and opencode's own cached key
+    /// still beats the antigravity one when both are present.
+    #[test]
+    fn usage_precedence_is_usage_block_then_meta() {
+        let (usage, _) = usage_from_prompt_result(&serde_json::json!({
+            "usage": {"inputTokens": 5, "cachedInputTokens": 3, "cachedReadTokens": 9},
+            "_meta": {"inputTokens": 50, "outputTokens": 7, "cachedReadTokens": 90,
+                      "reasoningTokens": 2}
+        }));
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(usage.reasoning_output_tokens, Some(2));
+    }
     use serde_json::json;
 
     #[test]

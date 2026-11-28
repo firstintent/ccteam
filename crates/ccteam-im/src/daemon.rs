@@ -165,13 +165,14 @@ pub fn adapter_factory_with_dsh_runtime(
         Arc::new(ccteam_harness::OpencodeAcpAdapter::new());
     let kimi: Arc<dyn HarnessAdapter + Send + Sync> =
         Arc::new(ccteam_harness::KimiAcpAdapter::new());
+    let agy: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ccteam_harness::AgyAcpAdapter::new());
     let pi_rpc = Arc::new(PiRpcAdapter::new(pi_role_reader()));
     let pi: Arc<dyn HarnessAdapter + Send + Sync> = pi_rpc.clone();
     // v0.10.3 — DSH hires connect to the identity's shared `dsh web` runtime
     // over its ccteam Cordis plugin's ACP socket; no per-hire child exists.
     let dsh: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(DshAcpAdapter::new(dsh_runtime));
     // Vendor-first factory (v0.8.23 §3.E + v0.8.24 OpenCode): protocol is
-    // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi/Dsh always ACP.
+    // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi/Dsh/Agy always ACP.
     let factory: AdapterFactory = Arc::new(
         move |vendor: AgentVendor, protocol: SessionProtocol| match vendor {
             AgentVendor::Claude => match protocol {
@@ -186,6 +187,7 @@ pub fn adapter_factory_with_dsh_runtime(
             AgentVendor::Kimi => Arc::clone(&kimi),
             AgentVendor::Pi => Arc::clone(&pi),
             AgentVendor::Dsh => Arc::clone(&dsh),
+            AgentVendor::Agy => Arc::clone(&agy),
         },
     );
     (factory, claude_stream_json, pi_rpc)

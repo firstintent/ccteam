@@ -1,9 +1,12 @@
-//! Shared ACP (Agent Client Protocol) stdio core for Grok + OpenCode.
+//! Shared ACP (Agent Client Protocol) stdio core for every ACP vendor.
 //!
 //! Transport / translate / protocol types are vendor-neutral. Vendor-specific
 //! spawn argv and adapter wiring live in:
 //! - [`crate::execution::grok_acp`]
 //! - [`crate::execution::opencode_acp`]
+//! - [`crate::execution::kimi_acp`]
+//! - [`crate::execution::dsh_acp`]
+//! - [`crate::execution::agy_acp`]
 
 pub mod context_probe;
 pub mod protocol;
@@ -20,7 +23,7 @@ pub use protocol::{
 };
 pub use translate::{
     apply_notification, apply_notification_shared, fail_turn, finalize_from_prompt_result,
-    in_flight_narration, SessionTranslateState, TurnBuffer,
+    in_flight_narration, spawn_notification_dispatcher, SessionTranslateState, TurnBuffer,
 };
 pub use transport::{AcpTransport, InboundPolicy, JsonRpcError, Notification};
 pub use turn_runner::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};

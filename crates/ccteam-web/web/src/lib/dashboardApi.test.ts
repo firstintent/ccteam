@@ -100,7 +100,15 @@ describe("createProject", () => {
       jsonResponse(201, { slug: "demo", host: "local", path: "/home/u/demo" }),
     );
     const got = await createProject("demo", "~/demo");
-    expect(got).toEqual({ slug: "demo", host: "local", path: "/home/u/demo" });
+    expect(got).toEqual({ slug: "demo", host: "local", path: "/home/u/demo", existing: false });
+  });
+
+  it("flags a directory that already was a project (200, #239)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(200, { slug: "demo", host: "local", path: "/home/u/demo" }),
+    );
+    const got = await createProject("demo2", "~/demo");
+    expect(got).toEqual({ slug: "demo", host: "local", path: "/home/u/demo", existing: true });
   });
 
   it("lifts the JSON error body on 409 (not a bare 'HTTP 409')", async () => {

@@ -172,6 +172,21 @@ pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
     Ok(mcp_json)
 }
 
+/// Production path for Antigravity CLI MCP install (vendor symmetry): the
+/// global `~/.gemini/config/mcp_config.json` entry carries the machine-user
+/// enrollment credential so a plain `agy` main session is a first-class
+/// caller; ccteam-managed agy sessions keep their ACP-injected per-session
+/// principal.
+pub fn install_agy_mcp() -> Result<std::path::PathBuf> {
+    let mcp_json = ccteam_core::mcp_register::resolve_agy_config_path()?;
+    let paths = CcteamPaths::from_env()?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    ccteam_core::mcp_register::install_agy_mcp_into(&mcp_json, &mcp_http_url, &bearer)?;
+    Ok(mcp_json)
+}
+
 /// Best-effort daemon-start registration for every installed/configured vendor.
 ///
 /// The gate is deliberately read-only and never executes a vendor binary: an
@@ -216,6 +231,7 @@ fn auto_register_one(
         "grok" => install_grok_mcp(),
         "opencode" => install_opencode_mcp(),
         "kimi" => install_kimi_mcp(),
+        "agy" => install_agy_mcp(),
         other => anyhow::bail!("unsupported MCP registration vendor: {other}"),
     }?;
     Ok(Some(path))
@@ -228,6 +244,7 @@ fn vendor_config_path(vendor: &str) -> Result<std::path::PathBuf> {
         "grok" => ccteam_core::mcp_register::resolve_grok_config_path(),
         "opencode" => ccteam_core::mcp_register::resolve_opencode_config_path(),
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path(),
+        "agy" => ccteam_core::mcp_register::resolve_agy_config_path(),
         other => anyhow::bail!("unsupported MCP registration vendor: {other}"),
     }
 }

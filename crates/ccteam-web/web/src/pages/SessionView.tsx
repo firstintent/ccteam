@@ -314,6 +314,21 @@ export default function SessionView({
       return next;
     });
   }, []);
+  // Reply footers a touch reader has tapped open (#246). Touch devices hide
+  // the `HH:MM · vendor · sid · model · turn · ctx` line until the reply is
+  // tapped; hover devices fade it in on hover/focus (index.css). Per-sid like
+  // `expandedFolds`.
+  const [openFooters, setOpenFooters] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const toggleFooter = useCallback((rowId: string) => {
+    setOpenFooters((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+  }, []);
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
   const [ctxPct, setCtxPct] = useState<number | null>(null);
@@ -418,7 +433,7 @@ export default function SessionView({
     ctxToggleRef.current?.focus();
   }, [setContextOpen]);
 
-  const { events, lastError, gatewayUnavailable, connectionEpoch } =
+  const { events, lastError, gatewayUnavailable, connectionEpoch, turnState } =
     useSessionEvents(sid);
 
   // A turn ending is the moment the window changes, so the panel re-fetches
@@ -569,12 +584,25 @@ export default function SessionView({
   // interim line (the session talking mid-turn; Stop + the cursor must stay),
   // an approval prompt, or a sealed progress card (`done` closes one card,
   // not the turn) does not end it.
-  const busy = turnInFlight(events, turnMark);
-  if (turnMark !== null && !busy) {
+  const localBusy = turnInFlight(events, turnMark);
+  if (turnMark !== null && !localBusy) {
     // Retire the finished turn's watermark (render-phase adjust) so its
     // boundary aging out of the ring can never resurrect it.
     setTurnMark(null);
   }
+  // ---- a turn started anywhere (#247) --------------------------------------
+  // The daemon says on the stream whether a turn is in flight (`turn_state`),
+  // so a turn IM / CLI / another device started shows the cursor, heartbeat
+  // and Stop here too. It ends on the same boundary a send from this page
+  // waits for (ordered by the daemon's replay seq), or on an idle frame.
+  const remoteBusy = turnState?.busy === true;
+  const busy = localBusy || remoteBusy;
+  // The heartbeat's clock: our own send's when we sent it, else the daemon's.
+  const shownBusySince = localBusy
+    ? busySince
+    : turnState?.busy
+      ? turnState.receivedAt - (turnState.elapsedSeconds ?? 0) * 1000
+      : null;
 
   // ---- per-session status (model + effort + ctx%) --------------------------
   const lastEventTs =
@@ -644,16 +672,20 @@ export default function SessionView({
   }, []);
 
   const scheduleText = useCallback(
-    (content: string, when: string) => {
+    // Resolves the composer's draft (#237): it is kept unless the row landed.
+    (content: string, when: string) =>
       createScheduled(sid, content, when)
-        .then(() => reloadScheduled())
+        .then(() => {
+          reloadScheduled();
+          return true;
+        })
         .catch((error) => {
           pushRow({
             kind: "system",
             content: `${t("scheduleFailed")}: ${error instanceof Error ? error.message : "unknown"}`,
           });
-        });
-    },
+          return false;
+        }),
     [sid, reloadScheduled, pushRow, t],
   );
 
@@ -689,17 +721,23 @@ export default function SessionView({
       // would anchor behind a boundary already on screen (ending busy at once).
       setTurnMark({ after: events[events.length - 1] ?? null });
       setBusySince(Date.now());
-      submitTurn(sid, content, attachments).catch((e) => {
-        setTurnMark(null);
-        setBusySince(null);
-        const detail = e instanceof Error ? e.message : "unknown";
-        pushRow({
-          kind: "system",
-          content: detail.startsWith("发送失败")
-            ? detail
-            : `发送失败: ${detail}`,
-        });
-      });
+      // Resolves the composer's draft (#237): a failed send leaves the text
+      // in the composer to retry instead of only in the optimistic row.
+      return submitTurn(sid, content, attachments).then(
+        () => true,
+        (e) => {
+          setTurnMark(null);
+          setBusySince(null);
+          const detail = e instanceof Error ? e.message : "unknown";
+          pushRow({
+            kind: "system",
+            content: detail.startsWith("发送失败")
+              ? detail
+              : `发送失败: ${detail}`,
+          });
+          return false;
+        },
+      );
     },
     [sid, pushRow, events],
   );
@@ -1157,7 +1195,20 @@ export default function SessionView({
                       }
                       // assistant — full Markdown document (红线: never plain text).
                       return (
-                        <div key={row.id} className="msg agent fade-in">
+                        <div
+                          key={row.id}
+                          className={`msg agent fade-in${openFooters.has(row.id) ? " footer-open" : ""}`}
+                          data-testid="agent-reply"
+                          onClick={(event) => {
+                            // A tap on the reply body toggles its footer; a tap
+                            // on a link / button / file chip keeps its own job,
+                            // and finishing a text selection is not a tap.
+                            const target = event.target as Element | null;
+                            if (target?.closest("a, button, input, textarea, select, summary, [role=button]")) return;
+                            if (window.getSelection()?.toString()) return;
+                            toggleFooter(row.id);
+                          }}
+                        >
                           <div className="bubble md">
                             {row.content ? (
                               <Markdown
@@ -1185,8 +1236,8 @@ export default function SessionView({
                               .filter((part): part is string => !!part)
                               .join(" · ");
                             return (
-                              <div className="reply-footer">
-                                <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                              <div className={`reply-footer${footer?.warn ? " warn" : ""}`} data-testid="reply-footer">
+                                <span className={`turn-status${footer?.warn ? " warn" : ""}`} title={tail}>
                                 <RowTime ts={row.ts} lang={lang} />
                                 {row.ts ? ` · ${tail}` : tail}
                                 </span>
@@ -1206,7 +1257,7 @@ export default function SessionView({
                         <div className="bubble">
                           <span className="cursor" />
                           <BusyHeartbeat
-                            since={busySince}
+                            since={shownBusySince}
                             lastEventTs={lastEventTs}
                             lang={lang}
                           />

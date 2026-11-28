@@ -240,8 +240,11 @@ impl DshAcpAdapter {
             }
         }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
-        let dispatcher =
-            spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
+        let dispatcher = crate::execution::acp::spawn_notification_dispatcher(
+            Arc::clone(&transport),
+            Arc::clone(&state),
+            event_tx.clone(),
+        );
         let live = Arc::new(LiveSession {
             transport,
             session_id: session_id.clone(),
@@ -368,35 +371,6 @@ fn describe_state(state: DshRuntimeState) -> &'static str {
         DshRuntimeState::Running => "running",
         DshRuntimeState::Attached => "attached (started outside ccteam)",
     }
-}
-
-fn spawn_notif_dispatcher(
-    transport: Arc<AcpTransport>,
-    state: Arc<StdMutex<SessionTranslateState>>,
-    event_tx: broadcast::Sender<ThreadEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let (early, mut sub) = transport.subscribe_with_early();
-        for n in early {
-            for ev in crate::execution::acp::apply_notification_shared(&state, &n) {
-                let _ = event_tx.send(ev);
-            }
-        }
-        loop {
-            tokio::select! {
-                _ = transport.wait_closed() => return,
-                msg = sub.recv() => match msg {
-                    Ok(n) => {
-                        for ev in crate::execution::acp::apply_notification_shared(&state, &n) {
-                            let _ = event_tx.send(ev);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        }
-    })
 }
 
 #[async_trait]

@@ -14,7 +14,15 @@
 
 import type { VendorCatalog } from "./modelsApi";
 
-export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi" | "pi" | "dsh";
+export type VendorId =
+  | "claude"
+  | "codex"
+  | "grok"
+  | "opencode"
+  | "kimi"
+  | "pi"
+  | "dsh"
+  | "agy";
 
 /** One selectable wire protocol for a vendor. `wire` is the value POSTed to
  *  `POST /projects/{slug}/sessions` (`protocol` field); `label` is what the
@@ -129,6 +137,18 @@ export const VENDORS: VendorSpec[] = [
     // path; the static entry exists only as an icon/label fallback.
     models: [],
     efforts: [],
+    protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
+  },
+  {
+    id: "agy",
+    label: "Antigravity",
+    // Antigravity CLI (`agy acp`) declares its models in the ACP handshake and
+    // they follow the signed-in plan — live-only.
+    models: [],
+    // Thinking levels are per-model (`xhigh` on some, none at all on others);
+    // these are the three every thinking model offered. The live catalog
+    // replaces them once a session has been observed.
+    efforts: ["low", "medium", "high"],
     protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
 ];
