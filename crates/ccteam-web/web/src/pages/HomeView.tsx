@@ -23,7 +23,7 @@ import { Folder, GitBranch, Globe } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ChatComposer, saveComposerDraft, type SendOutcome } from "../components/ChatComposer";
 import { CswapAccountPicker } from "../components/CswapAccountPicker";
-import { useVendorCatalog } from "../hooks/useVendorCatalog";
+import { useVendorCatalog, vendorCatalogStore } from "../hooks/useVendorCatalog";
 import { projectsStore } from "../hooks/useProjectsStore";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
@@ -420,6 +420,10 @@ export default function HomeView({
         claude_account: effectiveDraft.vendor === "claude" && effectiveHost === "local" && wireProtocol(effectiveDraft) === "stream-json"
           ? claudeAccount || undefined : undefined,
       });
+      // Live-only vendors (agy, codex, grok, kimi, opencode, pi, dsh) record
+      // their models during the spawn handshake — refresh so the next menu
+      // open sees them without a page reload.
+      vendorCatalogStore.refresh();
       try {
         await submitTurn(sid, text, attachments);
       } catch (cause) {

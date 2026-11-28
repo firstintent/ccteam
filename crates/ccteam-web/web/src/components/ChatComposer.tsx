@@ -6,7 +6,7 @@
 //   - HITL 胶囊 toggle (black-on when armed) with a permission-mode toast
 //   - the 3-section model menu: models grouped by vendor · effort · protocol,
 //     all of it driven by what the vendor itself declares (`GET
-//     /api/v1/models`, cached once per page load) — never a ccteam-invented
+//     /api/v1/models`, shared and auto-refreshed on focus/menu/spawn) — never a ccteam-invented
 //     ladder, and the picked token rides the spawn verbatim
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
@@ -42,7 +42,7 @@ import {
   type SkillSummary,
   type TurnAttachment,
 } from "../lib/attachmentsApi";
-import { useVendorCatalog } from "../hooks/useVendorCatalog";
+import { useVendorCatalog, vendorCatalogStore } from "../hooks/useVendorCatalog";
 import type { VendorCatalog } from "../lib/modelsApi";
 import {
   effortRowLabel,
@@ -789,6 +789,7 @@ export function ChatComposer({
       return;
     }
     onDraftChange(switchDraftVendor(draft, vendor));
+    vendorCatalogStore.refresh();
   };
 
   /** `effort` is the vendor's own token, verbatim; `""` = vendor default. */
@@ -1135,6 +1136,7 @@ export function ChatComposer({
               onClick={(e) => {
                 e.stopPropagation();
                 setVendorOpen(false);
+                if (!menuOpen) vendorCatalogStore.refresh();
                 setMenuOpen((o) => !o);
               }}
             >
